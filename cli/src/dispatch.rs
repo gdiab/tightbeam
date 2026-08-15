@@ -118,6 +118,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
@@ -1187,11 +1188,20 @@ where
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
         Command::Onboard {
             identity,
             provider,
             api_key,
+            hostname,
+            remote,
         } => {
+            if provider == "github" {
+                return crate::github_auth::onboard(
+                    hostname.as_deref().unwrap_or("github.com"),
+                    remote.as_deref(),
+                );
+            }
             let endpoint = discover_endpoint()?;
             require_session_endpoint(&identity, &endpoint)?;
             crate::ceremonies::onboard(
@@ -1310,6 +1320,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
         | Command::ToolCallObserved
+        | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
     }
@@ -2405,6 +2416,8 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                hostname: None,
+                remote: None,
             },
             || {
                 discoveries.set(discoveries.get() + 1);
@@ -2512,6 +2525,8 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                hostname: None,
+                remote: None,
             },
             || {
                 Ok(Endpoint {

@@ -1111,7 +1111,11 @@ defmodule Tightbeam.PlacementTest do
 
     assert hooks == %{
              "hooks" => %{
-               "PreToolUse" => [Rails.observation_entry(), Rails.probe_entry()]
+               "PreToolUse" => [
+                 Rails.github_auth_entry(),
+                 Rails.observation_entry(),
+                 Rails.probe_entry()
+               ]
              }
            }
   end
