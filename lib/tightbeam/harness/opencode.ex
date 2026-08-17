@@ -139,7 +139,7 @@ defmodule Tightbeam.Harness.Opencode do
 
         case target.sh.(command) do
           {output, 0} ->
-            {:ok, %{version: String.trim(output)}}
+            {:ok, %{version: observed_version(output)}}
 
           {output, status} ->
             {:error, {:exec_failed, "exit=#{status} output=#{inspect(String.trim(output))}"}}
@@ -169,6 +169,29 @@ defmodule Tightbeam.Harness.Opencode do
                "#{@adapter_version} pin: #{inspect(reason)}"
          }}
     end
+  end
+
+  # The version an ssh-carried `opencode --version` actually observed.
+  #
+  # The remote branch runs through `target.sh`, which in production is `Spinup.ensure_ready`'s
+  # default `Support.system_cmd/1` -- and that one merges stderr into stdout. ssh chatters on
+  # stderr even when it SUCCEEDS ("Warning: Permanently added ... to known hosts." on a first
+  # connection, plus any host banner), so trimming the whole output would compare that warning
+  # against the pin and refuse a host that genuinely has 1.0.41 -- naming the ssh warning as the
+  # installed version. `opencode --version` answers on its LAST line, so the answer is the
+  # trailing line and leading chatter is tolerated; this is the same trailing-line reading
+  # `catalog_probe` already uses for its ssh-carried probes (support.ex).
+  #
+  # This does NOT loosen the pin: the extracted line is still matched EXACTLY against
+  # @adapter_version, so a real non-1.0.41 is still refused and now reports the REAL version
+  # instead of the chatter. Kept local to this seam rather than reusing catalog_probe's private
+  # splitter, whose contract is body-plus-HTTP-status, not a version line.
+  defp observed_version(output) do
+    output
+    |> String.trim()
+    |> String.split("\n")
+    |> List.last("")
+    |> String.trim()
   end
 
   # The gate plugin is static Tightbeam-owned code; its config references it by ABSOLUTE path, so

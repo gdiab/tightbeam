@@ -162,6 +162,105 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
 
       File.rm_rf!(base)
     end
+
+    # The remote branch of the pin probe runs through `target.sh`, which in production is
+    # `Spinup.ensure_ready`'s default `Support.system_cmd/1` -- stderr merged into stdout. ssh
+    # chatters on stderr even on SUCCESS, so a correctly-pinned host arrives as
+    # "Warning: ...\n1.0.41". Reading the whole output refused exactly the hosts the pin exists
+    # to admit, and named the ssh warning as the installed version. Every case below carries
+    # that chatter, because a probe that only works on a silent connection is the bug.
+    test "the remote pin probe reads through ssh chatter without loosening the pin" do
+      base = Path.join(System.tmp_dir!(), "oc-pin-remote-#{System.unique_integer([:positive])}")
+      cli_path = Path.join(base, "opencode-cli")
+      File.mkdir_p!(base)
+      File.write!(cli_path, "#!/bin/sh\n")
+      File.chmod!(cli_path, 0o755)
+
+      chatter = "Warning: Permanently added 'remote' (ED25519) to the list of known hosts.\n"
+
+      # Mirrors the conformance vector's remote shim mock: resolve `command -v`, and actually
+      # execute the ssh-carried script so the shim/gate writes land on disk.
+      remote_target = fn reported ->
+        %{
+          base_dir: base,
+          host_name: "remote-host",
+          host_config: %{base_dir: base, ssh: "vector@remote"},
+          adapter_binary: Path.join([base, "adapters", "node_modules", ".bin", "opencode"]),
+          find_executable: fn _ -> cli_path end,
+          sh: fn command ->
+            joined = Enum.join(command, " ")
+
+            cond do
+              String.contains?(joined, "--version") ->
+                {chatter <> reported <> "\n", 0}
+
+              String.contains?(joined, "command -v") ->
+                {cli_path <> "\n", 0}
+
+              match?(["ssh" | _], command) ->
+                ssh_opts = Tightbeam.Harness.Support.ssh_opts()
+                script_args = Enum.drop(command, 1 + length(ssh_opts) + 1)
+                System.cmd("sh", ["-c", Enum.join(script_args, " ")])
+
+              true ->
+                {"", 0}
+            end
+          end
+        }
+      end
+
+      # ACCEPTED: the host genuinely has the pin; the warning must not cost it placement.
+      assert {:ok, "shim adapter present"} = Opencode.ensure_adapter(remote_target.("1.0.41"))
+
+      # REFUSED: a real non-pin version, still behind chatter. The pin is exact, and the
+      # refusal must name the REAL version -- not the ssh warning it used to report.
+      assert {:error, %{code: "host_unready", message: message}} =
+               Opencode.ensure_adapter(remote_target.("1.18.18"))
+
+      assert message =~ "1.18.18"
+      assert message =~ "requires the temporary rails pin 1.0.41"
+      refute message =~ "Warning"
+      refute message =~ "known hosts"
+
+      # The pin stays EXACT under the new reading: a version that merely CONTAINS the pin, or
+      # trails it, is still refused. Last-line reading is not prefix/substring matching.
+      for near <- ["1.0.410", "v1.0.41", "1.0.41-beta"] do
+        assert {:error, %{code: "host_unready", message: near_message}} =
+                 Opencode.ensure_adapter(remote_target.(near))
+
+        assert near_message =~ near
+      end
+
+      File.rm_rf!(base)
+    end
+
+    # Scope check: the fix is remote-only. The local branch execs the binary directly, where
+    # there is no ssh to chatter, so it still reads the WHOLE output -- unchanged by this fix.
+    test "the local pin probe is untouched: it still reads the whole output" do
+      base = Path.join(System.tmp_dir!(), "oc-pin-local-#{System.unique_integer([:positive])}")
+      cli = Path.join(base, "opencode-bin")
+      File.mkdir_p!(base)
+      File.write!(cli, "#!/bin/sh\n")
+      File.chmod!(cli, 0o755)
+
+      local = fn output ->
+        %{
+          host_name: "t",
+          host_config: %{ssh: nil, base_dir: base},
+          find_executable: fn "opencode" -> cli end,
+          run: fn [^cli, "--version"] -> {output, 0} end
+        }
+      end
+
+      assert {:ok, "shim adapter present"} = Opencode.ensure_adapter(local.("1.0.41\n"))
+
+      # Not last-lined: locally a multi-line answer is not a chatter-prefixed one, and the
+      # local path never pretended otherwise.
+      assert {:error, %{code: "host_unready"}} =
+               Opencode.ensure_adapter(local.("something odd\n1.0.41\n"))
+
+      File.rm_rf!(base)
+    end
   end
 
   describe "fetch_catalog (no fabricated catalog in production)" do
