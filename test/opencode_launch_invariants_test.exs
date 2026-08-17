@@ -130,6 +130,38 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
       assert Tightbeam.Harness.Claude in Harness.npm_provisioned()
       assert Tightbeam.Harness.Codex in Harness.npm_provisioned()
     end
+
+    test "registration is live and provisioning refuses every version except the temporary pin" do
+      assert Opencode in Harness.all()
+      assert Harness.module!(:opencode) == Opencode
+      assert Harness.parse!("opencode") == Opencode
+      assert Opencode.adapter_version() == "1.0.41"
+
+      base = Path.join(System.tmp_dir!(), "oc-pin-#{System.unique_integer([:positive])}")
+      cli = Path.join(base, "opencode-bin")
+      File.mkdir_p!(base)
+      File.write!(cli, "#!/bin/sh\n")
+      File.chmod!(cli, 0o755)
+
+      target = %{
+        host_name: "t",
+        host_config: %{ssh: nil, base_dir: base},
+        find_executable: fn "opencode" -> cli end,
+        run: fn [^cli, "--version"] -> {"1.0.41\n", 0} end
+      }
+
+      assert {:ok, "shim adapter present"} = Opencode.ensure_adapter(target)
+
+      wrong = %{target | run: fn [^cli, "--version"] -> {"1.18.18\n", 0} end}
+
+      assert {:error, %{code: "host_unready", message: message}} =
+               Opencode.ensure_adapter(wrong)
+
+      assert message =~ "1.18.18"
+      assert message =~ "requires the temporary rails pin 1.0.41"
+
+      File.rm_rf!(base)
+    end
   end
 
   describe "fetch_catalog (no fabricated catalog in production)" do

@@ -14,5 +14,13 @@
     "install_package": "@agentclientprotocol/codex-acp",
     "cli_binary": "codex",
     "process_markers": ["codex-acp"]
+  },
+  {
+    "module": "Tightbeam.Harness.Opencode",
+    "id": "opencode",
+    "wire_name": "opencode",
+    "install_package": "opencode",
+    "cli_binary": "opencode",
+    "process_markers": ["opencode acp"]
   }
 ]

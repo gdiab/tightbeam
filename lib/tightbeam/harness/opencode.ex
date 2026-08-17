@@ -49,9 +49,10 @@ defmodule Tightbeam.Harness.Opencode do
   alias Tightbeam.Harness.Support
   alias Tightbeam.Model
 
-  # The operator-installed binary is versioned by the operator, not pinned/patched by us (there
-  # is no adapter bundle to patch). Recorded for readiness/doctor display; re-probe per host.
-  @adapter_version "1.18.18"
+  # TEMPORARY rails pin: v1.0.41 is the last curl-confirmed stdio-only ACP release. Current
+  # releases expose an ungated HTTP command surface from `opencode acp`; moving this pin belongs
+  # to the separately tracked release-evaluation work, never to routine provisioning.
+  @adapter_version "1.0.41"
 
   # The gate plugin + its config are materialized out-of-tree under the host base_dir, a
   # directory the agent cannot edit. `prepare_launch/3` points OPENCODE_CONFIG at the config.
@@ -119,12 +120,54 @@ defmodule Tightbeam.Harness.Opencode do
   # the out-of-tree gate plugin + config. No npm package, no bundle to patch.
   @impl true
   def ensure_adapter(target) do
-    with {:ok, detail} <-
+    with :ok <- ensure_pinned_cli(target),
+         {:ok, detail} <-
            Tightbeam.Spinup.ensure_shim_adapter(target, adapter_binary(target), cli_binary(), [
              "acp"
            ]),
          :ok <- ensure_gate(target) do
       {:ok, detail}
+    end
+  end
+
+  defp ensure_pinned_cli(target) do
+    result =
+      if Support.local?(target) do
+        probe_cli(target)
+      else
+        command = Support.catalog_probe_argv(target.host_config.ssh, "opencode --version")
+
+        case target.sh.(command) do
+          {output, 0} ->
+            {:ok, %{version: String.trim(output)}}
+
+          {output, status} ->
+            {:error, {:exec_failed, "exit=#{status} output=#{inspect(String.trim(output))}"}}
+        end
+      end
+
+    case result do
+      {:ok, %{version: @adapter_version}} ->
+        :ok
+
+      {:ok, %{version: found}} ->
+        {:error,
+         %{
+           code: "host_unready",
+           message:
+             "host #{target.host_name} is not ready: OpenCode #{found} is installed, but " <>
+               "this release requires the temporary rails pin #{@adapter_version}. Install " <>
+               "opencode-ai@#{@adapter_version}, then retry placement."
+         }}
+
+      {:error, reason} ->
+        {:error,
+         %{
+           code: "host_unready",
+           message:
+             "host #{target.host_name} is not ready: cannot verify the required OpenCode " <>
+               "#{@adapter_version} pin: #{inspect(reason)}"
+         }}
     end
   end
 
@@ -435,7 +478,7 @@ defmodule Tightbeam.Harness.Opencode do
       cli_name: "opencode",
       shim_exec_args: ["acp"],
       session_meta: %{instructions: "vector guidance"},
-      cli_version: "opencode vector 1.0",
+      cli_version: "1.0.41",
       probe_path: :discovered,
       auth_events: [
         %{
