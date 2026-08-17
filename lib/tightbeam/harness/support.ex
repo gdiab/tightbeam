@@ -429,6 +429,8 @@ defmodule Tightbeam.Harness.Support do
       local? = locality == :local
       adapter = adapter_path(base, profile.adapter_bin, locality)
       cli_path = Path.join(base, "#{profile.cli_name}-cli")
+      File.write!(cli_path, "#!/bin/sh\nprintf '%s\\n' #{shell_quote(profile.cli_version)}\n")
+      File.chmod!(cli_path, 0o755)
 
       ref = make_ref()
 
@@ -437,6 +439,11 @@ defmodule Tightbeam.Harness.Support do
         joined = Enum.join(command, " ")
 
         cond do
+          # A pinned binary-native harness verifies its operator CLI before writing the shim.
+          # Return the profile's declared version so this vector exercises that check.
+          String.contains?(joined, "--version") ->
+            {profile.cli_version <> "\n", 0}
+
           # The shim resolves the operator CLI with `command -v`; hand back the fake path.
           String.contains?(joined, "command -v") ->
             {cli_path <> "\n", 0}
