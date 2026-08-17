@@ -139,7 +139,7 @@ defmodule Tightbeam.Harness.Opencode do
 
         case target.sh.(command) do
           {output, 0} ->
-            {:ok, %{version: String.trim(output)}}
+            {:ok, %{version: probe_version(output)}}
 
           {output, status} ->
             {:error, {:exec_failed, "exit=#{status} output=#{inspect(String.trim(output))}"}}
@@ -169,6 +169,30 @@ defmodule Tightbeam.Harness.Opencode do
                "#{@adapter_version} pin: #{inspect(reason)}"
          }}
     end
+  end
+
+  # The version an ssh-carried `opencode --version` actually reported, read from its TRAILING line.
+  #
+  # The remote branch above runs through `target.sh`, which in the production `ensure_adapter` path
+  # is `Spinup.ensure_ready`'s default `Support.system_cmd/1` — and that merges stderr into stdout
+  # (`System.cmd(..., stderr_to_stdout: true)`, support.ex). ssh chatters on stderr even on a
+  # SUCCESSFUL connection ("Warning: Permanently added ... to known hosts." on first contact, host
+  # banners), so trimming the whole output would compare that warning against the pin and refuse a
+  # host that genuinely has @adapter_version — naming the ssh warning as the installed version.
+  # `opencode --version` answers on its last line, so the answer is the trailing line and any
+  # leading chatter is tolerated; this is the same trailing-line reading `Support.catalog_probe`
+  # (support.ex) and the sibling remote `ensure_shim_adapter` `command -v` resolve (spinup.ex) use
+  # for their ssh-carried probes.
+  #
+  # This does NOT loosen the pin: the extracted line is still matched EXACTLY against
+  # @adapter_version by the caller, so a real non-@adapter_version is still refused — and now
+  # reports the REAL version instead of the ssh chatter.
+  defp probe_version(output) do
+    output
+    |> String.trim_trailing()
+    |> String.split("\n")
+    |> List.last("")
+    |> String.trim()
   end
 
   # The gate plugin is static Tightbeam-owned code; its config references it by ABSOLUTE path, so
