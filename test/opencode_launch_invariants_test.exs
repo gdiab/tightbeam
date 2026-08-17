@@ -164,6 +164,108 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
     end
   end
 
+  describe "remote pin probe reads through ssh chatter (blocker att_13a3220d)" do
+    # The remote branch of ensure_pinned_cli/1 runs `opencode --version` through `target.sh`,
+    # which in production is Spinup.ensure_ready's default Support.system_cmd/1 — stderr merged
+    # into stdout. ssh chatters on stderr even on SUCCESS, so a correctly-pinned host arrives as
+    # "Warning: ...\n1.0.41". Reading the whole output refused exactly the hosts the pin exists
+    # to admit and named the ssh warning as the installed version. Every leg below carries that
+    # chatter, because a probe that only works on a silent first-hop is the bug.
+    @chatter "Warning: Permanently added 'remote' (ED25519) to the list of known hosts.\n"
+
+    # A remote target (ssh != nil) whose sh mock carries ssh chatter on every ssh-carried leg:
+    # the --version pin probe, the `command -v` shim resolve, and the shim/gate write scripts.
+    defp remote_target(base, reported_version) do
+      %{
+        host_name: "remote-host",
+        host_config: %{ssh: "vector@remote", base_dir: base},
+        sh: fn command ->
+          joined = Enum.join(command, " ")
+
+          cond do
+            String.contains?(joined, "--version") ->
+              {@chatter <> reported_version <> "\n", 0}
+
+            String.contains?(joined, "command -v") ->
+              {@chatter <> Path.join(base, "opencode") <> "\n", 0}
+
+            # shim write + gate materialization scripts: succeed.
+            true ->
+              {"", 0}
+          end
+        end
+      }
+    end
+
+    test "chatter + true 1.0.41 is ACCEPTED (the warning must not cost a pinned host placement)" do
+      base = Path.join(System.tmp_dir!(), "oc-remote-ok-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base)
+
+      assert {:ok, "shim adapter present"} =
+               Opencode.ensure_adapter(remote_target(base, "1.0.41"))
+
+      File.rm_rf!(base)
+    end
+
+    test "chatter + true wrong version is REFUSED and reports the REAL version, not the chatter" do
+      base = Path.join(System.tmp_dir!(), "oc-remote-wrong-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base)
+
+      assert {:error, %{code: "host_unready", message: message}} =
+               Opencode.ensure_adapter(remote_target(base, "1.18.18"))
+
+      assert message =~ "1.18.18"
+      assert message =~ "requires the temporary rails pin 1.0.41"
+      refute message =~ "Warning"
+      refute message =~ "known hosts"
+
+      File.rm_rf!(base)
+    end
+
+    test "the pin stays EXACT under trailing-line reading: near versions behind chatter are refused" do
+      base = Path.join(System.tmp_dir!(), "oc-remote-near-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base)
+
+      # Last-line reading is not prefix/substring matching: a version that contains or trails the
+      # pin is still refused, and the refusal names that real version.
+      for near <- ["1.0.410", "v1.0.41", "1.0.41-beta"] do
+        assert {:error, %{code: "host_unready", message: message}} =
+                 Opencode.ensure_adapter(remote_target(base, near))
+
+        assert message =~ near
+      end
+
+      File.rm_rf!(base)
+    end
+
+    test "scope: the LOCAL branch is untouched — it still reads the whole output, not the last line" do
+      # The local branch execs the binary directly (Support.bounded_probe), where there is no ssh
+      # to chatter, so it still trims the WHOLE output. This proves the fix is remote-only: a
+      # multi-line local answer is NOT last-lined into acceptance.
+      base = Path.join(System.tmp_dir!(), "oc-local-scope-#{System.unique_integer([:positive])}")
+      cli = Path.join(base, "opencode-bin")
+      File.mkdir_p!(base)
+      File.write!(cli, "#!/bin/sh\n")
+      File.chmod!(cli, 0o755)
+
+      local = fn output ->
+        %{
+          host_name: "t",
+          host_config: %{ssh: nil, base_dir: base},
+          find_executable: fn "opencode" -> cli end,
+          run: fn [^cli, "--version"] -> {output, 0} end
+        }
+      end
+
+      assert {:ok, "shim adapter present"} = Opencode.ensure_adapter(local.("1.0.41\n"))
+
+      assert {:error, %{code: "host_unready"}} =
+               Opencode.ensure_adapter(local.("something odd\n1.0.41\n"))
+
+      File.rm_rf!(base)
+    end
+  end
+
   describe "fetch_catalog (no fabricated catalog in production)" do
     test "with no wired source it FAILS LOUD rather than inventing a catalog" do
       assert {:error, :opencode_catalog_source_unwired} = Opencode.fetch_catalog(%{})
