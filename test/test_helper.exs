@@ -104,7 +104,7 @@ missing =
       acc
     else
       [
-        "a registered harness CLI on PATH — claude, codex, or fixture — for the\n" <>
+        "a registered harness CLI on PATH — claude, codex, opencode, or fixture — for the\n" <>
           "      gateway boot probe. The in-repo fixture harness CLI is enough:\n" <>
           "      export PATH=\"#{Path.expand("../priv/harness_cli", __DIR__)}:$PATH\""
         | acc
