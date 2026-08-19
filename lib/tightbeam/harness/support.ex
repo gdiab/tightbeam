@@ -54,6 +54,55 @@ defmodule Tightbeam.Harness.Support do
     do: ["ssh" | @ssh_opts] ++ [dest, "sh", "-c", shell_quote(script)]
 
   @doc """
+  Run fixed command tokens on a local or SSH target with separated output streams.
+
+  The outer local shell exists only to capture the final argv's stdout and stderr
+  independently. Every argv element is shell-quoted before that envelope is built.
+  """
+  @spec catalog_command(String.t() | nil, [String.t()], pos_integer()) ::
+          {:ok, %{stdout: String.t(), stderr: String.t(), exit_status: non_neg_integer()}}
+          | {:error, :timeout}
+  def catalog_command(dest, command, timeout_ms) do
+    task =
+      Task.async(fn ->
+        root =
+          Path.join(
+            System.tmp_dir!(),
+            "tightbeam-catalog-command-#{System.unique_integer([:positive, :monotonic])}"
+          )
+
+        stdout_path = Path.join(root, "stdout")
+        stderr_path = Path.join(root, "stderr")
+        File.mkdir!(root)
+
+        try do
+          script = Enum.map_join(command, " ", &shell_quote/1)
+          argv = catalog_probe_argv(dest, script)
+
+          envelope =
+            Enum.map_join(argv, " ", &shell_quote/1) <>
+              " > #{shell_quote(stdout_path)} 2> #{shell_quote(stderr_path)}"
+
+          {_output, exit_status} = System.cmd("sh", ["-c", envelope])
+
+          {:ok,
+           %{
+             stdout: File.read!(stdout_path),
+             stderr: File.read!(stderr_path),
+             exit_status: exit_status
+           }}
+        after
+          File.rm_rf!(root)
+        end
+      end)
+
+    case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      nil -> {:error, :timeout}
+    end
+  end
+
+  @doc """
   The curl line every catalog probe ends in.
 
   `-f` is deliberately absent: on 400 or 401 both vendors return a JSON body
