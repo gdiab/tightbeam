@@ -426,6 +426,17 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
       assert message =~ "1.18.18"
       assert message =~ "1.0.41"
       assert File.read!(calls) == "--version\nmodels\n--version\n"
+
+      File.write!(
+        opencode,
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> #{Harness.Support.shell_quote(calls)}\nprintf 'warning-on-stdout\\n1.0.41\\n'\n"
+      )
+
+      assert {:error, %{code: "host_unready", message: message}} =
+               Opencode.fetch_catalog(state)
+
+      assert message =~ "warning-on-stdout\n1.0.41"
+      assert File.read!(calls) == "--version\nmodels\n--version\n--version\n"
     end
   end
 
