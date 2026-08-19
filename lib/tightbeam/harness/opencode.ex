@@ -413,7 +413,7 @@ defmodule Tightbeam.Harness.Opencode do
   def fetch_catalog(state) do
     case get_in(state, [:options, :opencode_fetch]) do
       nil ->
-        with :ok <- production_pin(state) do
+        with :ok <- state |> catalog_pin_target() |> ensure_pinned_cli() do
           state
           |> Map.get(:host_config, %{ssh: nil})
           |> Map.get(:ssh)
@@ -426,23 +426,11 @@ defmodule Tightbeam.Harness.Opencode do
     end
   end
 
-  defp production_pin(state) do
-    ssh = state |> Map.get(:host_config, %{ssh: nil}) |> Map.get(:ssh)
-
-    result =
-      case Support.catalog_command(ssh, [cli_binary(), "--version"], @catalog_timeout_ms) do
-        {:ok, %{stdout: output, exit_status: 0}} ->
-          {:ok, %{version: probe_version(output)}}
-
-        {:ok, %{stdout: stdout, stderr: stderr, exit_status: status}} ->
-          {:error,
-           {:exec_failed, "exit=#{status} output=#{inspect(String.trim(stderr <> stdout))}"}}
-
-        {:error, reason} ->
-          {:error, reason}
-      end
-
-    pinned_cli_result(state, result)
+  defp catalog_pin_target(state) do
+    case get_in(state, [:options, :sh]) do
+      sh when is_function(sh, 1) -> Map.put_new(state, :sh, sh)
+      _ -> state
+    end
   end
 
   defp derive_catalog({:ok, %{stdout: stdout, stderr: _stderr, exit_status: 0}}) do
