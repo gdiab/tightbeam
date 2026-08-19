@@ -266,20 +266,166 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
     end
   end
 
-  describe "fetch_catalog (no fabricated catalog in production)" do
-    test "with no wired source it FAILS LOUD rather than inventing a catalog" do
-      assert {:error, :opencode_catalog_source_unwired} = Opencode.fetch_catalog(%{})
-      assert {:error, :opencode_catalog_source_unwired} = Opencode.fetch_catalog(%{options: %{}})
+  describe "catalog command" do
+    test "local execution keeps stdout, stderr, and status separate" do
+      assert {:ok, %{stdout: "out", stderr: "err", exit_status: 7}} =
+               Harness.Support.catalog_command(
+                 nil,
+                 ["sh", "-c", "printf out; printf err >&2; exit 7"],
+                 1_000
+               )
     end
 
-    test "the injected fetcher (conformance only) derives a provider-stamped entry" do
-      state = %{options: %{opencode_fetch: fn -> {:ok, :valid} end}}
+    test "tokens are quoted and timeout is truthful" do
+      assert {:ok, %{stdout: "a b;$()", stderr: "", exit_status: 0}} =
+               Harness.Support.catalog_command(nil, ["printf", "%s", "a b;$()"], 1_000)
 
-      assert {:ok, [%{provider: :opencode, family: "opencode/zen"}]} =
-               Opencode.fetch_catalog(state)
+      assert {:error, :timeout} =
+               Harness.Support.catalog_command(nil, ["sh", "-c", "sleep 1"], 10)
+
+      # The contract brutally stops the supervising Task; it deliberately does not claim that an
+      # OS subprocess surviving its parent was killed. Let this fixture process finish before the
+      # suite-wide process census runs.
+      Process.sleep(1_000)
+    end
+
+    test "remote argv keeps destination separate and transport stderr out of stdout" do
+      assert ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", dest | _rest] =
+               Harness.Support.catalog_probe_argv("vector@remote; touch /nope", "opencode models")
+
+      assert dest == "vector@remote; touch /nope"
+
+      base = Path.join(System.tmp_dir!(), "oc-fake-ssh-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base)
+      ssh = Path.join(base, "ssh")
+      File.write!(ssh, "#!/bin/sh\nprintf remote-out\nprintf remote-warning >&2\nexit 9\n")
+      File.chmod!(ssh, 0o755)
+      old_path = System.get_env("PATH")
+      System.put_env("PATH", base <> ":" <> old_path)
+
+      on_exit(fn ->
+        System.put_env("PATH", old_path)
+        File.rm_rf!(base)
+      end)
+
+      assert {:ok, %{stdout: "remote-out", stderr: "remote-warning", exit_status: 9}} =
+               Harness.Support.catalog_command("vector@remote", ["opencode", "models"], 1_000)
+    end
+  end
+
+  describe "fetch_catalog" do
+    defp fetched(stdout, stderr \\ "", status \\ 0),
+      do: %{
+        options: %{
+          opencode_fetch: fn -> {:ok, %{stdout: stdout, stderr: stderr, exit_status: status}} end
+        }
+      }
+
+    test "captured newline inventory keeps order and stamps exact fields" do
+      body =
+        "opencode/laguna-s-2.1-free\n" <>
+          "opencode/nemotron-3.5-lightning-free\n" <>
+          "opencode/deepseek-v4-flash-free\n" <>
+          "opencode/nemotron-3-ultra-free\n" <>
+          "opencode/hy3-free\n" <>
+          "opencode/mimo-v2.5-free\n" <>
+          "opencode/big-pickle\n"
+
+      assert {:ok, entries} = Opencode.fetch_catalog(fetched(body, "transport warning"))
+      assert length(entries) == 7
+
+      assert hd(entries) == %{
+               family: "opencode/laguna-s-2.1-free",
+               context: nil,
+               display_name: "opencode/laguna-s-2.1-free",
+               name: "opencode/laguna-s-2.1-free",
+               efforts: [],
+               max_input_tokens: nil,
+               capabilities: %{},
+               provider: :opencode
+             }
+
+      assert List.last(entries).family == "opencode/big-pickle"
+    end
+
+    test "blank lines and duplicates are discarded in first-occurrence order" do
+      assert {:ok, entries} =
+               Opencode.fetch_catalog(fetched("\n opencode/a \n\n opencode/a\nopencode/b\n"))
+
+      assert Enum.map(entries, & &1.family) == ["opencode/a", "opencode/b"]
+    end
+
+    test "malformed and empty inventories fail without partial entries" do
+      for body <- [
+            "missing-slash",
+            "/missing-provider",
+            "missing-model/",
+            "open code/model",
+            "opencode/good\nmalformed"
+          ] do
+        assert {:error, :malformed_catalog} = Opencode.fetch_catalog(fetched(body))
+      end
+
+      assert {:error, :empty_inventory} = Opencode.fetch_catalog(fetched("\n \t\n"))
+    end
+
+    test "nonzero status preserves stderr then stdout and never parses partial rows" do
+      assert {:error, {:exec_failed, 1, "failure|partial"}} =
+               Opencode.fetch_catalog(fetched("partial", "failure|", 1))
+
+      assert {:error, {:exec_failed, 1, diagnostic}} =
+               Opencode.fetch_catalog(fetched("", "BunInstallFailedError", 1))
+
+      assert diagnostic =~ "BunInstallFailedError"
+    end
+
+    test "timeout and removed sentinel stay failures with no fallback" do
+      assert {:error, :timeout} =
+               Opencode.fetch_catalog(%{
+                 options: %{opencode_fetch: fn -> {:error, :timeout} end}
+               })
 
       assert {:error, :malformed_catalog} =
-               Opencode.fetch_catalog(%{options: %{opencode_fetch: fn -> {:ok, :other} end}})
+               Opencode.fetch_catalog(%{options: %{opencode_fetch: fn -> {:ok, :valid} end}})
+    end
+
+    test "production observes the exact pin before models and refuses wrong versions" do
+      base = Path.join(System.tmp_dir!(), "oc-catalog-pin-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(base)
+      opencode = Path.join(base, "opencode")
+      calls = Path.join(base, "calls")
+      old_path = System.get_env("PATH")
+
+      File.write!(
+        opencode,
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> #{Harness.Support.shell_quote(calls)}\n" <>
+          "case \"$1\" in --version) printf '1.0.41\\n';; models) printf 'opencode/a\\nopencode/b\\n';; esac\n"
+      )
+
+      File.chmod!(opencode, 0o755)
+      System.put_env("PATH", base <> ":" <> old_path)
+
+      on_exit(fn ->
+        System.put_env("PATH", old_path)
+        File.rm_rf!(base)
+      end)
+
+      state = %{host_name: "local", host_config: %{ssh: nil}, options: %{}}
+      assert {:ok, entries} = Opencode.fetch_catalog(state)
+      assert Enum.map(entries, & &1.family) == ["opencode/a", "opencode/b"]
+      assert File.read!(calls) == "--version\nmodels\n"
+
+      File.write!(
+        opencode,
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> #{Harness.Support.shell_quote(calls)}\nprintf '1.18.18\\n'\n"
+      )
+
+      assert {:error, %{code: "host_unready", message: message}} =
+               Opencode.fetch_catalog(state)
+
+      assert message =~ "1.18.18"
+      assert message =~ "1.0.41"
+      assert File.read!(calls) == "--version\nmodels\n--version\n"
     end
   end
 

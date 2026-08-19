@@ -53,6 +53,7 @@ defmodule Tightbeam.Harness.Opencode do
   # releases expose an ungated HTTP command surface from `opencode acp`; moving this pin belongs
   # to the separately tracked release-evaluation work, never to routine provisioning.
   @adapter_version "1.0.41"
+  @catalog_timeout_ms 30_000
 
   # The gate plugin + its config are materialized out-of-tree under the host base_dir, a
   # directory the agent cannot edit. `prepare_launch/3` points OPENCODE_CONFIG at the config.
@@ -146,6 +147,10 @@ defmodule Tightbeam.Harness.Opencode do
         end
       end
 
+    pinned_cli_result(target, result)
+  end
+
+  defp pinned_cli_result(target, result) do
     case result do
       {:ok, %{version: @adapter_version}} ->
         :ok
@@ -408,39 +413,93 @@ defmodule Tightbeam.Harness.Opencode do
   def fetch_catalog(state) do
     case get_in(state, [:options, :opencode_fetch]) do
       nil ->
-        # No production catalog source is wired yet (HB-04, deferred). FAIL LOUD — fabricating a
-        # `{:ok, …}` here would advertise a model that may not exist and silently ship a wrong
-        # catalog. The injected fetcher below exists ONLY for conformance derivation tests.
-        {:error, :opencode_catalog_source_unwired}
+        with :ok <- production_pin(state) do
+          state
+          |> Map.get(:host_config, %{ssh: nil})
+          |> Map.get(:ssh)
+          |> Support.catalog_command([cli_binary(), "models"], @catalog_timeout_ms)
+          |> derive_catalog()
+        end
 
       fetch ->
         derive_catalog(fetch.())
     end
   end
 
-  defp derive_catalog(fetched) do
-    case fetched do
-      {:ok, :valid} ->
-        {:ok,
-         [
-           %{
-             family: "opencode/zen",
-             context: nil,
-             display_name: "OpenCode Zen",
-             name: "OpenCode Zen",
-             efforts: [],
-             max_input_tokens: nil,
-             capabilities: %{},
-             provider: credential_provider()
-           }
-         ]}
+  defp production_pin(state) do
+    ssh = state |> Map.get(:host_config, %{ssh: nil}) |> Map.get(:ssh)
 
-      {:ok, _malformed} ->
-        {:error, :malformed_catalog}
+    result =
+      case Support.catalog_command(ssh, [cli_binary(), "--version"], @catalog_timeout_ms) do
+        {:ok, %{stdout: output, exit_status: 0}} ->
+          {:ok, %{version: probe_version(output)}}
 
-      {:error, reason} ->
-        {:error, reason}
+        {:ok, %{stdout: stdout, stderr: stderr, exit_status: status}} ->
+          {:error,
+           {:exec_failed, "exit=#{status} output=#{inspect(String.trim(stderr <> stdout))}"}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+
+    pinned_cli_result(state, result)
+  end
+
+  defp derive_catalog({:ok, %{stdout: stdout, stderr: _stderr, exit_status: 0}}) do
+    stdout
+    |> String.split("\n")
+    |> Enum.reduce_while({MapSet.new(), []}, fn raw, {seen, entries} ->
+      record = String.trim(raw)
+
+      cond do
+        record == "" ->
+          {:cont, {seen, entries}}
+
+        not valid_catalog_record?(record) ->
+          {:halt, :malformed}
+
+        MapSet.member?(seen, record) ->
+          {:cont, {seen, entries}}
+
+        true ->
+          {:cont, {MapSet.put(seen, record), [catalog_entry(record) | entries]}}
+      end
+    end)
+    |> case do
+      :malformed -> {:error, :malformed_catalog}
+      {_seen, []} -> {:error, :empty_inventory}
+      {_seen, entries} -> {:ok, Enum.reverse(entries)}
     end
+  end
+
+  defp derive_catalog({:ok, %{stdout: stdout, stderr: stderr, exit_status: status}}),
+    do: {:error, {:exec_failed, status, stderr <> stdout}}
+
+  defp derive_catalog({:error, reason}), do: {:error, reason}
+  defp derive_catalog(_other), do: {:error, :malformed_catalog}
+
+  defp valid_catalog_record?(record) do
+    case String.split(record, "/", parts: 2) do
+      [provider, model] ->
+        provider != "" and model != "" and
+          not String.match?(provider, ~r/\s/) and not String.match?(model, ~r/\s/)
+
+      _ ->
+        false
+    end
+  end
+
+  defp catalog_entry(record) do
+    %{
+      family: record,
+      context: nil,
+      display_name: record,
+      name: record,
+      efforts: [],
+      max_input_tokens: nil,
+      capabilities: %{},
+      provider: credential_provider()
+    }
   end
 
   @impl true
@@ -448,8 +507,8 @@ defmodule Tightbeam.Harness.Opencode do
     valid_entry = %{
       family: "opencode/zen",
       context: nil,
-      display_name: "OpenCode Zen",
-      name: "OpenCode Zen",
+      display_name: "opencode/zen",
+      name: "opencode/zen",
       efforts: [],
       max_input_tokens: nil,
       capabilities: %{},
@@ -538,9 +597,9 @@ defmodule Tightbeam.Harness.Opencode do
       catalog_state: fn case_name, _base ->
         fetch = fn ->
           case case_name do
-            "valid" -> {:ok, :valid}
-            "valid_api_key" -> {:ok, :valid}
-            "malformed" -> {:ok, :malformed}
+            "valid" -> {:ok, %{stdout: "opencode/zen\n", stderr: "", exit_status: 0}}
+            "valid_api_key" -> {:ok, %{stdout: "opencode/zen\n", stderr: "", exit_status: 0}}
+            "malformed" -> {:ok, %{stdout: "malformed\n", stderr: "", exit_status: 0}}
             "unavailable" -> {:error, :opencode_unavailable}
           end
         end
