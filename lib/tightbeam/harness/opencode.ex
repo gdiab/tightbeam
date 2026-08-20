@@ -427,9 +427,27 @@ defmodule Tightbeam.Harness.Opencode do
   end
 
   defp catalog_pin_target(state) do
+    ssh = state |> Map.fetch!(:host_config) |> Map.get(:ssh)
+
     case get_in(state, [:options, :sh]) do
       sh when is_function(sh, 1) -> Map.put_new(state, :sh, sh)
+      _ when is_binary(ssh) -> Map.put(state, :sh, catalog_pin_runner(ssh))
       _ -> state
+    end
+  end
+
+  defp catalog_pin_runner(ssh) do
+    fn _argv ->
+      case Support.catalog_command(ssh, [cli_binary(), "--version"], @catalog_timeout_ms) do
+        {:ok, %{stdout: stdout, stderr: _stderr, exit_status: 0}} ->
+          {stdout, 0}
+
+        {:ok, %{stdout: stdout, stderr: stderr, exit_status: status}} ->
+          {stderr <> stdout, status}
+
+        {:error, :timeout} ->
+          {"catalog version observation timed out", 124}
+      end
     end
   end
 
