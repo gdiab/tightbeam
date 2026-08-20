@@ -957,9 +957,16 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
-  test "qualifying review verdict requires exactly one independent card and its latest holder verdict",
+  test "qualifying review verdict follows the latest independent round across terminal state",
        ctx do
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "qualifying producer"))
+    item = create_work_item(ctx, "Review rounds")
+
+    producer =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "qualifying producer", nil, item.id)
+      )
 
     review =
       assign_call({:user, "flynn"}, "qualifying review")
@@ -1012,12 +1019,129 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    _ =
+      attest_call({:session, "other-session"}, second_review.id, "completion")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    revoked_review =
+      assign_call({:user, "flynn"}, "revoked qualifying review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, revoked_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    _ = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked_review.id))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    blocking_review =
+      assign_call({:user, "flynn"}, "blocking latest review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, blocking_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    trace =
+      WorkItems.__handle__(ctx.db, "work-item-trace", %{
+        verb: "work-item-trace",
+        principal: {:user, "flynn"},
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{work_item_id: item.id}
+      })
+
+    review_ids = [review.id, second_review.id, revoked_review.id, blocking_review.id]
+
+    assert trace.assignments
+           |> Enum.filter(&(&1.reviewsAssignmentId == producer.id))
+           |> Enum.map(& &1.id)
+           |> Enum.sort() == Enum.sort(review_ids)
+
+    assert Enum.any?(trace.timeline, fn
+             %{
+               type: "attest",
+               assignmentId: id,
+               verdict: "changes-requested"
+             }
+             when id == blocking_review.id ->
+               true
+
+             _ ->
+               false
+           end)
+
+    assert Enum.any?(trace.timeline, fn
+             %{type: "attest", assignmentId: id, verdict: "reviewed-clean"}
+             when id == review.id ->
+               true
+
+             _ ->
+               false
+           end)
+  end
+
+  test "qualifying review verdict uses creation order when review rounds share a timestamp",
+       ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "tied review producer"))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id, subject, holderKey, holderFallback, openedByUser, openedAt,
+                  reviewsAssignmentId, holderHarness, holderProvider)
+               VALUES
+                 ('zzzz_older_review', 'older review', 'other-session', 0, 'flynn', 42,
+                  ?1, 'claude', 'anthropic'),
+                 ('aaaa_newer_review', 'newer review', 'other-session', 0, 'flynn', 42,
+                  ?1, 'claude', 'anthropic')
+               """,
+               [producer.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO attests
+                 (id, assignmentId, kind, verdictKind, bySession, byHarness, byProvider, ts)
+               VALUES
+                 ('older_clean', 'zzzz_older_review', 'verdict', 'reviewed-clean',
+                  'other-session', 'claude', 'anthropic', 42),
+                 ('newer_changes', 'aaaa_newer_review', 'verdict', 'changes-requested',
+                  'other-session', 'claude', 'anthropic', 42)
+               """
+             )
 
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
