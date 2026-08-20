@@ -451,7 +451,7 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
       File.write!(
         ssh,
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> #{Harness.Support.shell_quote(calls)}\n" <>
-          "case \"$*\" in *--version*) printf 'transport warning\\n' >&2; printf '1.0.41\\n';; " <>
+          "case \"$*\" in *--version*) printf 'transport warning\\n' >&2; printf 'probe chatter\\n1.0.41\\n';; " <>
           "*models*) printf 'opencode/remote-a\\nopencode/remote-b\\n';; esac\n"
       )
 
@@ -472,6 +472,80 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
       assert version_call =~ "--version"
       assert models_call =~ "opencode"
       assert models_call =~ "models"
+    end
+
+    test "runner-free remote pin refusals never invoke models and match local wrong-version wording" do
+      base =
+        Path.join(
+          System.tmp_dir!(),
+          "oc-catalog-remote-refuse-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(base)
+      ssh = Path.join(base, "ssh")
+      opencode = Path.join(base, "opencode")
+      calls = Path.join(base, "calls")
+      old_path = System.get_env("PATH")
+      quote_calls = Harness.Support.shell_quote(calls)
+
+      File.write!(opencode, "#!/bin/sh\nprintf '1.18.18\\n'\n")
+      File.chmod!(opencode, 0o755)
+      System.put_env("PATH", base <> ":" <> old_path)
+
+      on_exit(fn ->
+        System.put_env("PATH", old_path)
+        File.rm_rf!(base)
+      end)
+
+      local = %{host_name: "local", host_config: %{ssh: nil}, options: %{}}
+
+      assert {:error, %{code: local_code, message: local_message}} =
+               Opencode.fetch_catalog(local)
+
+      remote = %{host_name: "remote", host_config: %{ssh: "vector@remote"}, options: %{}}
+
+      File.write!(
+        ssh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> #{quote_calls}\nprintf '1.18.18\\n'\n"
+      )
+
+      File.chmod!(ssh, 0o755)
+
+      assert {:error, %{code: ^local_code, message: remote_message}} =
+               Opencode.fetch_catalog(remote)
+
+      assert local_message =~ "1.18.18"
+      assert remote_message =~ "1.18.18"
+      assert local_message =~ "requires the temporary rails pin 1.0.41"
+      assert remote_message =~ "requires the temporary rails pin 1.0.41"
+      refute File.read!(calls) =~ "models"
+
+      File.write!(
+        ssh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> #{quote_calls}\nprintf 'probe failed\\n' >&2\nexit 17\n"
+      )
+
+      assert {:error, %{code: "host_unready", message: failure_message}} =
+               Opencode.fetch_catalog(remote)
+
+      assert failure_message =~ "exit=17"
+      assert failure_message =~ "probe failed"
+      refute File.read!(calls) =~ "models"
+
+      File.write!(
+        ssh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> #{quote_calls}\nsleep 31\n"
+      )
+
+      assert {:error, %{code: "host_unready", message: timeout_message}} =
+               Opencode.fetch_catalog(remote)
+
+      assert timeout_message =~ "timed out"
+      refute File.read!(calls) =~ "models"
+
+      # catalog_command/3 bounds its supervising task; it does not claim to kill a detached OS
+      # process. Let this fixture's final sleep exit before the suite-wide process census.
+      Process.sleep(1_100)
     end
   end
 
