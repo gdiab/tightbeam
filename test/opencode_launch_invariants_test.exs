@@ -438,6 +438,41 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
       assert message =~ "warning-on-stdout\n1.0.41"
       assert File.read!(calls) == "--version\nmodels\n--version\n--version\n"
     end
+
+    test "remote production without an injected sh runner observes the pin before models" do
+      base =
+        Path.join(System.tmp_dir!(), "oc-catalog-remote-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(base)
+      ssh = Path.join(base, "ssh")
+      calls = Path.join(base, "calls")
+      old_path = System.get_env("PATH")
+
+      File.write!(
+        ssh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> #{Harness.Support.shell_quote(calls)}\n" <>
+          "case \"$*\" in *--version*) printf 'transport warning\\n' >&2; printf '1.0.41\\n';; " <>
+          "*models*) printf 'opencode/remote-a\\nopencode/remote-b\\n';; esac\n"
+      )
+
+      File.chmod!(ssh, 0o755)
+      System.put_env("PATH", base <> ":" <> old_path)
+
+      on_exit(fn ->
+        System.put_env("PATH", old_path)
+        File.rm_rf!(base)
+      end)
+
+      state = %{host_name: "remote", host_config: %{ssh: "vector@remote"}, options: %{}}
+      assert {:ok, entries} = Opencode.fetch_catalog(state)
+      assert Enum.map(entries, & &1.family) == ["opencode/remote-a", "opencode/remote-b"]
+
+      assert [version_call, models_call] = calls |> File.read!() |> String.split("\n", trim: true)
+      assert version_call =~ "opencode"
+      assert version_call =~ "--version"
+      assert models_call =~ "opencode"
+      assert models_call =~ "models"
+    end
   end
 
   describe "reuse contract (the shared shim seam is generic, nothing opencode-specific leaked)" do
