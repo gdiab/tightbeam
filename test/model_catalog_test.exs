@@ -10,6 +10,15 @@ defmodule Tightbeam.ModelCatalogTest do
   @host "testhost"
   @claude_secret "sk-ant-oat01-NEVER-ON-A-COMMAND-LINE"
   @codex_secret "ey-codex-access-NEVER-ON-A-COMMAND-LINE"
+  @opencode_models """
+  opencode/laguna-s-2.1-free
+  opencode/nemotron-3.5-lightning-free
+  opencode/deepseek-v4-flash-free
+  opencode/nemotron-3-ultra-free
+  opencode/hy3-free
+  opencode/mimo-v2.5-free
+  opencode/big-pickle
+  """
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "model-catalog-#{System.unique_integer([:positive])}")
@@ -448,6 +457,7 @@ defmodule Tightbeam.ModelCatalogTest do
        base_dir: Path.join(ctx.base_dir, "missing"),
        db: ctx.db,
        sh: ctx.codex_sh,
+       opencode_fetch: fn -> {:error, :not_stubbed} end,
        credential_status: fn _provider -> :onboarded end}
     )
 
@@ -478,7 +488,8 @@ defmodule Tightbeam.ModelCatalogTest do
        sh: fn _command -> raise "no probe may run: the credential gate must refuse first" end,
        claude_fetch: fn _path, _headers ->
          raise "no probe may run: the credential gate must refuse first"
-       end}
+       end,
+       opencode_fetch: fn -> {:error, :not_stubbed} end}
     )
 
     for harness <- ["claude", "codex"] do
@@ -739,7 +750,7 @@ defmodule Tightbeam.ModelCatalogTest do
     to_string(raw) |> String.replace_prefix("Bearer ", "")
   end
 
-  test "missing Credentials server fails catalog refresh closed", ctx do
+  test "missing Credentials server fails claude/codex catalog refresh closed", ctx do
     parent = self()
     name = unique_name(:missing_credentials)
 
@@ -757,7 +768,8 @@ defmodule Tightbeam.ModelCatalogTest do
        sh: fn command ->
          send(parent, :provider_io)
          ctx.codex_sh.(command)
-       end}
+       end,
+       opencode_fetch: fn -> {:error, :not_stubbed} end}
     )
 
     unavailable = {:unavailable, {:needs_onboarding, :credential_server_unavailable}}
@@ -771,11 +783,69 @@ defmodule Tightbeam.ModelCatalogTest do
     # host, and it goes back to racing a live Task with nothing going red.
     await(fn ->
       Enum.all?(Tightbeam.Harness.all(), fn harness ->
-        ModelCatalog.get(@host, harness.wire_name(), name) == {[], unavailable}
+        expected =
+          if harness == Tightbeam.Harness.Opencode,
+            do: {:unavailable, :not_stubbed},
+            else: unavailable
+
+        ModelCatalog.get(@host, harness.wire_name(), name) == {[], expected}
       end)
     end)
 
     refute_receive :provider_io
+  end
+
+  test "OpenCode derives without Tightbeam onboarding while gated harnesses stay refused", ctx do
+    catalog =
+      start_catalog(ctx,
+        credential_status: fn _provider -> {:needs_onboarding, :missing} end,
+        credential_kind: fn _provider -> {:error, :no_kind} end,
+        opencode_fetch: fn -> opencode_reply(@opencode_models) end
+      )
+
+    await_fresh(catalog, "opencode")
+
+    {entries, :fresh} = ModelCatalog.get(@host, "opencode", catalog)
+    assert Enum.map(entries, & &1.family) == String.split(@opencode_models)
+
+    for harness <- ["claude", "codex"] do
+      assert ModelCatalog.get(@host, harness, catalog) ==
+               {[], {:unavailable, {:needs_onboarding, :missing}}}
+    end
+  end
+
+  test "OpenCode never consults Tightbeam credential functions", ctx do
+    catalog =
+      start_catalog(ctx,
+        credential_status: fn
+          :opencode -> raise "credential status must not be called for OpenCode"
+          _provider -> :onboarded
+        end,
+        credential_kind: fn
+          :opencode -> raise "credential kind must not be called for OpenCode"
+          _provider -> :subscription
+        end,
+        opencode_fetch: fn -> opencode_reply(@opencode_models) end
+      )
+
+    await_fresh(catalog, "opencode")
+    await_fresh(catalog, "claude")
+    assert ModelCatalog.get(@host, "opencode", catalog) |> elem(1) == :fresh
+    assert ModelCatalog.get(@host, "claude", catalog) |> elem(1) == :fresh
+  end
+
+  test "OpenCode catalog fetch failures remain unavailable", ctx do
+    catalog = start_catalog(ctx, opencode_fetch: fn -> {:error, :timeout} end)
+    expected = {[], {:unavailable, :timeout}}
+    await(fn -> ModelCatalog.get(@host, "opencode", catalog) == expected end)
+    assert ModelCatalog.get(@host, "opencode", catalog) == expected
+  end
+
+  test "OpenCode empty inventory remains unavailable without fallback", ctx do
+    catalog = start_catalog(ctx, opencode_fetch: fn -> opencode_reply("") end)
+    expected = {[], {:unavailable, :empty_inventory}}
+    await(fn -> ModelCatalog.get(@host, "opencode", catalog) == expected end)
+    assert ModelCatalog.get(@host, "opencode", catalog) == expected
   end
 
   test "a hung refresh never blocks a reader or concurrent org-options list", ctx do
@@ -1463,6 +1533,8 @@ defmodule Tightbeam.ModelCatalogTest do
 
   defp requeue(skipped), do: skipped |> Enum.reverse() |> Enum.each(&send(self(), &1))
 
+  defp opencode_reply(stdout), do: {:ok, %{stdout: stdout, stderr: "", exit_status: 0}}
+
   defp start_catalog(ctx, overrides \\ []) do
     name = Keyword.get(overrides, :name, unique_name(:catalog))
 
@@ -1473,6 +1545,7 @@ defmodule Tightbeam.ModelCatalogTest do
         db: ctx.db,
         claude_fetch: ctx.claude_fetch,
         sh: ctx.codex_sh,
+        opencode_fetch: fn -> {:error, :not_stubbed} end,
         credential_status: fn _provider -> :onboarded end,
         credential_kind: fn _provider -> :subscription end,
         # These tests exercise catalog DERIVATION (field mapping, effort parsing,

@@ -24,6 +24,8 @@ defmodule Tightbeam.ModelCatalog do
   require Logger
   alias Tightbeam.{Harness, Model, Placement, Unroutable}
 
+  @self_owned_auth_harnesses [Tightbeam.Harness.Opencode]
+
   @default_ttl_ms :timer.minutes(15)
 
   @type health :: :fresh | :stale | {:unavailable, term()}
@@ -499,31 +501,38 @@ defmodule Tightbeam.ModelCatalog do
   defp safely_derive({host, harness}, probe, state) do
     try do
       module = Harness.parse!(harness)
-      provider = module.credential_provider()
 
-      with :onboarded <- credential_status(state, provider, host),
-           kind when kind in [:api_key, :subscription] <-
-             credential_kind(state, provider, host) do
-        probe = Map.put(probe, :credential_kind, kind)
-
-        probe
-        |> module.fetch_catalog()
-        |> retry_after_rotation_harvest(kind, probe, module)
+      if module in @self_owned_auth_harnesses do
+        # This catalog read needs no Tightbeam-held credential. Its probe therefore
+        # carries no credential_kind; a self-owned-auth fetcher must not require one.
+        module.fetch_catalog(probe)
       else
-        {:needs_onboarding, reason} ->
-          {:error, {:needs_onboarding, reason}}
+        provider = module.credential_provider()
 
-        # Onboarded, but the store records no kind. Refused rather than
-        # defaulted: the two kinds read different routes, so a catalog derived
-        # against a guessed kind would be a confident answer about the wrong
-        # account. Production cannot reach this — `:onboarded` and a readable
-        # kind have the same preconditions — but a half-migrated or
-        # hand-assembled store can, and it deserves a refusal, not a guess.
-        :none ->
-          {:error, {:needs_onboarding, :missing}}
+        with :onboarded <- credential_status(state, provider, host),
+             kind when kind in [:api_key, :subscription] <-
+               credential_kind(state, provider, host) do
+          probe = Map.put(probe, :credential_kind, kind)
 
-        {:error, reason} ->
-          {:error, reason}
+          probe
+          |> module.fetch_catalog()
+          |> retry_after_rotation_harvest(kind, probe, module)
+        else
+          {:needs_onboarding, reason} ->
+            {:error, {:needs_onboarding, reason}}
+
+          # Onboarded, but the store records no kind. Refused rather than
+          # defaulted: the two kinds read different routes, so a catalog derived
+          # against a guessed kind would be a confident answer about the wrong
+          # account. Production cannot reach this — `:onboarded` and a readable
+          # kind have the same preconditions — but a half-migrated or
+          # hand-assembled store can, and it deserves a refusal, not a guess.
+          :none ->
+            {:error, {:needs_onboarding, :missing}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
       end
     rescue
       error -> {:error, {:exception, Exception.message(error)}}
