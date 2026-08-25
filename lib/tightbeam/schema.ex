@@ -40,7 +40,7 @@ defmodule Tightbeam.Schema do
   @shape "pi-harness-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
-  @pi_provider_values "'anthropic','openai','opencode_go'" <>
+  @pi_provider_values "'anthropic','openai','opencode_go','local_openai'" <>
                         if(Application.compile_env(:tightbeam, :fixture_harness, false),
                           do: ",'fixture_provider'",
                           else: ""
