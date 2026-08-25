@@ -294,6 +294,7 @@ pub enum Command {
         provider: String,
         api_key: bool,
         endpoint: Option<String>,
+        provider_name: Option<String>,
         hostname: Option<String>,
         remote: Option<String>,
     },
@@ -604,7 +605,7 @@ COMMANDS:
       Bank an OpenCode Go API key for Pi. The key is read from stdin, validated
       by one live Pi-shaped model request, and stored in Pi's native auth.json
       form. OpenCode Go has no subscription onboarding path here.
-  onboard local-openai --endpoint URL [--api-key]
+  onboard local-openai --name NAME --endpoint URL [--api-key]
       Bank a host-scoped local OpenAI-compatible provider. The endpoint base URL
       is required. An API key is optional and, when present, is read from stdin
       -- never as an argument. The endpoint is live-probed with GET /v1/models
@@ -1977,6 +1978,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     let allowed = [
         "api-key",
         "endpoint",
+        "name",
         "hostname",
         "remote",
         "as",
@@ -1990,6 +1992,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         );
     }
     let endpoint = nonempty(flags, "endpoint");
+    let provider_name = nonempty(flags, "name");
     let hostname = nonempty(flags, "hostname");
     let remote = nonempty(flags, "remote");
     if provider == "github" && flags.contains_key("api-key") {
@@ -2008,6 +2011,9 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         if endpoint.is_none() {
             return Err("tightbeam onboard local-openai requires --endpoint URL".to_owned());
         }
+        if provider_name.is_none() {
+            return Err("tightbeam onboard local-openai requires --name NAME".to_owned());
+        }
         if hostname.is_some() || remote.is_some() {
             return Err(
                 "tightbeam onboard local-openai does not accept --hostname or --remote".to_owned(),
@@ -2015,6 +2021,9 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         }
     } else if endpoint.is_some() {
         return Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned());
+    }
+    if provider != "local-openai" && provider_name.is_some() {
+        return Err("--name is only valid for tightbeam onboard local-openai".to_owned());
     }
     if provider == "github"
         && ["as", "as-user", "as-process"]
@@ -2034,11 +2043,9 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     Ok(Command::Onboard {
         identity: identity(flags)?,
         provider,
-        // A BOOLEAN flag, deliberately. `--api-key <value>` would put the key in
-        // this process's argv, where anyone on the box can read it out of the
-        // process table. The key arrives on stdin instead.
         api_key: flags.contains_key("api-key"),
         endpoint,
+        provider_name,
         hostname,
         remote,
     })
@@ -2462,6 +2469,7 @@ mod tests {
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
                 endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             })
@@ -2482,6 +2490,7 @@ mod tests {
                 provider: "github".to_owned(),
                 api_key: false,
                 endpoint: None,
+                provider_name: None,
                 hostname: Some("github.example".to_owned()),
                 remote: None,
             })
@@ -2498,6 +2507,7 @@ mod tests {
                 provider: "github".to_owned(),
                 api_key: false,
                 endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: Some("https://github.com/example/project.git".to_owned()),
             })
@@ -2537,6 +2547,7 @@ mod tests {
                 provider: "opencode-go".to_owned(),
                 api_key: true,
                 endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             })
@@ -2551,11 +2562,13 @@ mod tests {
     }
 
     #[test]
-    fn local_openai_onboard_requires_endpoint() {
+    fn local_openai_onboard_requires_endpoint_and_name() {
         assert_eq!(
             parse(strings(&[
                 "onboard",
                 "local-openai",
+                "--name",
+                "spark",
                 "--endpoint",
                 "https://spark.example/v1",
                 "--as-user",
@@ -2566,6 +2579,7 @@ mod tests {
                 provider: "local-openai".to_owned(),
                 api_key: false,
                 endpoint: Some("https://spark.example/v1".to_owned()),
+                provider_name: Some("spark".to_owned()),
                 hostname: None,
                 remote: None,
             })
@@ -2573,6 +2587,17 @@ mod tests {
         assert_eq!(
             parse(strings(&["onboard", "local-openai", "--as-user", "flynn"])),
             Err("tightbeam onboard local-openai requires --endpoint URL".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "local-openai",
+                "--endpoint",
+                "https://spark.example/v1",
+                "--as-user",
+                "flynn"
+            ])),
+            Err("tightbeam onboard local-openai requires --name NAME".to_owned())
         );
         assert_eq!(
             parse(strings(&[
@@ -2715,7 +2740,7 @@ mod tests {
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
             "onboard opencode-go --api-key",
-            "onboard local-openai --endpoint URL [--api-key]",
+            "onboard local-openai --name NAME --endpoint URL [--api-key]",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
             "config get default-archetype",
@@ -3667,6 +3692,7 @@ mod tests {
                     provider: "openai".to_owned(),
                     api_key: false,
                     endpoint: None,
+                    provider_name: None,
                     hostname: None,
                     remote: None,
                 },
