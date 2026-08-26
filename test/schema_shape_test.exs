@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "pi-harness-v1"
+  @shape "pi-harness-v2"
+  @pi_harness_v1_shape "pi-harness-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
@@ -182,6 +183,59 @@ defmodule Tightbeam.SchemaShapeTest do
     assert pi.harness == "pi"
     assert pi.provider == "opencode_go"
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "pi-harness-v1 migrates sessions exactly and admits named local providers", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 1, 1);
+      INSERT INTO sessions
+        (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+         provider, model, host, createdAt, updatedAt)
+      VALUES
+        ('kept', 'Kept', 'owner', 'user:owner', 'default', 'pi',
+         'opencode_go', 'opencode-go/gpt-5.6-luna', 'remote-a', 1, 2);
+      INSERT INTO harness_pointers
+        (sessionKey, harnessSessionId, sourceSessionRef, harness, machine, reason, createdAt)
+      VALUES ('kept', 'hs_kept', 'source', 'pi', 'remote-a', 'created', 3);
+      """)
+
+    downgrade_sessions_to_pi_harness_v1(db)
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["kept", "remote-a", 2]]} =
+             DB.query(db, "SELECT sessionKey, host, updatedAt FROM sessions")
+
+    assert {:ok, [["kept"]]} = DB.query(db, "SELECT sessionKey FROM harness_pointers")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    assert {:ok, [[1]]} = index_count(db, "sessions_owner")
+    assert {:ok, [[1]]} = index_count(db, "sessions_cli_token")
+
+    fresh = :"schema_shape_pi_v2_fresh_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: fresh}, id: fresh)
+    assert :ok = Schema.ensure_all(fresh)
+    assert object_sql(db, "table", "sessions") == object_sql(fresh, "table", "sessions")
+
+    for name <- ~w(sessions_owner sessions_cli_token) do
+      assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
+    end
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES
+               ('spark', 'Spark', 'owner', 'user:owner', 'default', 'pi',
+                'local_openai', 'spark/qwen3.5-35b', 4, 4)
+             """)
+
+    assert {:ok, [["local_openai"]]} =
+             DB.query(db, "SELECT provider FROM sessions WHERE sessionKey='spark'")
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
@@ -636,7 +690,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @shape
 
     assert error.message =~
-             "can migrate #{@model_identity_shape} through\n#{@operator_decision_shape} to #{@shape}"
+             "can migrate #{@model_identity_shape} through\n#{@operator_decision_shape}, or #{@pi_harness_v1_shape}, to #{@shape}"
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
@@ -792,6 +846,40 @@ defmodule Tightbeam.SchemaShapeTest do
         CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
         CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
         UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp downgrade_sessions_to_pi_harness_v1(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        CREATE TABLE sessions_old (
+          sessionKey TEXT PRIMARY KEY, displayName TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+          orderIndex INTEGER NOT NULL DEFAULT 0, isBuiltIn INTEGER NOT NULL DEFAULT 0,
+          adopted INTEGER NOT NULL DEFAULT 0, ownerUserId TEXT NOT NULL, origin TEXT NOT NULL,
+          spawnedBy TEXT, handle TEXT UNIQUE, archetype TEXT NOT NULL, overrides TEXT,
+          identityName TEXT, identityRevision TEXT, cliToken TEXT,
+          harness TEXT NOT NULL CHECK (harness IN ('claude','codex','pi','fixture')),
+          provider TEXT NOT NULL CHECK (provider IN ('anthropic','openai','opencode_go','fixture_provider')),
+          model TEXT NOT NULL, thinkingLevel TEXT, modelContext TEXT,
+          host TEXT NOT NULL DEFAULT 'local', clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+          createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+        );
+        INSERT INTO sessions_old SELECT * FROM sessions;
+        DROP INDEX sessions_owner;
+        DROP INDEX sessions_cli_token;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_old RENAME TO sessions;
+        CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
+        CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
+        UPDATE schema_stamp SET shape = '#{@pi_harness_v1_shape}', stampedAt = 1;
         """)
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")

@@ -37,7 +37,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "pi-harness-v1"
+  @shape "pi-harness-v2"
+  @pi_harness_v1_shape "pi-harness-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @pi_provider_values "'anthropic','openai','opencode_go','local_openai'" <>
@@ -1046,12 +1047,15 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@pi_harness_v1_shape]]} ->
+        migrate_sessions_provider_shape(db, @pi_harness_v1_shape)
+
       {:ok, [[@operator_decision_shape]]} ->
-        migrate_pi_harness_v1(db)
+        migrate_sessions_provider_shape(db, @operator_decision_shape)
 
       {:ok, [[@model_identity_shape]]} ->
         migrate_model_identity_v1(db)
-        migrate_pi_harness_v1(db)
+        migrate_sessions_provider_shape(db, @operator_decision_shape)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1068,7 +1072,7 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         This build can migrate #{@model_identity_shape} through
-        #{@operator_decision_shape} to #{@shape}.
+        #{@operator_decision_shape}, or #{@pi_harness_v1_shape}, to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1237,11 +1241,11 @@ defmodule Tightbeam.Schema do
     :ok
   end
 
-  defp migrate_pi_harness_v1(db) do
+  defp migrate_sessions_provider_shape(db, source_shape) do
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
-      case DB.transaction(db, &migrate_pi_harness_v1_in_txn/1) do
+      case DB.transaction(db, &migrate_sessions_provider_shape_in_txn(&1, source_shape)) do
         {:ok, :ok} ->
           :ok
 
@@ -1251,14 +1255,14 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@operator_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{source_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
   end
 
-  defp migrate_pi_harness_v1_in_txn(%Txn{} = txn) do
+  defp migrate_sessions_provider_shape_in_txn(%Txn{} = txn, source_shape) do
     [[session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions")
 
     :ok = Txn.exec(txn, pi_sessions_ddl())
@@ -1284,7 +1288,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != session_count do
       raise ShapeError,
         message:
-          "migration #{@operator_decision_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{session_count} sessions"
+          "migration #{source_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{session_count} sessions"
     end
 
     [[^session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions_new")
@@ -1308,19 +1312,18 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@operator_decision_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{source_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-      [@shape, System.system_time(:millisecond), @operator_decision_shape]
+      [@shape, System.system_time(:millisecond), source_shape]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
-        message:
-          "migration #{@operator_decision_shape} -> #{@shape} lost its exact stamp transition"
+        message: "migration #{source_shape} -> #{@shape} lost its exact stamp transition"
     end
 
     :ok
