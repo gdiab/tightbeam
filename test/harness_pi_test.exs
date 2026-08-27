@@ -4,22 +4,33 @@ defmodule Tightbeam.HarnessPiTest do
   alias Tightbeam.Harness.Pi
 
   test "adapter patch adds close lifecycle and preserves concurrent sessions idempotently" do
-    source =
-      [
-        "          list: {},\n          delete: {}",
-        "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
-        "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
-        "  async listSessions(params) {"
-      ]
-      |> Enum.join("\n")
+    source = pristine_adapter_fixture()
 
     patched = Pi.patch_adapter_source(source)
 
     assert patched =~ "          close: {}"
     assert patched =~ "  async closeSession(params) {"
+    assert patched =~ "    const session = this.sessions.maybeGet(params.sessionId);"
+    assert patched =~ "    if (session) await session.cancel();"
     assert patched =~ "    this.sessions.close(params.sessionId);"
     refute patched =~ "closeAllExcept"
     assert Pi.patch_adapter_source(patched) == patched
+  end
+
+  test "adapter patch upgrades the prior close-only handler to abort-on-close idempotently" do
+    source =
+      pristine_adapter_fixture()
+      |> Pi.patch_adapter_source()
+      |> String.replace(
+        "    const session = this.sessions.maybeGet(params.sessionId);\n    if (session) await session.cancel();\n    this.sessions.close(params.sessionId);",
+        "    this.sessions.close(params.sessionId);",
+        global: false
+      )
+
+    upgraded = Pi.patch_adapter_source(source)
+
+    assert upgraded =~ "    if (session) await session.cancel();"
+    assert Pi.patch_adapter_source(upgraded) == upgraded
   end
 
   test "projected extension injects served identity and blocks compiled rails before execution" do
@@ -205,6 +216,16 @@ defmodule Tightbeam.HarnessPiTest do
     assert script =~ "unsupported pi adapter version"
     assert script =~ "0.0.33"
     assert script =~ "const rs=JSON.parse"
+  end
+
+  defp pristine_adapter_fixture do
+    [
+      "          list: {},\n          delete: {}",
+      "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
+      "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
+      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {"
+    ]
+    |> Enum.join("\n")
   end
 
   defp tmp_dir!(label) do
