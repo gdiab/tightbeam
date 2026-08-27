@@ -1,5 +1,6 @@
 defmodule Tightbeam.IdentityTest do
   use Tightbeam.TestCase, async: false
+  import ExUnit.CaptureIO
   import ExUnit.CaptureLog
 
   alias Tightbeam.Identity
@@ -80,6 +81,107 @@ defmodule Tightbeam.IdentityTest do
                root_archetype: "product-owner"
              }
            ]
+  end
+
+  test "two concurrent first boots publish one complete intact seed", ctx do
+    parent = self()
+
+    tasks =
+      for _ <- 1..2 do
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :start -> Identity.init!(ctx.base)
+          end
+        end)
+      end
+
+    pids =
+      for _ <- tasks do
+        assert_receive {:ready, pid}, 5_000
+        pid
+      end
+
+    Enum.each(pids, &send(&1, :start))
+    results = Enum.map(tasks, &Task.await(&1, 30_000))
+
+    assert Enum.count(results, &(&1 == :initialized)) == 1
+    assert Enum.count(results, &(&1 == :noop)) == 1
+
+    dir = Path.join(ctx.base, "identity")
+
+    assert dir
+           |> git!(["branch", "--format=%(refname:short)"])
+           |> String.split("\n", trim: true)
+           |> MapSet.new() == MapSet.new(["main", "tightbeam/live", "tightbeam/upstream"])
+
+    expected_entries = seed_fixture_entries()
+    expected_paths = Enum.map(expected_entries, &elem(&1, 0))
+
+    assert dir
+           |> git!(["ls-tree", "-r", "--name-only", "main"])
+           |> String.split("\n", trim: true) == expected_paths
+
+    Enum.each(expected_entries, fn {relative, bytes} ->
+      assert git_bytes!(dir, "main", relative) == bytes
+      assert File.read!(Path.join(dir, relative)) == bytes
+    end)
+
+    assert git!(dir, ["status", "--short"]) == ""
+  end
+
+  test "a first boot killed mid-seed recovers without destructive repair guidance", ctx do
+    template = Path.join(ctx.root, "git-template")
+    hook = Path.join(template, "hooks/pre-commit")
+    entered_hook = Path.join(ctx.root, "seed-entered-pre-commit")
+    release_hook = Path.join(ctx.root, "release-seed-hook")
+    previous_template = System.get_env("GIT_TEMPLATE_DIR")
+
+    File.mkdir_p!(Path.dirname(hook))
+
+    File.write!(hook, """
+    #!/bin/sh
+    touch #{entered_hook}
+    while [ ! -e #{release_hook} ]; do sleep 0.1; done
+    """)
+
+    File.chmod!(hook, 0o755)
+    System.put_env("GIT_TEMPLATE_DIR", template)
+
+    on_exit(fn ->
+      if previous_template,
+        do: System.put_env("GIT_TEMPLATE_DIR", previous_template),
+        else: System.delete_env("GIT_TEMPLATE_DIR")
+    end)
+
+    {pid, monitor} = spawn_monitor(fn -> Identity.init!(ctx.base) end)
+    wait_until!(fn -> File.exists?(entered_hook) end)
+
+    [temporary_dir] = Path.wildcard(Path.join(ctx.base, "identity.tmp-*"))
+    assert File.dir?(Path.join(temporary_dir, ".git"))
+    refute File.exists?(Path.join(ctx.base, "identity"))
+    refute git_ref_exists?(temporary_dir, "tightbeam/live")
+
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}, 5_000
+    File.touch!(release_hook)
+
+    if previous_template,
+      do: System.put_env("GIT_TEMPLATE_DIR", previous_template),
+      else: System.delete_env("GIT_TEMPLATE_DIR")
+
+    captured =
+      capture_io(:stderr, fn ->
+        assert :initialized = Identity.init!(ctx.base)
+      end)
+
+    refute captured =~ "remove #{Path.join(ctx.base, "identity")} and re-boot"
+
+    dir = Path.join(ctx.base, "identity")
+    assert git_ref_exists?(dir, "main")
+    assert git_ref_exists?(dir, "tightbeam/upstream")
+    assert git_ref_exists?(dir, "tightbeam/live")
   end
 
   # S4 coverage pin: the file-list assertion above proves the seed ships
@@ -1180,6 +1282,38 @@ defmodule Tightbeam.IdentityTest do
       {_output, _status} -> false
     end
   end
+
+  defp git_ref_exists?(dir, ref) do
+    case System.cmd("git", ["show-ref", "--verify", "--quiet", "refs/heads/#{ref}"], cd: dir) do
+      {_output, 0} -> true
+      {_output, 1} -> false
+      {output, status} -> raise "git show-ref failed #{status}: #{output}"
+    end
+  end
+
+  defp seed_fixture_entries do
+    root = Application.app_dir(:tightbeam, "priv/seed")
+
+    root
+    |> Path.join("**/*")
+    |> Path.wildcard()
+    |> Enum.reject(&File.dir?/1)
+    |> Enum.map(&{Path.relative_to(&1, root), File.read!(&1)})
+    |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp wait_until!(predicate, attempts \\ 500)
+
+  defp wait_until!(predicate, attempts) when attempts > 0 do
+    if predicate.() do
+      :ok
+    else
+      Process.sleep(10)
+      wait_until!(predicate, attempts - 1)
+    end
+  end
+
+  defp wait_until!(_predicate, 0), do: flunk("timed out waiting for seed checkpoint")
 
   defp git!(dir, args, author \\ nil) do
     env =

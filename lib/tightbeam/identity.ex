@@ -57,19 +57,51 @@ defmodule Tightbeam.Identity do
     identity_dir = identity_dir(base_dir)
 
     if File.dir?(Path.join(identity_dir, ".git")) do
-      verify_required_refs!(identity_dir)
-      maybe_mint_grandfather_receipt!(identity_dir)
-      :noop
+      verify_existing_identity!(identity_dir)
     else
-      File.mkdir_p!(identity_dir)
-      git!(identity_dir, ["init", "-b", "main"])
-      replace_with_entries!(identity_dir, seed_entries())
-      git!(identity_dir, ["add", "-A"])
-      git!(identity_dir, ["commit", "-m", "seed: neutral-identity"], "tightbeam")
-      git!(identity_dir, ["branch", @upstream])
-      git!(identity_dir, ["branch", @live])
-      :initialized
+      seed_and_publish_identity!(identity_dir)
     end
+  end
+
+  defp verify_existing_identity!(identity_dir) do
+    verify_required_refs!(identity_dir)
+    maybe_mint_grandfather_receipt!(identity_dir)
+    :noop
+  end
+
+  defp seed_and_publish_identity!(identity_dir) do
+    temporary_dir = temporary_identity_dir(identity_dir)
+    File.mkdir_p!(temporary_dir)
+
+    try do
+      git!(temporary_dir, ["init", "-b", "main"])
+      replace_with_entries!(temporary_dir, seed_entries())
+      git!(temporary_dir, ["add", "-A"])
+      git!(temporary_dir, ["commit", "-m", "seed: neutral-identity"], "tightbeam")
+      git!(temporary_dir, ["branch", @upstream])
+      git!(temporary_dir, ["branch", @live])
+
+      case File.rename(temporary_dir, identity_dir) do
+        :ok ->
+          :initialized
+
+        {:error, reason} when reason in [:eexist, :enotempty] ->
+          verify_existing_identity!(identity_dir)
+
+        {:error, reason} ->
+          raise File.Error,
+            action: "publish seeded identity",
+            path: identity_dir,
+            reason: reason
+      end
+    after
+      File.rm_rf!(temporary_dir)
+    end
+  end
+
+  defp temporary_identity_dir(identity_dir) do
+    suffix = "#{System.pid()}-#{System.unique_integer([:positive, :monotonic])}"
+    identity_dir <> ".tmp-" <> suffix
   end
 
   defp verify_required_refs!(identity_dir) do
