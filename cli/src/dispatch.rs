@@ -895,6 +895,7 @@ pub fn build_onboard_phase_request(
     machine: Option<&str>,
     lease_id: Option<&str>,
     reason: Option<&str>,
+    source: Option<&str>,
 ) -> RequestSpec {
     // `kind` rides on EVERY phase, not just finish, so the conversation is
     // self-describing in a gateway log. Only finish acts on it.
@@ -911,6 +912,9 @@ pub fn build_onboard_phase_request(
     }
     if let Some(reason) = reason {
         params.push(string_field("reason", reason));
+    }
+    if let Some(source) = source {
+        params.push(string_field("source", source));
     }
     request(identity, "onboard", vec![], params)
 }
@@ -1387,6 +1391,7 @@ where
             identity,
             provider,
             api_key,
+            daemon_credential,
             endpoint: local_endpoint,
             hostname,
             remote,
@@ -1403,6 +1408,7 @@ where
                 &identity,
                 &provider,
                 api_key,
+                daemon_credential,
                 local_endpoint.as_deref(),
                 &endpoint,
                 send_request,
@@ -2273,6 +2279,7 @@ mod tests {
             Some("work-1"),
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -2293,6 +2300,7 @@ mod tests {
             Some("work-1"),
             Some("lease-7"),
             None,
+            None,
         );
 
         assert_eq!(
@@ -2300,6 +2308,31 @@ mod tests {
             r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
         );
         assert!(!keyed.body_json.contains("sk-"));
+
+        let daemon = build_onboard_phase_request(
+            &Identity::User("flynn".to_owned()),
+            "opencode-go",
+            "begin",
+            "apiKey",
+            None,
+            None,
+            None,
+            Some("daemonCredential"),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&daemon.body_json).unwrap(),
+            serde_json::json!({
+                "asUser": "flynn",
+                "verb": "onboard",
+                "params": {
+                    "provider": "opencode-go",
+                    "phase": "begin",
+                    "kind": "apiKey",
+                    "source": "daemonCredential"
+                }
+            })
+        );
+        assert!(!daemon.body_json.contains("fake-daemon-key"));
     }
 
     #[test]
@@ -2796,6 +2829,7 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                daemon_credential: false,
                 endpoint: None,
                 hostname: None,
                 remote: None,
@@ -2906,6 +2940,7 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                daemon_credential: false,
                 endpoint: None,
                 hostname: None,
                 remote: None,
@@ -3002,6 +3037,7 @@ mod tests {
             "finish",
             "subscription",
             Some("work-1"),
+            None,
             None,
             None,
         );
