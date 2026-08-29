@@ -727,9 +727,10 @@ COMMANDS:
       After: add the host to an archetype's `where`.
         tightbeam assimilate work-1.local --as-user flynn
 
-DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
-  TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
-  <TIGHTBEAM_BASE_DIR|TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
+DISCOVERY: an explicitly set TIGHTBEAM_BASE_DIR is an isolation boundary and
+  uses only <base>/gateway.json. Otherwise, the CLI walks up from cwd for
+  .tightbeam-session, then uses TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
+  <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
 
 DURATIONS (for --after and --fallback-after): <n>ms | <n>s | <n>m | <n>h
   (e.g. 30s, 5m, 2h).

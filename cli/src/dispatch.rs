@@ -997,6 +997,15 @@ fn discover_with<F>(get_env: F, cwd: &Path, home_dir: &Path) -> Result<Endpoint,
 where
     F: Fn(&str) -> Option<String>,
 {
+    // An explicit base is an isolation boundary, not a fallback hint. Proofs and
+    // parallel orgs set it precisely so a session file inherited from the caller's
+    // worktree cannot redirect the command into another (including production)
+    // gateway. Refuse on a missing or malformed gateway.json inside that base; do
+    // not continue discovery through cwd, named endpoint variables, or defaults.
+    if let Some(base_dir) = crate::base_dir::explicit(&get_env) {
+        return endpoint_from_gateway_file(&PathBuf::from(base_dir).join("gateway.json"));
+    }
+
     if let Some(endpoint) = discover_session_from(cwd)? {
         return Ok(endpoint);
     }
@@ -2771,7 +2780,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_walks_up_to_the_nearest_session_file_before_env_or_gateway() {
+    fn an_explicit_base_dir_cannot_be_overridden_by_a_session_file() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2800,6 +2809,10 @@ mod tests {
         .unwrap();
 
         let env = HashMap::from([
+            (
+                "TIGHTBEAM_BASE_DIR".to_owned(),
+                configured.display().to_string(),
+            ),
             ("TIGHTBEAM_URL".to_owned(), "https://env-gateway".to_owned()),
             ("TIGHTBEAM_TOKEN".to_owned(), "env-token".to_owned()),
             (
@@ -2810,23 +2823,48 @@ mod tests {
         assert_eq!(
             discover_with(|name| env.get(name).cloned(), &cwd, &root),
             Ok(Endpoint {
-                base: "https://nearest-session".to_owned(),
-                token: "nearest-token".to_owned(),
-                origin: Origin::Session(ancestor.join("work").join(".tightbeam-session")),
+                base: "http://127.0.0.1:4321".to_owned(),
+                token: "configured".to_owned(),
+                origin: Origin::Provisioned,
             })
         );
 
         fs::write(ancestor.join("work").join(".tightbeam-session"), "{").unwrap();
+        assert!(discover_with(|name| env.get(name).cloned(), &cwd, &root).is_ok());
+
+        fs::remove_file(configured.join("gateway.json")).unwrap();
         let error = discover_with(|name| env.get(name).cloned(), &cwd, &root).unwrap_err();
-        assert!(error.starts_with("malformed session file"));
-        assert!(
-            error.contains(
-                &ancestor
-                    .join("work")
-                    .join(".tightbeam-session")
-                    .display()
-                    .to_string()
-            )
+        assert!(error.contains(&configured.join("gateway.json").display().to_string()));
+        assert!(!error.contains("session file"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn without_an_explicit_base_discovery_still_uses_the_nearest_session() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam_cli_session_fallback_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd = root.join("work/nested");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            root.join("work/.tightbeam-session"),
+            r#"{"url":"https://nearest-session","token":"nearest-token"}"#,
+        )
+        .unwrap();
+
+        let env: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            discover_with(|name| env.get(name).cloned(), &cwd, &root),
+            Ok(Endpoint {
+                base: "https://nearest-session".to_owned(),
+                token: "nearest-token".to_owned(),
+                origin: Origin::Session(root.join("work/.tightbeam-session")),
+            })
         );
 
         fs::remove_dir_all(root).unwrap();

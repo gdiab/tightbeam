@@ -49,10 +49,19 @@ pub fn resolve_with<F>(get_env: &F, home_dir: &Path) -> PathBuf
 where
     F: Fn(&str) -> Option<String>,
 {
-    get_env("TIGHTBEAM_BASE_DIR")
+    explicit(get_env)
         .or_else(|| get_env("TIGHTBEAM_HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| default_in(home_dir))
+}
+
+/// Return the explicitly selected base, if present. Callers use this to preserve
+/// the distinction between an isolation boundary and the default discovery path.
+pub fn explicit<F>(get_env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env("TIGHTBEAM_BASE_DIR")
 }
 
 /// The default when neither variable is set.
