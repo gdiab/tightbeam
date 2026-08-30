@@ -85,8 +85,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert Path.basename(Path.dirname(canonical)) == Cursor.adapter_version()
     assert sha256(canonical) == "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
 
-    assert sha256(bundle_path) ==
-             "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0"
+    assert sha256(bundle_path) == Cursor.bundle_sha256_for_host!()
 
     assert bundle =~ ~s("file"===t?"file":"memory"===t?"memory":"default")
     assert bundle =~ ~s("darwin"===e&&t&&!n&&"default"===r)
@@ -368,7 +367,7 @@ defmodule Tightbeam.CursorRegistrationTest do
               {"eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831\n", 0}
 
             command =~ "index.js" ->
-              {"6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0\n", 0}
+              {Cursor.bundle_sha256_for_host!() <> "\n", 0}
           end
         end
       }
@@ -424,7 +423,7 @@ defmodule Tightbeam.CursorRegistrationTest do
       realpath: fn path -> {:ok, path} end,
       sha256: fn path ->
         if Path.basename(path) == "index.js",
-          do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+          do: Cursor.bundle_sha256_for_host!(),
           else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
       end,
       verify_adapter_shim: fn _shim, _launcher -> :ok end
