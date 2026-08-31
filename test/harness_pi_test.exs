@@ -1,5 +1,5 @@
 defmodule Tightbeam.HarnessPiTest do
-  use Tightbeam.TestCase, async: true
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Harness.Pi
 
@@ -31,6 +31,40 @@ defmodule Tightbeam.HarnessPiTest do
 
     assert upgraded =~ "    if (session) await session.cancel();"
     assert Pi.patch_adapter_source(upgraded) == upgraded
+  end
+
+  @tag :pi_acp_contract
+  test "exact pi-acp@0.0.33 patched bundle aborts an in-flight turn on session/close" do
+    {root, adapter_root} = exact_pi_acp_fixture!()
+    mock_pi = Path.join([__DIR__, "fixtures", "mock_pi_rpc_stall.js"])
+    contract = Path.join([__DIR__, "fixtures", "pi_acp_close_abort_contract.mjs"])
+    log = Path.join(root, "contract-log.json")
+
+    assert {:ok,
+            %{
+              "abortCount" => 1,
+              "closeOk" => true,
+              "mode" => "patched",
+              "stopReason" => "cancelled"
+            }} =
+             run_pi_acp_close_contract(adapter_root, mock_pi, contract, log, "patched")
+  end
+
+  @tag :pi_acp_contract
+  test "exact pi-acp@0.0.33 close-only oracle lets a stalled turn finish as end_turn without abort" do
+    {root, adapter_root} = exact_pi_acp_fixture!()
+    mock_pi = Path.join([__DIR__, "fixtures", "mock_pi_rpc_stall.js"])
+    contract = Path.join([__DIR__, "fixtures", "pi_acp_close_abort_contract.mjs"])
+    log = Path.join(root, "contract-log-oracle.json")
+
+    assert {:ok,
+            %{
+              "abortCount" => 0,
+              "closeOk" => true,
+              "mode" => "oracle",
+              "stopReason" => "end_turn"
+            }} =
+             run_pi_acp_close_contract(adapter_root, mock_pi, contract, log, "oracle")
   end
 
   test "projected extension injects served identity and blocks compiled rails before execution" do
@@ -226,6 +260,57 @@ defmodule Tightbeam.HarnessPiTest do
       "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {"
     ]
     |> Enum.join("\n")
+  end
+
+  defp exact_pi_acp_fixture! do
+    root = tmp_dir!("pi-acp-exact-contract")
+    source_root = exact_pi_acp_source_root!()
+    dest_adapters = Path.join(root, "adapters")
+    File.mkdir_p!(dest_adapters)
+    File.cp_r!(Path.join(source_root, "node_modules"), Path.join(dest_adapters, "node_modules"))
+
+    bundle = Path.join(dest_adapters, "node_modules/pi-acp/dist/index.js")
+    package = Path.join(dest_adapters, "node_modules/pi-acp/package.json")
+
+    %{"version" => "0.0.33"} =
+      package |> File.read!() |> JSON.decode!()
+
+    patched = Pi.patch_adapter_source(File.read!(bundle))
+    File.write!(bundle, patched)
+    File.mkdir_p!(Path.join(dest_adapters, "session-cwd"))
+    File.mkdir_p!(Path.join(dest_adapters, "pi-home"))
+    {root, dest_adapters}
+  end
+
+  defp exact_pi_acp_source_root! do
+    candidates = [
+      "/private/tmp/pr32-lifecycle-live/adapters",
+      Path.expand("../../../e66f350ee63a/pr32-leftspin-fixes/adapters", __DIR__)
+    ]
+
+    Enum.find_value(candidates, fn path ->
+      package = Path.join(path, "node_modules/pi-acp/package.json")
+
+      if File.regular?(package) do
+        case File.read!(package) |> JSON.decode!() do
+          %{"version" => "0.0.33"} -> path
+          _ -> nil
+        end
+      end
+    end) ||
+      raise "exact pi-acp@0.0.33 source tree not found; stage adapters/node_modules/pi-acp 0.0.33"
+  end
+
+  defp run_pi_acp_close_contract(root, mock_pi, contract, log, mode) do
+    File.chmod!(mock_pi, 0o755)
+
+    {output, 0} =
+      System.cmd("node", [contract, root, mock_pi, log, mode], stderr_to_stdout: true)
+
+    case JSON.decode(output) do
+      {:ok, decoded} -> {:ok, decoded}
+      _ -> flunk("contract fixture failed: #{output}")
+    end
   end
 
   defp tmp_dir!(label) do
