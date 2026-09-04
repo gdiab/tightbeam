@@ -1,0 +1,11 @@
+[Unit]
+Description=Probe the Tightbeam gateway every minute
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=tightbeam-gateway-down-probe.service
+
+[Install]
+WantedBy=timers.target

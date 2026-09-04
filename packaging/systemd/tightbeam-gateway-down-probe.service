@@ -1,0 +1,13 @@
+[Unit]
+Description=Record and alert when the Tightbeam gateway is down
+After=network.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+StateDirectory=tightbeam-gateway-down-probe
+ExecStart=/usr/local/libexec/tightbeam-gateway-down-probe
+SocketBindDeny=any
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tightbeam-gateway-down-probe
