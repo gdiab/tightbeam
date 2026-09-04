@@ -16,6 +16,63 @@ while [ -L "$SELF" ]; do
 done
 DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 
+print_help () {
+  cat <<'EOF'
+tightbeam-gateway — start the Tightbeam gateway (the bundled BEAM release).
+
+Usage:
+  tightbeam-gateway [start]         Start the gateway in the foreground.
+  tightbeam-gateway stop            Stop the running gateway.
+  tightbeam-gateway restart         Restart the running gateway.
+  tightbeam-gateway pid             Print the running gateway's OS pid.
+  tightbeam-gateway rpc "EXPR"      Evaluate EXPR on the running gateway.
+  tightbeam-gateway remote          Open a remote shell on the running gateway.
+  tightbeam-gateway --version       Print the release version and exit.
+  tightbeam-gateway -h, --help      Print this help and exit.
+
+Environment:
+  TIGHTBEAM_BASE_DIR   Data directory (default per README).
+  TIGHTBEAM_PORT       Listen port (default 11373).
+  TIGHTBEAM_NODE       Erlang node name (default tightbeam_gateway_<port>).
+EOF
+}
+
+# FRONT DOOR. A flag is never a boot. `-h`/`--help` and any unknown option are answered
+# HERE — before any node name is derived and before exec — so asking for help, or a typo,
+# can never fall through into boot/bind (the `--help`-boots-a-live-gateway defect, made
+# unrepresentable at the entrypoint). Only a BARE invocation maps to `start`; VM-passthrough
+# flags require the explicit `start` subcommand (`tightbeam-gateway start --erl "..."`).
+# A real subcommand (`start`/`stop`/`restart`/`rpc`/`pid`/`remote`) falls through untouched
+# to the node-scoped exec below.
+case "${1:-}" in
+  -h|--help)
+    print_help
+    exit 0
+    ;;
+  --version)
+    exec "$DIR/release/bin/tightbeam_gateway" version
+    ;;
+  "")
+    set -- start
+    ;;
+  start)
+    # An explicit `start` still owes pure help: a leading -h/--help is a help request,
+    # not a VM flag. The release `start` branch reads only its subcommand word and would
+    # silently drop a trailing `--help` into a full boot, so catch it here where the
+    # discrimination is possible.
+    case "${2:-}" in
+      -h|--help)
+        print_help
+        exit 0
+        ;;
+    esac
+    ;;
+  -*)
+    echo "tightbeam-gateway: unknown option: $1 (did you mean 'start'?)" >&2
+    exit 2
+    ;;
+esac
+
 # ONE ERLANG NODE NAME PER INSTANCE, DERIVED FROM THE PORT.
 #
 # A mix release names its node after the RELEASE, so every instance on a machine
@@ -59,12 +116,8 @@ fi
 # narrower than the code gives. The resolution is the four lines below and the release's
 # own `RELEASE_NODE="${RELEASE_NODE:-$RELEASE_NAME}"`; read those, not a paraphrase.
 #
-# A LEADING FLAG STILL MEANS `start`. The previous form was `start "$@"`, so
-# `tightbeam-gateway --erl "+sbwt none"` passed that option to start; treating a
-# leading `-` as a subcommand would answer it with `Unknown command --erl`. Only a
-# bare word is a subcommand.
-case "${1:-}" in
-  "" | -*) set -- start "$@" ;;
-esac
+# The leading token was already classified at the FRONT DOOR above: a bare invocation
+# became `start`, `-h`/`--help`/`--version` were answered and exited, and an unknown flag
+# was refused. So `$1` here is a real subcommand, and it exec's under the derived node name.
 
 exec "$DIR/release/bin/tightbeam_gateway" "$@"
