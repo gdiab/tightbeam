@@ -269,6 +269,21 @@ defmodule Tightbeam.Application do
 
   @impl true
   def prep_stop(state) do
+    # LEGIBILITY FOR THE NEXT SILENT EXIT-0. prep_stop runs ONLY on an orderly VM stop
+    # (init:stop / System.stop — the release `stop` command, a System.stop RPC, or OTP's
+    # SIGTERM handler), NEVER on a crash: a permanent app that crashes escalates to a
+    # nonzero exit + erl_crash.dump without reaching here. So this line is the marker that
+    # an exit-0 outage was a GRACEFUL shutdown, not a swallowed fault. The exact external
+    # trigger is not distinguishable in-process (there is no in-VM record of whether a
+    # SIGTERM arrived vs a stop RPC); a SIGTERM also emits the kernel's own
+    # "SIGTERM received - shutting down" line, so cross-reference the log at this timestamp.
+    Logger.notice(
+      "gateway stopping: orderly VM stop (prep_stop) — " <>
+        "boot_epoch=#{inspect(Application.get_env(:tightbeam, :boot_epoch))} " <>
+        "drain_timeout_ms=#{Application.get_env(:tightbeam, :drain_timeout_ms, 90_000)}; " <>
+        "exit 0 here is a graceful stop, not a crash"
+    )
+
     # Graceful drain (deploys must not eat turns): flip the draining flag so
     # lanes claim nothing new, then wait — bounded — for in-flight turns to
     # finish. Whatever is still running after the deadline dies exactly as a
