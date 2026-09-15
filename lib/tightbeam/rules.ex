@@ -140,7 +140,9 @@ defmodule Tightbeam.Rules do
     "work_item.verdict_kinds" => {:list, :string},
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
-    "assign.declared_files_overlap_open" => :bool
+    "assign.declared_files_overlap_open" => :bool,
+    "assign.review_provider_relation" => :string,
+    "assign.review_provider_fallback_authorized" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
 
@@ -1165,6 +1167,22 @@ defmodule Tightbeam.Rules do
            System.system_time(:millisecond) - 86_400_000
          ), cache}
     end
+  end
+
+  defp compute_fact("$review_provider", db, call, cache) do
+    {Tightbeam.ReviewProvider.facts(db, call), cache}
+  end
+
+  defp compute_fact("assign.review_provider_relation", db, call, cache) do
+    with_dependency("$review_provider", db, call, cache, fn facts, cache ->
+      {facts.relation, cache}
+    end)
+  end
+
+  defp compute_fact("assign.review_provider_fallback_authorized", db, call, cache) do
+    with_dependency("$review_provider", db, call, cache, fn facts, cache ->
+      {facts.authorized, cache}
+    end)
   end
 
   defp compute_fact("attest.kind", _db, call, cache) do

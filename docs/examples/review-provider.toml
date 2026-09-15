@@ -1,0 +1,22 @@
+# Opt-in: install in identity/rules after upgrading to a build with these facts.
+# Scope: new linked reviews of code assignments. See docs/REVIEW-PROVIDER-RAIL.md.
+[[rule]]
+name = "code-review-provider-identity"
+verb = "assign"
+text = "Code review needs a different session with known provider identity. Select a fresh qualified reviewer; resolve missing provider metadata before assigning."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.review_provider_relation", op = "in", value = ["self", "unknown"] },
+]
+
+[[rule]]
+name = "code-review-prefers-other-provider"
+verb = "assign"
+text = "Try qualified different-provider reviewers first. For same-provider fallback, the opening coordinator or responsible user must file a review-provider-fallback-approved verdict on the code assignment. Its JSON note must contain version: 1, reviewer_session, assignment_key, a nonblank reason and nonempty evidence_attest_ids naming earlier progress/verdict notes on that assignment. Then assign that reviewer as the same principal using that --key."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.review_provider_relation", op = "eq", value = "same" },
+  { fact = "assign.review_provider_fallback_authorized", op = "eq", value = false },
+]
