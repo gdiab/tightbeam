@@ -1322,7 +1322,7 @@ defmodule Tightbeam.Acp.Adapter do
     canonical = Model.to_ref(model_ref)
 
     aliases =
-      state.preset.model_option_aliases
+      Map.get(state.preset, :model_option_aliases, %{})
       |> Enum.filter(fn {_wire, public} -> public == canonical end)
       |> Enum.map(&elem(&1, 0))
 
@@ -1342,9 +1342,21 @@ defmodule Tightbeam.Acp.Adapter do
 
       case result do
         {:ok, response} ->
-          if read_back?(response, "model", value),
-            do: {:halt, {:ok, response}},
-            else: {:halt, {:error, :model_verification_failed}}
+          cond do
+            read_back?(response, "model", value) ->
+              {:halt, {:ok, response}}
+
+            # Wire-by-name presets (Cursor) prove application only by value
+            # echo; a success that does not echo is a verification failure.
+            # Other presets hand the response to the caller's readback —
+            # `verify_candidate_model/3` or `readback_confirms_model?/3` —
+            # which names the model that actually took.
+            Map.get(state.preset, :model_wire_by_name, false) ->
+              {:halt, {:error, :model_verification_failed}}
+
+            true ->
+              {:halt, {:ok, response}}
+          end
 
         {:error, :model_unavailable} ->
           {:cont, {:error, :model_unavailable}}
@@ -1370,7 +1382,7 @@ defmodule Tightbeam.Acp.Adapter do
     canonical = Model.to_ref(model_ref)
 
     aliases =
-      state.preset.model_option_aliases
+      Map.get(state.preset, :model_option_aliases, %{})
       |> Enum.filter(fn {_wire, public} -> public == canonical end)
       |> Enum.map(&elem(&1, 0))
 

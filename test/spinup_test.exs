@@ -67,7 +67,7 @@ defmodule Tightbeam.SpinupTest do
                end
              })
 
-    assert [["sh", "-c", script]] = receive_commands(1)
+    assert [["/bin/sh", "-c", script]] = receive_commands(1)
     assert script =~ "@agentclientprotocol/claude-agent-acp@0.81.0"
     assert_received :patched
   end
@@ -94,7 +94,7 @@ defmodule Tightbeam.SpinupTest do
              Tightbeam.Harness.Claude.ensure_adapter(target)
 
     assert message =~ "adapter deployment failed: npm failed"
-    assert [["sh", "-c", _script]] = receive_commands(1)
+    assert [["/bin/sh", "-c", _script]] = receive_commands(1)
     refute_received :patched
 
     manifest =
