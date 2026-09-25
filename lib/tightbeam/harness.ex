@@ -135,6 +135,7 @@ defmodule Tightbeam.Harness do
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
+  @callback local_client_model_authority?(Tightbeam.Model.t()) :: boolean()
 
   @optional_callbacks preflight_launch: 3
 
@@ -166,7 +167,7 @@ defmodule Tightbeam.Harness do
   @spec probe_cli(module(), target()) :: probe_result()
   def probe_cli(module, target), do: module.probe_cli(target)
 
-  @optional_callbacks warm_home: 2, requires_zero_listeners?: 0
+  @optional_callbacks warm_home: 2, requires_zero_listeners?: 0, local_client_model_authority?: 1
 
   @doc """
   Whether the shared launch seam asserts the launched process group has ZERO LISTEN sockets,
@@ -249,5 +250,14 @@ defmodule Tightbeam.Harness do
       raise ArgumentError,
             "unknown harness #{inspect(wire_name)}; expected one of: " <>
               Enum.map_join(all(), ", ", & &1.wire_name())
+  end
+
+  @doc "Whether the selected harness delegates model acceptance to its local client."
+  @spec local_client_model_authority?(binary(), Tightbeam.Model.t()) :: boolean()
+  def local_client_model_authority?(wire_name, model) when is_binary(wire_name) do
+    module = parse!(wire_name)
+
+    function_exported?(module, :local_client_model_authority?, 1) and
+      module.local_client_model_authority?(model)
   end
 end
