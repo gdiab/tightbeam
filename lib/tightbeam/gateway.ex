@@ -735,6 +735,13 @@ defmodule Tightbeam.Gateway do
         Escalation.revoke_waiver(db, call, authorized: admin_origin?(db, call.origin))
       end,
       "withdraw" => fn call -> Escalation.withdraw(db, call) end,
+      "operator-ask" => fn call -> Escalation.operator_ask(db, call) end,
+      "operator-rule" => fn call ->
+        Escalation.operator_rule(db, call,
+          scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+        )
+      end,
+      "operator-withdraw" => fn call -> Escalation.operator_withdraw(db, call) end,
       # The `input-needed` carrier (fabric §7, GitHub #11). Both verbs are
       # ordinary routed verbs and nothing more: `Rules.decide` sees them at the
       # Dispatch chokepoint like every other, the target is resolved by the same
