@@ -714,7 +714,15 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp lsof_listen_probe(pgid, lsof_path) do
-    args = ["-nP", "-a", "-g", Integer.to_string(pgid), "-iTCP", "-sTCP:LISTEN", "-Fn"]
+    # `-w` silences lsof's WARNING lines only. On a Linux host running Docker,
+    # an unprivileged lsof cannot stat the container overlay and netns mounts
+    # and prints one "can't stat() ... Output information may be incomplete"
+    # warning per mount; those concern path resolution on other file systems,
+    # not the TCP socket table this probe selects on (-iTCP -sTCP:LISTEN), so
+    # they are noise here rather than evidence. Fatal lsof errors are not
+    # warnings and still surface as diagnostics or a non-0/1 exit, which
+    # `listener_sample/2` keeps failing closed on.
+    args = ["-w", "-nP", "-a", "-g", Integer.to_string(pgid), "-iTCP", "-sTCP:LISTEN", "-Fn"]
 
     with {:ok, executable} <- lsof_executable(lsof_path) do
       bounded_command(executable, args, 5_000)
