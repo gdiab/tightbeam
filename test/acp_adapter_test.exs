@@ -440,6 +440,29 @@ defmodule Tightbeam.Acp.AdapterTest do
           models[m.params.sessionId] = "opus[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
+        if (["semantic-opus-high", "semantic-opus-wrong-effort"].includes(failMode) &&
+            m.params.configId === "model" &&
+            m.params.value === "claude-opus-4-8") {
+          models[m.params.sessionId] = "opus[1m]";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "semantic-opus-wrong-family" &&
+            m.params.configId === "model" &&
+            m.params.value === "claude-opus-4-8") {
+          models[m.params.sessionId] = "sonnet";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "semantic-opus-wrong-effort" &&
+            m.params.configId === "effort") {
+          efforts[m.params.sessionId] = "medium";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "semantic-opus-wrong-provider" &&
+            m.params.configId === "reasoning_effort") {
+          models[m.params.sessionId] = "opus[1m]";
+          efforts[m.params.sessionId] = m.params.value;
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if (failMode === "resident-default-context-variant" &&
             m.params.configId === "model" && m.params.value === "orbit-9") {
           models[m.params.sessionId] = "orbit-9[1m]";
@@ -2715,6 +2738,61 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
 
     refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "a canonical Claude Opus high candidate accepts and retains generic semantic readback" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "semantic-opus-high")
+
+    requested = Model.new("claude-opus-4-8", effort: "high")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    assert {:ok, %Model{family: "opus", context: "1m", effort: "high"}} =
+             Adapter.current_model(adapter, "sess-1")
+
+    assert capture_path
+           |> captured_requests()
+           |> Enum.filter(&(&1["method"] == "session/set_config_option"))
+           |> Enum.map(&{&1["configId"], &1["value"]}) ==
+             [{"model", "claude-opus-4-8"}, {"effort", "high"}]
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+  end
+
+  test "generic Opus high semantics reject the wrong provider, family, or effort" do
+    cases = [
+      {:codex, "semantic-opus-wrong-provider",
+       %Model{family: "opus", context: "1m", effort: "high"}},
+      {:claude, "semantic-opus-wrong-family",
+       %Model{family: "sonnet", context: nil, effort: "high"}},
+      {:claude, "semantic-opus-wrong-effort",
+       %Model{family: "opus", context: "1m", effort: "medium"}}
+    ]
+
+    for {harness, fail_mode, actual} <- cases do
+      {adapter, capture_path} = start_adapter(harness: harness, fail_mode: fail_mode)
+
+      assert {:error,
+              {:session_prepare_failed, {:runtime_config_mismatch, ^actual}, "sess-1",
+               %{status: "verified", reason: nil}}} =
+               Adapter.new_candidate_session(
+                 adapter,
+                 Model.new("claude-opus-4-8", effort: "high"),
+                 "/tmp",
+                 [],
+                 "guidance"
+               )
+
+      assert Enum.any?(captured_requests(capture_path), fn request ->
+               request["method"] == "session/close" and request["sessionId"] == "sess-1"
+             end)
+
+      refute Adapter.knows_session?(adapter, "sess-1")
+    end
   end
 
   test "a Claude Opus 5.5 high candidate verifies the client's Opus 5.5 alias" do

@@ -1066,7 +1066,7 @@ defmodule Tightbeam.Acp.Adapter do
         with :ok <- project_guidance(state, sid, guidance),
              {:ok, applied_model} <-
                establish_new_session_model(state, sid, model, result, request_timeout),
-             :ok <- verify_candidate_model(report_cleanup?, model, applied_model),
+             :ok <- verify_candidate_model(report_cleanup?, state.harness, model, applied_model),
              :ok <- set_mode(state, sid, request_timeout) do
           state =
             state
@@ -1106,13 +1106,36 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp verify_candidate_model(true, %Model{} = requested, %Model{} = actual)
+  defp verify_candidate_model(true, harness, %Model{} = requested, %Model{} = actual)
        when requested.family != actual.family or
               requested.context != actual.context or
               (not is_nil(requested.effort) and requested.effort != actual.effort),
-       do: {:error, {:runtime_config_mismatch, actual}}
+       do:
+         if(claude_opus_high_semantic_match?(harness, requested, actual),
+           do: :ok,
+           else: {:error, {:runtime_config_mismatch, actual}}
+         )
 
-  defp verify_candidate_model(_report_cleanup?, _requested, _actual), do: :ok
+  defp verify_candidate_model(_report_cleanup?, _harness, _requested, _actual), do: :ok
+
+  # Claude's public catalog ref is versioned while its ACP readback is not. This
+  # admits only the observed generic Opus/high semantics; it does not verify the
+  # version label, and the generic readback remains the resident model record.
+  defp claude_opus_high_semantic_match?(
+         harness,
+         %Model{family: "claude-opus-4-8", context: nil, effort: "high"} = requested,
+         %Model{family: "opus", effort: "high"}
+       ),
+       do: claude_catalog_authority?(harness, requested)
+
+  defp claude_opus_high_semantic_match?(_harness, _requested, _actual), do: false
+
+  defp claude_catalog_authority?(harness, requested) do
+    module = Harness.module!(harness)
+
+    function_exported?(module, :local_client_model_authority?, 1) and
+      module.local_client_model_authority?(requested)
+  end
 
   defp load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout) do
     with :ok <- project_guidance(state, sid, guidance) do
