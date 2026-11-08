@@ -1184,4 +1184,16 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       DROP INDEX IF EXISTS wakes_cancellation_state;
       """)
   end
+
+  # Brings a synthetic users table created by Devices.ensure_schema/1 alone to
+  # the current shape: the two nullable columns the user-removal migration adds.
+  def add_user_removal_columns!(db) do
+    assert :ok =
+             DB.execute(db, """
+             ALTER TABLE users ADD COLUMN removedAt INTEGER;
+             ALTER TABLE users ADD COLUMN removedBy TEXT CHECK ((removedAt IS NULL) = (removedBy IS NULL));
+             """)
+
+    :ok
+  end
 end
