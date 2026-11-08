@@ -6621,7 +6621,11 @@ mod tests {
             &["remove-user", "a", "b"],
         ];
         for argv in refused {
-            assert!(parse(strings(argv)).unwrap_err().starts_with("usage: tightbeam "));
+            assert!(
+                parse(strings(argv))
+                    .unwrap_err()
+                    .starts_with("usage: tightbeam ")
+            );
         }
     }
 
