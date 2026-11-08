@@ -522,6 +522,7 @@ pub enum Command {
         verdict: Option<String>,
         note: Option<String>,
         commit_refs: Option<Vec<serde_json::Value>>,
+        receipts: Vec<String>,
         artifact_id: Option<String>,
         content_sha256: Option<String>,
         wait_id: Option<String>,
@@ -1155,6 +1156,7 @@ COMMANDS:
   attest <assignmentId> --kind progress|completion|cannot-proceed|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
       [--artifact <artifactId> --sha256 <hash>]
+      [--receipt <artifactId>:<sha256> ...]
          [--verdict <kind>] [--wait <wakeId>] [--note "..."]
          [--release-fact-kind <kind> --release-fact-scope <scope>
           --release-fact-principal-ref <principal>]
@@ -1162,6 +1164,13 @@ COMMANDS:
       holder; producer-card verdicts may be filed by any session or user.
       cannot-proceed requires a non-empty --note, keeps the assignment open,
       and accepts the three release-fact flags only as one complete tuple.
+      --receipt verifies a live_mutation or evidence assignment without commits:
+      its holder files --kind verdict --verdict verified citing artifacts recorded
+      on the assignment's work item by their recorded hash; code keeps its commit
+      evidence, and review rules are unchanged.
+      --artifact with --sha256 is a second route on this release: it verifies any
+      non-code assignment without declared files from one artifact recorded by its
+      holder for that assignment, with captured bytes that match the hash.
   attests <assignmentId>
       List every attest filed against an assignment.
   check-attest <attestId>
@@ -1491,6 +1500,7 @@ fn split_args(args: Vec<String>) -> Flags {
                         | "supersedes"
                         | "detail"
                         | "where"
+                        | "receipt"
                 ) {
                     repeated
                         .entry(name.to_owned())
@@ -3826,6 +3836,15 @@ fn parse_with_optional_catalog(
             if kind != "verdict" && wait_id.is_some() {
                 return Err("--wait is only valid when --kind is verdict".to_owned());
             }
+            let receipts = parsed.repeated.get("receipt").cloned().unwrap_or_default();
+            if receipts.iter().any(String::is_empty) {
+                return Err("--receipt requires <artifactId>:<sha256>".to_owned());
+            }
+            if !receipts.is_empty() && verdict.as_deref() != Some("verified") {
+                return Err(
+                    "--receipt is only valid with --kind verdict --verdict verified".to_owned(),
+                );
+            }
             Ok(Command::Attest {
                 identity: identity(flags)?,
                 mementos: inline_mementos(&parsed)?,
@@ -3834,6 +3853,7 @@ fn parse_with_optional_catalog(
                 verdict,
                 note,
                 commit_refs,
+                receipts,
                 artifact_id,
                 content_sha256,
                 wait_id,
@@ -6023,6 +6043,24 @@ mod tests {
                 "missing {required:?} from:\n{entry}"
             );
         }
+    }
+
+    #[test]
+    fn attest_help_lists_receipts_and_keeps_code_and_review_unchanged() {
+        let entry = render_command_help(None, "attest").unwrap();
+
+        for required in [
+            "[--receipt <artifactId>:<sha256> ...]",
+            "--receipt verifies a live_mutation or evidence assignment without commits",
+            "code keeps its commit",
+            "review rules are unchanged",
+        ] {
+            assert!(
+                entry.contains(required),
+                "missing {required:?} from:\n{entry}"
+            );
+        }
+        assert!(!entry.contains("policy"), "{entry}");
     }
 
     #[test]
