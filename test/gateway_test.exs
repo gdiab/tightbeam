@@ -34,6 +34,7 @@ defmodule Tightbeam.GatewayTest do
         ~w(kungfu-setup sentinel-demand sentinel-enable sentinel-disable sentinel-list sentinel-events sentinel-post sentinel-subscribe sentinel-subscriptions sentinel-unsubscribe)
 
     expected = expected ++ ~w(memento-set mementos)
+    expected = expected ++ ~w(users remove-user)
 
     expected =
       expected ++ ~w(subtree-guidance-set subtree-guidance-withdraw subtree-guidance-show)
