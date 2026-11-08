@@ -1913,6 +1913,13 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 format!("\"isAdmin\":{admin}"),
             ],
         )),
+        Command::Users { identity } => Ok(request(identity, "users", vec![], vec![])),
+        Command::RemoveUser { identity, user_id } => Ok(request(
+            identity,
+            "remove-user",
+            vec![],
+            vec![string_field("userId", user_id)],
+        )),
         Command::ConfigGet { identity, setting } => Ok(request(
             identity,
             "config",
@@ -4138,6 +4145,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
         | Command::AddUser { identity, .. }
+        | Command::Users { identity }
+        | Command::RemoveUser { identity, .. }
         | Command::ConfigGet { identity, .. }
         | Command::ConfigSet { identity, .. }
         | Command::HostEnvSet { identity, .. }
