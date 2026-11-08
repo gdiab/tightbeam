@@ -405,6 +405,9 @@ defmodule Tightbeam.Wire.Socket do
 
             auth_replay(msg, device, conn_ref, subscriptions, %{state | registry_monitor: monitor})
 
+          :user_removed ->
+            stop_with(Payloads.auth_result_failure("user_removed"), state)
+
           {:error, code, message} ->
             stop_with(Payloads.wire_error(code, message), state)
         end
@@ -420,6 +423,9 @@ defmodule Tightbeam.Wire.Socket do
         case seed_main_stream_for_chat(subscriptions, device.user_id, state) do
           :ok ->
             auth_replay(msg, device, state.conn_ref, subscriptions, state)
+
+          :user_removed ->
+            stop_with(Payloads.auth_result_failure("user_removed"), state)
 
           {:error, code, message} ->
             stop_with(Payloads.wire_error(code, message), state)
@@ -623,6 +629,10 @@ defmodule Tightbeam.Wire.Socket do
     Payloads.wire_error(error[:code] || "server_error", error[:message], id, diagnostic)
   end
 
+  # Returns :ok, or :user_removed when the user was removed before the seed
+  # transaction ran. The removal check and the ownership insert share one
+  # transaction, so a removal that commits after the device lookup cannot leave a
+  # session owned by a removed user (admin-user-list-and-removal r3 R5).
   defp seed_main_stream(user_id, state) do
     key = Org.personal_session_key(user_id)
 
@@ -634,11 +644,14 @@ defmodule Tightbeam.Wire.Socket do
       provider = if is_function(provider, 0), do: provider.(), else: provider
 
       case DB.transaction(db(state), fn txn ->
-             case DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) do
-               [[1]] ->
+             cond do
+               UserAdmin.removed_in_txn?(txn, user_id) ->
+                 :user_removed
+
+               DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) == [[1]] ->
                  :ok
 
-               [] ->
+               true ->
                  archetype =
                    case DB.Txn.q(
                           txn,
@@ -664,6 +677,9 @@ defmodule Tightbeam.Wire.Socket do
                  })
              end
            end) do
+        {:ok, :user_removed} ->
+          :user_removed
+
         {:ok, _session} ->
           :ok
 
