@@ -2839,6 +2839,7 @@ defmodule Tightbeam.EscalationTest do
   test "agent ask accepts organization-readable assignments and refuses invalid references atomically",
        ctx do
     asked = session(ctx.db, "about-target", "other")
+    Devices.add_user(ctx.db, "third", false)
     holder = session(ctx.db, "about-holder", "third")
 
     insert_assignment!(ctx.db, "asg_about_open", holder.session_key, "open")
