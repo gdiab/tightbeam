@@ -568,6 +568,20 @@ defmodule Tightbeam.QuotaRecoveryTest do
     refute TurnLifecycle.progress_identity(first) == TurnLifecycle.progress_identity(changed)
   end
 
+  defp eventually(fun, tries \\ 60) do
+    cond do
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
+      true ->
+        Process.sleep(25)
+        eventually(fun, tries - 1)
+    end
+  end
+
   defp open_quota(ctx, observed_at, cause) do
     HarnessHealth.observe(ctx.db, %{
       correlation_id: "quota-#{observed_at}",
