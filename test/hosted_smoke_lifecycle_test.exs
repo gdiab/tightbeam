@@ -25,17 +25,19 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
     "feature-smoke leg codex: 14 checks PASS"
   ]
 
-  # Runs `script` in bash with the library sourced and short waits, $1 = the scratch dir.
+  # Runs `script` in bash with the library sourced and short waits, from inside the scratch
+  # dir. Paths reach bash only as arguments ($1 = the scratch dir, $2 = the supervisor), never
+  # as script text, so no character in a path can split a word or run as a command.
   defp run(dir, script, supervisor \\ @supervisor) do
     prelude = """
     . "$0"
     DIR="$1"
-    SUPERVISOR=#{supervisor}
+    SUPERVISOR="$2"
     SUP_TERM_WAIT=2
     SUP_SWEEP_WAIT=3
     """
 
-    System.cmd("bash", ["-c", prelude <> script, @lib, dir])
+    System.cmd("bash", ["-c", prelude <> script, @lib, dir, supervisor], cd: dir)
   end
 
   defp write_results(dir, lines) do
@@ -135,10 +137,11 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
       """
     }
 
+    # Writes the fake into the scratch dir and returns how a script names it: a quoted
+    # reference through $DIR, so the path itself never enters the script text.
     defp fake!(dir, name) do
-      path = Path.join(dir, "#{name}.sh")
-      File.write!(path, @hold <> Map.fetch!(@fakes, name))
-      path
+      File.write!(Path.join(dir, "#{name}.sh"), @hold <> Map.fetch!(@fakes, name))
+      ~s("$DIR/#{name}.sh")
     end
 
     # Cooperative cleanup: no signal is sent; every fixture exits once release exists.
@@ -155,9 +158,11 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
       end
     end
 
-    # The unmodified supervisor, run after a standard-library function is patched.
+    # The unmodified supervisor, run after a standard-library function is patched. Its path
+    # is embedded as a JSON string, which is also a valid Python string literal.
     defp faulty_supervisor!(dir, mode) do
       path = Path.join(dir, "faulty_supervisor.py")
+      supervisor = JSON.encode!(@supervisor)
 
       File.write!(path, """
       import errno, os, runpy, select, signal, sys
@@ -179,8 +184,8 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
           def boom(*args, **kw):
               raise RuntimeError("injected")
           select.select = boom
-      sys.argv = [#{inspect(@supervisor)}] + sys.argv[1:]
-      runpy.run_path(#{inspect(@supervisor)}, run_name="__main__")
+      sys.argv = [#{supervisor}] + sys.argv[1:]
+      runpy.run_path(#{supervisor}, run_name="__main__")
       """)
 
       path
@@ -351,6 +356,76 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
           assert out =~ "stop=1"
           assert received(dir) == 0
         end)
+      end
+    end
+
+    describe "paths are data, never script text" do
+      @describetag :tmp_dir
+
+      # Scratch directories no shell may split or execute. Pasted unquoted into a script, the
+      # first fails to parse (an unmatched quote, parentheses); the second runs commands (a
+      # separator, two substitutions, a background operator), which would create INJECTED
+      # in the directory the script runs from: the scratch directory itself.
+      @hostile [
+        ~S|it's a "(setsid)" dir|,
+        ~S|a dir; $(touch INJECTED) `touch INJECTED` & x|
+      ]
+
+      defp hostile_dir!(dir, name) do
+        path = Path.join(dir, name)
+        File.mkdir_p!(path)
+        path
+      end
+
+      test "the supervisor and a gateway fixture run from hostile paths, and nothing executes",
+           %{tmp_dir: tmp} do
+        for name <- @hostile do
+          dir = hostile_dir!(tmp, name)
+          supervisor = Path.join(dir, "supervisor.py")
+          File.cp!(@supervisor, supervisor)
+
+          with_fixtures(dir, fn ->
+            {out, 0} =
+              run(
+                dir,
+                """
+                start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "marker")} "$DIR"
+                sleep 0.5
+                stop_gateway; echo "rc=$? state=$SUP_STATE result=$(cat "$DIR/sup/result")"
+                """,
+                supervisor
+              )
+
+            assert out =~ "rc=0 state=stopped result=stopped"
+            assert received(dir) == 1
+            assert File.exists?(Path.join(dir, "started"))
+            refute File.exists?(Path.join(dir, "INJECTED"))
+          end)
+        end
+      end
+
+      test "a fault-injecting supervisor wrapper at a hostile path is the one that runs",
+           %{tmp_dir: tmp} do
+        for name <- @hostile do
+          dir = hostile_dir!(tmp, name)
+          supervisor = faulty_supervisor!(dir, "pidfd_open_at_launch")
+
+          with_fixtures(dir, fn ->
+            {out, 0} =
+              run(
+                dir,
+                """
+                start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "marker")} "$DIR"
+                echo "rc=$? state=$SUP_STATE reason=$STOP_REASON"
+                """,
+                supervisor
+              )
+
+            assert out =~ "rc=1 state=none reason=start:control_unavailable:pidfd_open=EMFILE"
+            refute File.exists?(Path.join(dir, "started"))
+            refute File.exists?(Path.join(dir, "INJECTED"))
+          end)
+        end
       end
     end
 
