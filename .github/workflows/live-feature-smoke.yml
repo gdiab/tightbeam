@@ -94,6 +94,7 @@ jobs:
           test -f scripts/hosted_feature_smoke.sh
           test -f scripts/hosted_smoke_evidence.sh
           test -f scripts/hosted_smoke_lifecycle.sh
+          test -f scripts/hosted_smoke_supervisor.py
 
       # The same pinned BEAM as the ci.yml gate: a version difference must never be
       # mistaken for a candidate difference.
@@ -118,6 +119,10 @@ jobs:
           [ "$node_major" -ge 22 ] || { echo "Node $(node --version) is older than the required 22" >&2; exit 1; }
           npm --version
           sqlite3 --version
+          # The gateway's supervisor needs pidfds (Linux 5.3+, Python 3.9+) and refuses
+          # to start anything without them; this prints what the image provides.
+          python3 --version
+          uname -r
           git config --global user.name "tightbeam live smoke"
           git config --global user.email "live-smoke@tightbeam.invalid"
 
