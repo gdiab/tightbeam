@@ -503,8 +503,11 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
             scenario(dir, """
             start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "clean")} "$DIR"
             sleep 0.5
-            eval "original_$(declare -f send_stop_request)"
-            send_stop_request() { kill -INT $$; original_send_stop_request; }
+            # Signal at the send's own write, inside the section. The library's send runs
+            # unchanged: a copy made with `declare -f` is re-printed by bash, which drops
+            # the explicit fd of `1<>` (fd 0 after re-reading), so the copy wrote to stdout.
+            # One-shot: the send's printf is the first after this point.
+            printf() { unset -f printf; kill -INT $$; builtin printf "$@"; }
             PHASE=restart
             stop_gateway
             echo unreachable
