@@ -474,6 +474,9 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             produced_by_assignment_id,
         } => {
             let (content_sha256, content_base64) = if *capture {
+                if Path::new(origin_path).is_relative() {
+                    return Err("--capture requires --path to be absolute".to_owned());
+                }
                 let bytes = fs::read(origin_path).map_err(|error| {
                     format!("--capture could not read --path {origin_path:?}: {error}")
                 })?;

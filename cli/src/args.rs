@@ -850,7 +850,7 @@ COMMANDS:
                   [--produced-by-assignment <assignmentId>]
                   [--content-base64 <bytes> | --capture]
       Record a deliberate artifact pointer for the calling session.
-      --capture reads --path and sends its bytes through the existing captured-content route.
+      --capture requires an absolute --path, reads it, and sends its bytes through the existing captured-content route.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
   harklight-revise --message <id> --base-revision <n> --title <text>
@@ -7539,7 +7539,7 @@ mod tests {
 
         let help = render_command_help(None, "artifact-record").unwrap();
         assert!(help.contains("[--content-base64 <bytes> | --capture]"));
-        assert!(help.contains("--capture reads --path"));
+        assert!(help.contains("--capture requires an absolute --path"));
     }
 
     #[test]

@@ -1130,6 +1130,37 @@ defmodule Tightbeam.CliIntegrationTest do
     assert Base.decode64!(fetched["contentBase64"]) == bytes
   end
 
+  test "artifact file capture refuses an ambiguous relative path from a nested cwd", ctx do
+    relative_path = "ambiguous-result.bin"
+    session_root = Path.dirname(ctx.workdir)
+    File.write!(Path.join(session_root, relative_path), "session-root bytes")
+    File.write!(Path.join(ctx.workdir, relative_path), "nested-cwd bytes")
+
+    assert File.read!(Path.join(session_root, relative_path)) !=
+             File.read!(Path.join(ctx.workdir, relative_path))
+
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Ambiguous result",
+          "--path",
+          relative_path,
+          "--capture"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert output =~ "--capture requires --path to be absolute"
+    refute_receive {:cli_call, _call}, 50
+  end
+
   test "artifact file capture refuses a sha mismatch before dispatch", ctx do
     capture_path = Path.join(ctx.workdir, "mismatch.bin")
     File.write!(capture_path, "actual bytes")
