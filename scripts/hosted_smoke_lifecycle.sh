@@ -11,21 +11,33 @@
 #
 # Globals: SUPERVISOR (path to the supervisor), SUP_STATE, SUP_PID, SUP_DIR, STOP_REASON
 # (the FIRST lifecycle failure reason), INTERRUPTED, PHASE, SMOKE_RC, SMOKE_RUN_ROOT,
-# SMOKE_EVIDENCE_DIR. Callers may set SUP_TERM_WAIT / SUP_SWEEP_WAIT (seconds; defaults
-# are LegGateway's 30 and 15).
+# SMOKE_EVIDENCE_DIR. Callers may set SUP_TERM_WAIT / SUP_SWEEP_WAIT (the supervisor's
+# bounds; LegGateway's 30 and 15 by default) and SUP_RECEIPT_WAIT (default 10 s).
 #
-# SUP_STATE and who owns what:
+# SUP_STATE, and who owns the gateway and its stop in each:
 #   none        nothing launched (or the last gateway is confirmed stopped and released)
-#   running     the supervisor holds the gateway's pidfd (DIR/owned seen); no stop asked
-#   requested   "stop" has been written ONCE; the outcome is not yet consumed
+#   running     the supervisor holds the gateway's pidfd (DIR/owned); no stop sent
+#   sending     transient, inside the send's critical section only (see below)
+#   sent        exactly one "stop" was written to the FIFO; receipt not yet observed
+#   requested   the supervisor has acknowledged the request (DIR/received >= 1) or its
+#               stop has begun (DIR/stopping) or it has already reported; it owns the
+#               stop and will finish it within its own bounds
 #   stopped     the supervisor reported "stopped": gateway and whole tree gone
-#   stop_failed terminal: any other outcome, or ownership lost. Never stopped again.
-# Every transition happens before control can leave the function: no command whose
-# failure could unwind the shell under `set -e` runs between a request and its state.
+#   stop_failed terminal: anything else. Never sent again, never waited on again.
+#
+# Delivery is not intent. "sent" means the write returned success; only the supervisor's
+# own DIR/received count, its DIR/stopping marker or its result show that a stop is
+# actually under way. Every wait is bounded: receipt by SUP_RECEIPT_WAIT, collection by
+# the supervisor's own two bounds plus a 10 s margin. A bound that expires is a truthful
+# terminal failure, never a pass: the gateway may still be running, and the run root is
+# kept for the VM's decommissioning (the backstop, not the lifecycle).
 
 SUP_STATE=none
 STOP_REASON=
 INTERRUPTED=
+IN_CRITICAL=
+IN_FINISH=
+PENDING_EXIT=
 
 stop_fail() { [ -n "$STOP_REASON" ] || STOP_REASON=$1; }
 
@@ -47,10 +59,11 @@ start_gateway_supervised() {
   }
   SUP_DIR=$dir
   mkdir -p "$dir"
-  rm -f "$dir/control" "$dir/owned" "$dir/result" "$dir/requests"
+  rm -f "$dir/control" "$dir/owned" "$dir/received" "$dir/stopping" "$dir/result"
   mkfifo -m 600 "$dir/control"
   python3 "$SUPERVISOR" --dir "$dir" --log "$log" \
-    --term-wait "${SUP_TERM_WAIT:-30}" --sweep-wait "${SUP_SWEEP_WAIT:-15}" -- "$@" &
+    --term-wait "${SUP_TERM_WAIT:-30}" --sweep-wait "${SUP_SWEEP_WAIT:-15}" -- "$@" \
+    > "$dir/supervisor.out" 2>&1 &
   SUP_PID=$!
   while [ ! -e "$dir/owned" ] && [ ! -s "$dir/result" ] && supervisor_alive; do sleep 0.1; done
   if [ -e "$dir/owned" ]; then
@@ -84,46 +97,92 @@ require_supervised() {
   return 1
 }
 
-# The one stop of the current gateway. "stop" is written at most once per gateway (the
-# request is logged to DIR/requests); a later call, from the EXIT trap or anywhere else,
-# only collects the outcome. Waiting is guarded so that `set -e` cannot unwind the shell
-# between the request and the state that records it.
+# The single delivery attempt: one "stop" line written to the FIFO. A read-write open of a
+# FIFO never blocks on Linux, and printf is an ordinary builtin, so a failed redirection
+# or write returns non-zero here instead of ending the shell. Kept separate so tests can
+# wrap it to inject failures and signals at the delivery boundary.
+send_stop_request() {
+  [ -p "$SUP_DIR/control" ] || return 1
+  printf 'stop\n' 1<>"$SUP_DIR/control"
+}
+
+# Has the supervisor taken the stop? Its own receipt count, its stopping marker, or its
+# result are authoritative; the shell's write is not.
+stop_acknowledged() {
+  [ -s "$SUP_DIR/stopping" ] || [ -s "$SUP_DIR/result" ] \
+    || { [ -s "$SUP_DIR/received" ] && [ "$(cat "$SUP_DIR/received")" -ge 1 ]; }
+}
+
+# Act on a signal that arrived inside the critical section, now that the state is true.
+deferred_exit() {
+  if [ -n "$PENDING_EXIT" ] && [ -z "$IN_FINISH" ]; then exit "$PENDING_EXIT"; fi
+}
+
+# The one stop of the current gateway. The send happens at most once per gateway, inside
+# a critical section in which a signal is recorded but not acted on, so the state always
+# says whether the write happened before any trap can run the EXIT handler. Nothing in
+# the section can trip `set -e`. Later calls (the EXIT trap included) never send again:
+# they continue from the recorded state, with bounded waits.
 stop_gateway() {
-  local fd result wrc
+  local deadline
   case "$SUP_STATE" in
     none | stopped) return 0 ;;
     stop_failed) return 1 ;;
+    sending)
+      # Unreachable by construction (the section defers signals and cannot fail out);
+      # if ever seen, whether the write happened is unknown, so never send again.
+      SUP_STATE=stop_failed
+      stop_fail request_delivery_uncertain
+      return 1
+      ;;
     running)
-      SUP_STATE=requested
-      # A supervisor that has already reported (an early exit, a lost owner) is only
-      # collected; there is nothing left to ask.
-      if [ ! -s "$SUP_DIR/result" ]; then
-        printf 'stop\n' >> "$SUP_DIR/requests"
-        # A read-write open of a FIFO never blocks on Linux, even if the reader is gone.
-        exec {fd}<>"$SUP_DIR/control"
-        printf 'stop\n' >&"$fd" 2>/dev/null || true
-        exec {fd}>&-
+      if [ -s "$SUP_DIR/result" ]; then
+        # The supervisor has already reported (an early exit, a lost owner): nothing to ask.
+        SUP_STATE=requested
+      else
+        IN_CRITICAL=1
+        SUP_STATE=sending
+        if send_stop_request; then SUP_STATE=sent; else SUP_STATE=stop_failed; fi
+        IN_CRITICAL=
+        if [ "$SUP_STATE" = stop_failed ]; then stop_fail request_not_delivered; fi
+        deferred_exit
+        [ "$SUP_STATE" = sent ] || return 1
       fi
       ;;
-    requested) ;;
   esac
-  # Collect: wait until the supervisor is reaped (127: no such job left) or has reported.
-  # A trapped signal ends a wait early (status > 128); the supervisor keeps its own bounded
-  # course, so waiting again is not a second stop.
-  while :; do
-    wrc=0
-    wait "$SUP_PID" 2>/dev/null || wrc=$?
-    [ -s "$SUP_DIR/result" ] && ! supervisor_alive && break
-    [ "$wrc" -eq 127 ] && break
-    [ "$wrc" -le 128 ] && break
+
+  if [ "$SUP_STATE" = sent ]; then
+    deadline=$((SECONDS + ${SUP_RECEIPT_WAIT:-10}))
+    until stop_acknowledged; do
+      if ! supervisor_alive || [ "$SECONDS" -ge "$deadline" ]; then
+        stop_acknowledged && break
+        SUP_STATE=stop_failed
+        if supervisor_alive; then stop_fail request_unacknowledged; else stop_fail supervisor_gone_before_receipt; fi
+        return 1
+      fi
+      sleep 0.1
+    done
+    SUP_STATE=requested
+  fi
+
+  # requested: the supervisor owns the stop and finishes it within its own bounds.
+  deadline=$((SECONDS + ${SUP_TERM_WAIT:-30} + ${SUP_SWEEP_WAIT:-15} + 10))
+  while [ ! -s "$SUP_DIR/result" ] && supervisor_alive && [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 0.2
   done
-  result=$(cat "$SUP_DIR/result" 2>/dev/null || true)
+  if [ ! -s "$SUP_DIR/result" ]; then
+    SUP_STATE=stop_failed
+    if supervisor_alive; then stop_fail supervisor_unresponsive; else stop_fail supervisor_reported_nothing; fi
+    return 1
+  fi
+  local result
+  result=$(cat "$SUP_DIR/result")
   if [ "$result" = stopped ]; then
     SUP_STATE=stopped
     return 0
   fi
   SUP_STATE=stop_failed
-  if [ -n "$result" ]; then stop_fail "${result// /:}"; else stop_fail supervisor_reported_nothing; fi
+  stop_fail "${result// /:}"
   return 1
 }
 
@@ -152,6 +211,7 @@ smoke_verdict() {
 finish_run() {
   local rc=$? stopped=yes removed=no verdict
   trap - EXIT
+  IN_FINISH=1
   trap 'INTERRUPTED=yes' HUP INT TERM
   set +e
   stop_gateway || stopped=no
@@ -175,10 +235,21 @@ finish_run() {
 }
 
 # A signal in the main flow records the interruption and exits with the conventional
-# status, which finish_run then refuses to report as success.
+# status, which finish_run then refuses to report as success. Inside the stop request's
+# critical section the exit is deferred until the state records whether the write
+# happened (deferred_exit); it is never dropped.
+on_signal() {
+  INTERRUPTED=yes
+  if [ -n "$IN_CRITICAL" ]; then
+    [ -n "$PENDING_EXIT" ] || PENDING_EXIT=$1
+    return 0
+  fi
+  exit "$1"
+}
+
 install_traps() {
   trap finish_run EXIT
-  trap 'INTERRUPTED=yes; exit 129' HUP
-  trap 'INTERRUPTED=yes; exit 130' INT
-  trap 'INTERRUPTED=yes; exit 143' TERM
+  trap 'on_signal 129' HUP
+  trap 'on_signal 130' INT
+  trap 'on_signal 143' TERM
 }

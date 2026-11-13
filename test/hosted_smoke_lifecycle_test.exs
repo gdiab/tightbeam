@@ -186,11 +186,21 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
       path
     end
 
-    defp requests(dir) do
-      case File.read(Path.join([dir, "sup", "requests"])) do
-        {:ok, text} -> text |> String.split("\n", trim: true) |> length()
+    # The supervisor's own count of "stop" lines it READ from the FIFO: the receiver-side
+    # record of delivery. Absent means it never received one.
+    defp received(dir) do
+      case File.read(Path.join([dir, "sup", "received"])) do
+        {:ok, text} -> text |> String.trim() |> String.to_integer()
         _ -> 0
       end
+    end
+
+    # Waits (bounded) for a supervisor left running by a deliberately failed stop to finish
+    # on its own once the fixtures are released, so `received` holds its final total.
+    defp settle(dir) do
+      release(dir)
+      result = Path.join([dir, "sup", "result"])
+      Enum.find(1..100, fn _ -> File.exists?(result) || (Process.sleep(100) && false) end)
     end
 
     describe "supervisor ownership and the single stop" do
@@ -207,7 +217,7 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
             """)
 
           assert out =~ "rc=0 state=stopped result=stopped"
-          assert requests(dir) == 1
+          assert received(dir) == 1
         end)
       end
 
@@ -237,7 +247,7 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
 
           assert out =~ ~r/first=1 state=stop_failed reason=gateway_outlived_sigterm:direct_children=\d+/
           assert out =~ ~r/second=1 reason=gateway_outlived_sigterm:/
-          assert requests(dir) == 1
+          assert received(dir) == 1
         end)
       end
 
@@ -267,7 +277,7 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
 
           assert out =~ "not-supervised"
           assert out =~ "rc=1 reason=gateway_exited_early:stopped"
-          assert requests(dir) == 0
+          assert received(dir) == 0
         end)
       end
     end
@@ -334,7 +344,7 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
 
           assert out =~ "refused state=stop_failed reason=owner_lost:supervisor_error:RuntimeError"
           assert out =~ "stop=1"
-          assert requests(dir) == 0
+          assert received(dir) == 0
         end)
       end
     end
@@ -390,7 +400,7 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
             """)
 
           assert status == 1
-          assert requests(dir) == 1
+          assert received(dir) == 1
 
           assert %{
                    "verdict" => "FAIL",
@@ -402,6 +412,113 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
 
           assert File.dir?(Path.join(dir, "root"))
         end)
+      end
+
+      test "a signal inside the delivery section is deferred: one stop received, 130",
+           %{tmp_dir: dir} do
+        write_results(dir, @full)
+
+        with_fixtures(dir, fn ->
+          {_out, status} =
+            scenario(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "clean")} "$DIR"
+            sleep 0.5
+            eval "original_$(declare -f send_stop_request)"
+            send_stop_request() { kill -INT $$; original_send_stop_request; }
+            PHASE=restart
+            stop_gateway
+            echo unreachable
+            """)
+
+          assert status == 130
+          assert received(dir) == 1
+
+          assert %{"verdict" => "FAIL", "interrupted" => "yes", "gateway_stopped" => "yes"} =
+                   summary(dir)
+        end)
+      end
+
+      test "a signal before the delivery section leaves the one send to the EXIT trap",
+           %{tmp_dir: dir} do
+        write_results(dir, @full)
+
+        with_fixtures(dir, fn ->
+          {_out, status} =
+            scenario(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "clean")} "$DIR"
+            sleep 0.5
+            PHASE=restart
+            kill -INT $$
+            stop_gateway
+            """)
+
+          assert status == 130
+          assert received(dir) == 1
+          assert %{"verdict" => "FAIL", "gateway_stopped" => "yes"} = summary(dir)
+        end)
+      end
+
+      test "a failed send is terminal at once: nothing received, nothing retried",
+           %{tmp_dir: dir} do
+        write_results(dir, @full)
+
+        try do
+          {_out, status} =
+            scenario(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "stubborn")} "$DIR"
+            sleep 0.5
+            send_stop_request() { return 1; }
+            PHASE=restart
+            stop_gateway
+            echo unreachable
+            """)
+
+          assert status == 1
+
+          assert %{
+                   "verdict" => "FAIL",
+                   "gateway_stopped" => "no",
+                   "run_root_removed" => "no",
+                   "stop_reason" => "request_not_delivered"
+                 } = summary(dir)
+        after
+          settle(dir)
+        end
+
+        assert received(dir) == 0
+      end
+
+      test "a send nobody receives fails within the receipt bound, never waiting on",
+           %{tmp_dir: dir} do
+        write_results(dir, @full)
+
+        try do
+          {_out, status} =
+            scenario(dir, """
+            SUP_RECEIPT_WAIT=2
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "stubborn")} "$DIR"
+            sleep 0.5
+            # The supervisor keeps reading the original, now-unlinked FIFO; this write lands
+            # in a new one nobody reads, so delivery cannot be confirmed.
+            rm "$DIR/sup/control"
+            mkfifo "$DIR/sup/control"
+            PHASE=restart
+            stop_gateway
+            echo unreachable
+            """)
+
+          assert status == 1
+
+          assert %{
+                   "verdict" => "FAIL",
+                   "gateway_stopped" => "no",
+                   "stop_reason" => "request_unacknowledged"
+                 } = summary(dir)
+        after
+          settle(dir)
+        end
+
+        assert received(dir) == 0
       end
 
       test "an interruption during the stop collects the outcome without asking again",
@@ -419,7 +536,7 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
             """)
 
           assert status == 130
-          assert requests(dir) == 1
+          assert received(dir) == 1
 
           assert %{"verdict" => "FAIL", "interrupted" => "yes", "gateway_stopped" => "no"} =
                    summary(dir)

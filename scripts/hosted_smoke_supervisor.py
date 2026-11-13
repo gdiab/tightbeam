@@ -4,8 +4,14 @@
     python3 scripts/hosted_smoke_supervisor.py --dir DIR --log FILE \
         [--term-wait SECONDS] [--sweep-wait SECONDS] -- GATEWAY_ARGV...
 
-DIR must exist and hold the control FIFO DIR/control. The supervisor writes DIR/owned once
-it holds the gateway's pidfd, and DIR/result (one line, atomically) as its last act.
+DIR must exist and hold the control FIFO DIR/control. The supervisor writes, each atomically:
+    DIR/owned     once it holds the gateway's pidfd (the control handoff);
+    DIR/received  the number of "stop" lines it has READ from the FIFO: written when the
+                  first arrives and rewritten with the final total, after draining the
+                  FIFO, just before the result. This is the receiver's own count, the
+                  authoritative record of delivery;
+    DIR/stopping  the moment its one stop begins, whatever started it;
+    DIR/result    one line, as its last act.
 
 OWNERSHIP. This process marks itself a child subreaper (prctl(2) PR_SET_CHILD_SUBREAPER)
 before anything is started. Every process the gateway ever creates therefore stays inside
@@ -68,6 +74,40 @@ def write_atomic(path, line):
         handle.flush()
         os.fsync(handle.fileno())
     os.rename(tmp, path)
+
+
+class Control:
+    """The control FIFO, read by this process only. Counts every "stop" line received."""
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.fd = os.open(
+            os.path.join(directory, "control"), os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC
+        )
+        self.buffered = b""
+        self.received = 0
+
+    def read(self):
+        """Read what is waiting; return True if at least one new stop line arrived."""
+        before = self.received
+        while True:
+            try:
+                chunk = os.read(self.fd, 4096)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            self.buffered += chunk
+        *lines, self.buffered = self.buffered.split(b"\n")
+        self.received += sum(1 for line in lines if line == b"stop")
+        if self.received != before:
+            write_atomic(os.path.join(self.directory, "received"), str(self.received))
+        return self.received > before
+
+    def final(self):
+        """Drain what is still queued and record the final count, even if it is zero."""
+        self.read()
+        write_atomic(os.path.join(self.directory, "received"), str(self.received))
 
 
 def errname(error):
@@ -215,9 +255,7 @@ def main():
 
     # Opened read-write so the open neither blocks nor sees end-of-file while no writer
     # is attached (Linux fifo(7) behavior).
-    control = os.open(
-        os.path.join(args.dir, "control"), os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC
-    )
+    control = Control(args.dir)
     log_fd = os.open(args.log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o600)
 
     try:
@@ -232,21 +270,16 @@ def main():
         os.write(gate_w, b"go")
         os.close(gate_w)
 
-        buffered = b""
         early = False
         while not requested["stop"]:
-            ready, _, _ = select.select([gateway_fd, control], [], [], 1.0)
+            ready, _, _ = select.select([gateway_fd, control.fd], [], [], 1.0)
             if gateway_fd in ready:
                 early = True
                 break
-            if control in ready:
-                try:
-                    buffered += os.read(control, 64)
-                except BlockingIOError:
-                    pass
-                if b"stop\n" in buffered:
-                    requested["stop"] = True
+            if control.fd in ready and control.read():
+                requested["stop"] = True
 
+        write_atomic(os.path.join(args.dir, "stopping"), "early" if early else "requested")
         if early:
             outcome = "gateway_exited_early " + owner.sweep(time.monotonic() + args.sweep_wait)
             code = 1
@@ -260,7 +293,12 @@ def main():
             else:
                 outcome = owner.sweep(time.monotonic() + args.sweep_wait)
                 code = 0 if outcome == "stopped" and not owner.errors else 1
+        control.final()
     except BaseException as error:  # ownership is lost: say so, never claim a stop
+        try:
+            control.final()
+        except BaseException:
+            pass
         write_atomic(result_path, "supervisor_error %s" % type(error).__name__)
         return 1
 
