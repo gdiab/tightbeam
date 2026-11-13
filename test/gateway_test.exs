@@ -69,6 +69,7 @@ defmodule Tightbeam.GatewayTest do
     Org,
     Placement,
     Projection,
+    QuotaRecovery,
     Rails,
     Roles,
     Rules,
@@ -1416,7 +1417,8 @@ defmodule Tightbeam.GatewayTest do
     assert unauthorized == %{
              ok: false,
              code: "not_authorized",
-             message: "assignment repair requires its opener or an admin"
+             message:
+               "assignment repair requires its opener or an admin; quota resume also permits Main, and unknown-effect disposition also permits the holder"
            }
 
     refute unauthorized.message =~ repair.incident.id
@@ -9197,8 +9199,10 @@ defmodule Tightbeam.GatewayTest do
                )
 
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+      turn = Map.put(turn, :session_key, "k1")
+      QuotaRecovery.turn_started(ctx.db, turn, "claude", "testhost")
 
-      assert {:error, failure} = runner.(Map.put(turn, :session_key, "k1"))
+      assert {:error, failure} = runner.(turn)
 
       assert %{
                reason: reason,
@@ -9222,6 +9226,7 @@ defmodule Tightbeam.GatewayTest do
 
       after_commit.(notice)
       publish.(terminal)
+      assert :ok = QuotaRecovery.terminal(ctx.db, turn.seq)
       {turn, collect_pushes_until_failed("c_#{client_key}", [])}
     end
 

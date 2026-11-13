@@ -9,7 +9,7 @@ defmodule Tightbeam.QuotaRecovery do
 
   use GenServer
 
-  alias Tightbeam.{DB, EventLog, HarnessProcess}
+  alias Tightbeam.{DB, EventLog, Harness, HarnessProcess}
   alias Tightbeam.DB.Txn
 
   @owner_notice_ms 6 * 60 * 60 * 1_000
@@ -150,7 +150,7 @@ defmodule Tightbeam.QuotaRecovery do
         incident_id,
         input.harness,
         input.host,
-        provider_for(input.harness),
+        input.harness |> Harness.parse!() |> then(& &1.credential_provider()) |> Atom.to_string(),
         Map.get(input, :model),
         input.observed_at,
         reset_at,
@@ -547,7 +547,12 @@ defmodule Tightbeam.QuotaRecovery do
     }
 
   defp mark_quota_known(db, seq),
-    do: DB.query(db, "UPDATE quota_recovery_turns SET quotaKnown=1 WHERE turnSeq=?1", [seq])
+    do:
+      DB.query(
+        db,
+        "UPDATE quota_recovery_turns SET quotaKnown=1 WHERE turnSeq=?1 AND state IN ('running','in_flight_stalled')",
+        [seq]
+      )
 
   defp fence_adapter(db, key, generation, seq, cause),
     do:
@@ -680,10 +685,6 @@ defmodule Tightbeam.QuotaRecovery do
       Enum.each(rows, fn [session_key] -> Tightbeam.SessionLane.nudge(session_key) end)
     end
   end
-
-  defp provider_for("claude"), do: "anthropic"
-  defp provider_for("codex"), do: "openai"
-  defp provider_for(harness), do: harness
 
   def key_name({harness, preset, host}), do: "#{harness}:#{preset}@#{host}"
   def key_name(harness, host), do: "#{harness}:shared@#{host}"

@@ -518,11 +518,67 @@ defmodule Tightbeam.QuotaRecoveryTest do
     turn = Map.put(turn, :session_key, ctx.holder)
     QuotaRecovery.turn_started(ctx.db, turn, "codex", "quota-host")
 
-    assert :ok =
-             QuotaRecovery.record_unknown_effect(ctx.db, seq, false, 10_000, turn.owner_lease)
+    assert {:ok, {:ok, notice}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, seq, "failed_unknown", "unknown_effect",
+                        owner_lease: turn.owner_lease,
+                        cause: "no-genuine-progress",
+                        principal: "process:tightbeam"
+                      )
+
+               QuotaRecovery.record_unknown_effect_in_txn(
+                 txn,
+                 seq,
+                 false,
+                 10_000,
+                 turn.owner_lease
+               )
+             end)
+
+    EventLog.complete_notice(notice)
 
     assert {:opened, _incident} = open_quota(ctx, 10_001, "usage limit without reset")
     assert %{reason_class: "blocked_other"} = QuotaRecovery.held_state(ctx.db, ctx.holder)
+
+    assert {:ok, [["unknown_effect", 0, "failed_unknown"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT q.state,q.quotaKnown,t.status
+               FROM quota_recovery_turns q JOIN turns t ON t.seq=q.turnSeq
+               WHERE q.turnSeq=?1
+               """,
+               [seq]
+             )
+
+    assert :ok = QuotaRecovery.dispose_unknown_effect(ctx.db, seq, "session:#{ctx.holder}")
+    assert %{reason_class: "provider_quota"} = QuotaRecovery.held_state(ctx.db, ctx.holder)
+  end
+
+  test "a quota park cannot relabel an already-cancelled unknown-effect row", ctx do
+    seq = enqueue!(ctx, "cancelled-before-park")
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder, "lane:test")
+    turn = Map.put(turn, :session_key, ctx.holder)
+    QuotaRecovery.turn_started(ctx.db, turn, "codex", "quota-host")
+
+    assert :ok =
+             QuotaRecovery.record_unknown_effect(ctx.db, seq, false, 11_000, turn.owner_lease)
+
+    assert {:opened, _incident} = open_quota(ctx, 11_001, "usage limit without reset")
+
+    assert {:ok, [["unknown_effect", 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,quotaKnown FROM quota_recovery_turns WHERE turnSeq=?1",
+               [seq]
+             )
+
+    assert :ok =
+             Ledger.finish(ctx.db, seq, "failed_unknown", "unknown_effect",
+               owner_lease: turn.owner_lease,
+               cause: "no-genuine-progress",
+               principal: "process:tightbeam"
+             )
 
     assert :ok = QuotaRecovery.dispose_unknown_effect(ctx.db, seq, "session:#{ctx.holder}")
     assert %{reason_class: "provider_quota"} = QuotaRecovery.held_state(ctx.db, ctx.holder)
