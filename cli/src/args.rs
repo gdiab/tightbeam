@@ -167,6 +167,7 @@ pub enum Command {
         work_item_id: Option<String>,
         content_sha256: Option<String>,
         content_base64: Option<String>,
+        capture: bool,
         produced_by_assignment_id: Option<String>,
     },
     ArtifactContentFetch {
@@ -846,8 +847,10 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
-                  [--produced-by-assignment <assignmentId>] [--content-base64 <bytes>]
+                  [--produced-by-assignment <assignmentId>]
+                  [--content-base64 <bytes> | --capture]
       Record a deliberate artifact pointer for the calling session.
+      --capture reads --path and sends its bytes through the existing captured-content route.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
   harklight-revise --message <id> --base-revision <n> --title <text>
@@ -1313,6 +1316,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "clear-choices",
     "clear-delivery-owner",
     "clear",
+    "capture",
     "daemon-credential",
     "dry-run",
     "help",
@@ -2449,7 +2453,10 @@ fn parse_with_optional_catalog(
         }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes>] [--produced-by-assignment <assignmentId>]".to_owned());
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--content-base64 <bytes> | --capture] [--produced-by-assignment <assignmentId>]".to_owned());
+            }
+            if flags.contains_key("capture") && flags.contains_key("content-base64") {
+                return Err("--capture and --content-base64 are mutually exclusive".to_owned());
             }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
@@ -2461,6 +2468,7 @@ fn parse_with_optional_catalog(
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
                 content_base64: nonempty(flags, "content-base64"),
+                capture: flags.contains_key("capture"),
                 produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
             })
         }
@@ -7490,6 +7498,48 @@ mod tests {
                 Err("usage: tightbeam artifact-content-fetch <artifactId>".to_owned())
             );
         }
+    }
+
+    #[test]
+    fn artifact_record_capture_is_explicit_and_exclusive() {
+        assert!(matches!(
+            parse(strings(&[
+                "artifact-record",
+                "--kind",
+                "report",
+                "--title",
+                "Captured file",
+                "--path",
+                "result.bin",
+                "--capture",
+            ])),
+            Ok(Command::ArtifactRecord {
+                origin_path,
+                capture: true,
+                content_base64: None,
+                ..
+            }) if origin_path == "result.bin"
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "artifact-record",
+                "--kind",
+                "report",
+                "--title",
+                "Conflicting content",
+                "--path",
+                "result.bin",
+                "--capture",
+                "--content-base64",
+                "Ynl0ZXM=",
+            ])),
+            Err("--capture and --content-base64 are mutually exclusive".to_owned())
+        );
+
+        let help = render_command_help(None, "artifact-record").unwrap();
+        assert!(help.contains("[--content-base64 <bytes> | --capture]"));
+        assert!(help.contains("--capture reads --path"));
     }
 
     #[test]

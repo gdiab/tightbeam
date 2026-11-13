@@ -3,7 +3,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::attempt_diagnostic::command_context::CommandContext;
 
@@ -468,8 +470,28 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             work_item_id,
             content_sha256,
             content_base64,
+            capture,
             produced_by_assignment_id,
         } => {
+            let (content_sha256, content_base64) = if *capture {
+                let bytes = fs::read(origin_path).map_err(|error| {
+                    format!("--capture could not read --path {origin_path:?}: {error}")
+                })?;
+                if let Some(expected_sha256) = content_sha256 {
+                    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+                    if expected_sha256 != &actual_sha256 {
+                        return Err(format!(
+                            "--sha256 does not match bytes read from --path: expected {expected_sha256}, actual {actual_sha256}"
+                        ));
+                    }
+                }
+                (
+                    content_sha256.clone(),
+                    Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                )
+            } else {
+                (content_sha256.clone(), content_base64.clone())
+            };
             let mut params = vec![
                 string_field("kind", kind),
                 string_field("title", title),
@@ -478,8 +500,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             for (name, value) in [
                 ("description", description),
                 ("workItemId", work_item_id),
-                ("contentSha256", content_sha256),
-                ("contentBase64", content_base64),
+                ("contentSha256", &content_sha256),
+                ("contentBase64", &content_base64),
                 ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {

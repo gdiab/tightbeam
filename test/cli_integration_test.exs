@@ -1066,6 +1066,155 @@ defmodule Tightbeam.CliIntegrationTest do
     refute payload =~ Base.encode64(bytes)
   end
 
+  test "real CLI captures a file above 128 KiB and fetches identical bytes", ctx do
+    item =
+      ctx.handlers["work-item-create"].(%{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{title: "Large captured result"}
+      })
+
+    assignment =
+      ctx.handlers["assign"].(%{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.session.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "Record large result", work_item_id: item.id}
+      })
+
+    bytes = :binary.copy(<<0, 1, 2, 255, 10>>, 30_000)
+    assert byte_size(bytes) > 128 * 1024
+    capture_path = Path.join(ctx.workdir, "large-result.bin")
+    File.write!(capture_path, bytes)
+    digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Large observed result",
+          "--path",
+          capture_path,
+          "--work-item",
+          item.id,
+          "--produced-by-assignment",
+          assignment.id,
+          "--sha256",
+          digest,
+          "--capture"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    recorded = JSON.decode!(recorded)
+    assert recorded["contentSha256"] == digest
+
+    {fetched, 0} =
+      System.cmd(ctx.binary, ["artifact-content-fetch", recorded["artifactId"]],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    fetched = JSON.decode!(fetched)
+    assert fetched["contentSha256"] == digest
+    assert fetched["contentSize"] == byte_size(bytes)
+    assert Base.decode64!(fetched["contentBase64"]) == bytes
+  end
+
+  test "artifact file capture refuses a sha mismatch before dispatch", ctx do
+    capture_path = Path.join(ctx.workdir, "mismatch.bin")
+    File.write!(capture_path, "actual bytes")
+
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Mismatched result",
+          "--path",
+          capture_path,
+          "--sha256",
+          String.duplicate("0", 64),
+          "--capture"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert output =~ "--sha256 does not match bytes read from --path"
+    refute_receive {:cli_call, _call}, 50
+  end
+
+  test "artifact file capture refuses conflicting content before dispatch", ctx do
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Conflicting result",
+          "--path",
+          "result.bin",
+          "--capture",
+          "--content-base64",
+          "Ynl0ZXM="
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert output =~ "--capture and --content-base64 are mutually exclusive"
+    refute_receive {:cli_call, _call}, 50
+  end
+
+  test "artifact file capture clearly refuses missing and unreadable paths before dispatch", ctx do
+    missing_path = Path.join(ctx.workdir, "missing.bin")
+    unreadable_path = Path.join(ctx.workdir, "unreadable.bin")
+    File.write!(unreadable_path, "unreadable bytes")
+    File.chmod!(unreadable_path, 0o000)
+
+    for path <- [missing_path, unreadable_path] do
+
+      {output, status} =
+        System.cmd(
+          ctx.binary,
+          [
+            "artifact-record",
+            "--kind",
+            "report",
+            "--title",
+            "Unreadable result",
+            "--path",
+            path,
+            "--capture"
+          ],
+          cd: ctx.workdir,
+          stderr_to_stdout: true
+        )
+
+      assert status == 1
+      assert output =~ "--capture could not read --path"
+      assert output =~ path
+      refute_receive {:cli_call, _call}, 50
+    end
+  end
+
   test "real CLI writes and reads declared record metadata", ctx do
     manifest = Path.join([ctx.base_dir, "identity", "kungfu", "example", "manifest.toml"])
     File.mkdir_p!(Path.dirname(manifest))
