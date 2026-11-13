@@ -12,6 +12,9 @@ defmodule Tightbeam.SessionDiagnose do
          :ok <- compatible(conn),
          {:ok, bytes, conn} <-
            read_body(conn, length: @max_body, read_length: @max_body, read_timeout: 500),
+         # `:length` is a read hint, not a cap: Bandit 1.14's HTTP/2 reader may return more
+         # than it. The 1024-byte total-body bound is enforced here, before decoding.
+         true <- byte_size(bytes) <= @max_body,
          {:ok, body} <- JSON.decode(bytes),
          %{"sessionKey" => key} <- body,
          true <- map_size(Map.drop(body, ["as", "asUser", "asProcess"])) == 1 and is_binary(key),

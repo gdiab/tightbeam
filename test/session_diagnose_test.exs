@@ -341,4 +341,120 @@ defmodule Tightbeam.SessionDiagnoseTest do
     refute_receive {_tag, {:ok, :late_result}}, 50
     assert Process.alive?(self())
   end
+
+  # Answers `read_body` with the whole body as `{:ok, ...}` regardless of `:length`, as
+  # Bandit 1.14's HTTP/2 reader is permitted to, so only the explicit bound can refuse it.
+  defmodule OverlongBodyAdapter do
+    def read_req_body(body, _opts), do: {:ok, body, body}
+    def send_resp(body, _status, _headers, resp), do: {:ok, resp, body}
+  end
+
+  test "an otherwise-valid body over 1024 bytes is refused even when read whole", %{deps: deps} do
+    conn =
+      conn(:post, "/agent/session-diagnose", "")
+      |> Plug.Conn.put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> @secret)
+
+    response =
+      SessionDiagnose.handle(
+        %{conn | adapter: {__MODULE__.OverlongBodyAdapter, sized_body(1025)}},
+        deps
+      )
+
+    assert response.status == 400
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "invalid_diagnostic_request"}
+           }
+  end
+
+  describe "over the pinned Bandit HTTP/2 adapter" do
+    setup %{deps: deps} do
+      owner =
+        start_supervised!({Tightbeam.ListenerLifecycle, name: nil, emit: fn _ -> :ok end})
+
+      bandit =
+        start_supervised!(
+          Tightbeam.ListenerLifecycle.listener_spec(
+            [plug: {Router, Map.to_list(deps)}, port: 0, ip: {127, 0, 0, 1}, startup_log: false],
+            owner
+          )
+        )
+
+      {:ok, {_, port}} = ThousandIsland.listener_info(bandit)
+      %{port: port}
+    end
+
+    test "the 1024-byte total bound holds for otherwise-valid bodies", %{port: port} do
+      assert h2_status(port, sized_body(1024), [1024]) == "200"
+      assert h2_status(port, sized_body(1025), [1025]) == "400"
+      assert h2_status(port, sized_body(4096), [1000, 1000, 1000, 1096]) == "400"
+    end
+  end
+
+  # A valid diagnostic body of exactly `size` bytes; only the unbounded `asUser` grows.
+  defp sized_body(size) do
+    base = byte_size(JSON.encode!(Map.put(body(), "asUser", "")))
+    JSON.encode!(Map.put(body(), "asUser", String.duplicate("u", size - base)))
+  end
+
+  # A minimal prior-knowledge h2c client: one POST on stream 1 whose body is sent as DATA
+  # frames of the given sizes (the last carries END_STREAM); returns the response :status.
+  defp h2_status(port, body, frame_sizes) do
+    {:ok, socket} = :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 1_000)
+
+    headers = [
+      {":method", "POST"},
+      {":scheme", "http"},
+      {":authority", "localhost"},
+      {":path", "/agent/session-diagnose"},
+      {"content-length", Integer.to_string(byte_size(body))},
+      {"x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version()},
+      {"authorization", "Bearer " <> @secret}
+    ]
+
+    {block, _} = HPAX.encode(:no_store, headers, HPAX.new(4096))
+
+    :ok =
+      :gen_tcp.send(socket, [
+        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        h2_frame(4, 0, 0, ""),
+        h2_frame(1, 0x4, 1, block) | h2_data(body, frame_sizes)
+      ])
+
+    status = h2_await_status(socket, HPAX.new(4096))
+    :gen_tcp.close(socket)
+    status
+  end
+
+  defp h2_data(body, [_last]), do: [h2_frame(0, 0x1, 1, body)]
+
+  defp h2_data(body, [size | rest]) do
+    <<chunk::binary-size(size), tail::binary>> = body
+    [h2_frame(0, 0, 1, chunk) | h2_data(tail, rest)]
+  end
+
+  defp h2_frame(type, flags, stream, payload),
+    do: [<<IO.iodata_length(payload)::24, type::8, flags::8, 0::1, stream::31>>, payload]
+
+  defp h2_await_status(socket, table) do
+    {:ok, <<length::24, type::8, flags::8, _::1, stream::31>>} = :gen_tcp.recv(socket, 9, 5_000)
+    {:ok, payload} = if length > 0, do: :gen_tcp.recv(socket, length, 5_000), else: {:ok, ""}
+
+    case {type, stream} do
+      {1, 1} ->
+        {:ok, headers, _} = HPAX.decode(payload, table)
+        :proplists.get_value(":status", headers)
+
+      {4, 0} when :erlang.band(flags, 0x1) == 0 ->
+        :ok = :gen_tcp.send(socket, h2_frame(4, 0x1, 0, ""))
+        h2_await_status(socket, table)
+
+      _ ->
+        h2_await_status(socket, table)
+    end
+  end
 end
