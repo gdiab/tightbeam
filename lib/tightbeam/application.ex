@@ -156,6 +156,7 @@ defmodule Tightbeam.Application do
       {Tightbeam.DB, path: db_path, name: Tightbeam.DB},
       # Schema + boot epoch as a transient one-shot after the DB is up.
       {Tightbeam.Boot, base_dir},
+      {Tightbeam.QuotaRecovery, db: Tightbeam.DB, name: Tightbeam.QuotaRecovery},
       # Lane naming registry and the task supervisor for turn work.
       {Registry, keys: :unique, name: Tightbeam.LaneRegistry},
       {Task.Supervisor, name: Tightbeam.TurnTaskSupervisor},

@@ -131,6 +131,11 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, {:last_failure, key, generation})
   end
 
+  @doc "The opaque identity of the exact live adapter instance for a checked-out generation."
+  def instance_ref(server \\ __MODULE__, key, generation) do
+    GenServer.call(server, {:instance_ref, key, generation})
+  end
+
   @doc """
   Whether the adapter for `key` has completed boot RIGHT NOW.
 
@@ -169,6 +174,13 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.cast(server, {:close_adapter, key})
   end
 
+  @doc "Cancel the active harness session without targeting any other in-flight turn."
+  def cancel_turn(server \\ __MODULE__, key, session_id) do
+    GenServer.call(server, {:cancel_turn, key, session_id}, 30_000)
+  catch
+    :exit, _reason -> :ok
+  end
+
   @impl true
   def init(opts) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
@@ -204,6 +216,21 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      live_entry?(entry) and
+          Tightbeam.QuotaRecovery.adapter_fenced?(
+            state.db,
+            key,
+            entry.generation,
+            entry.instance_ref
+          ) ->
+        case do_close_adapter(key, state) do
+          {:ok, state} ->
+            {:noreply, capture_adapter_context(key, {:checkout, from}, state)}
+
+          {{:error, _reason} = error, state} ->
+            {:reply, error, state}
+        end
+
       live_entry?(entry) and entry.circuit == :closed ->
         {:reply, checkout(entry), state}
 
@@ -234,6 +261,17 @@ defmodule Tightbeam.AdapterCoordinator do
     reply =
       case get_in(state.adapters, [key, :last_failure]) do
         {^generation, reason} -> reason
+        _ -> nil
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:instance_ref, key, generation}, _from, state) do
+    reply =
+      case state.adapters[key] do
+        %{generation: ^generation, pid: pid, instance_ref: instance_ref}
+        when is_pid(pid) and is_binary(instance_ref) -> instance_ref
         _ -> nil
       end
 
@@ -315,10 +353,42 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, result, state}
   end
 
+  def handle_call({:cancel_turn, key, session_id}, _from, state) do
+    entry = Map.get(state.adapters, key, fresh_entry())
+
+    if live_entry?(entry) and is_binary(session_id) do
+      try do
+        Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(entry.pid), "session/cancel", %{
+          sessionId: session_id
+        })
+      catch
+        :exit, _reason -> :ok
+      end
+    end
+
+    {:reply, :ok, state}
+  end
+
   defp adapter_for_reply(key, context, state, authoritative? \\ false) do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
+      live_entry?(entry) and
+          Tightbeam.QuotaRecovery.adapter_fenced?(
+            state.db,
+            key,
+            entry.generation,
+            entry.instance_ref
+          ) ->
+        case do_close_adapter(key, state) do
+          {:ok, state} ->
+            {reply, state} = start_adapter(key, state.adapters[key], state, context)
+            {:reply, reply, state}
+
+          {{:error, _reason} = error, state} ->
+            {:reply, error, state}
+        end
+
       live_entry?(entry) and authoritative? and entry.context != normalize_context(context) ->
         case do_close_adapter(key, state) do
           {:ok, state} ->
@@ -781,6 +851,7 @@ defmodule Tightbeam.AdapterCoordinator do
           | pid: pid,
             monitor: ref,
             generation: generation,
+            instance_ref: Tightbeam.Id.uuid4(),
             generation_started_at_ms: generation_started_at_ms,
             binary_capture_fun: nil,
             binary_capture: nil,
@@ -825,6 +896,7 @@ defmodule Tightbeam.AdapterCoordinator do
       pid: nil,
       monitor: nil,
       generation: 0,
+      instance_ref: nil,
       generation_started_at_ms: nil,
       binary_capture_fun: nil,
       binary_capture: nil,

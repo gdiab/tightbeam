@@ -104,6 +104,120 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            end)
   end
 
+  test "a permanently fenced live generation is retired before the next checkout", ctx do
+    node = System.find_executable("node")
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [harness: :codex, cmd: [node, "-e", @fake], home: ctx.test_dir, cwd: ctx.test_dir]
+         end,
+         db: ctx.db,
+         name: :fenced_generation_coordinator}
+      )
+
+    key = {:codex, "shared", "testhost"}
+    assert {:ok, first, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert eventually(fn -> AdapterCoordinator.ready?(coordinator, key) end)
+
+    assert :ok =
+             DB.execute(ctx.db, """
+             INSERT INTO users (userId,isAdmin,creationKind,createdAt)
+             VALUES ('fence-owner',0,'admin_add',1);
+             INSERT INTO sessions
+               (sessionKey,displayName,kind,isBuiltIn,ownerUserId,origin,operationalParent,
+                archetype,identityName,harness,provider,model,createdAt,updatedAt,host)
+             VALUES ('fence-session','Fence session','main',1,'fence-owner','user:fence-owner',
+                     'fence-session','default','default','codex','openai','gpt-5',1,1,'testhost');
+             """)
+
+    assert {:ok, seq} =
+             Tightbeam.Ledger.enqueue(ctx.db, %{
+               session_key: "fence-session",
+               message_id: "fence-message",
+               origin: "user:fence-owner",
+               prompt: "work"
+             })
+
+    assert {:ok, turn} = Tightbeam.Ledger.claim_next(ctx.db, "fence-session", "lane:test")
+    turn = Map.put(turn, :session_key, "fence-session")
+    started = Tightbeam.QuotaRecovery.turn_started(ctx.db, turn, "codex", "testhost")
+    instance_ref = AdapterCoordinator.instance_ref(coordinator, key, 1)
+    assert is_binary(instance_ref)
+
+    assert :ok =
+             Tightbeam.QuotaRecovery.stamp_generation(ctx.db, seq, 1, instance_ref)
+
+    assert {:stalled, "fence-session", true} =
+             Tightbeam.QuotaRecovery.enter_stall(ctx.db, seq, started + 60 * 60 * 1_000)
+
+    assert {:ok, second, 2} = AdapterCoordinator.adapter_for(coordinator, key)
+    refute second == first
+    assert eventually(fn -> not Process.alive?(first) end)
+    assert Tightbeam.QuotaRecovery.adapter_fenced?(ctx.db, key, 1)
+  end
+
+  test "a generation number reused after coordinator restart does not inherit another instance's fence",
+       ctx do
+    assert :ok =
+             DB.execute(ctx.db, """
+             INSERT INTO users (userId,isAdmin,creationKind,createdAt)
+             VALUES ('restart-fence-owner',0,'admin_add',1);
+             INSERT INTO sessions
+               (sessionKey,displayName,kind,isBuiltIn,ownerUserId,origin,operationalParent,
+                archetype,identityName,harness,provider,model,createdAt,updatedAt,host)
+             VALUES ('restart-fence-session','Restart fence session','main',1,
+                     'restart-fence-owner','user:restart-fence-owner','restart-fence-session',
+                     'default','default','codex','openai','gpt-5',1,1,'testhost');
+             """)
+
+    assert {:ok, seq} =
+             Tightbeam.Ledger.enqueue(ctx.db, %{
+               session_key: "restart-fence-session",
+               message_id: "restart-fence-message",
+               origin: "user:restart-fence-owner",
+               prompt: "work"
+             })
+
+    assert {:ok, turn} =
+             Tightbeam.Ledger.claim_next(ctx.db, "restart-fence-session", "lane:test")
+
+    turn = Map.put(turn, :session_key, "restart-fence-session")
+    started = Tightbeam.QuotaRecovery.turn_started(ctx.db, turn, "codex", "testhost")
+    assert :ok = Tightbeam.QuotaRecovery.stamp_generation(ctx.db, seq, 1, "old-instance")
+
+    assert {:stalled, "restart-fence-session", true} =
+             Tightbeam.QuotaRecovery.enter_stall(
+               ctx.db,
+               seq,
+               started + 60 * 60 * 1_000
+             )
+
+    node = System.find_executable("node")
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [harness: :codex, cmd: [node, "-e", @fake], home: ctx.test_dir, cwd: ctx.test_dir]
+         end,
+         db: ctx.db,
+         name: :restart_fence_coordinator}
+      )
+
+    key = {:codex, "shared", "testhost"}
+    assert {:ok, first, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    current_instance = AdapterCoordinator.instance_ref(coordinator, key, 1)
+    refute current_instance == "old-instance"
+    refute Tightbeam.QuotaRecovery.adapter_fenced?(ctx.db, key, 1, current_instance)
+    assert {:ok, ^first, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+  end
+
   test "five consecutive boot failures latch the circuit across restart races", ctx do
     path = Path.join(ctx.test_dir, "recovery_fake.js")
     File.write!(path, @fake)

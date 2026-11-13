@@ -57,6 +57,7 @@ defmodule Tightbeam.Acp.Adapter do
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
+    progress_seen: %{},
     trace_errors: %{},
     subagent_tasks: %{},
     known: MapSet.new(),
@@ -836,10 +837,11 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp start_prompt(state, sid, text, opts, from) do
     state = put_in(state.chunks[sid], [])
+    state = put_in(state.progress_seen[sid], MapSet.new())
     state = %{state | trace_errors: Map.delete(state.trace_errors, sid)}
     # Per-turn progress channel: {live_fun, trace_fun, last_status, seq}.
-    # Deduped on text so
-    # per-token thought chunks emit ONE "Thinking…" until something changes.
+    # Live labels remain deduped by text; durable advancement is deduped by
+    # the stable identity of the underlying active-turn observation.
     state =
       case Keyword.get(opts, :progress) do
         fun when is_function(fun, 2) ->
@@ -962,6 +964,7 @@ defmodule Tightbeam.Acp.Adapter do
     state = %{
       state
       | progress: Map.delete(state.progress, sid),
+        progress_seen: Map.delete(state.progress_seen, sid),
         trace_errors: Map.delete(state.trace_errors, sid)
     }
 
@@ -1136,17 +1139,37 @@ defmodule Tightbeam.Acp.Adapter do
   defp emit_progress(state, sid, update) do
     with nil <- Map.get(state.trace_errors, sid),
          {fun, trace_fun, last, seq} <- Map.get(state.progress, sid),
-         {:ok, text} when text != last <- progress_status(update) do
+         observation when not is_nil(observation) <- Tightbeam.TurnLifecycle.progress_observation(update),
+         fingerprint <-
+           :crypto.hash(
+             :sha256,
+             :erlang.term_to_binary(Tightbeam.TurnLifecycle.progress_identity(update), [
+               :deterministic
+             ])
+           ),
+         seen <- Map.get(state.progress_seen, sid, MapSet.new()),
+         false <- MapSet.member?(seen, fingerprint) do
       next_seq = seq + 1
 
       case trace_progress(trace_fun, update, next_seq) do
         :ok ->
-          fun.(text, next_seq)
-          put_in(state.progress[sid], {fun, trace_fun, text, next_seq})
+          {next_last, state} =
+            case progress_status(update) do
+              {:ok, text} when text != last ->
+                fun.(text, next_seq)
+                {text, state}
+
+              _ ->
+                {last, state}
+            end
+
+          state
+          |> put_in([Access.key(:progress), sid], {fun, trace_fun, next_last, next_seq})
+          |> put_in([Access.key(:progress_seen), sid], MapSet.put(seen, fingerprint))
 
         {:error, reason} ->
           state
-          |> put_in([Access.key(:progress), sid], {fun, trace_fun, text, next_seq})
+          |> put_in([Access.key(:progress), sid], {fun, trace_fun, last, next_seq})
           |> put_in([Access.key(:trace_errors), sid], reason)
       end
     else

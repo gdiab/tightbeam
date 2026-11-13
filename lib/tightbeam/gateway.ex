@@ -664,17 +664,17 @@ defmodule Tightbeam.Gateway do
 
           case outcome do
             {kind, message_id, turn_seq} when kind in [:recorded, :duplicate] ->
-              %{
+              maybe_put_queued_reason(%{
                 outcome: to_string(kind),
                 sessionKey: call.session_key,
                 deviceId: p.device_id,
                 clientMessageId: p.client_message_id,
                 messageId: message_id,
                 turnSeq: turn_seq
-              }
+              }, db, call.session_key)
 
             :appended ->
-              %{ack: p.client_message_id}
+              maybe_put_queued_reason(%{ack: p.client_message_id}, db, call.session_key)
 
             :conflict when rest_send? ->
               %{code: "invalid_message", message: "clientMessageId reused with different content"}
@@ -1481,17 +1481,57 @@ defmodule Tightbeam.Gateway do
     do: {:error, "invalid_request", "repair-assignment requires assignmentId"}
 
   defp repair_authorized(db, call, assignment) do
+    unknown_effect =
+      call.params[:action] == "resume" and
+        not is_nil(Tightbeam.QuotaRecovery.disposition_for_assignment(db, assignment.id))
+
+    main_quota_resume =
+      call.params[:action] == "resume" and not unknown_effect and
+        open_quota_incident_for_assignment?(db, assignment.id) and
+        main_for_holder?(db, call.principal, assignment.holder)
+
     allowed =
       case call.principal do
-        {:user, user} -> assignment.opened_by_user == user or admin_caller?(db, call)
-        {:session, session} -> assignment.opened_by_session == session or admin_caller?(db, call)
+        {:user, user} ->
+          assignment.opened_by_user == user or admin_caller?(db, call)
+
+        {:session, session} ->
+          assignment.opened_by_session == session or
+            (unknown_effect and assignment.holder == session) or main_quota_resume or
+            admin_caller?(db, call)
+
         _ -> false
       end
 
     if allowed,
       do: :ok,
-      else: {:error, "not_authorized", "assignment repair requires its opener or an admin"}
+      else:
+        {:error, "not_authorized",
+         "assignment repair requires its opener or an admin; quota resume also permits Main, and unknown-effect disposition also permits the holder"}
   end
+
+  defp open_quota_incident_for_assignment?(db, assignment_id) do
+    case DB.query(db, """
+         SELECT 1 FROM harness_health_assignments a
+         JOIN harness_health_incidents i ON i.id=a.incidentId
+         WHERE a.assignmentId=?1 AND i.state='open' AND i.failureClass='rate-limit-dead'
+         LIMIT 1
+         """, [assignment_id]) do
+      {:ok, [[1]]} -> true
+      _ -> false
+    end
+  end
+
+  defp main_for_holder?(db, {:session, main_key}, holder_key) do
+    with %{kind: "main", owner_user_id: owner} <- Org.get(db, main_key),
+         %{owner_user_id: ^owner} <- Org.get(db, holder_key) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp main_for_holder?(_db, _principal, _holder_key), do: false
 
   defp repair_holder(db, assignment) do
     case Org.get(db, assignment.holder) do
@@ -1501,6 +1541,25 @@ defmodule Tightbeam.Gateway do
   end
 
   defp repair_incident(db, assignment, session, action) do
+    unknown_effect =
+      if action == "resume",
+        do: Tightbeam.QuotaRecovery.disposition_for_assignment(db, assignment.id)
+
+    if unknown_effect do
+      {:ok,
+       %{
+         id: "turn:#{unknown_effect.turn_seq}",
+         failure_class: "unknown_effect_disposition_required",
+         action: "resume",
+         turn_seq: unknown_effect.turn_seq,
+         session_key: unknown_effect.session_key
+       }}
+    else
+      repair_harness_incident(db, assignment, session, action)
+    end
+  end
+
+  defp repair_harness_incident(db, assignment, session, action) do
     {:ok, rows} =
       DB.query(
         db,
@@ -1532,6 +1591,20 @@ defmodule Tightbeam.Gateway do
         {:error, "no_open_incident",
          "no open harness incident covers this assignment; use relaunch only for a holder with no turn"}
     end
+  end
+
+  defp execute_assignment_repair(
+         _config,
+         db,
+         call,
+         _assignment,
+         _session,
+         %{failure_class: "unknown_effect_disposition_required", turn_seq: turn_seq} = incident
+       ) do
+    principal = TurnLifecycle.principal(call.principal)
+    :ok = Tightbeam.QuotaRecovery.dispose_unknown_effect(db, turn_seq, principal)
+    Tightbeam.SessionLane.nudge(incident.session_key)
+    %{ok: true, action: "resume", turnSeq: turn_seq, disposition: "acknowledged"}
   end
 
   defp execute_assignment_repair(
@@ -1581,10 +1654,23 @@ defmodule Tightbeam.Gateway do
     case AdapterCoordinator.close_adapter(coordinator, key) do
       :ok ->
         if incident.failure_class == "rate-limit-dead" do
-          :ok = HarnessProcess.complete_park(db, key)
-        end
+          :ok =
+            Tightbeam.QuotaRecovery.explicit_resume(
+              db,
+              session.harness,
+              session.host,
+              TurnLifecycle.principal(call.principal)
+            )
 
-        rerun_latest(db, call, assignment, incident)
+          %{
+            ok: true,
+            action: "resume",
+            incidentId: incident.id,
+            release: "queued turns re-admitted; the failed started turn was not replayed"
+          }
+        else
+          rerun_latest(db, call, assignment, incident)
+        end
 
       {:error, reason} ->
         %{ok: false, code: "repair_failed", message: inspect(reason)}
@@ -1713,6 +1799,21 @@ defmodule Tightbeam.Gateway do
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp maybe_put_queued_reason(result, db, session_key) do
+    case queued_delivery_reason(db, session_key) do
+      reason when is_binary(reason) -> Map.put(result, :queued, reason)
+      nil -> result
+    end
+  end
+
+  @doc false
+  def queued_delivery_reason(db, session_key) do
+    case Tightbeam.QuotaRecovery.held_state(db, session_key) do
+      %{reason_class: reason} -> "recipient parked (#{reason})"
+      nil -> nil
+    end
+  end
 
   @doc """
   Shared turn-bearing delivery (gateway.ts `deliverPrompt`): ONE transaction
@@ -2352,11 +2453,16 @@ defmodule Tightbeam.Gateway do
             verbosity: nil
           },
           run: %{
-            state: if(depth > 0, do: "running", else: "idle"),
+            state:
+              case Tightbeam.QuotaRecovery.held_state(db, session_key) do
+                nil -> if(depth > 0, do: "running", else: "idle")
+                _hold -> "held"
+              end,
             runId: nil,
             messageId: nil,
             startedAt: nil,
-            queueDepth: depth
+            queueDepth: depth,
+            hold: Tightbeam.QuotaRecovery.held_state(db, session_key)
           },
           context: nil,
           approval: nil,
@@ -2588,7 +2694,9 @@ defmodule Tightbeam.Gateway do
 
   # An agent reading `inspect` sees the identity as FIELDS, the same way it
   # supplies them back on spawn.
-  defp inspect_session(session) do
+  defp inspect_session(db, session) do
+    hold = Tightbeam.QuotaRecovery.held_state(db, session.session_key)
+
     session
     |> Map.take([
       :session_key,
@@ -2606,6 +2714,8 @@ defmodule Tightbeam.Gateway do
       :created_at
     ])
     |> Map.merge(published_identity(session.model))
+    |> Map.put(:run_state, if(hold, do: "held", else: session.mechanical_status))
+    |> Map.put(:hold, hold)
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -2795,7 +2905,11 @@ defmodule Tightbeam.Gateway do
                ),
              :ok <- append_assistant_messages(db, turn, echo, result) do
           record_in_txn = fn txn ->
-            HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+            :ok = HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+
+            fn ->
+              Tightbeam.QuotaRecovery.park_released(db, session.harness, session.host)
+            end
           end
 
           {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}
@@ -2916,14 +3030,33 @@ defmodule Tightbeam.Gateway do
                   session,
                   turn,
                   failed_stage,
-                  raw_reason
+                  raw_reason,
+                  db
                 )
 
-              %{notice: notice, health: health}
+              recovery =
+                if HarnessHealth.classify_turn_failure(raw_reason) == "rate-limit-dead" do
+                  {_result, delivery} =
+                    Tightbeam.QuotaRecovery.record_unknown_effect_in_txn(
+                      txn,
+                      turn.seq,
+                      true,
+                      System.system_time(:millisecond),
+                      turn.owner_lease
+                    )
+
+                  delivery
+                end
+
+              %{notice: notice, health: health, recovery: recovery}
             end
 
+            quota_failure =
+              HarnessHealth.classify_turn_failure(raw_reason) == "rate-limit-dead"
+
             terminal =
-              if match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason),
+              if quota_failure or
+                   match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason),
                 do: "failed_unknown",
                 else: "failed"
 
@@ -2939,6 +3072,9 @@ defmodule Tightbeam.Gateway do
                  )
 
                  if is_function(recorded.health, 0), do: recorded.health.()
+                 EventLog.complete_notice(recorded.recovery,
+                   conn_registry: Map.get(config, :conn_registry, ConnRegistry)
+                 )
                end
              }}
         end
@@ -3027,10 +3163,24 @@ defmodule Tightbeam.Gateway do
     with :ok <- trace_stage_started(db, turn, :checkout) do
       case traced_call(db, turn, :checkout, fn -> checkout_adapter(session) end) do
         {:ok, adapter, generation} ->
+          key = {Harness.parse!(session.harness).id(), "shared", session.host}
+
+          instance_ref =
+            AdapterCoordinator.instance_ref(Tightbeam.AdapterCoordinator, key, generation)
+
           case trace_call(fn ->
                  Ledger.stamp_adapter(db, turn.seq, generation, turn.owner_lease)
                end) do
-            :ok -> {:ok, adapter, generation}
+            :ok ->
+              :ok =
+                Tightbeam.QuotaRecovery.stamp_generation(
+                  db,
+                  turn.seq,
+                  generation,
+                  instance_ref
+                )
+
+              {:ok, adapter, generation}
             {:error, reason} -> {:error, {:checkout, {:lifecycle_trace_failed, reason}}}
           end
 
@@ -3212,7 +3362,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp trace_progress_observation(db, turn, observation, seq) do
-    trace_event(db, turn.seq, %{
+    result = trace_event(db, turn.seq, %{
       event_key: "progress:#{seq}",
       producer_event_id: "adapter:#{turn.owner_lease}:progress:#{seq}",
       kind: "progress_observed",
@@ -3223,6 +3373,14 @@ defmodule Tightbeam.Gateway do
       owner_lease: turn.owner_lease,
       detail: %{v: 1, class: observation.class, label: observation.label}
     })
+
+    if result == :ok do
+      at = System.system_time(:millisecond)
+      :ok = Tightbeam.QuotaRecovery.genuine_advancement(db, turn.seq, at)
+      Tightbeam.SessionLane.genuine_advancement(turn.session_key, turn.seq, at)
+    end
+
+    result
   end
 
   defp trace_event(db, turn_seq, event) do
@@ -3433,6 +3591,18 @@ defmodule Tightbeam.Gateway do
     _ -> :ok
   catch
     :exit, _ -> :ok
+  end
+
+  @doc false
+  def cancel_harness_turn(db, session_key) do
+    with %{} = session <- Org.get(db, session_key) do
+      key = {Harness.parse!(session.harness).id(), "shared", session.host}
+      pointer = Org.current_pointer(db, session_key)
+      session_id = pointer && pointer.harness_session_id
+      AdapterCoordinator.cancel_turn(Tightbeam.AdapterCoordinator, key, session_id)
+    end
+
+    :ok
   end
 
   defp checkout_adapter(session) do
@@ -5152,7 +5322,7 @@ defmodule Tightbeam.Gateway do
         }
 
         result = %{
-          sessions: Enum.map(sessions, &inspect_session/1),
+          sessions: Enum.map(sessions, &inspect_session(db, &1)),
           wakes: wakes,
           digest_carriers: digest_carriers,
           roles: role_list_result(db).roles,

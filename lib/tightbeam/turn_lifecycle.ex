@@ -217,11 +217,33 @@ defmodule Tightbeam.TurnLifecycle do
   def progress_observation(%{"sessionUpdate" => "agent_thought_chunk"}),
     do: %{class: "thought", label: "Thinking"}
 
+  def progress_observation(%{
+        "sessionUpdate" => "agent_message_chunk",
+        "content" => %{"text" => text}
+      })
+      when is_binary(text) and text != "",
+      do: %{class: "assistant_output", label: "Responding"}
+
   def progress_observation(%{"sessionUpdate" => kind})
       when kind in ["tool_call", "tool_call_update"],
       do: %{class: kind, label: "Tool activity"}
 
   def progress_observation(_update), do: nil
+
+  @doc "A stable, in-memory identity for one substantive progress fact."
+  def progress_identity(%{"sessionUpdate" => "agent_message_chunk"} = update),
+    do: {"agent_message_chunk", update["messageId"], get_in(update, ["content", "text"])}
+
+  def progress_identity(%{"sessionUpdate" => "agent_thought_chunk"} = update),
+    do: {"agent_thought_chunk", update["messageId"], update["content"]}
+
+  def progress_identity(%{"sessionUpdate" => kind} = update)
+      when kind in ["tool_call", "tool_call_update"] do
+    {kind, update["toolCallId"] || update["id"], update["status"], update["title"],
+     update["kind"], update["content"], update["result"]}
+  end
+
+  def progress_identity(update), do: update
 
   @doc "A bounded attribution label for a resolved gateway principal."
   @spec principal(term()) :: String.t()

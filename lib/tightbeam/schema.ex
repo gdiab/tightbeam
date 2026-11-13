@@ -38,6 +38,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.HarnessProcess,
     Tightbeam.AdminProjection,
     Tightbeam.HarnessHealth,
+    Tightbeam.QuotaRecovery,
     Tightbeam.Toplines,
     Tightbeam.Premises
   ]

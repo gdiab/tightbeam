@@ -132,6 +132,9 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:adapter_for, key, _context}, from, state),
       do: handle_call({:adapter_for, key}, from, state)
 
+    def handle_call({:instance_ref, _key, generation}, _from, state),
+      do: {:reply, "test-instance-#{generation}", state}
+
     def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
@@ -150,7 +153,11 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_cast({:close_adapter, key}, {adapter, parent} = state) do
       if is_pid(parent), do: send(parent, {:close_adapter, key})
-      GenServer.stop(adapter)
+      # The real coordinator retires and replaces the instance. This shared
+      # gateway stub has no adapter factory, so retain its stand-in after
+      # recording the asynchronous request; exact retirement/replacement is
+      # covered by AdapterCoordinatorTest.
+      _ = adapter
       {:noreply, state}
     end
   end
@@ -1580,22 +1587,6 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [["queued"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
 
-    assert :repair_required =
-             HarnessHealth.resolve(ctx.db, %{
-               correlation_id: "rate-success-before-resume",
-               harness: "claude",
-               host: "testhost",
-               failure_class: "rate-limit-dead",
-               session_key: "k1",
-               assignment_id: nil,
-               observed_at: 61,
-               cause: "a concurrent turn delivered before explicit resume",
-               principal: "agent:k1"
-             })
-
-    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
-    assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
-
     {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
 
     handler =
@@ -2057,19 +2048,6 @@ defmodule Tightbeam.GatewayTest do
     assert Task.await(reconciliation) == :ok
     assert HarnessProcess.parked?(ctx.db, adapter_key)
     assert HarnessHealth.get(ctx.db, incident.id).state == "open"
-
-    assert :repair_required =
-             HarnessHealth.resolve(ctx.db, %{
-               correlation_id: "rate-reconcile-race-normal-success",
-               harness: session.harness,
-               host: session.host,
-               failure_class: "rate-limit-dead",
-               session_key: "k1",
-               assignment_id: nil,
-               observed_at: 72,
-               cause: "normal success before explicit resume",
-               principal: "agent:k1"
-             })
 
     {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
 
@@ -9220,19 +9198,22 @@ defmodule Tightbeam.GatewayTest do
 
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
-      assert {:error,
-              %{
-                reason: reason,
-                terminal_publish: publish,
-                record_in_txn: record,
-                after_commit: after_commit
-              }} = runner.(Map.put(turn, :session_key, "k1"))
+      assert {:error, failure} = runner.(Map.put(turn, :session_key, "k1"))
+
+      assert %{
+               reason: reason,
+               terminal_publish: publish,
+               record_in_txn: record,
+               after_commit: after_commit
+             } = failure
+
+      terminal = Map.get(failure, :terminal, "failed")
 
       assert {:ok, notice} =
                DB.transaction(ctx.db, fn txn ->
                  stored_error = if is_binary(reason), do: reason, else: inspect(reason)
 
-                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", stored_error,
+                 assert Ledger.finish_in_txn(txn, turn.seq, terminal, stored_error,
                           owner_lease: turn.owner_lease
                         )
 
@@ -9240,7 +9221,7 @@ defmodule Tightbeam.GatewayTest do
                end)
 
       after_commit.(notice)
-      publish.("failed")
+      publish.(terminal)
       {turn, collect_pushes_until_failed("c_#{client_key}", [])}
     end
 
@@ -9413,8 +9394,54 @@ defmodule Tightbeam.GatewayTest do
                "[turn failed]\n\nThe agent could not answer the message above: " <> expected_quota
            end)
 
-    assert {:ok, [[^expected_quota]]} =
-             DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [quota_turn.seq])
+    assert {:ok, [["failed_unknown", ^expected_quota]]} =
+             DB.query(ctx.db, "SELECT status,error FROM turns WHERE seq=?1", [quota_turn.seq])
+
+    assert {:ok, [["unknown_effect", 1]]} =
+             DB.query(ctx.db, """
+             SELECT state,quotaKnown FROM quota_recovery_turns WHERE turnSeq=?1
+             """, [quota_turn.seq])
+
+    assert %{reason_class: "provider_quota", last_error_class: "rate-limit-dead"} =
+             Tightbeam.QuotaRecovery.held_state(ctx.db, "k1")
+
+    parked_recipient = create_session(ctx.db, "agent:quota-public-read", "sample-user")
+
+    assert %{
+             outcome: "recorded",
+             queued: "recipient parked (provider_quota)",
+             sessionKey: parked_session
+           } =
+             Gateway.handlers(config)["post"].(%{
+               transport: :rest,
+               session_key: parked_recipient.session_key,
+               origin: "user:sample-user",
+               params: %{
+                 content: "preserve this queued message",
+                 device_id: "quota-device",
+                 client_message_id: "quota-client-message"
+               }
+             })
+
+    assert parked_session == parked_recipient.session_key
+
+    assert %{
+             run: %{
+               state: "held",
+               hold: %{reason_class: "provider_quota", last_error_class: "rate-limit-dead"}
+             }
+           } = Gateway.session_status("k1", ctx.db)
+
+    inspect = Gateway.handlers(config)["inspect"].(%{
+      origin: "user:sample-user",
+      session_key: nil,
+      params: %{}
+    })
+
+    assert %{
+             run_state: "held",
+             hold: %{reason_class: "provider_quota", last_error_class: "rate-limit-dead"}
+           } = Enum.find(inspect.sessions, &(&1.session_key == "k1"))
 
     quota_notice =
       EventLog.lifecycle_events(ctx.db)
@@ -9431,6 +9458,14 @@ defmodule Tightbeam.GatewayTest do
 
     assert quota_owner_marker.content ==
              "[assignment action needed]\n\nReview assignment asg_quota: Codex usage limit reached."
+
+    assert :ok =
+             Tightbeam.QuotaRecovery.explicit_resume(
+               ctx.db,
+               "claude",
+               "testhost",
+               "session:test-owner"
+             )
 
     degrade_host_catalog("testhost", "claude", {:needs_onboarding, :missing})
 

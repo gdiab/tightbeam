@@ -25,13 +25,17 @@ defmodule Tightbeam.SessionLane do
     :db,
     :runner,
     :task_sup,
+    :cancel_harness,
     terminal_publisher: nil,
     on_terminal: nil,
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
     current_message_id: nil,
-    current_owner_lease: nil
+    current_owner_lease: nil,
+    recovery_timer: nil,
+    last_advancement_at: nil,
+    recovery_canceling: false
   ]
 
   @doc """
@@ -58,6 +62,22 @@ defmodule Tightbeam.SessionLane do
   def nudge(session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
       [{pid, _}] -> GenServer.cast(pid, :nudge)
+      [] -> :no_lane
+    end
+  end
+
+  @doc "Record substantive progress for the active turn and restart its recovery clocks."
+  def genuine_advancement(session_key, turn_seq, at \\ System.system_time(:millisecond)) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.cast(pid, {:genuine_advancement, turn_seq, at})
+      [] -> :no_lane
+    end
+  end
+
+  @doc "Cancel an active turn immediately when its shared key becomes quota parked."
+  def quota_parked(session_key, turn_seq) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, {:quota_parked, turn_seq}, 30_000)
       [] -> :no_lane
     end
   end
@@ -121,6 +141,8 @@ defmodule Tightbeam.SessionLane do
       task_sup: Keyword.fetch!(opts, :task_sup),
       # runner: (turn_map -> {:ok, result_map} | {:error, term}); injectable for tests
       runner: Keyword.fetch!(opts, :runner),
+      cancel_harness:
+        Keyword.get(opts, :cancel_harness, &Tightbeam.Gateway.cancel_harness_turn/2),
       # Wire-notifies terminals that have NO runner closure (task crash,
       # cancel races) — without it a crashed turn leaves the client's typing
       # indicator stuck forever. No-op default keeps unit tests standalone.
@@ -159,17 +181,79 @@ defmodule Tightbeam.SessionLane do
 
   def handle_call({:at_turn_boundary, fun}, _from, state), do: {:reply, {:ok, fun.()}, state}
 
+  def handle_call({:quota_parked, seq}, _from, %{current_seq: seq, task_ref: ref} = state)
+      when not is_nil(ref) do
+    {:reply, :ok, cancel_unknown_effect(state, true)}
+  end
+
+  def handle_call({:quota_parked, _seq}, _from, state), do: {:reply, :stale, state}
+
   @impl true
   def handle_cast(:nudge, state), do: {:noreply, maybe_start(state)}
 
+  def handle_cast(
+        {:genuine_advancement, seq, at},
+        %{current_seq: seq, task_ref: ref} = state
+      )
+      when not is_nil(ref) and is_integer(at) do
+    :ok = Tightbeam.QuotaRecovery.genuine_advancement(state.db, seq, at)
+    elapsed = max(System.system_time(:millisecond) - at, 0)
+
+    {:noreply,
+     arm_recovery(%{state | last_advancement_at: at}, max(60 * 60 * 1_000 - elapsed, 0))}
+  end
+
+  def handle_cast({:genuine_advancement, _seq, _at}, state), do: {:noreply, state}
+
   @impl true
   def handle_info(:nudge, state), do: {:noreply, maybe_start(state)}
+
+  def handle_info({:quota_recovery_deadline, seq, expected}, %{current_seq: seq, task_ref: ref} = state)
+      when not is_nil(ref) do
+    if state.last_advancement_at != expected do
+      {:noreply, state}
+    else
+      elapsed = System.system_time(:millisecond) - expected
+
+      cond do
+        elapsed >= 120 * 60 * 1_000 ->
+          {:noreply, cancel_unknown_effect(state, false)}
+
+        elapsed >= 60 * 60 * 1_000 ->
+          case Tightbeam.QuotaRecovery.enter_stall(state.db, seq, System.system_time(:millisecond)) do
+            {:stalled, _session_key, _notice_sent} ->
+              :ok
+            _ ->
+              :ok
+          end
+
+          {:noreply, arm_recovery(state, 60 * 60 * 1_000)}
+
+        true ->
+          {:noreply, arm_recovery(state, 60 * 60 * 1_000 - elapsed)}
+      end
+    end
+  end
+
+  def handle_info({:quota_recovery_deadline, _seq, _expected}, state), do: {:noreply, state}
+
+  # A recovery cancellation already committed the terminal truth.
+  def handle_info({ref, {_seq, _outcome}}, %{task_ref: ref, recovery_canceling: true} = state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, maybe_start(clear_turn_state(state))}
+  end
 
   # TurnTask finished normally.
   def handle_info({ref, {seq, outcome}}, %{task_ref: ref} = state) do
     Process.demonitor(ref, [:flush])
     finalize(state, seq, outcome, cause: "turn-runner", principal: "process:tightbeam")
-    {:noreply, maybe_start(%{state | task_ref: nil})}
+    :ok = Tightbeam.QuotaRecovery.terminal(state.db, seq)
+    {:noreply, maybe_start(clear_turn_state(state))}
+  end
+
+  # TurnTask crashed.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{task_ref: ref, recovery_canceling: true} = state) do
+    {:noreply, maybe_start(clear_turn_state(state))}
   end
 
   # TurnTask crashed.
@@ -185,11 +269,12 @@ defmodule Tightbeam.SessionLane do
       principal: "process:tightbeam"
     )
 
-    {:noreply, maybe_start(%{state | task_ref: nil})}
+    :ok = Tightbeam.QuotaRecovery.terminal(state.db, seq)
+    {:noreply, maybe_start(clear_turn_state(state))}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _}, %{task_ref: ref} = state) do
-    {:noreply, maybe_start(%{state | task_ref: nil})}
+    {:noreply, maybe_start(clear_turn_state(state))}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -231,7 +316,7 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp claim_and_start(state) do
-    if harness_parked?(state) do
+    if harness_parked?(state) or Tightbeam.QuotaRecovery.admission_held?(state.db, state.session_key) do
       state
     else
       claim_next(state)
@@ -255,6 +340,16 @@ defmodule Tightbeam.SessionLane do
       {:ok, turn} ->
         runner = state.runner
 
+        {harness, host} = session_harness_host!(state)
+
+        started_at =
+          Tightbeam.QuotaRecovery.turn_started(
+            state.db,
+            Map.put(turn, :session_key, state.session_key),
+            harness,
+            host
+          )
+
         task =
           Task.Supervisor.async_nolink(state.task_sup, fn ->
             {turn.seq, runner.(Map.put(turn, :session_key, state.session_key))}
@@ -266,6 +361,8 @@ defmodule Tightbeam.SessionLane do
         |> Map.put(:current_seq, turn.seq)
         |> Map.put(:current_message_id, turn.message_id)
         |> Map.put(:current_owner_lease, turn.owner_lease)
+        |> Map.put(:last_advancement_at, started_at)
+        |> arm_recovery(60 * 60 * 1_000)
 
       :busy ->
         state
@@ -394,6 +491,70 @@ defmodule Tightbeam.SessionLane do
   # row is marked published. The publisher hook is injected by the composition
   # root; in E1 the ledger's publishedAt marking is the observable seam.
   defp publish_terminal(state, seq), do: Ledger.mark_published(state.db, seq)
+
+  defp arm_recovery(state, delay) do
+    if state.recovery_timer, do: Process.cancel_timer(state.recovery_timer)
+    timer = Process.send_after(self(), {:quota_recovery_deadline, state.current_seq, state.last_advancement_at}, max(delay, 0))
+    %{state | recovery_timer: timer}
+  end
+
+  defp clear_turn_state(state) do
+    if state.recovery_timer, do: Process.cancel_timer(state.recovery_timer)
+    %{state | task_ref: nil, task_pid: nil, current_seq: nil, current_message_id: nil,
+      current_owner_lease: nil, recovery_timer: nil, last_advancement_at: nil,
+      recovery_canceling: false}
+  end
+
+  defp cancel_unknown_effect(state, quota_known) do
+    now = System.system_time(:millisecond)
+    terminal_opts = [
+      owner_lease: state.current_owner_lease,
+      cause: if(quota_known, do: "provider-quota", else: "no-genuine-progress"),
+      principal: "process:tightbeam"
+    ]
+
+    {:ok, result} =
+      DB.transaction(state.db, fn txn ->
+        if Ledger.finish_in_txn(
+             txn,
+             state.current_seq,
+             "failed_unknown",
+             "unknown_effect",
+             terminal_opts
+           ) do
+          {:won,
+           Tightbeam.QuotaRecovery.record_unknown_effect_in_txn(
+             txn,
+             state.current_seq,
+             quota_known,
+             now,
+             state.current_owner_lease
+           )}
+        else
+          :already_terminal
+        end
+      end)
+
+    case result do
+      {:won, {:ok, delivery}} ->
+        EventLog.complete_notice(delivery)
+        :ok = state.cancel_harness.(state.db, state.session_key)
+        state.terminal_publisher.(%{session_key: state.session_key, message_id: state.current_message_id,
+          status: "failed_unknown", error: "unknown_effect"})
+        publish_terminal(state, state.current_seq)
+        state.on_terminal.(state.session_key, state.current_seq)
+        if is_pid(state.task_pid), do: Process.exit(state.task_pid, :kill)
+        %{state | recovery_canceling: true}
+
+      :already_terminal ->
+        state
+    end
+  end
+
+  defp session_harness_host!(state) do
+    {:ok, [[harness, host]]} = DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [state.session_key])
+    {harness, host}
+  end
 
   defp error_text(reason) when is_binary(reason), do: reason
   defp error_text(reason), do: inspect(reason)

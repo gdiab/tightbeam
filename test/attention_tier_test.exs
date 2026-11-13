@@ -51,6 +51,9 @@ defmodule Tightbeam.AttentionTierTest do
     def handle_call({:adapter_for, _key}, _from, adapter),
       do: {:reply, {:ok, adapter, 1}, adapter}
 
+    def handle_call({:instance_ref, _key, 1}, _from, adapter),
+      do: {:reply, "attention-tier-instance", adapter}
+
     def handle_call({:generation, _key}, _from, adapter), do: {:reply, 1, adapter}
   end
 

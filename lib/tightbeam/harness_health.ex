@@ -212,8 +212,36 @@ defmodule Tightbeam.HarnessHealth do
   END;
   """
 
+  @resolution_trigger_ddl """
+  DROP TRIGGER IF EXISTS harness_health_incident_resolution_once;
+  CREATE TRIGGER harness_health_incident_resolution_once
+  BEFORE UPDATE OF state,resolvedAt,resolutionObservationId,resolvedFactId
+  ON harness_health_incidents
+  WHEN NOT (
+    OLD.state = 'open' AND OLD.resolvedAt IS NULL AND
+    OLD.resolutionObservationId IS NULL AND OLD.resolvedFactId IS NULL AND
+    NEW.state = 'resolved' AND NEW.resolvedAt IS NOT NULL AND
+    NEW.resolutionObservationId IS NOT NULL AND NEW.resolvedFactId IS NOT NULL AND
+    EXISTS (
+      SELECT 1 FROM harness_health_observations
+      WHERE id = NEW.resolutionObservationId AND incidentId = OLD.id AND
+            harness = OLD.harness AND host = OLD.host AND
+            failureClass = OLD.failureClass AND (
+              evidenceKind = 'normal-turn-success' OR
+              (evidenceKind = 'authoritative-provider' AND
+               cause = 'provider-declared reset reached')
+            )
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'harness health incident may resolve exactly once');
+  END;
+  """
+
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl), do: DB.execute(db, @resolution_trigger_ddl)
+  end
 
   @doc "The fixed inference window established by the reviewed patrol design."
   @spec evidence_window_ms() :: pos_integer()
@@ -331,7 +359,16 @@ defmodule Tightbeam.HarnessHealth do
   @doc "Record classified turn-failure evidence inside the turn's terminal transaction."
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
-  def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+  @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term(), DB.server()) ::
+          nil | (-> :ok)
+  def observe_turn_failure_in_txn(
+        %Txn{} = txn,
+        session,
+        turn,
+        failed_stage,
+        reason,
+        db \\ DB
+      ) do
     case classify_turn_failure(reason) do
       nil ->
         nil
@@ -343,13 +380,18 @@ defmodule Tightbeam.HarnessHealth do
             [] -> nil
           end
 
+        evidence_kind =
+          if failure_class == "rate-limit-dead",
+            do: "authoritative-provider",
+            else: "terminal-failure"
+
         result =
           observe_in_txn(txn, %{
             correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
             harness: to_string(session.harness),
             host: session.host,
             failure_class: failure_class,
-            evidence_kind: "terminal-failure",
+            evidence_kind: evidence_kind,
             session_key: turn.session_key,
             assignment_id: assignment_id,
             observed_at: System.system_time(:millisecond),
@@ -357,7 +399,18 @@ defmodule Tightbeam.HarnessHealth do
             principal: turn.origin || "process:tightbeam"
           })
 
-        post_commit(result)
+        publication = post_commit(result)
+
+        case result do
+          {:opened, %{failureClass: "rate-limit-dead", adapterKey: key}} ->
+            fn ->
+              if publication, do: publication.()
+              Tightbeam.QuotaRecovery.park_opened(db, key)
+            end
+
+          _ ->
+            publication
+        end
     end
   end
 
@@ -468,6 +521,14 @@ defmodule Tightbeam.HarnessHealth do
       publish -> publish.()
     end
 
+    case result do
+      {:opened, %{failureClass: "rate-limit-dead", adapterKey: key}} ->
+        Tightbeam.QuotaRecovery.park_opened(db, key)
+
+      _ ->
+        :ok
+    end
+
     strip_publication(result)
   end
 
@@ -485,28 +546,89 @@ defmodule Tightbeam.HarnessHealth do
 
   @doc "Resolve one class-specific open incident on normal-turn success."
   @spec resolve(DB.server(), map()) ::
-          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
+          {:resolved | :duplicate, map()} | :already_healthy
   def resolve(db \\ DB, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
-    transaction!(db, &resolve_in_txn(&1, input))
+    result = transaction!(db, &resolve_in_txn(&1, input))
+
+    if match?({:resolved, _}, result) and input.failure_class == "rate-limit-dead" do
+      Tightbeam.QuotaRecovery.park_released(db, input.harness, input.host)
+    end
+
+    result
   end
 
   @doc "The class-specific resolution mutation inside a caller-owned transaction."
   @spec resolve_in_txn(Txn.t(), map()) ::
-          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
+          {:resolved | :duplicate, map()} | :already_healthy
   def resolve_in_txn(%Txn{} = txn, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     validate_session_membership!(txn, input)
 
-    if input.failure_class == "rate-limit-dead" and
-         HarnessProcess.parked_in_txn?(txn, adapter_key(input.harness, input.host)) do
-      :repair_required
-    else
-      case observation_by_correlation(txn, input.correlation_id) do
-        nil -> resolve_open(txn, input)
-        prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
-      end
+    case observation_by_correlation(txn, input.correlation_id) do
+      nil -> resolve_open(txn, input)
+      prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
     end
+  end
+
+  @doc false
+  def resolve_declared_reset(db \\ DB, harness, host, reset_at) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        case open_incident(txn, %{harness: harness, host: host, failure_class: "rate-limit-dead"}) do
+          nil ->
+            :stale
+
+          incident ->
+            observation_id = "hho_" <> Id.uuid4()
+            correlation_id = "provider-reset:#{incident.id}:#{reset_at}"
+
+            Txn.q(txn, """
+            INSERT INTO harness_health_observations
+              (id,correlationId,harness,host,failureClass,evidenceKind,observedAt,cause,principal,incidentId)
+            VALUES (?1,?2,?3,?4,'rate-limit-dead','authoritative-provider',?5,
+                    'provider-declared reset reached','process:tightbeam',?6)
+            """, [observation_id, correlation_id, harness, host, reset_at, incident.id])
+
+            %{fact_id: fact_id} =
+              ConditionFacts.file_harness_health_in_txn(
+                txn,
+                harness,
+                host,
+                "rate-limit-dead",
+                :retract
+              )
+
+            Txn.q(txn, """
+            UPDATE harness_health_incidents
+            SET state='resolved',resolvedAt=?2,resolutionObservationId=?3,resolvedFactId=?4
+            WHERE id=?1 AND state='open'
+            """, [incident.id, reset_at, observation_id, fact_id])
+
+            if Txn.changes(txn) != 1, do: raise("harness health declared-reset race")
+
+            key =
+              Tightbeam.QuotaRecovery.release_park_in_txn(
+                txn,
+                harness,
+                host,
+                "process:tightbeam",
+                "provider_declared_reset",
+                reset_at
+              )
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "harness_health_incident_resolved",
+              incident.id,
+              "observationId=#{observation_id} cause=provider_declared_reset principal=process:tightbeam"
+            )
+
+            {:resolved, key}
+        end
+      end)
+
+    result
   end
 
   @doc "List currently open incidents, oldest first."
@@ -612,9 +734,11 @@ defmodule Tightbeam.HarnessHealth do
       ]
     )
 
-    if input.failure_class == "rate-limit-dead" do
-      HarnessProcess.begin_park_in_txn(txn, adapter_key(input.harness, input.host))
-    end
+    adapter_key =
+      if input.failure_class == "rate-limit-dead" do
+        HarnessProcess.begin_park_in_txn(txn, adapter_key(input.harness, input.host))
+        Tightbeam.QuotaRecovery.open_park_in_txn(txn, input, incident_id)
+      end
 
     snapshot_affected_work(txn, incident_id, input)
 
@@ -640,6 +764,7 @@ defmodule Tightbeam.HarnessHealth do
        openedAt: input.observed_at,
        openedFactId: fact_id,
        observationId: opening_observation_id,
+       adapterKey: if(input.failure_class == "rate-limit-dead", do: adapter_key, else: nil),
        notice_publication: notice_publication
      }}
   end
@@ -675,7 +800,14 @@ defmodule Tightbeam.HarnessHealth do
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
         if input.failure_class == "rate-limit-dead" do
-          HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
+          Tightbeam.QuotaRecovery.release_park_in_txn(
+            txn,
+            input.harness,
+            input.host,
+            input.principal,
+            "same_credential_success",
+            input.observed_at
+          )
         end
 
         EventLog.lifecycle_in_txn(
