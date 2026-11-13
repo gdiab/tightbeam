@@ -1,6 +1,6 @@
 # The gate for a successful compile and test is EVERY supported platform, not one.
 # This suite ran macOS-only for the project's whole life; the first correctly
-# provisioned linux run (2026-07-27, shrdlu) showed 44 failures the mac suite
+# provisioned linux run (2026-07-27, the test host) showed 44 failures the mac suite
 # never saw. Both jobs below run the same gates in the same order, on the same
 # pinned BEAM, against the same declared environment — so a difference in outcome
 # between them is a platform-parity defect by definition, and nothing else.
@@ -11,9 +11,18 @@ on:
     branches: [main]
     tags: ["v*.*.*"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact 40-hex candidate commit to verify; no release publication"
+        required: true
+        type: string
 
 permissions:
   contents: read
+
+env:
+  CI_SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}
 
 jobs:
   test:
@@ -28,9 +37,22 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Validate exact source SHA
+        shell: bash
+        run: |
+          [[ "$CI_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          ref: ${{ env.CI_SOURCE_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+
+      - name: Shipped assets contain no internal identifiers
+        run: python3 scripts/verify_shipped_privacy.py
 
       - name: Public rule facts never shrink
         run: python3 scripts/verify_public_rule_facts.py
@@ -60,7 +82,7 @@ jobs:
       # PATH. CI used to satisfy that by npm-installing pinned claude and codex,
       # which is a network dependency, ~40s, and — measured — worth nothing: the
       # suite's failure set is byte-identical with only the in-repo Fixture CLI on
-      # PATH (26 failures either way, shrdlu 2026-07-27). CI holds no credentials,
+      # PATH (26 failures either way, the test host 2026-07-27). CI holds no credentials,
       # so it never drove a real harness turn to begin with; a pinned `--version`
       # cannot catch a harness that changed under us. That is the LIVE
       # feature_smoke matrix's job, and it stays its job.
@@ -76,7 +98,7 @@ jobs:
       # committer. `Identity.relearn!/1` runs its merge with no author env, so on
       # a host with no git identity the merge fails for a reason that is not a
       # conflict and relearn reports `{:conflict, []}` — a phantom conflict with
-      # nothing to resolve. Every dev mac has a global identity; shrdlu and the
+      # nothing to resolve. Every dev mac has a global identity; the test host and the
       # runners have none, which is the whole 2-failure IdentityTest delta.
       - name: Declare a git identity (suite prerequisite)
         run: |
@@ -149,8 +171,7 @@ jobs:
   # THE DEPLOY ARTIFACT IS BUILT HERE, from the pushed SHA, by a machine nobody
   # develops or smoke-tests on. Building it from a dev tree conflates "what I
   # have" with "what was reviewed"; building it on the smoke host conflates the
-  # gate with the artifact (caught by Flynn, 2026-08-04: "you're bundling up a
-  # deploy from a smoke test?!"). The runners are exactly the two supported
+  # gate with the artifact. The runners are exactly the two supported
   # platforms — ubuntu x86_64 and macOS arm64 — so `assemble.sh`'s refusal of
   # anything else composes with this matrix rather than fighting it.
   #
@@ -158,7 +179,7 @@ jobs:
   # not pass on that platform.
   release:
     needs: test
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       matrix:
         include:
@@ -169,29 +190,25 @@ jobs:
     name: release ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Validate exact source SHA
+        shell: bash
+        run: |
+          [[ "$CI_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           # A tagged release must prove that its commit is the canonical main tip.
           # The full history exposes origin/main for the exact-tip check below.
           fetch-depth: 0
 
+      - name: Verify exact checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+
       - name: Validate the release tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
-            echo "release: tag must be exactly v<major>.<minor>.<patch>" >&2
-            exit 1
-          }
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml)
-          [ "$GITHUB_REF_NAME" = "v$version" ] || {
-            echo "release: tag $GITHUB_REF_NAME does not match cli/Cargo.toml version $version" >&2
-            exit 1
-          }
-          main_sha=$(git rev-parse 'origin/main^{commit}')
-          [ "$GITHUB_SHA" = "$main_sha" ] || {
-            echo "release: tagged commit $GITHUB_SHA is not the origin/main tip $main_sha" >&2
-            exit 1
-          }
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
+        run: sh scripts/validate_release_tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"
 
       - name: Install BEAM (pinned, same as the gate)
         uses: erlef/setup-beam@v1
@@ -217,7 +234,7 @@ jobs:
         run: |
           cd _build/npm
           for f in tightbeam-*.tgz; do
-            mv "$f" "${f%.tgz}-${GITHUB_SHA::7}.tgz"
+            mv "$f" "${f%.tgz}-${CI_SOURCE_SHA::7}.tgz"
           done
           ls -la
 
@@ -234,7 +251,7 @@ jobs:
   # and publishes the checksums and source provenance beside them.
   publish-release:
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -247,7 +264,8 @@ jobs:
 
       - name: Verify the release set and write provenance
         run: |
-          version=${GITHUB_REF_NAME#v}
+          identity=${GITHUB_REF_NAME#v}
+          version=${identity%%+*}
           short_sha=${GITHUB_SHA::7}
           darwin="tightbeam-$version-darwin-aarch64-$short_sha.tgz"
           linux="tightbeam-$version-linux-x86_64-$short_sha.tgz"
