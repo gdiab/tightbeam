@@ -68,6 +68,8 @@ defmodule FeatureSmoke do
   def run do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+    # `mix run --no-start` starts no application, and post/3 speaks HTTP in-process.
+    {:ok, _} = Application.ensure_all_started(:inets)
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
 
     announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
@@ -2302,44 +2304,40 @@ defmodule FeatureSmoke do
         end
       end)
 
-    url = "http://127.0.0.1:#{state.port}/agent/dispatch"
+    url = ~c"http://127.0.0.1:#{state.port}/agent/dispatch"
 
-    args = [
-      "-sS",
-      "--max-time",
-      "30",
-      "-o",
-      "-",
-      "-w",
-      "\n%{http_code}",
-      "-H",
-      "Authorization: Bearer #{state.token}",
+    # In-process HTTP, not a curl child: every org and session bearer this script holds is
+    # a secret, and a child's argv is readable by anything on the host for the life of the
+    # request. The header lives only in this BEAM. Same 30 s whole-request bound as before.
+    headers = [
+      {~c"authorization", String.to_charlist("Bearer " <> state.token)},
       # The wire refuses a caller that will not say what it is (42f7bd5). This script IS a
       # CLI client, so it states the version the gateway was built from rather than a
       # literal — a pinned string here would pass while claiming something untrue.
-      "-H",
-      "x-tightbeam-cli-version: #{Tightbeam.CliCompatibility.required_version()}",
-      "-X",
-      "POST",
-      "-H",
-      "Content-Type: application/json",
-      "-d",
-      JSON.encode!(body),
-      url
+      {~c"x-tightbeam-cli-version",
+       String.to_charlist(Tightbeam.CliCompatibility.required_version())}
     ]
 
-    case System.cmd("curl", args, stderr_to_stdout: true) do
-      {out, 0} ->
-        {head, [code]} = out |> String.split("\n") |> Enum.split(-1)
-        payload = Enum.join(head, "\n")
+    request = {url, headers, ~c"application/json", JSON.encode!(body)}
 
+    case :httpc.request(:post, request, [timeout: 30_000], body_format: :binary) do
+      {:ok, {{_version, status, _reason}, _headers, payload}} ->
         case JSON.decode(payload) do
-          {:ok, v} -> v
-          _ -> %{"error" => %{"code" => "bad_json", "http" => code, "raw" => payload}}
+          {:ok, v} ->
+            v
+
+          _ ->
+            %{
+              "error" => %{
+                "code" => "bad_json",
+                "http" => Integer.to_string(status),
+                "raw" => payload
+              }
+            }
         end
 
-      {out, rc} ->
-        fail(state, "curl failed rc=#{rc}: #{out}")
+      {:error, reason} ->
+        fail(state, "dispatch request failed: #{inspect(reason)}")
     end
   end
 

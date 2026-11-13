@@ -1,0 +1,150 @@
+# The LIVE feature_smoke matrix (docs/SMOKE.md): BOTH real harnesses against a fresh
+# org that exists only on one GitHub-hosted runner VM, for one exact candidate commit.
+#
+# Manual only. It spends provider API credit and handles provider keys, so nothing may
+# start it implicitly: no push, pull_request or schedule trigger, and no other workflow
+# calls it. The definition that runs (github.workflow_sha) and the candidate under test
+# (inputs.candidate_sha) are separate revisions and both are recorded in the evidence.
+#
+# Isolation is the runner itself: each job gets a new, ephemeral GitHub-hosted VM, and
+# the org, its database, its minted bearers and its banked keys never leave it. Network
+# egress from that VM is open by decision; this workflow adds no sandbox or proxy.
+# Publishable output is limited to what scripts/hosted_smoke_evidence.sh selects.
+name: live feature smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact 40-hex candidate commit to smoke"
+        required: true
+        type: string
+      claude_cli_version:
+        description: "Exact @anthropic-ai/claude-code version to put on PATH"
+        required: true
+        type: string
+      codex_cli_version:
+        description: "Exact @openai/codex version to put on PATH"
+        required: true
+        type: string
+      model_claude:
+        description: "Claude leg model (TIGHTBEAM_SMOKE_MODEL_CLAUDE)"
+        required: true
+        type: string
+      effort_claude:
+        description: "Claude leg effort (TIGHTBEAM_SMOKE_EFFORT_CLAUDE)"
+        required: true
+        type: string
+      model_codex:
+        description: "Codex leg model (TIGHTBEAM_SMOKE_MODEL_CODEX)"
+        required: true
+        type: string
+      effort_codex:
+        description: "Codex leg effort (TIGHTBEAM_SMOKE_EFFORT_CODEX)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: live feature smoke (claude + codex, fresh org)
+    runs-on: ubuntu-24.04
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      CLAUDE_CLI_VERSION: ${{ inputs.claude_cli_version }}
+      CODEX_CLI_VERSION: ${{ inputs.codex_cli_version }}
+      TIGHTBEAM_SMOKE_MODEL_CLAUDE: ${{ inputs.model_claude }}
+      TIGHTBEAM_SMOKE_EFFORT_CLAUDE: ${{ inputs.effort_claude }}
+      TIGHTBEAM_SMOKE_MODEL_CODEX: ${{ inputs.model_codex }}
+      TIGHTBEAM_SMOKE_EFFORT_CODEX: ${{ inputs.effort_codex }}
+    steps:
+      # Inputs reach scripts only through the environment above, never by expression
+      # interpolation into a script, and each is checked against a closed shape here.
+      - name: Validate inputs
+        run: |
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "candidate_sha must be lower-case 40-hex" >&2; exit 1; }
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          [[ "$CLAUDE_CLI_VERSION" =~ $semver ]] || { echo "claude_cli_version must be an exact version" >&2; exit 1; }
+          [[ "$CODEX_CLI_VERSION" =~ $semver ]] || { echo "codex_cli_version must be an exact version" >&2; exit 1; }
+          for value in "$TIGHTBEAM_SMOKE_MODEL_CLAUDE" "$TIGHTBEAM_SMOKE_MODEL_CODEX"; do
+            [[ "$value" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "model inputs must be plain model ids" >&2; exit 1; }
+          done
+          for value in "$TIGHTBEAM_SMOKE_EFFORT_CLAUDE" "$TIGHTBEAM_SMOKE_EFFORT_CODEX"; do
+            [[ "$value" =~ ^[a-z]{1,16}$ ]] || { echo "effort inputs must be plain effort names" >&2; exit 1; }
+          done
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          persist-credentials: false
+
+      - name: Verify exact checkout
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          # The runner and its evidence filter come from the candidate itself, so the
+          # smoke never mixes one revision's driver with another revision's gateway.
+          test -f scripts/hosted_feature_smoke.sh
+          test -f scripts/hosted_smoke_evidence.sh
+
+      # The same pinned BEAM as the ci.yml gate: a version difference must never be
+      # mistaken for a candidate difference.
+      - name: Install BEAM (pinned, same as the gate)
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Node and npm come from the runner image; the gateway installs its pinned ACP
+      # adapters with them at first boot. Claude Code's npm package requires Node 22+.
+      # feature_smoke.exs reads its own fresh org with the sqlite3 CLI.
+      - name: Check runner prerequisites
+        run: |
+          node_major=$(node -p 'process.versions.node.split(".")[0]')
+          [ "$node_major" -ge 22 ] || { echo "Node $(node --version) is older than the required 22" >&2; exit 1; }
+          npm --version
+          sqlite3 --version
+          git config --global user.name "tightbeam live smoke"
+          git config --global user.email "live-smoke@tightbeam.invalid"
+
+      # The vendor CLIs the gateway probes on PATH, at the exact versions the dispatcher
+      # named. Installed into a run-local prefix, not the image's global npm tree.
+      - name: Install harness CLIs (exact versions)
+        run: |
+          prefix="$RUNNER_TEMP/harness-cli"
+          npm install --prefix "$prefix" --no-save --no-fund --no-audit \
+            "@anthropic-ai/claude-code@$CLAUDE_CLI_VERSION" "@openai/codex@$CODEX_CLI_VERSION"
+          echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Build the candidate (CLI and gateway)
+        run: |
+          (cd cli && cargo build --release)
+          mix deps.get
+          mix compile
+
+      # The only step that sees provider keys. They are dedicated, revocable, spend-capped
+      # TEST keys held as this repository's Actions secrets; the script moves them out of
+      # the environment before launching anything and hands each to `onboard --api-key`
+      # on stdin. Every subprocess writes to the run's private directory; this step's log
+      # carries phase lines and the filtered results only.
+      - name: Live feature smoke (fresh org, both harnesses)
+        env:
+          SMOKE_PROVIDER_ANTHROPIC: ${{ secrets.TIGHTBEAM_SMOKE_ANTHROPIC_API_KEY }}
+          SMOKE_PROVIDER_OPENAI: ${{ secrets.TIGHTBEAM_SMOKE_OPENAI_API_KEY }}
+          SMOKE_RUN_ROOT: ${{ runner.temp }}/tightbeam-live-smoke
+          SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/tightbeam-live-smoke-evidence
+          SMOKE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: bash scripts/hosted_feature_smoke.sh
+
+      # Published even when the smoke fails, and only ever this directory: identity.json,
+      # smoke-results.txt (selected lines) and summary.json. Raw logs never leave the VM.
+      - name: Upload redacted evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-feature-smoke-${{ env.CANDIDATE_SHA }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/tightbeam-live-smoke-evidence/
+          if-no-files-found: error

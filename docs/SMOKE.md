@@ -168,6 +168,26 @@ on 2026-07-25:
   separately as `feature-smoke leg <wire>: <n> checks PASS`; absence of any
   registered leg is not a pass.
 
+## Hosted live run (disposable GitHub-hosted VM)
+
+`.github/workflows/live-feature-smoke.yml` runs the same `feature_smoke.exs` matrix
+(both real harnesses, every check unchanged) for one exact candidate commit on a new
+GitHub-hosted `ubuntu-24.04` VM. It is `workflow_dispatch` only. The dispatcher names
+the candidate, the exact `claude` and `codex` CLI versions, and each leg's model and
+effort; nothing defaults.
+`scripts/hosted_feature_smoke.sh` builds a fresh org on that VM through the sanctioned
+path: first boot installs the pinned adapters, `add-user --admin`, then
+`onboard <provider> --api-key` with the key on stdin, then `learn agentic-engineering`
+and a restart. It runs the smoke against that org.
+
+The keys are two repository Actions secrets, `TIGHTBEAM_SMOKE_ANTHROPIC_API_KEY` and
+`TIGHTBEAM_SMOKE_OPENAI_API_KEY`. They are dedicated, revocable, spend-capped TEST keys,
+never a person's or an org's working credential. Raw output never leaves the VM. The
+uploaded artifact is `identity.json` (candidate, workflow and toolchain identities),
+`summary.json` and the lines `scripts/hosted_smoke_evidence.sh` selects. A failure's
+message is withheld there, so diagnosing one means re-running where the raw output can
+be read.
+
 ## 0. Boot + pair
 
 1. [auto: J0] Boot the gateway (fresh base_dir; auth seeded for the claude harness).
