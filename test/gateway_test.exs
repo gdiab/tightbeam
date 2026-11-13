@@ -9273,7 +9273,11 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.map(owner_markers, &{&1.content, &1.attention_tier}) == [
              {"[assignment action needed]\n\nReview assignment asg_codex: Codex usage limit reached.",
               1},
+             {"[turn outcome unknown]\n\nTurn #{codex_turn.seq} was cancelled at its recovery bound. It will not be replayed automatically; the assignment holder or delivery owner must disposition its unknown effect.",
+              1},
              {"[assignment action needed]\n\nReview assignment asg_claude: Claude rate limit reached.",
+              1},
+             {"[turn outcome unknown]\n\nTurn #{claude_turn.seq} was cancelled at its recovery bound. It will not be replayed automatically; the assignment holder or delivery owner must disposition its unknown effect.",
               1}
            ]
 
