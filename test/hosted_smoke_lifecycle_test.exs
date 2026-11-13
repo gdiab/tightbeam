@@ -102,7 +102,7 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
     """
 
     # Each fake gets $1 = the scratch dir; `hold` loops until $1/release exists.
-    @hold ~s(hold() { while [ ! -e "$1/release" ]; do sleep 0.1; done; }\n)
+    @hold ~s|hold() { while [ ! -e "$1/release" ]; do sleep 0.1; done; }\n|
 
     @fakes %{
       "clean" => """
@@ -245,7 +245,9 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
             stop_gateway; echo "second=$? reason=$STOP_REASON"
             """)
 
-          assert out =~ ~r/first=1 state=stop_failed reason=gateway_outlived_sigterm:direct_children=\d+/
+          assert out =~
+                   ~r/first=1 state=stop_failed reason=gateway_outlived_sigterm:direct_children=\d+/
+
           assert out =~ ~r/second=1 reason=gateway_outlived_sigterm:/
           assert received(dir) == 1
         end)
@@ -321,7 +323,8 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
               supervisor
             )
 
-          assert out =~ ~r/rc=1 reason=owned_process_survived:direct_children=\d+:control_error=EPERM/
+          assert out =~
+                   ~r/rc=1 reason=owned_process_survived:direct_children=\d+:control_error=EPERM/
         end)
       end
 
@@ -342,7 +345,9 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
               supervisor
             )
 
-          assert out =~ "refused state=stop_failed reason=owner_lost:supervisor_error:RuntimeError"
+          assert out =~
+                   "refused state=stop_failed reason=owner_lost:supervisor_error:RuntimeError"
+
           assert out =~ "stop=1"
           assert received(dir) == 0
         end)

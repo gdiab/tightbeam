@@ -10,6 +10,7 @@ defmodule Tightbeam.HostedSmokeEvidenceTest do
   defp filter(lines) do
     dir =
       Path.join(System.tmp_dir!(), "hosted-smoke-evidence-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(dir)
     input = Path.join(dir, "smoke.out")
     File.write!(input, Enum.join(lines, "\n") <> "\n")
