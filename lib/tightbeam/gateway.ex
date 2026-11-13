@@ -664,14 +664,18 @@ defmodule Tightbeam.Gateway do
 
           case outcome do
             {kind, message_id, turn_seq} when kind in [:recorded, :duplicate] ->
-              maybe_put_queued_reason(%{
-                outcome: to_string(kind),
-                sessionKey: call.session_key,
-                deviceId: p.device_id,
-                clientMessageId: p.client_message_id,
-                messageId: message_id,
-                turnSeq: turn_seq
-              }, db, call.session_key)
+              maybe_put_queued_reason(
+                %{
+                  outcome: to_string(kind),
+                  sessionKey: call.session_key,
+                  deviceId: p.device_id,
+                  clientMessageId: p.client_message_id,
+                  messageId: message_id,
+                  turnSeq: turn_seq
+                },
+                db,
+                call.session_key
+              )
 
             :appended ->
               maybe_put_queued_reason(%{ack: p.client_message_id}, db, call.session_key)
@@ -1500,7 +1504,8 @@ defmodule Tightbeam.Gateway do
             (unknown_effect and assignment.holder == session) or main_quota_resume or
             admin_caller?(db, call)
 
-        _ -> false
+        _ ->
+          false
       end
 
     if allowed,
@@ -1511,12 +1516,16 @@ defmodule Tightbeam.Gateway do
   end
 
   defp open_quota_incident_for_assignment?(db, assignment_id) do
-    case DB.query(db, """
-         SELECT 1 FROM harness_health_assignments a
-         JOIN harness_health_incidents i ON i.id=a.incidentId
-         WHERE a.assignmentId=?1 AND i.state='open' AND i.failureClass='rate-limit-dead'
-         LIMIT 1
-         """, [assignment_id]) do
+    case DB.query(
+           db,
+           """
+           SELECT 1 FROM harness_health_assignments a
+           JOIN harness_health_incidents i ON i.id=a.incidentId
+           WHERE a.assignmentId=?1 AND i.state='open' AND i.failureClass='rate-limit-dead'
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
       {:ok, [[1]]} -> true
       _ -> false
     end
@@ -3057,8 +3066,8 @@ defmodule Tightbeam.Gateway do
             terminal =
               if quota_failure or
                    match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason),
-                do: "failed_unknown",
-                else: "failed"
+                 do: "failed_unknown",
+                 else: "failed"
 
             {:error,
              %{
@@ -3072,6 +3081,7 @@ defmodule Tightbeam.Gateway do
                  )
 
                  if is_function(recorded.health, 0), do: recorded.health.()
+
                  EventLog.complete_notice(recorded.recovery,
                    conn_registry: Map.get(config, :conn_registry, ConnRegistry)
                  )
@@ -3181,7 +3191,9 @@ defmodule Tightbeam.Gateway do
                 )
 
               {:ok, adapter, generation}
-            {:error, reason} -> {:error, {:checkout, {:lifecycle_trace_failed, reason}}}
+
+            {:error, reason} ->
+              {:error, {:checkout, {:lifecycle_trace_failed, reason}}}
           end
 
         {:error, reason} ->
@@ -3362,17 +3374,18 @@ defmodule Tightbeam.Gateway do
   end
 
   defp trace_progress_observation(db, turn, observation, seq) do
-    result = trace_event(db, turn.seq, %{
-      event_key: "progress:#{seq}",
-      producer_event_id: "adapter:#{turn.owner_lease}:progress:#{seq}",
-      kind: "progress_observed",
-      stage: "prompt",
-      outcome: "observed",
-      cause: "acp:session-update",
-      principal: "process:tightbeam",
-      owner_lease: turn.owner_lease,
-      detail: %{v: 1, class: observation.class, label: observation.label}
-    })
+    result =
+      trace_event(db, turn.seq, %{
+        event_key: "progress:#{seq}",
+        producer_event_id: "adapter:#{turn.owner_lease}:progress:#{seq}",
+        kind: "progress_observed",
+        stage: "prompt",
+        outcome: "observed",
+        cause: "acp:session-update",
+        principal: "process:tightbeam",
+        owner_lease: turn.owner_lease,
+        detail: %{v: 1, class: observation.class, label: observation.label}
+      })
 
     if result == :ok do
       at = System.system_time(:millisecond)

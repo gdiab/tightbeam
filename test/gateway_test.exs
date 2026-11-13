@@ -9398,9 +9398,13 @@ defmodule Tightbeam.GatewayTest do
              DB.query(ctx.db, "SELECT status,error FROM turns WHERE seq=?1", [quota_turn.seq])
 
     assert {:ok, [["unknown_effect", 1]]} =
-             DB.query(ctx.db, """
-             SELECT state,quotaKnown FROM quota_recovery_turns WHERE turnSeq=?1
-             """, [quota_turn.seq])
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,quotaKnown FROM quota_recovery_turns WHERE turnSeq=?1
+               """,
+               [quota_turn.seq]
+             )
 
     assert %{reason_class: "provider_quota", last_error_class: "rate-limit-dead"} =
              Tightbeam.QuotaRecovery.held_state(ctx.db, "k1")
@@ -9432,11 +9436,12 @@ defmodule Tightbeam.GatewayTest do
              }
            } = Gateway.session_status("k1", ctx.db)
 
-    inspect = Gateway.handlers(config)["inspect"].(%{
-      origin: "user:sample-user",
-      session_key: nil,
-      params: %{}
-    })
+    inspect =
+      Gateway.handlers(config)["inspect"].(%{
+        origin: "user:sample-user",
+        session_key: nil,
+        params: %{}
+      })
 
     assert %{
              run_state: "held",

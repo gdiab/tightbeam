@@ -583,12 +583,16 @@ defmodule Tightbeam.HarnessHealth do
             observation_id = "hho_" <> Id.uuid4()
             correlation_id = "provider-reset:#{incident.id}:#{reset_at}"
 
-            Txn.q(txn, """
-            INSERT INTO harness_health_observations
-              (id,correlationId,harness,host,failureClass,evidenceKind,observedAt,cause,principal,incidentId)
-            VALUES (?1,?2,?3,?4,'rate-limit-dead','authoritative-provider',?5,
-                    'provider-declared reset reached','process:tightbeam',?6)
-            """, [observation_id, correlation_id, harness, host, reset_at, incident.id])
+            Txn.q(
+              txn,
+              """
+              INSERT INTO harness_health_observations
+                (id,correlationId,harness,host,failureClass,evidenceKind,observedAt,cause,principal,incidentId)
+              VALUES (?1,?2,?3,?4,'rate-limit-dead','authoritative-provider',?5,
+                      'provider-declared reset reached','process:tightbeam',?6)
+              """,
+              [observation_id, correlation_id, harness, host, reset_at, incident.id]
+            )
 
             %{fact_id: fact_id} =
               ConditionFacts.file_harness_health_in_txn(
@@ -599,11 +603,15 @@ defmodule Tightbeam.HarnessHealth do
                 :retract
               )
 
-            Txn.q(txn, """
-            UPDATE harness_health_incidents
-            SET state='resolved',resolvedAt=?2,resolutionObservationId=?3,resolvedFactId=?4
-            WHERE id=?1 AND state='open'
-            """, [incident.id, reset_at, observation_id, fact_id])
+            Txn.q(
+              txn,
+              """
+              UPDATE harness_health_incidents
+              SET state='resolved',resolvedAt=?2,resolutionObservationId=?3,resolvedFactId=?4
+              WHERE id=?1 AND state='open'
+              """,
+              [incident.id, reset_at, observation_id, fact_id]
+            )
 
             if Txn.changes(txn) != 1, do: raise("harness health declared-reset race")
 

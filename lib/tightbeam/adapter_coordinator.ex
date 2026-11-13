@@ -271,8 +271,11 @@ defmodule Tightbeam.AdapterCoordinator do
     reply =
       case state.adapters[key] do
         %{generation: ^generation, pid: pid, instance_ref: instance_ref}
-        when is_pid(pid) and is_binary(instance_ref) -> instance_ref
-        _ -> nil
+        when is_pid(pid) and is_binary(instance_ref) ->
+          instance_ref
+
+        _ ->
+          nil
       end
 
     {:reply, reply, state}

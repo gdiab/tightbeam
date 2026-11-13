@@ -53,11 +53,15 @@ defmodule Tightbeam.QuotaRecoveryTest do
     })
 
     assert {:ok, []} =
-             DB.query(db, """
-             INSERT INTO assignments
-               (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
-             VALUES ('asg_quota','recover quota-stranded work',?1,?2,1,'open','codex','openai')
-             """, [holder, main])
+             DB.query(
+               db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+               VALUES ('asg_quota','recover quota-stranded work',?1,?2,1,'open','codex','openai')
+               """,
+               [holder, main]
+             )
 
     %{db: db, holder: holder, main: main, assignment: "asg_quota"}
   end
@@ -79,6 +83,7 @@ defmodule Tightbeam.QuotaRecoveryTest do
            } = QuotaRecovery.held_state(ctx.db, ctx.holder)
 
     assert release == "later same-credential success or recorded owner/Main resume"
+
     assert Gateway.queued_delivery_reason(ctx.db, ctx.holder) ==
              "recipient parked (provider_quota)"
 
@@ -127,10 +132,14 @@ defmodule Tightbeam.QuotaRecoveryTest do
              """)
 
     assert {:ok, [["authoritative-provider", "provider-declared reset reached"]]} =
-             DB.query(ctx.db, """
-             SELECT evidenceKind,cause FROM harness_health_observations
-             WHERE id=(SELECT resolutionObservationId FROM harness_health_incidents WHERE id=?1)
-             """, [incident.id])
+             DB.query(
+               ctx.db,
+               """
+               SELECT evidenceKind,cause FROM harness_health_observations
+               WHERE id=(SELECT resolutionObservationId FROM harness_health_incidents WHERE id=?1)
+               """,
+               [incident.id]
+             )
   end
 
   test "the first supported release records its actor and preserves queued order", ctx do
@@ -141,7 +150,14 @@ defmodule Tightbeam.QuotaRecoveryTest do
         enqueue!(ctx, label)
       end
 
-    assert :ok = QuotaRecovery.explicit_resume(ctx.db, "codex", "quota-host", "session:delivery-owner")
+    assert :ok =
+             QuotaRecovery.explicit_resume(
+               ctx.db,
+               "codex",
+               "quota-host",
+               "session:delivery-owner"
+             )
+
     assert QuotaRecovery.held_state(ctx.db, ctx.holder) == nil
 
     assert {:ok, [["released", "session:delivery-owner", "explicit_resume", released_at]]} =
@@ -170,7 +186,9 @@ defmodule Tightbeam.QuotaRecoveryTest do
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
 
     task_sup =
-      start_supervised!({Task.Supervisor, name: :"quota_tasks_#{System.unique_integer([:positive])}"})
+      start_supervised!(
+        {Task.Supervisor, name: :"quota_tasks_#{System.unique_integer([:positive])}"}
+      )
 
     runner = fn turn ->
       Agent.update(order, &(&1 ++ [turn.seq]))
@@ -194,11 +212,24 @@ defmodule Tightbeam.QuotaRecoveryTest do
     assert queued_before == Enum.map(seqs, &[&1, "queued"])
     assert Agent.get(order, & &1) == []
 
-    assert :ok = QuotaRecovery.explicit_resume(ctx.db, "codex", "quota-host", "session:delivery-owner")
+    assert :ok =
+             QuotaRecovery.explicit_resume(
+               ctx.db,
+               "codex",
+               "quota-host",
+               "session:delivery-owner"
+             )
 
     assert eventually(fn -> Agent.get(order, & &1) == seqs end)
     assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
-    assert assignment_snapshot(ctx) == [ctx.assignment, ctx.holder, ctx.main, "open", "recover quota-stranded work"]
+
+    assert assignment_snapshot(ctx) == [
+             ctx.assignment,
+             ctx.holder,
+             ctx.main,
+             "open",
+             "recover quota-stranded work"
+           ]
   end
 
   test "known quota cancels only the in-flight turn once and never replays it", ctx do
@@ -209,7 +240,9 @@ defmodule Tightbeam.QuotaRecoveryTest do
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
 
     task_sup =
-      start_supervised!({Task.Supervisor, name: :"quota_cancel_tasks_#{System.unique_integer([:positive])}"})
+      start_supervised!(
+        {Task.Supervisor, name: :"quota_cancel_tasks_#{System.unique_integer([:positive])}"}
+      )
 
     runner = fn turn ->
       send(parent, {:turn_started, turn.seq})
@@ -259,7 +292,9 @@ defmodule Tightbeam.QuotaRecoveryTest do
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
 
     task_sup =
-      start_supervised!({Task.Supervisor, name: :"stall_cancel_tasks_#{System.unique_integer([:positive])}"})
+      start_supervised!(
+        {Task.Supervisor, name: :"stall_cancel_tasks_#{System.unique_integer([:positive])}"}
+      )
 
     start_supervised!(
       {SessionLane,
@@ -286,9 +321,13 @@ defmodule Tightbeam.QuotaRecoveryTest do
     :sys.replace_state(lane, fn state -> %{state | last_advancement_at: expected} end)
 
     assert {:ok, []} =
-             DB.query(ctx.db, """
-             UPDATE quota_recovery_turns SET lastAdvancementAt=?2 WHERE turnSeq=?1
-             """, [started_seq, expected])
+             DB.query(
+               ctx.db,
+               """
+               UPDATE quota_recovery_turns SET lastAdvancementAt=?2 WHERE turnSeq=?1
+               """,
+               [started_seq, expected]
+             )
 
     send(lane, {:quota_recovery_deadline, started_seq, expected})
     assert_receive {:supported_cancel, session_key}
@@ -349,7 +388,8 @@ defmodule Tightbeam.QuotaRecoveryTest do
     assert notice_at == 5_000 + 6 * @hour
   end
 
-  test "stall recovery restarts clocks but never lifts the adapter fence or repeats notice", ctx do
+  test "stall recovery restarts clocks but never lifts the adapter fence or repeats notice",
+       ctx do
     holder = ctx.holder
     seq = enqueue!(ctx, "active")
     assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder, "lane:test")
@@ -375,12 +415,15 @@ defmodule Tightbeam.QuotaRecoveryTest do
 
     stall_notices =
       EventLog.lifecycle_events(ctx.db)
-      |> Enum.filter(&(&1.kind == "turn_in_flight_stalled" and &1.subject == Integer.to_string(seq)))
+      |> Enum.filter(
+        &(&1.kind == "turn_in_flight_stalled" and &1.subject == Integer.to_string(seq))
+      )
 
     assert length(stall_notices) == 1
   end
 
-  test "unknown effect is recorded once, never replayed, and holds only the not-started queue", ctx do
+  test "unknown effect is recorded once, never replayed, and holds only the not-started queue",
+       ctx do
     started_seq = enqueue!(ctx, "started")
     queued_seqs = [enqueue!(ctx, "queued-a"), enqueue!(ctx, "queued-b")]
 
@@ -420,10 +463,12 @@ defmodule Tightbeam.QuotaRecoveryTest do
              reason_class: "blocked_other",
              last_error_class: "unknown_effect",
              owner: owner
-           } = hold =
+           } =
+             hold =
              QuotaRecovery.held_state(ctx.db, ctx.holder)
 
     assert owner == ctx.main
+
     assert hold.release_condition ==
              "awaiting unknown-effect disposition by holder or delivery owner"
 
@@ -444,19 +489,27 @@ defmodule Tightbeam.QuotaRecoveryTest do
     assert QuotaRecovery.held_state(ctx.db, ctx.holder) == nil
 
     assert {:ok, [["disposed", "session:" <> holder, disposition_at, "effects reconciled"]]} =
-             DB.query(ctx.db, """
-             SELECT state,dispositionBy,dispositionAt,disposition
-             FROM quota_recovery_turns WHERE turnSeq=?1
-             """, [started_seq])
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,dispositionBy,dispositionAt,disposition
+               FROM quota_recovery_turns WHERE turnSeq=?1
+               """,
+               [started_seq]
+             )
 
     assert holder == ctx.holder
     assert is_integer(disposition_at)
 
     assert {:ok, [[1]]} =
-             DB.query(ctx.db, """
-             SELECT COUNT(*) FROM lifecycle_events
-             WHERE kind='turn_unknown_effect' AND subject=?1
-             """, [Integer.to_string(started_seq)])
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*) FROM lifecycle_events
+               WHERE kind='turn_unknown_effect' AND subject=?1
+               """,
+               [Integer.to_string(started_seq)]
+             )
   end
 
   test "a distinct quota hold remains after no-quota disposition", ctx do
@@ -486,9 +539,13 @@ defmodule Tightbeam.QuotaRecoveryTest do
     assert :ok = QuotaRecovery.genuine_advancement(ctx.db, seq, 30_000)
 
     assert {:ok, [["disposed", 20_000, "session:" <> holder]]} =
-             DB.query(ctx.db, """
-             SELECT state,canceledAt,dispositionBy FROM quota_recovery_turns WHERE turnSeq=?1
-             """, [seq])
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,canceledAt,dispositionBy FROM quota_recovery_turns WHERE turnSeq=?1
+               """,
+               [seq]
+             )
 
     assert holder == ctx.holder
   end
@@ -541,10 +598,14 @@ defmodule Tightbeam.QuotaRecoveryTest do
 
   defp assignment_snapshot(ctx) do
     {:ok, [row]} =
-      DB.query(ctx.db, """
-      SELECT id,holderKey,openedBySession,state,subject
-      FROM assignments WHERE id=?1
-      """, [ctx.assignment])
+      DB.query(
+        ctx.db,
+        """
+        SELECT id,holderKey,openedBySession,state,subject
+        FROM assignments WHERE id=?1
+        """,
+        [ctx.assignment]
+      )
 
     row
   end

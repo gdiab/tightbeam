@@ -1139,7 +1139,8 @@ defmodule Tightbeam.Acp.Adapter do
   defp emit_progress(state, sid, update) do
     with nil <- Map.get(state.trace_errors, sid),
          {fun, trace_fun, last, seq} <- Map.get(state.progress, sid),
-         observation when not is_nil(observation) <- Tightbeam.TurnLifecycle.progress_observation(update),
+         observation when not is_nil(observation) <-
+           Tightbeam.TurnLifecycle.progress_observation(update),
          fingerprint <-
            :crypto.hash(
              :sha256,

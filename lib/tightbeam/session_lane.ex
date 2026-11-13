@@ -208,7 +208,10 @@ defmodule Tightbeam.SessionLane do
   @impl true
   def handle_info(:nudge, state), do: {:noreply, maybe_start(state)}
 
-  def handle_info({:quota_recovery_deadline, seq, expected}, %{current_seq: seq, task_ref: ref} = state)
+  def handle_info(
+        {:quota_recovery_deadline, seq, expected},
+        %{current_seq: seq, task_ref: ref} = state
+      )
       when not is_nil(ref) do
     if state.last_advancement_at != expected do
       {:noreply, state}
@@ -220,9 +223,14 @@ defmodule Tightbeam.SessionLane do
           {:noreply, cancel_unknown_effect(state, false)}
 
         elapsed >= 60 * 60 * 1_000 ->
-          case Tightbeam.QuotaRecovery.enter_stall(state.db, seq, System.system_time(:millisecond)) do
+          case Tightbeam.QuotaRecovery.enter_stall(
+                 state.db,
+                 seq,
+                 System.system_time(:millisecond)
+               ) do
             {:stalled, _session_key, _notice_sent} ->
               :ok
+
             _ ->
               :ok
           end
@@ -252,7 +260,10 @@ defmodule Tightbeam.SessionLane do
   end
 
   # TurnTask crashed.
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{task_ref: ref, recovery_canceling: true} = state) do
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %{task_ref: ref, recovery_canceling: true} = state
+      ) do
     {:noreply, maybe_start(clear_turn_state(state))}
   end
 
@@ -316,7 +327,8 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp claim_and_start(state) do
-    if harness_parked?(state) or Tightbeam.QuotaRecovery.admission_held?(state.db, state.session_key) do
+    if harness_parked?(state) or
+         Tightbeam.QuotaRecovery.admission_held?(state.db, state.session_key) do
       state
     else
       claim_next(state)
@@ -494,19 +506,36 @@ defmodule Tightbeam.SessionLane do
 
   defp arm_recovery(state, delay) do
     if state.recovery_timer, do: Process.cancel_timer(state.recovery_timer)
-    timer = Process.send_after(self(), {:quota_recovery_deadline, state.current_seq, state.last_advancement_at}, max(delay, 0))
+
+    timer =
+      Process.send_after(
+        self(),
+        {:quota_recovery_deadline, state.current_seq, state.last_advancement_at},
+        max(delay, 0)
+      )
+
     %{state | recovery_timer: timer}
   end
 
   defp clear_turn_state(state) do
     if state.recovery_timer, do: Process.cancel_timer(state.recovery_timer)
-    %{state | task_ref: nil, task_pid: nil, current_seq: nil, current_message_id: nil,
-      current_owner_lease: nil, recovery_timer: nil, last_advancement_at: nil,
-      recovery_canceling: false}
+
+    %{
+      state
+      | task_ref: nil,
+        task_pid: nil,
+        current_seq: nil,
+        current_message_id: nil,
+        current_owner_lease: nil,
+        recovery_timer: nil,
+        last_advancement_at: nil,
+        recovery_canceling: false
+    }
   end
 
   defp cancel_unknown_effect(state, quota_known) do
     now = System.system_time(:millisecond)
+
     terminal_opts = [
       owner_lease: state.current_owner_lease,
       cause: if(quota_known, do: "provider-quota", else: "no-genuine-progress"),
@@ -539,8 +568,14 @@ defmodule Tightbeam.SessionLane do
       {:won, {:ok, delivery}} ->
         EventLog.complete_notice(delivery)
         :ok = state.cancel_harness.(state.db, state.session_key)
-        state.terminal_publisher.(%{session_key: state.session_key, message_id: state.current_message_id,
-          status: "failed_unknown", error: "unknown_effect"})
+
+        state.terminal_publisher.(%{
+          session_key: state.session_key,
+          message_id: state.current_message_id,
+          status: "failed_unknown",
+          error: "unknown_effect"
+        })
+
         publish_terminal(state, state.current_seq)
         state.on_terminal.(state.session_key, state.current_seq)
         if is_pid(state.task_pid), do: Process.exit(state.task_pid, :kill)
@@ -552,7 +587,11 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp session_harness_host!(state) do
-    {:ok, [[harness, host]]} = DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [state.session_key])
+    {:ok, [[harness, host]]} =
+      DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [
+        state.session_key
+      ])
+
     {harness, host}
   end
 
