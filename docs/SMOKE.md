@@ -172,9 +172,10 @@ on 2026-07-25:
 
 `.github/workflows/live-feature-smoke.yml` runs the same `feature_smoke.exs` matrix
 (both real harnesses, every check unchanged) for one exact candidate commit on a new
-GitHub-hosted `ubuntu-24.04` VM. It is `workflow_dispatch` only. The dispatcher names
-the candidate, the exact `claude` and `codex` CLI versions, and each leg's model and
-effort; nothing defaults.
+GitHub-hosted `ubuntu-24.04` VM. GitHub provisions a new VM for the job and
+decommissions it when the job finishes. It is `workflow_dispatch` only. The dispatcher
+names the candidate, the exact `claude` and `codex` CLI versions, and each leg's model
+and effort; nothing defaults. Every action is pinned to a full commit SHA.
 `scripts/hosted_feature_smoke.sh` builds a fresh org on that VM through the sanctioned
 path: first boot installs the pinned adapters, `add-user --admin`, then
 `onboard <provider> --api-key` with the key on stdin, then `learn agentic-engineering`
@@ -182,11 +183,22 @@ and a restart. It runs the smoke against that org.
 
 The keys are two repository Actions secrets, `TIGHTBEAM_SMOKE_ANTHROPIC_API_KEY` and
 `TIGHTBEAM_SMOKE_OPENAI_API_KEY`. They are dedicated, revocable, spend-capped TEST keys,
-never a person's or an org's working credential. Raw output never leaves the VM. The
-uploaded artifact is `identity.json` (candidate, workflow and toolchain identities),
-`summary.json` and the lines `scripts/hosted_smoke_evidence.sh` selects. A failure's
-message is withheld there, so diagnosing one means re-running where the raw output can
-be read.
+never a person's or an org's working credential.
+
+The run passes only if all of these hold: every smoke assertion passed on both legs,
+the gateway and every process it owned are confirmed stopped, and the run directory
+holding the banked keys and minted bearers is confirmed removed. A teardown that cannot
+be confirmed is a failed run, even though GitHub later decommissions the VM.
+
+Raw output never leaves the VM. The uploaded artifact is `identity.json` (candidate,
+workflow and toolchain identities), `summary.json` (verdict, phase reached, teardown
+result) and the lines `scripts/hosted_smoke_evidence.sh` selects. A failure's message
+is withheld there. A failed run stops: nothing retries, and the redacted evidence is
+what remains. A diagnostic live run is a separate, one-shot operation that needs its
+own explicit authorization: its exact candidate and workflow identity, its effects,
+its spend, and how any secret-bearing evidence it produces will be handled. Nothing
+here grants one, and nothing here permits publishing or reading a run's raw private
+output.
 
 ## 0. Boot + pair
 

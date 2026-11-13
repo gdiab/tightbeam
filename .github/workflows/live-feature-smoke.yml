@@ -6,10 +6,16 @@
 # calls it. The definition that runs (github.workflow_sha) and the candidate under test
 # (inputs.candidate_sha) are separate revisions and both are recorded in the evidence.
 #
-# Isolation is the runner itself: each job gets a new, ephemeral GitHub-hosted VM, and
-# the org, its database, its minted bearers and its banked keys never leave it. Network
-# egress from that VM is open by decision; this workflow adds no sandbox or proxy.
+# Isolation is the runner itself: GitHub provisions a new VM for the job and
+# decommissions it when the job finishes. The org, its database, its minted bearers and
+# its banked keys never leave that VM, and the run must still prove its own teardown to
+# pass. Network egress from the VM is open by decision; this adds no sandbox or proxy.
 # Publishable output is limited to what scripts/hosted_smoke_evidence.sh selects.
+#
+# Every action is pinned to a full commit SHA, because each one runs on the same VM that
+# later holds the provider keys. Each pin is the commit its line's moving ref pointed to
+# on 2026-11-13, read from the action's own repository: the same line ci.yml uses, with
+# no upgrade. Moving a pin is a reviewed change, never a ref bump.
 name: live feature smoke
 
 on:
@@ -75,7 +81,7 @@ jobs:
             [[ "$value" =~ ^[a-z]{1,16}$ ]] || { echo "effort inputs must be plain effort names" >&2; exit 1; }
           done
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (= v4)
         with:
           ref: ${{ env.CANDIDATE_SHA }}
           persist-credentials: false
@@ -87,16 +93,21 @@ jobs:
           # smoke never mixes one revision's driver with another revision's gateway.
           test -f scripts/hosted_feature_smoke.sh
           test -f scripts/hosted_smoke_evidence.sh
+          test -f scripts/hosted_smoke_lifecycle.sh
 
       # The same pinned BEAM as the ci.yml gate: a version difference must never be
       # mistaken for a candidate difference.
       - name: Install BEAM (pinned, same as the gate)
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1 (= v1)
         with:
           otp-version: "28"
           elixir-version: "1.19.5"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The action is pinned; the toolchain it installs is still the moving `stable`
+      # channel, exactly as in ci.yml. The run records `rustc --version` in identity.json.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch head
+        with:
+          toolchain: stable
 
       # Node and npm come from the runner image; the gateway installs its pinned ACP
       # adapters with them at first boot. Claude Code's npm package requires Node 22+.
@@ -143,7 +154,7 @@ jobs:
       # smoke-results.txt (selected lines) and summary.json. Raw logs never leave the VM.
       - name: Upload redacted evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 (= v4)
         with:
           name: live-feature-smoke-${{ env.CANDIDATE_SHA }}-${{ github.run_id }}
           path: ${{ runner.temp }}/tightbeam-live-smoke-evidence/
