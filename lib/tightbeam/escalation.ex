@@ -1600,50 +1600,52 @@ defmodule Tightbeam.Escalation do
   # it). It attributes the question in the execution map's telemetry; it gates
   # nothing there either.
   #
-  # A bare existence check let an outsider name ANY assignment id, filing a
-  # question that associates it with private work it has no standing to
-  # reference — and an existing-but-invisible id filed successfully while a
-  # nonexistent one refused, which is an existence oracle on top (Sol xhigh
-  # review, finding 5). There is no general assignment-visibility predicate in
-  # this codebase to reuse (`assignment-get` itself is unscoped), so this is
-  # the minimal one: the asker must hold the assignment, have opened it, or be
-  # the one it reviews. Both an invisible id and a nonexistent one refuse
-  # identically. This lane intentionally accepts only the exact id; prefix/cursor
-  # resolution belongs to the excluded read-surface work.
+  # Assignment reads are organization-wide: `assignment-get` is unscoped and
+  # `work-item-get` returns every assignment on a readable item, including
+  # closed ones. `--about` accepts the same readable rows. A nonexistent id is
+  # still refused rather than silently dropped.
   defp asked_about_in_txn(_txn, nil, _asker_session_key), do: {:ok, nil}
 
-  defp asked_about_in_txn(txn, id, asker_session_key) when is_binary(id) do
-    if askable_assignment_in_txn?(txn, id, asker_session_key),
-      do: {:ok, id},
-      else: {:error, error("not_found", "unknown assignment: #{id}")}
+  defp asked_about_in_txn(txn, id, _asker_session_key) when is_binary(id) do
+    case resolve_assignment_id_in_txn(txn, id) do
+      {:ok, canonical} ->
+        {:ok, canonical}
+
+      :unknown ->
+        {:error, error("not_found", "unknown assignment: #{id}")}
+
+      {:ambiguous, candidates} ->
+        {:error,
+         %{
+           code: "ambiguous_id",
+           message: "assignment id prefix #{id} is ambiguous: #{Enum.join(candidates, ", ")}",
+           candidates: candidates
+         }}
+    end
   end
 
   defp asked_about_in_txn(_txn, _supplied, _asker_session_key),
     do: {:error, error("invalid", "--about takes an assignment id")}
 
-  defp askable_assignment_in_txn?(txn, assignment_id, asker_session_key) do
-    case Txn.q(
-           txn,
-           "SELECT holderKey, openedBySession, reviewsAssignmentId FROM assignments WHERE id = ?1",
-           [assignment_id]
-         ) do
-      [[holder_key, opened_by_session, reviews_id]] ->
-        holder_key == asker_session_key or
-          opened_by_session == asker_session_key or
-          (is_binary(reviews_id) and reviewed_holder_in_txn?(txn, reviews_id, asker_session_key))
+  defp resolve_assignment_id_in_txn(txn, supplied) do
+    case Txn.q(txn, "SELECT id FROM assignments WHERE id = ?1", [supplied]) do
+      [[^supplied]] ->
+        {:ok, supplied}
 
       [] ->
-        false
-    end
-  end
-
-  # The assignment named by `--about` reviews another one: the session being
-  # reviewed is legitimately referenced by that review even though it holds
-  # neither the review assignment nor opened it.
-  defp reviewed_holder_in_txn?(txn, reviewed_assignment_id, asker_session_key) do
-    case Txn.q(txn, "SELECT holderKey FROM assignments WHERE id = ?1", [reviewed_assignment_id]) do
-      [[holder_key]] -> holder_key == asker_session_key
-      [] -> false
+        if String.starts_with?(supplied, "asg_") do
+          case Txn.q(
+                 txn,
+                 "SELECT id FROM assignments WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id",
+                 [supplied]
+               ) do
+            [[id]] -> {:ok, id}
+            [] -> :unknown
+            rows -> {:ambiguous, Enum.map(rows, &hd/1)}
+          end
+        else
+          :unknown
+        end
     end
   end
 

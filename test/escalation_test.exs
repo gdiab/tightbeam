@@ -2826,7 +2826,7 @@ defmodule Tightbeam.EscalationTest do
                params: %{question: "user ask"}
              })
 
-    assert %{code: "not_found"} =
+    assert %{assignment_id: "a-agent-foreign"} =
              Escalation.ask(
                ctx.db,
                agent_call(ctx.raiser, %{question: "foreign", assignment_id: "a-agent-foreign"}, %{
@@ -2834,6 +2834,99 @@ defmodule Tightbeam.EscalationTest do
                  session_key: asked.session_key
                })
              )
+  end
+
+  test "agent ask accepts organization-readable assignments and refuses invalid references atomically",
+       ctx do
+    asked = session(ctx.db, "about-target", "other")
+    holder = session(ctx.db, "about-holder", "third")
+
+    insert_assignment!(ctx.db, "asg_about_open", holder.session_key, "open")
+    insert_assignment!(ctx.db, "asg_about_closed", holder.session_key, "closed")
+
+    assert %{id: "asg_about_closed", state: "closed", outcome: "revoked"} =
+             Tightbeam.Assignments.__handle__(ctx.db, "assignment-get", %{
+               principal: {:session, ctx.raiser.session_key},
+               params: %{assignment_id: "asg_about_closed"}
+             })
+
+    assert %{assignment_id: "asg_about_open"} =
+             Escalation.ask(
+               ctx.db,
+               agent_call(ctx.raiser, %{question: "open?", assignment_id: "asg_about_open"}, %{
+                 session_key: asked.session_key
+               })
+             )
+
+    assert %{assignment_id: "asg_about_closed"} =
+             Escalation.ask(
+               ctx.db,
+               agent_call(
+                 ctx.raiser,
+                 %{question: "closed?", assignment_id: "asg_about_closed"},
+                 %{session_key: asked.session_key}
+               )
+             )
+
+    insert_assignment!(ctx.db, "asg_about_alpha", holder.session_key, "open")
+
+    assert %{assignment_id: "asg_about_alpha"} =
+             Escalation.ask(
+               ctx.db,
+               agent_call(ctx.raiser, %{question: "prefix?", assignment_id: "asg_about_al"}, %{
+                 session_key: asked.session_key
+               })
+             )
+
+    insert_assignment!(ctx.db, "asg_about_atom", holder.session_key, "open")
+
+    snapshot = fn ->
+      {
+        table_count(ctx.db, "decision_requests"),
+        table_count(ctx.db, "lifecycle_events"),
+        table_count(ctx.db, "wakes")
+      }
+    end
+
+    before_refusals = snapshot.()
+
+    assert %{code: "not_found", message: "unknown assignment: asg_missing"} =
+             Escalation.ask(
+               ctx.db,
+               agent_call(ctx.raiser, %{question: "missing?", assignment_id: "asg_missing"}, %{
+                 session_key: asked.session_key
+               })
+             )
+
+    assert %{
+             code: "ambiguous_id",
+             candidates: ["asg_about_alpha", "asg_about_atom"]
+           } =
+             Escalation.ask(
+               ctx.db,
+               agent_call(ctx.raiser, %{question: "ambiguous?", assignment_id: "asg_about_a"}, %{
+                 session_key: asked.session_key
+               })
+             )
+
+    assert %{code: "invalid", message: "--about takes an assignment id"} =
+             Escalation.ask(
+               ctx.db,
+               agent_call(ctx.raiser, %{question: "invalid?", assignment_id: 7}, %{
+                 session_key: asked.session_key
+               })
+             )
+
+    assert %{code: "not_session"} =
+             Escalation.ask(ctx.db, %{
+               verb: "ask",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: asked.session_key,
+               params: %{question: "user?", assignment_id: "asg_about_open"}
+             })
+
+    assert snapshot.() == before_refusals
   end
 
   test "complete agent id grants session answer standing with private refusals and idempotency",
