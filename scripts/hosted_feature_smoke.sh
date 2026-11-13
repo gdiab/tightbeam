@@ -173,12 +173,14 @@ if adapter_install_failed; then echo "hosted-smoke: ACP adapter install failed" 
 #    admin by the cold-start rule; feature_smoke drives admin verbs as this user.
 PHASE=owner
 note "phase $PHASE"
+require_supervised
 "$CLI" add-user "$OWNER" --admin > "$PRIVATE/add-user.out" 2>&1
 
 # 3. Provider credentials, through the only sanctioned path: the key on stdin, never
 #    argv, validated against the provider before it is banked as an api_key-kind row.
 PHASE=onboard
 note "phase $PHASE"
+require_supervised
 printf '%s' "$anthropic_key" | "$CLI" onboard anthropic --api-key --as-user "$OWNER" > "$PRIVATE/onboard-anthropic.out" 2>&1
 printf '%s' "$openai_key" | "$CLI" onboard openai --api-key --as-user "$OWNER" > "$PRIVATE/onboard-openai.out" 2>&1
 unset anthropic_key openai_key
@@ -187,13 +189,13 @@ unset anthropic_key openai_key
 #    verification statutes and the coder/reviewer-code archetypes the smoke needs.
 PHASE=learn
 note "phase $PHASE"
+require_supervised
 "$CLI" learn agentic-engineering --as-user "$OWNER" > "$PRIVATE/learn.out" 2>&1
 
 # 5. Rules load once at boot: restart onto the provisioned org.
 PHASE=restart
 note "phase $PHASE"
 stop_gateway
-SUP_STATE=none
 verdicts_so_far=$(grep -cE '(READY|NOT READY): ' "$GATEWAY_LOG" || true)
 boot_gateway
 await_verdict "$verdicts_so_far"
@@ -202,6 +204,7 @@ await_verdict "$verdicts_so_far"
 #    own credential preflight. Raw output stays private; only selected lines publish.
 PHASE=smoke
 note "phase $PHASE"
+require_supervised
 set +e
 env TIGHTBEAM_BASE_DIR="$BASE" TIGHTBEAM_SMOKE_OWNER="$OWNER" \
   mix run --no-start scripts/feature_smoke.exs > "$PRIVATE/smoke.out" 2>&1

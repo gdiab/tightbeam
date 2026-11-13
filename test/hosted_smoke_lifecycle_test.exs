@@ -1,12 +1,17 @@
 defmodule Tightbeam.HostedSmokeLifecycleTest do
   # The hosted live smoke reports PASS only if the gateway and everything it owned are
-  # confirmed gone and the run's secret-bearing directory is removed, and it never signals
-  # a process it cannot prove is its own. These cases drive the REAL supervisor
-  # (scripts/hosted_smoke_supervisor.py) and the REAL stop / exit-trap code
-  # (scripts/hosted_smoke_lifecycle.sh) against small fake gateways, including the
-  # negative outcomes: a gateway that ignores SIGTERM, a descendant that survives, an
-  # escaped (setsid) descendant, a child spawned during shutdown, an early exit, a second
-  # stop request, and an interruption after the smoke's last phase.
+  # confirmed gone and the run's secret-bearing directory is removed; it asks for that stop
+  # exactly once; and it never signals a process it cannot prove is its own. These cases
+  # drive the REAL supervisor (scripts/hosted_smoke_supervisor.py) and the REAL lifecycle
+  # and exit-trap code (scripts/hosted_smoke_lifecycle.sh) under `set -e`, including the
+  # failure paths: control lost at launch, a pidfd operation failing after launch, a
+  # supervisor crash, a gateway that ignores SIGTERM, a surviving descendant, an escaped
+  # (setsid) descendant, a child spawned during shutdown, an early exit, an interruption
+  # during the stop, and an interruption after the last phase.
+  #
+  # The fixtures are COOPERATIVE: every fake process exits by itself once $DIR/release
+  # exists, so cleanup never signals anything. Faults are injected by a test-side wrapper
+  # that patches the standard library before running the unmodified supervisor.
   use ExUnit.Case, async: true
 
   @lib Path.expand("../scripts/hosted_smoke_lifecycle.sh", __DIR__)
@@ -20,12 +25,12 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
     "feature-smoke leg codex: 14 checks PASS"
   ]
 
-  # Runs `script` in bash with the library sourced, the supervisor path and short waits
-  # set, and $1 = a scratch directory. Returns {stdout, exit status}.
-  defp run(dir, script) do
+  # Runs `script` in bash with the library sourced and short waits, $1 = the scratch dir.
+  defp run(dir, script, supervisor \\ @supervisor) do
     prelude = """
     . "$0"
-    SUPERVISOR=#{@supervisor}
+    DIR="$1"
+    SUPERVISOR=#{supervisor}
     SUP_TERM_WAIT=2
     SUP_SWEEP_WAIT=3
     """
@@ -40,6 +45,13 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
 
   defp summary(dir), do: dir |> Path.join("ev/summary.json") |> File.read!() |> JSON.decode!()
 
+  # smoke_verdict with six fixed literal arguments and this test's results file.
+  defp verdict(dir, args) do
+    quoted = Enum.map_join(args, " ", &~s("#{&1}"))
+    {out, 0} = run(dir, ~s(smoke_verdict #{quoted} "$DIR/ev/smoke-results.txt"))
+    String.trim(out)
+  end
+
   describe "smoke_verdict" do
     @describetag :tmp_dir
 
@@ -49,12 +61,9 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
       verdict = &verdict(dir, &1)
 
       assert verdict.(["0", "0", "done", "yes", "yes", ""]) == "PASS"
-      # The script itself was interrupted or failed, though the smoke passed.
       assert verdict.(["130", "0", "done", "yes", "yes", "yes"]) == "FAIL"
       assert verdict.(["1", "0", "done", "yes", "yes", ""]) == "FAIL"
-      # An interruption is recorded even where the status would otherwise be 0.
       assert verdict.(["0", "0", "done", "yes", "yes", "yes"]) == "FAIL"
-      # Teardown not confirmed, or the run root still holds the keys and bearers.
       assert verdict.(["0", "0", "done", "no", "no", ""]) == "FAIL"
       assert verdict.(["0", "0", "done", "yes", "no", ""]) == "FAIL"
       assert verdict.(["0", "1", "done", "yes", "yes", ""]) == "FAIL"
@@ -79,136 +88,258 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
     end
   end
 
-  # smoke_verdict with six fixed literal arguments and this test's results file.
-  defp verdict(dir, args) do
-    quoted = Enum.map_join(args, " ", &~s("#{&1}"))
-    {out, 0} = run(dir, ~s(smoke_verdict #{quoted} "$1/ev/smoke-results.txt"))
-    String.trim(out)
-  end
-
   if @linux? do
-    # Fake gateways. Each records the pids it creates in $DIR so the test can clean up
-    # anything a deliberately failing case leaves behind (test cleanup only).
+    # Interrupts the shell that started it, through a pidfd: the helper opens its parent's
+    # pidfd, confirms that process is still its parent (so the pid was not reissued), and
+    # only then signals it.
+    @interrupt_parent ~S"""
+    python3 -c 'import os, signal, time
+    parent = os.getppid()
+    pidfd = os.pidfd_open(parent)
+    assert os.getppid() == parent
+    time.sleep(0.5)
+    signal.pidfd_send_signal(pidfd, signal.SIGINT)' &
+    """
+
+    # Each fake gets $1 = the scratch dir; `hold` loops until $1/release exists.
+    @hold ~s(hold() { while [ ! -e "$1/release" ]; do sleep 0.1; done; }\n)
+
     @fakes %{
       "clean" => """
       trap 'exit 0' TERM
-      sleep 1000 & echo $! >> "$1/pids"
-      setsid bash -c 'sleep 1000 & echo $! >> "$0/pids"; wait' "$1" & echo $! >> "$1/pids"
-      wait
+      hold "$1" &
+      setsid bash -c 'while [ ! -e "$0/release" ]; do sleep 0.1; done' "$1" &
+      hold "$1"
       """,
       "late" => """
-      trap 'sleep 1000 & echo $! >> "$1/pids"; exit 0' TERM
-      sleep 1000 & echo $! >> "$1/pids"
-      wait
+      trap 'hold "$1" & exit 0' TERM
+      hold "$1"
       """,
       "stubborn" => """
-      echo $$ >> "$1/pids"
       trap '' TERM
-      sleep 1000 & echo $! >> "$1/pids"
-      wait
+      hold "$1"
       """,
       "survivor" => """
       trap 'exit 0' TERM
-      (trap '' TERM; exec sleep 1000) & echo $! >> "$1/pids"
-      wait
+      (trap '' TERM; hold "$1") &
+      hold "$1"
       """,
       "early" => """
-      sleep 1000 & echo $! >> "$1/pids"
+      hold "$1" &
       exit 3
+      """,
+      "marker" => """
+      : > "$1/started"
+      trap 'exit 0' TERM
+      hold "$1"
       """
     }
 
     defp fake!(dir, name) do
       path = Path.join(dir, "#{name}.sh")
-      File.write!(path, Map.fetch!(@fakes, name))
+      File.write!(path, @hold <> Map.fetch!(@fakes, name))
       path
     end
 
-    defp cleanup(dir) do
-      case File.read(Path.join(dir, "pids")) do
-        {:ok, pids} ->
-          list = String.replace(pids, "\n", " ")
-          System.cmd("bash", ["-c", "kill -KILL #{list} 2>/dev/null; true"])
-
-        _ ->
-          :ok
-      end
+    # Cooperative cleanup: no signal is sent; every fixture exits once release exists.
+    defp release(dir) do
+      File.write!(Path.join(dir, "release"), "")
+      Process.sleep(500)
     end
 
-    defp supervise(dir, fake, after_start) do
+    defp with_fixtures(dir, fun) do
       try do
-        run(dir, """
-        DIR="$1"
-        start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake} "$DIR"
-        sleep 0.5
-        #{after_start}
-        """)
+        fun.()
       after
-        cleanup(dir)
+        release(dir)
       end
     end
 
-    describe "supervisor and single-attempt stop" do
+    # The unmodified supervisor, run after a standard-library function is patched.
+    defp faulty_supervisor!(dir, mode) do
+      path = Path.join(dir, "faulty_supervisor.py")
+
+      File.write!(path, """
+      import errno, os, runpy, select, signal, sys
+      mode = #{inspect(mode)}
+      if mode == "pidfd_open_at_launch":
+          def failing(pid, flags=0):
+              raise OSError(errno.EMFILE, "injected")
+          os.pidfd_open = failing
+      elif mode == "orphan_signal_fails":
+          real_send = signal.pidfd_send_signal
+          calls = {"n": 0}
+          def flaky(pidfd, sig, *rest, **kw):
+              calls["n"] += 1
+              if calls["n"] > 1:
+                  raise OSError(errno.EPERM, "injected")
+              return real_send(pidfd, sig, *rest, **kw)
+          signal.pidfd_send_signal = flaky
+      elif mode == "crash_after_launch":
+          def boom(*args, **kw):
+              raise RuntimeError("injected")
+          select.select = boom
+      sys.argv = [#{inspect(@supervisor)}] + sys.argv[1:]
+      runpy.run_path(#{inspect(@supervisor)}, run_name="__main__")
+      """)
+
+      path
+    end
+
+    defp requests(dir) do
+      case File.read(Path.join([dir, "sup", "requests"])) do
+        {:ok, text} -> text |> String.split("\n", trim: true) |> length()
+        _ -> 0
+      end
+    end
+
+    describe "supervisor ownership and the single stop" do
       @describetag :tmp_dir
 
       test "a clean stop accounts for orphaned and escaped (setsid) descendants",
            %{tmp_dir: dir} do
-        {out, 0} =
-          supervise(dir, fake!(dir, "clean"), """
-          stop_gateway; echo "rc=$? state=$SUP_STATE result=$(cat "$SUP_RESULT")"
-          """)
+        with_fixtures(dir, fn ->
+          {out, 0} =
+            run(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "clean")} "$DIR"
+            sleep 0.5
+            stop_gateway; echo "rc=$? state=$SUP_STATE result=$(cat "$DIR/sup/result")"
+            """)
 
-        assert out =~ "rc=0 state=stopped result=stopped"
+          assert out =~ "rc=0 state=stopped result=stopped"
+          assert requests(dir) == 1
+        end)
       end
 
       test "a child spawned during shutdown is still found and stopped", %{tmp_dir: dir} do
-        {out, 0} =
-          supervise(dir, fake!(dir, "late"), """
-          stop_gateway; echo "rc=$? result=$(cat "$SUP_RESULT")"
-          """)
+        with_fixtures(dir, fn ->
+          {out, 0} =
+            run(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "late")} "$DIR"
+            sleep 0.5
+            stop_gateway; echo "rc=$? result=$(cat "$DIR/sup/result")"
+            """)
 
-        assert out =~ "rc=0 result=stopped"
+          assert out =~ "rc=0 result=stopped"
+        end)
       end
 
-      test "a gateway that ignores SIGTERM fails the stop, and a second stop is refused",
+      test "a gateway that ignores SIGTERM fails, and later calls never ask again",
            %{tmp_dir: dir} do
-        {out, 0} =
-          supervise(dir, fake!(dir, "stubborn"), """
-          stop_gateway; echo "first=$? state=$SUP_STATE reason=$STOP_REASON"
-          before=$(stat -c %Y "$SUP_RESULT")
-          stop_gateway; echo "second=$? reason=$STOP_REASON"
-          [ "$(stat -c %Y "$SUP_RESULT")" = "$before" ] && echo result-untouched
-          """)
+        with_fixtures(dir, fn ->
+          {out, 0} =
+            run(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "stubborn")} "$DIR"
+            sleep 0.5
+            stop_gateway; echo "first=$? state=$SUP_STATE reason=$STOP_REASON"
+            stop_gateway; echo "second=$? reason=$STOP_REASON"
+            """)
 
-        assert out =~ ~r/first=1 state=stop_failed reason=gateway_outlived_sigterm:\d+/
-        assert out =~ ~r/second=1 reason=gateway_outlived_sigterm:\d+/
-        assert out =~ "result-untouched"
+          assert out =~ ~r/first=1 state=stop_failed reason=gateway_outlived_sigterm:direct_children=\d+/
+          assert out =~ ~r/second=1 reason=gateway_outlived_sigterm:/
+          assert requests(dir) == 1
+        end)
       end
 
       test "a descendant that survives its SIGTERM fails the stop", %{tmp_dir: dir} do
-        {out, 0} =
-          supervise(dir, fake!(dir, "survivor"), """
-          stop_gateway; echo "rc=$? reason=$STOP_REASON"
-          """)
+        with_fixtures(dir, fn ->
+          {out, 0} =
+            run(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "survivor")} "$DIR"
+            sleep 0.5
+            stop_gateway; echo "rc=$? reason=$STOP_REASON"
+            """)
 
-        assert out =~ ~r/rc=1 reason=owned_process_survived:\d+/
+          assert out =~ ~r/rc=1 reason=owned_process_survived:direct_children=[1-9]/
+        end)
       end
 
       test "a gateway that exits on its own is a failure even when its tree is swept",
            %{tmp_dir: dir} do
-        {out, 0} =
-          supervise(dir, fake!(dir, "early"), """
-          while [ ! -s "$SUP_RESULT" ]; do sleep 0.1; done
-          gateway_supervised || echo not-supervised
-          stop_gateway; echo "rc=$? reason=$STOP_REASON"
-          """)
+        with_fixtures(dir, fn ->
+          {out, 0} =
+            run(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "early")} "$DIR"
+            while [ ! -s "$DIR/sup/result" ]; do sleep 0.1; done
+            gateway_supervised || echo not-supervised
+            stop_gateway; echo "rc=$? reason=$STOP_REASON"
+            """)
 
-        assert out =~ "not-supervised"
-        assert out =~ "rc=1 reason=gateway_exited_early:stopped"
+          assert out =~ "not-supervised"
+          assert out =~ "rc=1 reason=gateway_exited_early:stopped"
+          assert requests(dir) == 0
+        end)
       end
     end
 
-    describe "exit trap composition" do
+    describe "faults after launch" do
+      @describetag :tmp_dir
+
+      test "no pidfd at the handoff: the gateway never starts and nothing is owned",
+           %{tmp_dir: dir} do
+        supervisor = faulty_supervisor!(dir, "pidfd_open_at_launch")
+
+        with_fixtures(dir, fn ->
+          {out, 0} =
+            run(
+              dir,
+              """
+              start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "marker")} "$DIR"
+              echo "rc=$? state=$SUP_STATE reason=$STOP_REASON"
+              """,
+              supervisor
+            )
+
+          assert out =~ "rc=1 state=none reason=start:control_unavailable:pidfd_open=EMFILE"
+          refute File.exists?(Path.join(dir, "started"))
+        end)
+      end
+
+      test "an orphan that cannot be signalled is recorded and fails the stop",
+           %{tmp_dir: dir} do
+        supervisor = faulty_supervisor!(dir, "orphan_signal_fails")
+
+        with_fixtures(dir, fn ->
+          {out, 0} =
+            run(
+              dir,
+              """
+              start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "clean")} "$DIR"
+              sleep 0.5
+              stop_gateway; echo "rc=$? reason=$STOP_REASON"
+              """,
+              supervisor
+            )
+
+          assert out =~ ~r/rc=1 reason=owned_process_survived:direct_children=\d+:control_error=EPERM/
+        end)
+      end
+
+      test "a supervisor crash after launch stops the next phase and is never re-stopped",
+           %{tmp_dir: dir} do
+        supervisor = faulty_supervisor!(dir, "crash_after_launch")
+
+        with_fixtures(dir, fn ->
+          {out, 0} =
+            run(
+              dir,
+              """
+              start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "marker")} "$DIR"
+              while [ ! -s "$DIR/sup/result" ]; do sleep 0.1; done
+              require_supervised || echo "refused state=$SUP_STATE reason=$STOP_REASON"
+              stop_gateway; echo "stop=$?"
+              """,
+              supervisor
+            )
+
+          assert out =~ "refused state=stop_failed reason=owner_lost:supervisor_error:RuntimeError"
+          assert out =~ "stop=1"
+          assert requests(dir) == 0
+        end)
+      end
+    end
+
+    describe "exit trap composition under set -e" do
       @describetag :tmp_dir
 
       defp scenario(dir, body) do
@@ -216,7 +347,6 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
 
         run(dir, """
         set -euo pipefail
-        DIR="$1"
         SMOKE_RUN_ROOT="$DIR/root"
         SMOKE_EVIDENCE_DIR="$DIR/ev"
         PHASE=start
@@ -241,15 +371,15 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
         {_out, status} = scenario(dir, "SMOKE_RC=0\nPHASE=done\nkill -INT $$\nsleep 5")
 
         assert status == 130
+
         assert %{"verdict" => "FAIL", "interrupted" => "yes", "exit_status" => "130"} =
                  summary(dir)
       end
 
-      test "a failed stop is not retried by the exit trap and keeps the run root",
-           %{tmp_dir: dir} do
+      test "a failed stop unwinding under set -e is asked exactly once", %{tmp_dir: dir} do
         write_results(dir, @full)
 
-        try do
+        with_fixtures(dir, fn ->
           {_out, status} =
             scenario(dir, """
             start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "stubborn")} "$DIR"
@@ -260,6 +390,7 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
             """)
 
           assert status == 1
+          assert requests(dir) == 1
 
           assert %{
                    "verdict" => "FAIL",
@@ -270,9 +401,29 @@ defmodule Tightbeam.HostedSmokeLifecycleTest do
                  } = summary(dir)
 
           assert File.dir?(Path.join(dir, "root"))
-        after
-          cleanup(dir)
-        end
+        end)
+      end
+
+      test "an interruption during the stop collects the outcome without asking again",
+           %{tmp_dir: dir} do
+        write_results(dir, @full)
+
+        with_fixtures(dir, fn ->
+          {_out, status} =
+            scenario(dir, """
+            start_gateway_supervised "$DIR/sup" "$DIR/gw.log" bash #{fake!(dir, "stubborn")} "$DIR"
+            sleep 0.5
+            PHASE=restart
+            #{@interrupt_parent}
+            stop_gateway
+            """)
+
+          assert status == 130
+          assert requests(dir) == 1
+
+          assert %{"verdict" => "FAIL", "interrupted" => "yes", "gateway_stopped" => "no"} =
+                   summary(dir)
+        end)
       end
     end
   end
