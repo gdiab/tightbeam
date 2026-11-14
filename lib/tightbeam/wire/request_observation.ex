@@ -19,7 +19,14 @@ defmodule Tightbeam.Wire.RequestObservation do
         |> put_resp_header("x-tightbeam-request-id", request_id)
         |> ResponseObservationAdapter.wrap()
 
-      Process.put(@key, %{conn: conn, state: "not_started", timeout: nil, status: nil})
+      Process.put(@key, %{
+        conn: conn,
+        state: "not_started",
+        timeout: nil,
+        status: nil,
+        result_class: nil
+      })
+
       conn = register_before_send(conn, &started/1)
 
       try do
@@ -76,6 +83,14 @@ defmodule Tightbeam.Wire.RequestObservation do
     case Process.get(@key) do
       nil -> :ok
       observation -> Process.put(@key, %{observation | state: "complete", status: status})
+    end
+  end
+
+  @doc false
+  def result_class(result_class) when is_binary(result_class) do
+    case Process.get(@key) do
+      nil -> :ok
+      observation -> Process.put(@key, %{observation | result_class: result_class})
     end
   end
 
@@ -167,7 +182,7 @@ defmodule Tightbeam.Wire.RequestObservation do
         _ -> OperationRegistry.http(observation.conn.method, nil)
       end
 
-    Diagnostics.emit(%{
+    record = %{
       event: "http_response_terminal",
       listener_generation: observation.conn.private[:tightbeam_listener_generation],
       request_id: context.request_id,
@@ -184,8 +199,14 @@ defmodule Tightbeam.Wire.RequestObservation do
       cause: cause || if(failure, do: "db_caller_timeout", else: nil),
       timeout_source: if(failure, do: failure.timeout_source, else: "none"),
       budget_ms: failure && failure.budget_ms,
-      elapsed_ms: failure && failure.elapsed_ms
-    })
+      elapsed_ms: failure && failure.elapsed_ms,
+      result_class: observation.result_class
+    }
+
+    case observation.conn.private[:tightbeam_deps] do
+      %{diagnostics_emit: emit} when is_function(emit, 1) -> emit.(record)
+      _ -> Diagnostics.emit(record)
+    end
   end
 
   defp json(conn, status, body) do

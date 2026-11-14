@@ -819,6 +819,9 @@ TARGET (for commands that take one — pass exactly one):
   --user <id>          that human's Main
 
 COMMANDS:
+  credential-health [--expect-instance <id>]
+      Check this standard client's discovered credential, loopback endpoint,
+      gateway instance and required version without application effects.
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
        [--after 30s|5m|2h] [--at <epochMs>] [--cron "<schedule>"] [--assignment <id>] [--replace-queued]
        [--class fyi|status-query|input-needed|blocker|algedonic]

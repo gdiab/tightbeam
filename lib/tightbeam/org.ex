@@ -806,6 +806,27 @@ defmodule Tightbeam.Org do
 
   def active_session_key_by_cli_token(_db, _token), do: nil
 
+  @doc "Classify a session bearer by retained token state without resolving a principal."
+  @spec credential_state_by_cli_token(db(), String.t()) ::
+          {:ok, "active" | "retired" | nil} | {:error, term()}
+  def credential_state_by_cli_token(db \\ Tightbeam.DB, token)
+
+  def credential_state_by_cli_token(db, token) when is_binary(token) do
+    case DB.query_for(
+           db,
+           "auth.session_by_cli_token",
+           "SELECT state FROM sessions WHERE cliToken = ?1",
+           [token]
+         ) do
+      {:ok, [[state]]} when state in ["active", "retired"] -> {:ok, state}
+      {:ok, []} -> {:ok, nil}
+      {:ok, _rows} -> {:error, :invalid_credential_rows}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def credential_state_by_cli_token(_db, _token), do: {:ok, nil}
+
   @doc "Fetch a session by key, or nil."
   @spec get(db(), String.t()) :: session() | nil
   def get(db \\ Tightbeam.DB, session_key) do

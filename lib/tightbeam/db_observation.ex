@@ -4,6 +4,7 @@ defmodule Tightbeam.DBObservation do
   require Logger
 
   @key {__MODULE__, :observation}
+  @emit_key {__MODULE__, :diagnostics_emit}
   @transaction_capture_tag {__MODULE__, :wire_preserving_transaction}
   @operations %{
     "db.query" => nil,
@@ -18,6 +19,20 @@ defmodule Tightbeam.DBObservation do
   @envelope_fields ~w(request_id db_call_id operation effect_kind principal_kind principal_ref timeout_source budget_ms)a
 
   def operations, do: @operations
+
+  @doc false
+  def with_diagnostics_emit(nil, fun) when is_function(fun, 0), do: fun.()
+
+  def with_diagnostics_emit(emit, fun) when is_function(emit, 1) and is_function(fun, 0) do
+    previous = Process.get(@emit_key)
+    Process.put(@emit_key, emit)
+
+    try do
+      fun.()
+    after
+      if previous, do: Process.put(@emit_key, previous), else: Process.delete(@emit_key)
+    end
+  end
 
   def call(server, payload, operation, budget, mode \\ :ordinary)
 
@@ -125,6 +140,7 @@ defmodule Tightbeam.DBObservation do
       principal_ref: context.principal_ref,
       timeout_source: "otp_db_call",
       budget_ms: budget,
+      diagnostics_emit: Process.get(@emit_key),
       deadline: System.monotonic_time(:millisecond) + budget,
       enqueued_monotonic: started
     }
@@ -481,8 +497,14 @@ defmodule Tightbeam.DBObservation do
   defp cause("callback_error"), do: "transaction_callback_error"
   defp cause(class), do: class
 
-  defp emit(envelope, fields),
-    do: Diagnostics.emit(Map.merge(Map.take(envelope, @envelope_fields), fields))
+  defp emit(envelope, fields) do
+    record = Map.merge(Map.take(envelope, @envelope_fields), fields)
+
+    case Map.get(envelope, :diagnostics_emit) || Process.get(@emit_key) do
+      emit when is_function(emit, 1) -> emit.(record)
+      _ -> Diagnostics.emit(record)
+    end
+  end
 
   defp ms(duration), do: System.convert_time_unit(duration, :native, :millisecond)
   defp elapsed(started), do: ms(System.monotonic_time() - started)
