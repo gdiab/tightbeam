@@ -281,6 +281,11 @@ defmodule Tightbeam.CredentialHealthTest do
     install_match_all_rule_fixture(ctx.base_dir, rail_marker, Map.keys(handlers))
     assert length(Rules.load!(ctx.base_dir, Map.keys(handlers))) == map_size(handlers)
 
+    # Setup committed sessions and devices, and their notices may still be queued at
+    # the Hub. Drain them while no observer is registered, so only notices from the
+    # measured phase can reach the subscription below.
+    firehose_frontier!(ctx.db)
+
     # Register as a production change socket does. The Hub advances `sequence/2` only
     # for subscription frames, never for a `mode: :all` socket, so a match-all
     # subscription is what lets the sequence checks below observe any notice at all.
