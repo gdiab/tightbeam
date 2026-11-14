@@ -362,6 +362,7 @@ defmodule Tightbeam.CredentialHealthTest do
 
     assert database_snapshot(ctx.db) == before_db
     assert EventLog.lifecycle_events(ctx.db) == before_rails
+    firehose_frontier!(ctx.db)
     assert Hub.sequence(Hub, self()) == before_firehose
     refute_received {:firehose_notice, _frame}
     refute File.exists?(marker)
@@ -399,9 +400,24 @@ defmodule Tightbeam.CredentialHealthTest do
     assert File.read!(marker) == "ordinary-dispatch-ran"
     assert File.read!(rail_marker) == "rail-check-ran\n"
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "rail_script"))
-    _barrier = :sys.get_state(Hub)
+    firehose_frontier!(ctx.db)
     assert Hub.sequence(Hub, self()) > before_firehose
     assert_received {:firehose_notice, _frame}
+  end
+
+  # Committed handoffs reach the Hub as casts from the DB owner, and messages are
+  # ordered only between one sender and one receiver. A transaction callback runs in
+  # the DB owner, so a synchronous Hub call made there is ordered behind every earlier
+  # handoff. Once it returns, the test's own Hub call is ordered behind any frame the
+  # Hub has already sent this process, and behind anything this process cast to the
+  # Hub itself. The subscription has no archetype filter, so the Hub makes no DB call
+  # while the owner waits on it.
+  defp firehose_frontier!(db) do
+    assert {:ok, :ok} =
+             DB.transaction(db, fn _txn ->
+               _state = :sys.get_state(Hub)
+               :ok
+             end)
   end
 
   defp health(ctx, token, overrides \\ []) do
