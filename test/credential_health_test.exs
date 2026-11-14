@@ -281,7 +281,11 @@ defmodule Tightbeam.CredentialHealthTest do
     install_match_all_rule_fixture(ctx.base_dir, rail_marker, Map.keys(handlers))
     assert length(Rules.load!(ctx.base_dir, Map.keys(handlers))) == map_size(handlers)
 
-    :ok = Hub.register(Hub, self(), %{mode: :all, db: ctx.db, user_id: "health-owner"})
+    # Register as a production change socket does. The Hub advances `sequence/2` only
+    # for subscription frames, never for a `mode: :all` socket, so a match-all
+    # subscription is what lets the sequence checks below observe any notice at all.
+    :ok = Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "health-owner"})
+    :ok = Hub.subscribe(Hub, self(), "credential-health-all", %{})
 
     before_db = database_snapshot(ctx.db)
     before_rails = EventLog.lifecycle_events(ctx.db)
