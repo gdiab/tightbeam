@@ -78,12 +78,15 @@ defmodule Tightbeam.CredentialHealth do
           end
       end
 
+    # Bound outside the guard: `deps[...]` is Access.get/2, which a guard cannot call.
+    instance = deps[:credential_health_instance]
+
     case result do
-      {:ok, result_class} when is_map(deps[:credential_health_instance]) ->
+      {:ok, result_class} when is_map(instance) ->
         body = %{
           "schemaVersion" => 1,
           "result" => result_class,
-          "instance" => deps[:credential_health_instance],
+          "instance" => instance,
           "version" => CliCompatibility.required_version()
         }
 
