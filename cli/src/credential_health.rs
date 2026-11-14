@@ -145,9 +145,18 @@ where
         return discovery_from_url(&url, Some(token), EndpointSource::Env, None);
     }
 
-    // Only crate::base_dir reads the base-dir variables. It selects from the
-    // environment exactly when a variable it consults is present, so the source class
-    // is observed from its own lookups rather than decided by a second reading here.
+    let (base_dir, source) = resolve_gateway_base(&get_env, home);
+    gateway_discovery(&base_dir, source)
+}
+
+// Only crate::base_dir reads the base-dir variables. Under its current contract it
+// selects from the environment exactly when a variable it consults is present, so the
+// source class is observed from its own lookups rather than decided by a second
+// reading here.
+fn resolve_gateway_base<F>(get_env: &F, home: &Path) -> (PathBuf, EndpointSource)
+where
+    F: Fn(&str) -> Option<String>,
+{
     let selected_from_env = Cell::new(false);
     let base_dir = crate::base_dir::resolve_with(
         &|name: &str| {
@@ -164,7 +173,7 @@ where
     } else {
         EndpointSource::Default
     };
-    gateway_discovery(&base_dir, source)
+    (base_dir, source)
 }
 
 fn session_discovery(cwd: &Path) -> Option<Discovery> {
@@ -593,12 +602,20 @@ mod tests {
         )
         .unwrap();
 
+        // These call the resolution seam and then gateway discovery on the directory it
+        // chose, so only fixture-owned gateway files are read: no session-file walk up
+        // from a working directory, and no relative path.
+
         // Both set: the base-dir variable wins, as crate::base_dir orders them.
         let both = HashMap::from([
             ("TIGHTBEAM_BASE_DIR", base.display().to_string()),
             ("TIGHTBEAM_HOME", home_var.display().to_string()),
         ]);
-        let discovery = discover_with(|name| both.get(name).cloned(), &root, &root);
+        let env = |name: &str| both.get(name).cloned();
+        let (base_dir, source) = resolve_gateway_base(&env, &root);
+        assert_eq!(base_dir, base);
+        assert_eq!(source, EndpointSource::Env);
+        let discovery = gateway_discovery(&base_dir, source);
         assert_eq!(discovery.source, EndpointSource::Env);
         assert_eq!(discovery.endpoint.unwrap().port, 11401);
         assert_eq!(discovery.token.as_deref(), Some("base-token"));
@@ -609,10 +626,18 @@ mod tests {
 
         // Only the home variable: it is the environment selection.
         let home_only = HashMap::from([("TIGHTBEAM_HOME", home_var.display().to_string())]);
-        let discovery = discover_with(|name| home_only.get(name).cloned(), &root, &root);
+        let env = |name: &str| home_only.get(name).cloned();
+        let (base_dir, source) = resolve_gateway_base(&env, &root);
+        assert_eq!(base_dir, home_var);
+        assert_eq!(source, EndpointSource::Env);
+        let discovery = gateway_discovery(&base_dir, source);
         assert_eq!(discovery.source, EndpointSource::Env);
         assert_eq!(discovery.endpoint.unwrap().port, 11402);
         assert_eq!(discovery.token.as_deref(), Some("home-token"));
+        assert_eq!(
+            discovery.implicit_instance,
+            instance_id(&fs::canonicalize(&home_var).unwrap())
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -631,7 +656,11 @@ mod tests {
         )
         .unwrap();
 
-        let discovery = discover_with(|_| None, &root, &root);
+        let env = |_: &str| None::<String>;
+        let (base_dir, source) = resolve_gateway_base(&env, &root);
+        assert_eq!(base_dir, default_dir);
+        assert_eq!(source, EndpointSource::Default);
+        let discovery = gateway_discovery(&base_dir, source);
         assert_eq!(discovery.source, EndpointSource::Default);
         assert_eq!(discovery.endpoint.unwrap().port, 11403);
         assert_eq!(discovery.token.as_deref(), Some("default-token"));
@@ -644,18 +673,17 @@ mod tests {
 
     #[test]
     fn a_set_but_empty_variable_is_still_the_environment_selection() {
-        // crate::base_dir resolves a set-but-empty variable to an empty path, so the
-        // selection came from the environment even though no gateway is found there.
-        let missing = std::env::temp_dir().join(format!(
-            "tightbeam-credential-health-empty-{}",
-            std::process::id()
-        ));
-        let discovery = discover_with(
-            |name| (name == "TIGHTBEAM_BASE_DIR").then(String::new),
-            &missing,
-            &missing,
-        );
-        assert_eq!(discovery.source, EndpointSource::Env);
+        // crate::base_dir lets a set-but-empty variable win and resolves it to an empty
+        // path, so the selection came from the environment. Only the seam is exercised:
+        // discovery on an empty path would read relative to the working directory.
+        let env = |name: &str| match name {
+            "TIGHTBEAM_BASE_DIR" => Some(String::new()),
+            "TIGHTBEAM_HOME" => Some("/fixture-home-var".to_owned()),
+            _ => None,
+        };
+        let (base_dir, source) = resolve_gateway_base(&env, Path::new("/fixture-home"));
+        assert_eq!(base_dir, PathBuf::new());
+        assert_eq!(source, EndpointSource::Env);
     }
 
     #[test]
