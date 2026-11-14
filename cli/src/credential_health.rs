@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr};
@@ -144,12 +145,25 @@ where
         return discovery_from_url(&url, Some(token), EndpointSource::Env, None);
     }
 
-    let source = if get_env("TIGHTBEAM_BASE_DIR").is_some() || get_env("TIGHTBEAM_HOME").is_some() {
+    // Only crate::base_dir reads the base-dir variables. It selects from the
+    // environment exactly when a variable it consults is present, so the source class
+    // is observed from its own lookups rather than decided by a second reading here.
+    let selected_from_env = Cell::new(false);
+    let base_dir = crate::base_dir::resolve_with(
+        &|name: &str| {
+            let value = get_env(name);
+            if value.is_some() {
+                selected_from_env.set(true);
+            }
+            value
+        },
+        home,
+    );
+    let source = if selected_from_env.get() {
         EndpointSource::Env
     } else {
         EndpointSource::Default
     };
-    let base_dir = crate::base_dir::resolve_with(&get_env, home);
     gateway_discovery(&base_dir, source)
 }
 
@@ -556,6 +570,92 @@ mod tests {
             instance_id(&fs::canonicalize(&root).unwrap())
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_canonical_resolver_picks_the_gateway_and_its_choice_is_the_source_class() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-credential-health-precedence-{}",
+            std::process::id()
+        ));
+        let base = root.join("base");
+        let home_var = root.join("home-var");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&home_var).unwrap();
+        fs::write(
+            base.join("gateway.json"),
+            r#"{"port":11401,"cliToken":"base-token"}"#,
+        )
+        .unwrap();
+        fs::write(
+            home_var.join("gateway.json"),
+            r#"{"port":11402,"cliToken":"home-token"}"#,
+        )
+        .unwrap();
+
+        // Both set: the base-dir variable wins, as crate::base_dir orders them.
+        let both = HashMap::from([
+            ("TIGHTBEAM_BASE_DIR", base.display().to_string()),
+            ("TIGHTBEAM_HOME", home_var.display().to_string()),
+        ]);
+        let discovery = discover_with(|name| both.get(name).cloned(), &root, &root);
+        assert_eq!(discovery.source, EndpointSource::Env);
+        assert_eq!(discovery.endpoint.unwrap().port, 11401);
+        assert_eq!(discovery.token.as_deref(), Some("base-token"));
+        assert_eq!(
+            discovery.implicit_instance,
+            instance_id(&fs::canonicalize(&base).unwrap())
+        );
+
+        // Only the home variable: it is the environment selection.
+        let home_only = HashMap::from([("TIGHTBEAM_HOME", home_var.display().to_string())]);
+        let discovery = discover_with(|name| home_only.get(name).cloned(), &root, &root);
+        assert_eq!(discovery.source, EndpointSource::Env);
+        assert_eq!(discovery.endpoint.unwrap().port, 11402);
+        assert_eq!(discovery.token.as_deref(), Some("home-token"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn without_either_variable_the_default_directory_is_used_and_reported() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-credential-health-default-{}",
+            std::process::id()
+        ));
+        let default_dir = root.join(".tightbeam");
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::write(
+            default_dir.join("gateway.json"),
+            r#"{"port":11403,"cliToken":"default-token"}"#,
+        )
+        .unwrap();
+
+        let discovery = discover_with(|_| None, &root, &root);
+        assert_eq!(discovery.source, EndpointSource::Default);
+        assert_eq!(discovery.endpoint.unwrap().port, 11403);
+        assert_eq!(discovery.token.as_deref(), Some("default-token"));
+        assert_eq!(
+            discovery.implicit_instance,
+            instance_id(&fs::canonicalize(&default_dir).unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_set_but_empty_variable_is_still_the_environment_selection() {
+        // crate::base_dir resolves a set-but-empty variable to an empty path, so the
+        // selection came from the environment even though no gateway is found there.
+        let missing = std::env::temp_dir().join(format!(
+            "tightbeam-credential-health-empty-{}",
+            std::process::id()
+        ));
+        let discovery = discover_with(
+            |name| (name == "TIGHTBEAM_BASE_DIR").then(String::new),
+            &missing,
+            &missing,
+        );
+        assert_eq!(discovery.source, EndpointSource::Env);
     }
 
     #[test]

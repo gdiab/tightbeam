@@ -6591,6 +6591,7 @@ mod tests {
         assert_eq!(
             headings,
             [
+                "credential-health",
                 "ask",
                 "answer",
                 "return",
