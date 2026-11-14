@@ -448,6 +448,33 @@ defmodule Tightbeam.CredentialHealthTest do
     pids = [self(), Process.whereis(ctx.db)] |> Enum.reject(&is_nil/1)
     tracer = spawn_link(fn -> trace_calls([]) end)
 
+    # Cleanup is armed before the first trace effect. Whatever fails below, every
+    # process flag, every pattern and the tracer are still removed, and the first
+    # failure is the one the test reports.
+    outcome =
+      try do
+        {:ok, trace_calls_during(ctx, fun, modules, pids, tracer)}
+      catch
+        kind, reason -> {:error, kind, reason, __STACKTRACE__}
+      end
+
+    cleanup_failures = stop_call_trace(pids, modules, tracer)
+
+    case outcome do
+      {:ok, captured} ->
+        assert cleanup_failures == []
+        captured
+
+      {:error, kind, reason, stacktrace} ->
+        if cleanup_failures != [] do
+          IO.puts(:stderr, "trace cleanup also failed: #{inspect(cleanup_failures)}")
+        end
+
+        :erlang.raise(kind, reason, stacktrace)
+    end
+  end
+
+  defp trace_calls_during(ctx, fun, modules, pids, tracer) do
     # A trace pattern breaks only on code that is already loaded, so a module first
     # loaded during `fun` would run untraced and an empty capture would prove nothing.
     # Load every module first and require each pattern to cover real functions.
@@ -462,27 +489,47 @@ defmodule Tightbeam.CredentialHealthTest do
       assert :erlang.trace(pid, true, [:call, {:tracer, tracer}]) == 1
     end)
 
-    try do
-      {result, log} =
-        case fun.() do
-          {result, log} when is_binary(log) -> {result, log}
-          result -> {result, ""}
-        end
+    {result, log} =
+      case fun.() do
+        {result, log} when is_binary(log) -> {result, log}
+        result -> {result, ""}
+      end
 
-      _db_barrier = :sys.get_state(ctx.db)
-      await_trace_delivery!(pids)
-      {result, traced_calls(tracer, modules), log}
-    after
-      Enum.each(pids, &:erlang.trace(&1, false, [:call]))
-      await_trace_delivery!(pids)
+    _db_barrier = :sys.get_state(ctx.db)
+    await_trace_delivery!(pids)
+    {result, traced_calls(tracer, modules), log}
+  end
 
-      Enum.each(modules, fn module ->
-        :erlang.trace_pattern({module, :_, :_}, false, [:local])
+  # Every step is attempted even when an earlier one fails; each failure is returned,
+  # not raised. Trace messages go only to the tracer, which is stopped last, so
+  # nothing remains to drain from the test mailbox.
+  defp stop_call_trace(pids, modules, tracer) do
+    flag_steps =
+      Enum.map(pids, fn pid ->
+        {{:trace_off, pid}, fn -> :erlang.trace(pid, false, [:call]) end}
       end)
 
-      Process.unlink(tracer)
-      Process.exit(tracer, :kill)
-    end
+    pattern_steps =
+      Enum.map(modules, fn module ->
+        {{:pattern_off, module},
+         fn -> :erlang.trace_pattern({module, :_, :_}, false, [:local]) end}
+      end)
+
+    tracer_step =
+      {:tracer_stop,
+       fn ->
+         Process.unlink(tracer)
+         Process.exit(tracer, :kill)
+       end}
+
+    Enum.flat_map(flag_steps ++ pattern_steps ++ [tracer_step], fn {step, cleanup} ->
+      try do
+        cleanup.()
+        []
+      catch
+        kind, reason -> [{step, kind, reason}]
+      end
+    end)
   end
 
   defp trace_calls(calls) do
