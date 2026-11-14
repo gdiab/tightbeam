@@ -276,6 +276,7 @@ defmodule Tightbeam.Gateway do
       Map.merge(socket_deps, %{
         base_dir: config.base_dir,
         cli_token: cli_token,
+        credential_health_instance: Tightbeam.CredentialHealth.instance(config.base_dir),
         diagnostic_scope: config[:diagnostic_scope] || %{},
         session_status: fn session_key -> session_status(session_key, db, config) end,
         adapter_coordinator: Tightbeam.AdapterCoordinator

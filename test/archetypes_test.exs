@@ -284,7 +284,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     assert role_guidance.("product-owner") =~ "have delivery ownership commission its\nbytes"
-    assert role_guidance.("pdo") =~ "You own landing order and branch health"
+    assert role_guidance.("pdo") =~ "You own landing order, watcher coverage and branch health"
 
     for role <- ~w(product-owner orchestrator) do
       refute role_guidance.(role) =~ heading
@@ -404,11 +404,17 @@ defmodule Tightbeam.ArchetypesTest do
     assert coder.guidance =~ "Load `repository-retirement` before disposing"
     refute coder.guidance =~ "hands you a specific checkout"
 
-    for role <- ~w(team-planner guidance-writer guidance-reviewer integrator) do
+    # The integrator carries changes to their destination, so it also elects `landing`.
+    for {role, skills} <- [
+          {"team-planner", ["repository-retirement"]},
+          {"guidance-writer", ["repository-retirement"]},
+          {"guidance-reviewer", ["repository-retirement"]},
+          {"integrator", ["landing", "repository-retirement"]}
+        ] do
       snapshot =
         Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
 
-      assert Map.keys(snapshot.skills) == ["repository-retirement"]
+      assert Map.keys(snapshot.skills) == skills
       assert snapshot.guidance =~ "# How Tightbeam works"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
     end
