@@ -806,9 +806,13 @@ defmodule Tightbeam.Org do
 
   def active_session_key_by_cli_token(_db, _token), do: nil
 
-  @doc "Classify a session bearer by retained token state without resolving a principal."
+  @doc """
+  Classify a session bearer by retained token state without resolving a principal.
+
+  The state is `"active"`, `"retired"`, or `nil` for an unknown token.
+  """
   @spec credential_state_by_cli_token(db(), String.t()) ::
-          {:ok, "active" | "retired" | nil} | {:error, term()}
+          {:ok, String.t() | nil} | {:error, term()}
   def credential_state_by_cli_token(db \\ Tightbeam.DB, token)
 
   def credential_state_by_cli_token(db, token) when is_binary(token) do
