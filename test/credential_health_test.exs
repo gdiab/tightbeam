@@ -515,14 +515,12 @@ defmodule Tightbeam.CredentialHealthTest do
          fn -> :erlang.trace_pattern({module, :_, :_}, false, [:local]) end}
       end)
 
-    tracer_step =
-      {:tracer_stop,
-       fn ->
-         Process.unlink(tracer)
-         Process.exit(tracer, :kill)
-       end}
+    tracer_steps = [
+      {:tracer_unlink, fn -> Process.unlink(tracer) end},
+      {:tracer_kill, fn -> Process.exit(tracer, :kill) end}
+    ]
 
-    Enum.flat_map(flag_steps ++ pattern_steps ++ [tracer_step], fn {step, cleanup} ->
+    Enum.flat_map(flag_steps ++ pattern_steps ++ tracer_steps, fn {step, cleanup} ->
       try do
         cleanup.()
         []
