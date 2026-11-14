@@ -31,7 +31,11 @@ defmodule Tightbeam.CredentialHealthTest do
     suffix = System.unique_integer([:positive])
     db = String.to_atom("credential_health_db_#{suffix}")
     registry = String.to_atom("credential_health_registry_#{suffix}")
-    base_dir = Path.join(System.tmp_dir!(), "tightbeam-credential-health-#{suffix}")
+
+    # The positive control's rail runs under containment, which refuses a write root
+    # with a symlink component. macOS's temp dir sits beneath one (/var), so resolve it.
+    {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
+    base_dir = Path.join(String.trim(tmp), "tightbeam-credential-health-#{suffix}")
 
     File.mkdir_p!(base_dir)
     start_supervised!({DB, path: ":memory:", name: db})
@@ -442,12 +446,21 @@ defmodule Tightbeam.CredentialHealthTest do
   defp capture_forbidden_calls(ctx, fun) do
     modules = [Dispatch, Rules, RailScript, Publisher, Mementos, ConditionFacts]
     pids = [self(), Process.whereis(ctx.db)] |> Enum.reject(&is_nil/1)
+    tracer = spawn_link(fn -> trace_calls([]) end)
 
+    # A trace pattern breaks only on code that is already loaded, so a module first
+    # loaded during `fun` would run untraced and an empty capture would prove nothing.
+    # Load every module first and require each pattern to cover real functions.
     Enum.each(modules, fn module ->
-      :erlang.trace_pattern({module, :_, :_}, true, [:local])
+      Code.ensure_loaded!(module)
+      assert :erlang.trace_pattern({module, :_, :_}, true, [:local]) > 0
     end)
 
-    Enum.each(pids, &:erlang.trace(&1, true, [:call]))
+    # A separate tracer receives the calls, so the test process is traced like any
+    # other process rather than tracing itself.
+    Enum.each(pids, fn pid ->
+      assert :erlang.trace(pid, true, [:call, {:tracer, tracer}]) == 1
+    end)
 
     try do
       {result, log} =
@@ -458,7 +471,7 @@ defmodule Tightbeam.CredentialHealthTest do
 
       _db_barrier = :sys.get_state(ctx.db)
       await_trace_delivery!(pids)
-      {result, collect_forbidden_calls(modules), log}
+      {result, traced_calls(tracer, modules), log}
     after
       Enum.each(pids, &:erlang.trace(&1, false, [:call]))
       await_trace_delivery!(pids)
@@ -467,8 +480,29 @@ defmodule Tightbeam.CredentialHealthTest do
         :erlang.trace_pattern({module, :_, :_}, false, [:local])
       end)
 
-      collect_forbidden_calls(modules)
+      Process.unlink(tracer)
+      Process.exit(tracer, :kill)
     end
+  end
+
+  defp trace_calls(calls) do
+    receive do
+      {:trace, _pid, :call, {module, function, arguments}} ->
+        trace_calls([{module, function, length(arguments)} | calls])
+
+      {:traced_calls, from, ref} ->
+        send(from, {:traced_calls, ref, Enum.reverse(calls)})
+        trace_calls(calls)
+    end
+  end
+
+  # Called only after `await_trace_delivery!/1`: every call traced before then is
+  # already in the tracer's mailbox, ahead of this request.
+  defp traced_calls(tracer, modules) do
+    ref = make_ref()
+    send(tracer, {:traced_calls, self(), ref})
+    assert_receive {:traced_calls, ^ref, calls}, 1_000
+    Enum.filter(calls, fn {module, _function, _arity} -> module in modules end)
   end
 
   defp await_trace_delivery!(pids) do
@@ -479,20 +513,6 @@ defmodule Tightbeam.CredentialHealthTest do
                      1_000,
                      "trace delivery acknowledgement timed out for #{inspect(pid)}"
     end)
-  end
-
-  defp collect_forbidden_calls(modules, calls \\ []) do
-    receive do
-      {:trace, _pid, :call, {module, function, arguments}} ->
-        calls =
-          if module in modules,
-            do: [{module, function, length(arguments)} | calls],
-            else: calls
-
-        collect_forbidden_calls(modules, calls)
-    after
-      0 -> Enum.reverse(calls)
-    end
   end
 
   defp refute_token_material(output, token) do

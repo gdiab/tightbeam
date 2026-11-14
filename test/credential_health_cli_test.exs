@@ -397,20 +397,8 @@ defmodule Tightbeam.CredentialHealthCliTest do
   end
 
   defp stub(ctx, opts) do
-    {ip, opts} = Keyword.pop(opts, :ip, {127, 0, 0, 1})
-    opts = Keyword.put(opts, :parent, self())
-
-    {:ok, pid} =
-      Bandit.start_link(
-        plug: {Stub, opts},
-        ip: ip,
-        port: 0,
-        startup_log: false
-      )
-
-    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
-    {:ok, {_bound_ip, port}} = ThousandIsland.listener_info(pid)
-    %{pid: pid, port: port, root: ctx.root}
+    {:ok, loopback} = try_start_stub(ctx, opts)
+    loopback
   end
 
   defp assert_loopback_contact(ctx, ip, url) do
@@ -466,22 +454,23 @@ defmodule Tightbeam.CredentialHealthCliTest do
     end
   end
 
+  # The test supervisor owns every listener and stops it after the test. Nothing links
+  # it to the test process, so a failed bind comes back here as `{:error, reason}`
+  # instead of an EXIT that kills the test, and no manual stop races its shutdown.
   defp try_start_stub(ctx, opts) do
     {ip, opts} = Keyword.pop(opts, :ip, {127, 0, 0, 1})
     opts = Keyword.put(opts, :parent, self())
 
-    try do
-      case Bandit.start_link(plug: {Stub, opts}, ip: ip, port: 0, startup_log: false) do
-        {:ok, pid} ->
-          on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
-          {:ok, {_bound_ip, port}} = ThousandIsland.listener_info(pid)
-          {:ok, %{pid: pid, port: port, root: ctx.root}}
+    case start_supervised(
+           {Bandit, plug: {Stub, opts}, ip: ip, port: 0, startup_log: false},
+           id: make_ref()
+         ) do
+      {:ok, pid} ->
+        {:ok, {_bound_ip, port}} = ThousandIsland.listener_info(pid)
+        {:ok, %{pid: pid, port: port, root: ctx.root}}
 
-        {:error, reason} ->
-          {:error, reason}
-      end
-    catch
-      :exit, reason -> {:error, reason}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -531,15 +520,12 @@ defmodule Tightbeam.CredentialHealthCliTest do
         diagnostics_emit: fn _record -> :accepted end
       )
 
-    {:ok, pid} =
-      Bandit.start_link(
-        plug: {Router, router},
-        ip: {127, 0, 0, 1},
-        port: 0,
-        startup_log: false
+    pid =
+      start_supervised!(
+        {Bandit, plug: {Router, router}, ip: {127, 0, 0, 1}, port: 0, startup_log: false},
+        id: make_ref()
       )
 
-    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
     {:ok, {_bound_ip, port}} = ThousandIsland.listener_info(pid)
     %{pid: pid, port: port, base_dir: base_dir}
   end
