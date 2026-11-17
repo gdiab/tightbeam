@@ -363,7 +363,7 @@ defmodule Tightbeam.TestIsolationTest do
     test "T8: every launch form outside the helper is reported; the real tree is clean" do
       source = ~S"""
       defmodule LeakTest do
-        use ExUnit.Case
+        use ExUnit.Case, async: true
 
         test "leaks" do
           System.cmd("tightbeam", ["list"])
@@ -408,7 +408,7 @@ defmodule Tightbeam.TestIsolationTest do
 
       File.write!(Path.join(root, "test/runner_test.exs"), ~S"""
       defmodule RunnerTest do
-        use ExUnit.Case
+        use ExUnit.Case, async: true
         @launched System.cmd("true", [])
         System.cmd("true", [])
 
