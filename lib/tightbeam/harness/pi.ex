@@ -138,7 +138,8 @@ defmodule Tightbeam.Harness.Pi do
         [
           cmd:
             [ssh | Support.ssh_opts()] ++
-              [target.host_config.ssh, "exec", "/usr/bin/env" | remote_env] ++ [binary],
+              [target.host_config.ssh, "exec", "/usr/bin/env" | Support.remote_env_unset()] ++
+              remote_env ++ [binary],
           env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
         ]
       end

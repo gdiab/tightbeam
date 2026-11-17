@@ -1067,6 +1067,28 @@ defmodule Tightbeam.Placement do
     end
   end
 
+  # F2-5e (wi_34a7be66): the write path has refused every TIGHTBEAM_* overlay name
+  # since 4e2db4e3, but a row written before that, or by anything but the API, would
+  # still reach a spawned agent: a TIGHTBEAM_URL/TIGHTBEAM_TOKEN pair or
+  # TIGHTBEAM_BASE_DIR there outranks the agent's own session file in CLI
+  # discovery. The read side drops TIGHTBEAM_* and production-identity names, the
+  # names Tightbeam owns for discovery and instance selection, and logs each dropped
+  # name, never its value. (Narrowed to these names per review note N2: older
+  # credential-named rows keep today's behaviour.)
+  defp tightbeam_owned_overlay?(%{name: name, host: host, harness: harness}) do
+    owned? =
+      String.starts_with?(name, "TIGHTBEAM_") or
+        Tightbeam.ProductionIdentityEnv.production_identity?(name)
+
+    if owned?,
+      do:
+        Logger.warning(
+          "dropping env overlay #{name} for #{harness}@#{host}: Tightbeam owns it; it is never passed to an agent"
+        )
+
+    owned?
+  end
+
   defp unreserved_env_name(name) do
     credential_env_names = Enum.flat_map(Harness.all(), & &1.credential_env_vars())
 
@@ -1461,6 +1483,7 @@ defmodule Tightbeam.Placement do
       |> Map.get(:db, DB)
       |> env_overlays(host, module.wire_name())
       |> Enum.reject(&(&1.name == "GH_CONFIG_DIR"))
+      |> Enum.reject(&tightbeam_owned_overlay?/1)
       |> Enum.map(&{&1.name, &1.value})
 
     path = adapter_path(config, host_config)
