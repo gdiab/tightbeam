@@ -106,9 +106,14 @@ defmodule Tightbeam.AdapterPatchModeTest do
         version: "1.0.0"
       )
 
-    assert {_output, 0} = System.cmd(System.find_executable("node"), ["-e", script])
+    assert {_output, 0} =
+             Tightbeam.TestIsolation.cmd(System.find_executable("node"), ["-e", script])
+
     assert File.read!(bundle) == "AFTER\nAFTER\n"
-    assert {_output, 0} = System.cmd(System.find_executable("node"), ["-e", script])
+
+    assert {_output, 0} =
+             Tightbeam.TestIsolation.cmd(System.find_executable("node"), ["-e", script])
+
     assert File.read!(bundle) == "AFTER\nAFTER\n"
   end
 end

@@ -1680,7 +1680,7 @@ defmodule Tightbeam.PlacementTest do
       script =
         "const fs = require('fs'); for (const path of process.argv.slice(1)) console.log(fs.realpathSync(path))"
 
-      {output, 0} = System.cmd(node, ["-e", script] ++ paths)
+      {output, 0} = Tightbeam.TestIsolation.cmd(node, ["-e", script] ++ paths)
       output |> String.split("\n", trim: true) |> Enum.sort()
     end
 

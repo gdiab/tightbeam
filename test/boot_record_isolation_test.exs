@@ -384,18 +384,24 @@ defmodule Tightbeam.BootRecordIsolationTest do
     revision = Identity.live_revision!(base)
 
     {_, 0} =
-      System.cmd("git", ["branch", "-D", "tightbeam/upstream"], cd: Path.join(base, "identity"))
+      Tightbeam.TestIsolation.cmd("git", ["branch", "-D", "tightbeam/upstream"],
+        cd: Path.join(base, "identity")
+      )
 
     assert capture_log(fn -> assert :noop = Identity.init!(base) end) =~ "tightbeam/upstream"
     assert Identity.live_revision!(base) == revision
 
     {_, 0} =
-      System.cmd("git", ["checkout", "--detach", "tightbeam/live"],
+      Tightbeam.TestIsolation.cmd("git", ["checkout", "--detach", "tightbeam/live"],
         cd: Path.join(base, "identity"),
         stderr_to_stdout: true
       )
 
-    {_, 0} = System.cmd("git", ["branch", "-D", "main"], cd: Path.join(base, "identity"))
+    {_, 0} =
+      Tightbeam.TestIsolation.cmd("git", ["branch", "-D", "main"],
+        cd: Path.join(base, "identity")
+      )
+
     assert capture_log(fn -> assert :noop = Identity.init!(base) end) =~ "main"
     assert Identity.live_revision!(base) == revision
   end
@@ -405,9 +411,13 @@ defmodule Tightbeam.BootRecordIsolationTest do
     dir = Path.join(base, "identity")
     File.mkdir_p!(Path.join(dir, "kungfu/broken"))
     File.write!(Path.join(dir, "kungfu/broken/manifest.toml"), "root_archetype='broken'")
-    {_, 0} = System.cmd("git", ["add", "."], cd: dir)
-    {_, 0} = System.cmd("git", ["commit", "-m", "Add malformed metadata"], cd: dir)
-    {_, 0} = System.cmd("git", ["branch", "-f", "tightbeam/live", "HEAD"], cd: dir)
+    {_, 0} = Tightbeam.TestIsolation.cmd("git", ["add", "."], cd: dir)
+
+    {_, 0} =
+      Tightbeam.TestIsolation.cmd("git", ["commit", "-m", "Add malformed metadata"], cd: dir)
+
+    {_, 0} =
+      Tightbeam.TestIsolation.cmd("git", ["branch", "-f", "tightbeam/live", "HEAD"], cd: dir)
 
     assert capture_log(fn -> assert :ok = AdminProjection.bootstrap_served(db, base) end) =~
              "broken"

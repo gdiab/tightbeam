@@ -117,7 +117,7 @@ defmodule Tightbeam.PackagingActivationTest do
     ]
 
     port =
-      Port.open(
+      Tightbeam.TestIsolation.port_open(
         {:spawn_executable, node},
         [
           :binary,
@@ -216,7 +216,10 @@ defmodule Tightbeam.PackagingActivationTest do
     archive = Path.join(parent, filename)
 
     {output, 0} =
-      System.cmd("tar", ["-czf", archive, "tightbeam"], cd: fixture_dir, stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("tar", ["-czf", archive, "tightbeam"],
+        cd: fixture_dir,
+        stderr_to_stdout: true
+      )
 
     assert output == ""
     sha256 = :crypto.hash(:sha256, File.read!(archive)) |> Base.encode16(case: :lower)
@@ -244,7 +247,8 @@ defmodule Tightbeam.PackagingActivationTest do
       System.find_executable("node") ||
         flunk("Node.js 20 or later is required for package staging")
 
-    {platform, 0} = System.cmd(node, ["-p", "process.platform + '-' + process.arch"])
+    {platform, 0} =
+      Tightbeam.TestIsolation.cmd(node, ["-p", "process.platform + '-' + process.arch"])
 
     case String.trim(platform) do
       "darwin-arm64" -> "darwin-aarch64"
@@ -254,7 +258,7 @@ defmodule Tightbeam.PackagingActivationTest do
   end
 
   defp stage(release, install_root) do
-    System.cmd(
+    Tightbeam.TestIsolation.cmd(
       System.find_executable("node") ||
         flunk("Node.js 20 or later is required for package staging"),
       [
@@ -279,7 +283,7 @@ defmodule Tightbeam.PackagingActivationTest do
   end
 
   defp select(install_root, build_id) do
-    System.cmd(
+    Tightbeam.TestIsolation.cmd(
       System.find_executable("node") ||
         flunk("Node.js 20 or later is required for package staging"),
       [@selector, "select", "--root", install_root, "--build", build_id],
@@ -320,7 +324,9 @@ defmodule Tightbeam.PackagingActivationTest do
   end
 
   defp kill_pid(kill, pid) do
-    {_output, _status} = System.cmd(kill, ["-KILL", to_string(pid)], stderr_to_stdout: true)
+    {_output, _status} =
+      Tightbeam.TestIsolation.cmd(kill, ["-KILL", to_string(pid)], stderr_to_stdout: true)
+
     :ok
   end
 end

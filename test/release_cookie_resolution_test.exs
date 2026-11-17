@@ -23,7 +23,7 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
       Path.join(System.tmp_dir!(), "tb-real-release-#{System.unique_integer([:positive])}")
 
     {out, status} =
-      System.cmd(mix, ["release", "--overwrite", "--path", release_dir],
+      Tightbeam.TestIsolation.cmd(mix, ["release", "--overwrite", "--path", release_dir],
         env: [{"MIX_ENV", "prod"}],
         stderr_to_stdout: true
       )
@@ -44,7 +44,7 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     expr = ~s{IO.puts("TBCOOKIE=" <> (System.get_env("RELEASE_COOKIE") || "nil"))}
 
     {out, status} =
-      System.cmd(launcher, ["eval", expr], env: env, stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(launcher, ["eval", expr], env: env, stderr_to_stdout: true)
 
     assert status == 0, out
     [cookie] = Regex.run(~r/^TBCOOKIE=(.*)$/m, out, capture: :all_but_first)

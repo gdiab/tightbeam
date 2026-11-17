@@ -88,7 +88,10 @@ defmodule Tightbeam.SentinelsTest do
 
       for bundle <- @bundles do
         path = "kungfu/#{bundle}/sentinels/watch"
-        {tree, 0} = System.cmd("git", ["-C", dir, "ls-tree", "tightbeam/live", "--", path])
+
+        {tree, 0} =
+          Tightbeam.TestIsolation.cmd("git", ["-C", dir, "ls-tree", "tightbeam/live", "--", path])
+
         assert tree =~ ~r/^100755 blob /
       end
 

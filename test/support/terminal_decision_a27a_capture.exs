@@ -326,7 +326,7 @@ defmodule Tightbeam.TerminalDecisionA27aCaptureTest do
     wrapper = Path.expand("capture_cli.sh", __DIR__)
 
     {status_text, 0} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         "/bin/sh",
         [wrapper, stdout_path, stderr_path, ctx.binary | args],
         cd: ctx.workdir
@@ -361,7 +361,7 @@ defmodule Tightbeam.TerminalDecisionA27aCaptureTest do
   defp route_inventory do
     router_path = Path.join(@repo_root, "lib/tightbeam/wire/router.ex")
     pattern = ~s(^[[:space:]]*get "/api/decision-requests)
-    {stdout, exit_status} = System.cmd("rg", ["-n", pattern, router_path])
+    {stdout, exit_status} = Tightbeam.TestIsolation.cmd("rg", ["-n", pattern, router_path])
 
     %{
       "command" => ~s(rg -n '#{pattern}' lib/tightbeam/wire/router.ex),
@@ -378,8 +378,8 @@ defmodule Tightbeam.TerminalDecisionA27aCaptureTest do
   end
 
   defp cli_identity(binary) do
-    {version, 0} = System.cmd(binary, ["version"])
-    {sha256, 0} = System.cmd("sha256sum", [binary])
+    {version, 0} = Tightbeam.TestIsolation.cmd(binary, ["version"])
+    {sha256, 0} = Tightbeam.TestIsolation.cmd("sha256sum", [binary])
 
     %{
       "path" => "cli/target/release/tightbeam",

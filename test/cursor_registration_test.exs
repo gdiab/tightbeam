@@ -106,7 +106,7 @@ defmodule Tightbeam.CursorRegistrationTest do
   test "the exact pinned vendor bundle recognizes memory and bypasses the login-Keychain selector" do
     launcher = System.find_executable("cursor-agent")
     assert is_binary(launcher), "the pinned Cursor acceptance fixture is not installed"
-    {canonical, 0} = System.cmd("realpath", [launcher])
+    {canonical, 0} = Tightbeam.TestIsolation.cmd("realpath", [launcher])
     canonical = String.trim(canonical)
     bundle_path = Path.join(Path.dirname(canonical), "index.js")
     bundle = File.read!(bundle_path)

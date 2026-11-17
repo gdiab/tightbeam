@@ -467,7 +467,7 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
     ]
 
     {output, exit} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         @release_binary,
         [
           "onboard",

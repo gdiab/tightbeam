@@ -238,7 +238,7 @@ defmodule Tightbeam.EphemeralTest do
     owner = self()
 
     sh = fn [command | args] ->
-      result = System.cmd(command, args, stderr_to_stdout: true)
+      result = Tightbeam.TestIsolation.cmd(command, args, stderr_to_stdout: true)
       if command == "rm", do: send(owner, {:directory_removed, List.last(args)})
       result
     end

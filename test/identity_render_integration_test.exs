@@ -87,7 +87,7 @@ defmodule Tightbeam.IdentityRenderIntegrationTest do
       {"GIT_COMMITTER_EMAIL", "test@tightbeam.invalid"}
     ]
 
-    case System.cmd("git", args, cd: dir, env: env, stderr_to_stdout: true) do
+    case Tightbeam.TestIsolation.cmd("git", args, cd: dir, env: env, stderr_to_stdout: true) do
       {output, 0} -> String.trim_trailing(output)
       {output, status} -> raise "git failed #{status}: #{output}"
     end

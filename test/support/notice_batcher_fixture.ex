@@ -30,7 +30,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
       Tightbeam.GuardRuntimeFixture.prepare!(tmp, "notice_batcher_runtime.exs")
 
     {output, status} =
-      System.cmd(executable, args ++ [Integer.to_string(scenario)],
+      Tightbeam.TestIsolation.cmd(executable, args ++ [Integer.to_string(scenario)],
         env: env,
         stderr_to_stdout: true
       )

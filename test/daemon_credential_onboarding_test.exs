@@ -126,7 +126,7 @@ defmodule Tightbeam.DaemonCredentialOnboardingTest do
     File.mkdir_p!(workdir)
 
     {output, exit} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         @release_binary,
         [
           "onboard",

@@ -449,7 +449,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
           send(parent, {:cleanup_command, executable, args, timeout})
           {"", 0}
         else
-          System.cmd(executable, args, stderr_to_stdout: true)
+          Tightbeam.TestIsolation.cmd(executable, args, stderr_to_stdout: true)
         end
       end
     )
@@ -2907,7 +2907,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   defp process_active?(pid) do
-    case System.cmd("ps", ["-o", "stat=", "-p", Integer.to_string(pid)], stderr_to_stdout: true) do
+    case Tightbeam.TestIsolation.cmd("ps", ["-o", "stat=", "-p", Integer.to_string(pid)], stderr_to_stdout: true) do
       {state, 0} -> not String.starts_with?(String.trim(state), "Z")
       _ -> false
     end

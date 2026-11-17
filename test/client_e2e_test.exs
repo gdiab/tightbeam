@@ -1165,7 +1165,7 @@ defmodule Tightbeam.ClientE2ETest do
       ready = Path.join(base_dir, "ready")
 
       port =
-        Port.open({:spawn_executable, System.find_executable("sh")}, [
+        Tightbeam.TestIsolation.port_open({:spawn_executable, System.find_executable("sh")}, [
           :binary,
           :exit_status,
           args: ["-c", "trap '' TERM; touch #{ready}; while true; do sleep 1; done"]
@@ -1188,7 +1188,9 @@ defmodule Tightbeam.ClientE2ETest do
 
       assert File.dir?(base_dir), "the base_dir must survive a gateway that is still running"
 
-      System.cmd("kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("kill", ["-KILL", Integer.to_string(os_pid)],
+        stderr_to_stdout: true
+      )
     end
 
     test "teardown reaps a GRANDCHILD that ignores SIGTERM" do
@@ -1243,7 +1245,9 @@ defmodule Tightbeam.ClientE2ETest do
 
       for f <- [grand_sh, mid_sh, top_sh], do: File.chmod!(f, 0o755)
 
-      port = Port.open({:spawn_executable, top_sh}, [:binary, :exit_status])
+      port =
+        Tightbeam.TestIsolation.port_open({:spawn_executable, top_sh}, [:binary, :exit_status])
+
       top = port |> Port.info(:os_pid) |> elem(1)
       wait_for_file(ready, 10_000)
       wait_for_file(mid_pid_file, 10_000)
@@ -1303,7 +1307,7 @@ defmodule Tightbeam.ClientE2ETest do
       ready = Path.join(base_dir, "ready")
 
       port =
-        Port.open({:spawn_executable, System.find_executable("sh")}, [
+        Tightbeam.TestIsolation.port_open({:spawn_executable, System.find_executable("sh")}, [
           :binary,
           :exit_status,
           args: ["-c", "touch #{ready}; while true; do sleep 1; done"]
@@ -1331,16 +1335,20 @@ defmodule Tightbeam.ClientE2ETest do
       assert LegGateway.teardown(gateway, exit_timeout_ms: 1_000, reap_timeout_ms: 1_000) == :ok
 
       assert {_, 0} =
-               System.cmd("kill", ["-0", Integer.to_string(bystander)], stderr_to_stdout: true),
+               Tightbeam.TestIsolation.cmd("kill", ["-0", Integer.to_string(bystander)],
+                 stderr_to_stdout: true
+               ),
              "the bystander holding a recycled pid must be left alone"
 
-      System.cmd("kill", ["-KILL", Integer.to_string(bystander)], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("kill", ["-KILL", Integer.to_string(bystander)],
+        stderr_to_stdout: true
+      )
     end
 
     test "reap_descendants leaves a pid alone once its command line has changed" do
       # The capture named a command that is not what this pid runs now.
       port =
-        Port.open({:spawn_executable, System.find_executable("sh")}, [
+        Tightbeam.TestIsolation.port_open({:spawn_executable, System.find_executable("sh")}, [
           :binary,
           :exit_status,
           args: ["-c", "while true; do sleep 1; done"]
@@ -1354,10 +1362,11 @@ defmodule Tightbeam.ClientE2ETest do
              ) ==
                :ok
 
-      assert {_, 0} = System.cmd("kill", ["-0", bystander], stderr_to_stdout: true),
+      assert {_, 0} =
+               Tightbeam.TestIsolation.cmd("kill", ["-0", bystander], stderr_to_stdout: true),
              "a pid whose identity no longer matches the capture must not be signalled"
 
-      System.cmd("kill", ["-KILL", bystander], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("kill", ["-KILL", bystander], stderr_to_stdout: true)
     end
 
     test "a clean stop removes the run-local base_dir and returns :ok" do
@@ -1529,7 +1538,10 @@ defmodule Tightbeam.ClientE2ETest do
       File.mkdir_p!(repo)
       on_exit(fn -> File.rm_rf!(repo) end)
 
-      git = fn args -> System.cmd("git", args, cd: repo, stderr_to_stdout: true) end
+      git = fn args ->
+        Tightbeam.TestIsolation.cmd("git", args, cd: repo, stderr_to_stdout: true)
+      end
+
       git.(["init", "-q", "-b", "main"])
       git.(["config", "user.email", "driver@example.test"])
       git.(["config", "user.name", "driver"])
@@ -1807,7 +1819,7 @@ defmodule Tightbeam.ClientE2ETest do
 
     poll = fn poll ->
       cond do
-        match?({_, 1}, System.cmd("kill", ["-0", pid], stderr_to_stdout: true)) ->
+        match?({_, 1}, Tightbeam.TestIsolation.cmd("kill", ["-0", pid], stderr_to_stdout: true)) ->
           :ok
 
         System.monotonic_time(:millisecond) >= deadline ->
