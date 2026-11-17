@@ -565,13 +565,13 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
     {:ok, [[token]]} = DB.query(ctx.db, "SELECT cliToken FROM sessions WHERE sessionKey='sub-a'")
 
-    File.write!(
+    Tightbeam.FixtureSession.write!(
       Path.join(ctx.root, ".tightbeam-session"),
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{port}",
         token: token,
         sessionKey: "sub-a"
-      })
+      }
     )
 
     env = [
@@ -582,7 +582,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     ]
 
     cli = fn args ->
-      {output, status} = Tightbeam.TestIsolation.cmd(binary, args, cd: ctx.root, env: env)
+      {output, status} = Tightbeam.FixtureSession.cmd(binary, args, cd: ctx.root, env: env)
       assert status == 0, output
       JSON.decode!(output)
     end
