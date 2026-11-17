@@ -201,14 +201,18 @@ jobs:
       - name: mix compile
         run: mix compile
 
-      - name: mix test
-        if: env.FULL_SUITE == 'true'
-        run: scripts/verify_mix.sh
-
-      - name: cargo test
+      # The test gate runs cargo offline inside the test sandbox (F1,
+      # wi_34a7be66), so every crate, dev-dependencies included, is fetched here.
+      - name: cargo fetch (suite prerequisite)
         if: env.FULL_SUITE == 'true'
         working-directory: cli
-        run: cargo test
+        run: cargo fetch
+
+      # mix test AND cargo test, both inside scripts/test_sandbox.sh: neither may
+      # run with the runner's real HOME, environment or PATH.
+      - name: mix test and cargo test
+        if: env.FULL_SUITE == 'true'
+        run: scripts/verify_mix.sh
 
   # THE DEPLOY ARTIFACT IS BUILT HERE, from the pushed SHA, by a machine nobody
   # develops or smoke-tests on. Building it from a dev tree conflates "what I
