@@ -89,16 +89,22 @@ defmodule Tightbeam.Harness.Pi do
       raise ArgumentError, "Pi isolation environment cannot be overridden"
     end
 
-    ssh =
-      if Support.local?(target) do
-        ensure_private_home!(target, private_home)
-        nil
-      else
-        {:ok, ssh} = absolute_executable(target, "ssh")
-        ensure_private_home!(target, private_home, ssh)
-        ssh
-      end
+    if Support.local?(target) do
+      ensure_private_home!(target, private_home)
+      launch_plan(target, home, opts, binary, private_home, nil)
+    else
+      case absolute_executable(target, "ssh") do
+        {:ok, ssh} ->
+          ensure_private_home!(target, private_home, ssh)
+          launch_plan(target, home, opts, binary, private_home, ssh)
 
+        :error ->
+          {:error, Support.ssh_not_found_refusal()}
+      end
+    end
+  end
+
+  defp launch_plan(target, home, opts, binary, private_home, ssh) do
     probe =
       if Keyword.fetch!(opts, :statutes) do
         probe_cwd = Path.join(target.host_config.base_dir, "work/gate-probe")

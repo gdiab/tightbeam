@@ -179,6 +179,39 @@ defmodule Tightbeam.HarnessPiTest do
     end
   end
 
+  test "remote launch refuses cleanly when the gateway PATH has no ssh" do
+    path = System.get_env("PATH")
+    on_exit(fn -> System.put_env("PATH", path) end)
+    System.put_env("PATH", tmp_dir!("pi-no-ssh-path"))
+    refusal = Tightbeam.Harness.Support.ssh_not_found_refusal()
+
+    for vector <- Pi.conformance_vectors()["prepare_launch"],
+        vector.input.locality == :remote do
+      assert vector.expected == {:error, refusal}
+
+      assert Tightbeam.Harness.Support.observe_vector(Pi, "prepare_launch", vector) ==
+               {:error, refusal}
+    end
+
+    owner = self()
+
+    target = %{
+      base_dir: "/fixture",
+      host_config: %{base_dir: "/fixture", ssh: "vector@remote"},
+      find_executable: fn _ -> nil end,
+      sh: fn command -> send(owner, {:ran, command}) && {"", 0} end
+    }
+
+    assert Pi.prepare_launch(target, "/owned",
+             common_env: [],
+             remote_env: [],
+             statutes: true,
+             lineage: "tb-vector"
+           ) == {:error, refusal}
+
+    refute_received {:ran, _}
+  end
+
   test "projected extension injects served identity and blocks compiled rails before execution" do
     root = tmp_dir!("pi-extension")
     identity = Path.join([root, ".pi", "skills", "tightbeam__served-identity", "SKILL.md"])
