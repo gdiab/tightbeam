@@ -24,6 +24,11 @@ defmodule Tightbeam.TestSandboxPreflight do
 
   @forbidden_tools ~w(gh ssh scp sftp op codex claude cursor-agent pi harklight-agent)
 
+  # The node name scripts/verify_mix.sh makes for its own run: a fixed prefix
+  # and mktemp's eight-character suffix. scripts/test_sandbox.sh refuses any
+  # other TIGHTBEAM_GATE_NODE with the same pattern.
+  @gate_node ~r/\Atightbeam_mix_gate_[A-Za-z0-9]{8}\z/
+
   # The launcher's ssh stand-in: something named ssh must resolve because the
   # product resolves it for remote launch vectors, and this one only refuses.
   # The exact bytes scripts/test_sandbox.sh writes; it refuses and exits 255
@@ -55,6 +60,9 @@ defmodule Tightbeam.TestSandboxPreflight do
   @doc "The allowed environment names, shared with Tightbeam.TestIsolation."
   def allowed_env, do: @allowed_env
 
+  @doc "The only TIGHTBEAM_GATE_NODE values a suite may carry."
+  def gate_node_pattern, do: @gate_node
+
   @doc "Tool names that must never resolve inside the sandbox."
   def forbidden_tools, do: @forbidden_tools
 
@@ -70,6 +78,7 @@ defmodule Tightbeam.TestSandboxPreflight do
     sandbox_problems(root, home) ++
       session_problems(repo, home) ++
       env_problems(env) ++
+      passthrough_problems(env) ++
       path_problems(repo, root, env["PATH"]) ++
       home_problems(home)
   end
@@ -211,6 +220,55 @@ defmodule Tightbeam.TestSandboxPreflight do
       [] -> []
       extra -> ["environment variables outside the allowlist: #{Enum.join(extra, ", ")}"]
     end
+  end
+
+  # b0's conditions on the launcher's named passthrough (asg_b30d5c78): the
+  # gateway port is pinned to 0 (OS-assigned), so no suite gateway takes a fixed
+  # or production port such as 11373; the gate node is one verify_mix.sh made
+  # for this run, never a live node's name, so the suite makes no distributed
+  # Erlang contact with a live node; the gate claim is the literal "1" beside
+  # such a node; the CI values have shapes that cannot carry a credential.
+  defp passthrough_problems(env) do
+    runner_temp = env["RUNNER_TEMP"]
+
+    [
+      if(env["TIGHTBEAM_PORT"] not in [nil, "0"],
+        do:
+          "TIGHTBEAM_PORT=#{env["TIGHTBEAM_PORT"]}: the sandbox pins the test gateway " <>
+            "port to 0 (OS-assigned)"
+      ),
+      if(env["TIGHTBEAM_GATE_NODE"] && not Regex.match?(@gate_node, env["TIGHTBEAM_GATE_NODE"]),
+        do:
+          "TIGHTBEAM_GATE_NODE=#{inspect(env["TIGHTBEAM_GATE_NODE"])} does not match " <>
+            "#{Regex.source(@gate_node)}, the node scripts/verify_mix.sh makes for its run"
+      ),
+      case {env["TIGHTBEAM_AUTHORITATIVE_GATE"], env["TIGHTBEAM_GATE_NODE"]} do
+        {nil, _node} ->
+          nil
+
+        {"1", node} when is_binary(node) ->
+          nil
+
+        {"1", nil} ->
+          "TIGHTBEAM_AUTHORITATIVE_GATE is set without TIGHTBEAM_GATE_NODE"
+
+        {other, _node} ->
+          "TIGHTBEAM_AUTHORITATIVE_GATE=#{inspect(other)} is not the gate claim \"1\""
+      end,
+      if(env["CANDIDATE_SHA"] && not Regex.match?(~r/\A[0-9a-f]{40}\z/, env["CANDIDATE_SHA"]),
+        do: "CANDIDATE_SHA is not a 40-character commit id"
+      ),
+      if(runner_temp && Path.type(runner_temp) != :absolute,
+        do: "RUNNER_TEMP is not an absolute path"
+      ),
+      if(
+        env["DD36_DARWIN_DIAGNOSTIC_DIR"] &&
+          not (is_binary(runner_temp) and
+                 inside?(env["DD36_DARWIN_DIAGNOSTIC_DIR"], runner_temp)),
+        do: "DD36_DARWIN_DIAGNOSTIC_DIR is not a directory under RUNNER_TEMP"
+      )
+    ]
+    |> Enum.reject(&is_nil/1)
   end
 
   @doc """

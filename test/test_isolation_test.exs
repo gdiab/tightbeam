@@ -394,6 +394,152 @@ defmodule Tightbeam.TestIsolationTest do
     assert {"fixture-gh\n", 0} = TestIsolation.cmd(fixture, [])
   end
 
+  describe "T12: the passthrough carries only b0's gate values (asg_b30d5c78)" do
+    # What a suite VM that got past its preflight does with these values: it
+    # connects to the gateway port it was configured with and joins its gate
+    # node. Each guarded child runs the preflight first and must be refused
+    # with no TCP accept and no node connection; the positive control runs the
+    # same contact without the preflight and must reach the test-owned decoys.
+    @contact_script ~S"""
+    [repo, guarded] = System.argv()
+    if guarded == "1", do: Tightbeam.TestSandboxPreflight.enforce!(repo)
+    port = String.to_integer(System.get_env("TIGHTBEAM_PORT", "0"))
+    if port != 0, do: :gen_tcp.connect({127, 0, 0, 1}, port, [], 2_000)
+
+    if gate = System.get_env("TIGHTBEAM_GATE_NODE") do
+      [_name, host] = node() |> Atom.to_string() |> String.split("@")
+      Node.connect(String.to_atom(gate <> "@" <> host))
+    end
+
+    IO.puts("CONTACT-DONE")
+    """
+
+    @decoy_node_script ~S"""
+    :ok = :net_kernel.monitor_nodes(true)
+    parent = self()
+    spawn(fn -> IO.read(:stdio, :eof); send(parent, :stop) end)
+    IO.puts("DECOY-READY")
+
+    loop = fn loop ->
+      receive do
+        {:nodeup, node} -> IO.puts("NODEUP #{node}"); loop.(loop)
+        {:nodedown, _node} -> loop.(loop)
+        :stop -> System.halt(0)
+      end
+    end
+
+    loop.(loop)
+    """
+
+    @cookie "f1-t12-decoy-cookie"
+
+    defp distributed_args(name),
+      do: ["--sname", "#{name}_#{System.unique_integer([:positive])}", "--cookie", @cookie]
+
+    # A test-owned BEAM node standing in for a live node; it reports each
+    # node that connects to it.
+    defp decoy_node! do
+      [_, sname, _, _] = args = distributed_args("f1_decoy")
+
+      port =
+        Tightbeam.TestIsolation.port_open(
+          {:spawn_executable, System.find_executable("elixir")},
+          [
+            :binary,
+            :exit_status,
+            {:line, 1024},
+            {:cd, scratch!("t12-decoy")},
+            {:env, [{~c"HOME", String.to_charlist(scratch!("t12-decoy-home"))}]},
+            {:args, args ++ ["-e", @decoy_node_script]}
+          ]
+        )
+
+      on_exit(fn -> if Port.info(port), do: Port.close(port) end)
+      assert_receive {^port, {:data, {:eol, "DECOY-READY"}}}, 30_000
+      %{port: port, name: sname}
+    end
+
+    defp contact_child(env, guarded) do
+      paths = Enum.flat_map(:code.get_path(), &["-pa", to_string(&1)])
+
+      TestIsolation.cmd(
+        System.find_executable("elixir"),
+        distributed_args("f1_probe") ++
+          paths ++ ["-e", @contact_script, TestIsolation.repo(), guarded],
+        cd: scratch!("t12"),
+        env: [{"HOME", scratch!("t12-home")} | env],
+        stderr_to_stdout: true
+      )
+    end
+
+    defp nodeups(decoy) do
+      receive do
+        {port, {:data, {:eol, "NODEUP " <> _}}} when port == decoy.port -> 1 + nodeups(decoy)
+      after
+        500 -> 0
+      end
+    end
+
+    test "a fixed or production TIGHTBEAM_PORT is refused, with no accept" do
+      decoy = decoy!()
+
+      for value <- ["11373", Integer.to_string(decoy.port)] do
+        {output, status} = contact_child([{"TIGHTBEAM_PORT", value}], "1")
+        assert status == 78, output
+        assert output =~ "TIGHTBEAM_PORT=#{value}"
+        refute output =~ "CONTACT-DONE"
+      end
+
+      Process.sleep(200)
+      assert accepts(decoy) == 0
+
+      {output, 0} = contact_child([{"TIGHTBEAM_PORT", Integer.to_string(decoy.port)}], "0")
+      assert output =~ "CONTACT-DONE"
+      assert accepts(decoy) >= 1, "positive control: the unguarded child must reach the decoy"
+    end
+
+    test "a foreign TIGHTBEAM_GATE_NODE is refused, with no node connection" do
+      decoy = decoy_node!()
+      gate = [{"TIGHTBEAM_AUTHORITATIVE_GATE", "1"}, {"TIGHTBEAM_GATE_NODE", decoy.name}]
+
+      {output, status} = contact_child(gate, "1")
+      assert status == 78, output
+      assert output =~ "TIGHTBEAM_GATE_NODE=#{inspect(decoy.name)} does not match"
+      assert nodeups(decoy) == 0
+
+      {output, 0} = contact_child(gate, "0")
+      assert output =~ "CONTACT-DONE"
+
+      assert nodeups(decoy) >= 1,
+             "positive control: the unguarded child must reach the decoy node"
+    end
+
+    test "the gate claim and CI values must have their fixed shapes" do
+      for {env, reason} <- [
+            {[{"TIGHTBEAM_AUTHORITATIVE_GATE", "yes"}], "is not the gate claim"},
+            {[{"TIGHTBEAM_AUTHORITATIVE_GATE", "1"}], "set without TIGHTBEAM_GATE_NODE"},
+            {[{"TIGHTBEAM_GATE_NODE", "tightbeam"}], "does not match"},
+            {[{"CANDIDATE_SHA", "ghp_not-a-commit"}], "not a 40-character commit id"},
+            {[{"RUNNER_TEMP", "relative/tmp"}], "RUNNER_TEMP is not an absolute path"},
+            {[{"RUNNER_TEMP", "/runner/tmp"}, {"DD36_DARWIN_DIAGNOSTIC_DIR", "/elsewhere"}],
+             "not a directory under RUNNER_TEMP"}
+          ] do
+        {output, 78} = preflight_child(scratch!("t12-shape"), env)
+        assert output =~ reason
+      end
+
+      gate = [
+        {"TIGHTBEAM_AUTHORITATIVE_GATE", "1"},
+        {"TIGHTBEAM_GATE_NODE", "tightbeam_mix_gate_AbCd1234"},
+        {"TIGHTBEAM_PORT", "0"},
+        {"CANDIDATE_SHA", String.duplicate("a", 40)}
+      ]
+
+      assert {output, 0} = preflight_child(scratch!("t12-shape"), gate)
+      assert output =~ "PREFLIGHT-PASSED"
+    end
+  end
+
   describe "T8 and T11: the launch lint fails closed" do
     test "T8: every launch form outside the helper is reported; the real tree is clean" do
       source = ~S"""
