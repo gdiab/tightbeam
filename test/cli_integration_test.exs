@@ -261,7 +261,9 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "retirement withdrawal crosses the CLI wire and requires a reason", ctx do
-    run = fn args -> Tightbeam.TestIsolation.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+    run = fn args ->
+      Tightbeam.TestIsolation.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+    end
 
     target =
       Org.create(ctx.db, %{
