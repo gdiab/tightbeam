@@ -145,8 +145,20 @@ for tool in bash erlc escript elixirc iex node python3 sqlite3 cargo rustc rustd
   tar gzip gunzip zcat mktemp mkfifo cmp diff od nohup timeout setsid flock \
   which hostname whoami sha256sum shasum md5sum file mount df du tty stty \
   getconf locale perl install patch curl jq rsync base64 unzip zip xxd nproc lsof getent \
-  iconv paste comm rev tac shuf truncate sync column nl fold xcrun; do
+  iconv paste comm rev tac shuf truncate sync column nl fold xcrun sandbox-exec; do
   [ -e "$root/bin/$tool" ] || link_tool "$tool"
+done
+
+# macOS: Apple's sqlite3 can refuse a closed Exqlite WAL database, so the
+# portable-schema fixture (test/support/guard_toplines_portable_runtime.exs)
+# runs Homebrew's standard sqlite3 by its keg path, in this order. Linking it
+# makes that path a toolbox tool's target, as the isolation helper requires of
+# any executable named by path.
+for keg in /opt/homebrew/opt/sqlite/bin/sqlite3 /usr/local/opt/sqlite/bin/sqlite3; do
+  if [ -x "$keg" ]; then
+    ln -s "$keg" "$root/bin/sqlite3-standard"
+    break
+  fi
 done
 
 # Tightbeam CLIs: only this repository's builds. The fixture harness CLI is the
