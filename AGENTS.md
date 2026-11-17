@@ -101,6 +101,9 @@ data shows whether the event path ever drops anything.
   fixture; prefer the bare name. A Rust test never strips the environment
   `test_isolation::command` set (`env_clear`, `env_remove("HOME"|"PATH")`).
   Allowlist entries name their reviewer and verdict, never "pending".
+- The sandbox pins `TIGHTBEAM_PORT=0` and passes `TIGHTBEAM_GATE_NODE` only as
+  the `tightbeam_mix_gate_` name `scripts/verify_mix.sh` makes for its run; the
+  launcher and the preflight refuse anything else (b0, asg_b30d5c78).
 - Make the requested change first, then run the focused checks that exercise it.
   Do not run a full-suite baseline before writing code; an untouched-tree replay
   delays the change without proving its result.
