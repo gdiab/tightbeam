@@ -2754,7 +2754,9 @@ defmodule Tightbeam.ConformanceTest do
       Tightbeam.TestIsolation.cmd("mix", ["test", dependency, "--trace"],
         cd: Path.expand("."),
         stderr_to_stdout: true,
-        env: [{"MIX_ENV", "test"}]
+        # A fresh sandbox HOME: the nested suite's own preflight refuses the
+        # parent's HOME once tests have written a .tightbeam there.
+        env: [{"MIX_ENV", "test"}, {"HOME", fresh_sandbox_home!()}]
       )
 
     assert status == 0, output
@@ -2834,5 +2836,11 @@ defmodule Tightbeam.ConformanceTest do
     after
       File.rm_rf!(root)
     end
+  end
+
+  defp fresh_sandbox_home! do
+    home = Path.join(System.tmp_dir!(), "nested-suite-home-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(home)
+    home
   end
 end

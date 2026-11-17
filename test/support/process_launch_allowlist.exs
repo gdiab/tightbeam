@@ -137,6 +137,22 @@ reviewer = "s_ccb14ac2 (F1 code review, pending)"
       "runs the CLI inside this test's fixture session tree only after checking the session file is inside the sandbox and names a loopback gateway, and after the isolation helper's env checks; every other launch delegates to Tightbeam.TestIsolation",
     reviewer: reviewer
   },
+  %{
+    file: "test/cli_integration_test.exs",
+    function: "defp session_port_open/2",
+    kind: "Port.open",
+    reason:
+      "the Port.open twin of session_cli/3 (session-connect streams lines): the same fixture-session, cwd and env checks before the launch",
+    reviewer: reviewer
+  },
+  %{
+    file: "test/cli_integration_test.exs",
+    function:
+      "test session-connect composes explicit organization identity with automatic session identity",
+    kind: "{:spawn_executable, _} port",
+    reason: "the spawn tuple this test hands to session_port_open/2, which runs the checks",
+    reviewer: reviewer
+  },
 
   # Scratch copies: the script runs from a copy the test made inside the sandbox.
   %{
