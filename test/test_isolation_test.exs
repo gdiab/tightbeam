@@ -158,7 +158,13 @@ defmodule Tightbeam.TestIsolationTest do
              TestSandboxPreflight.canonical(cli())
 
     for tool <- TestSandboxPreflight.forbidden_tools(),
+        tool != "ssh",
         do: assert(System.find_executable(tool) == nil, "#{tool} must not resolve")
+
+    # ssh resolves only to the launcher's tripwire, which refuses every use.
+    ssh = System.find_executable("ssh")
+    assert TestSandboxPreflight.ssh_tripwire?(ssh, TestIsolation.sandbox_root())
+    assert {_, 255} = TestIsolation.cmd(ssh, ["example.invalid"], stderr_to_stdout: true)
 
     {output, status} =
       TestIsolation.cmd("sh", ["-c", "tightbeam list --as-process f1-decoy"],
