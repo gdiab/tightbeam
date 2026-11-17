@@ -140,13 +140,16 @@ defmodule Tightbeam.TestIsolationTest do
       ~s({"port":#{decoy.port},"cliToken":"decoy-token"})
     )
 
+    # Without a session the CLI needs an explicit identity before discovery runs.
+    args = ["list", "--as-process", "f1-decoy"]
+
     {output, status} =
-      TestIsolation.cmd(cli(), ["list"], cd: scratch!("guarded-cwd"), stderr_to_stdout: true)
+      TestIsolation.cmd(cli(), args, cd: scratch!("guarded-cwd"), stderr_to_stdout: true)
 
     assert status != 0
     assert accepts(decoy) == 0, "the guarded child keeps the sandbox HOME: #{output}"
 
-    {output, _status} = raw_cli(["list"], scratch!("raw-cwd"), home)
+    {output, _status} = raw_cli(args, scratch!("raw-cwd"), home)
     assert accepts(decoy) >= 1, "positive control with the decoy HOME: #{output}"
   end
 
@@ -158,7 +161,7 @@ defmodule Tightbeam.TestIsolationTest do
         do: assert(System.find_executable(tool) == nil, "#{tool} must not resolve")
 
     {output, status} =
-      TestIsolation.cmd("sh", ["-c", "tightbeam list"],
+      TestIsolation.cmd("sh", ["-c", "tightbeam list --as-process f1-decoy"],
         cd: scratch!("t5"),
         stderr_to_stdout: true
       )
