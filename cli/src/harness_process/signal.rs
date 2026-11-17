@@ -147,13 +147,13 @@ mod tests {
     use super::*;
     use crate::process_tree::read_process;
     use std::os::unix::process::CommandExt;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
 
     struct OwnedChild(Child);
     impl OwnedChild {
         fn spawn() -> Self {
             Self(
-                Command::new("/bin/sleep")
+                crate::test_isolation::command("/bin/sleep")
                     .arg("30")
                     .process_group(0)
                     .stdin(Stdio::null())

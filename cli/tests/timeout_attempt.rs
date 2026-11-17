@@ -3,6 +3,9 @@
 //! test resolver until the client's own deadline has expired. These cases do
 //! not replace real gateway listener lifecycle/restart R9 evidence.
 
+#[path = "../src/test_isolation.rs"]
+mod test_isolation;
+
 use std::error::Error as _;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -348,18 +351,20 @@ impl CliRoot {
         } else {
             &[]
         };
-        std::process::Command::new(env!("CARGO_BIN_EXE_tightbeam"))
-            .arg(command)
-            .args(identity)
-            .env_clear()
-            .env("TIGHTBEAM_URL", format!("http://{addr}"))
-            .env("TIGHTBEAM_TOKEN", "synthetic-loopback-token")
-            .env("TIGHTBEAM_BASE_DIR", &self.0)
-            .current_dir(&self.0)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap()
+        test_isolation::command_in(
+            env!("CARGO_BIN_EXE_tightbeam"),
+            std::path::Path::new(&self.0),
+        )
+        .arg(command)
+        .args(identity)
+        .env_clear()
+        .env("TIGHTBEAM_URL", format!("http://{addr}"))
+        .env("TIGHTBEAM_TOKEN", "synthetic-loopback-token")
+        .env("TIGHTBEAM_BASE_DIR", &self.0)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
     }
 }
 

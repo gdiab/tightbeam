@@ -1,5 +1,11 @@
+# F1 (wi_34a7be66): this is the first executable code in the suite, before any
+# process launch or application start. It refuses unless scripts/test_sandbox.sh
+# built the sandbox this VM booted in, so no test can resolve a live gateway or a
+# real credential. There is deliberately no switch that skips it.
+Tightbeam.TestSandboxPreflight.enforce!(Path.expand("..", __DIR__))
+
 # An authoritative run must come through scripts/verify_mix.sh.  Focused developer
-# runs do not set this marker and remain ordinary `mix test test/file.exs` commands.
+# runs (scripts/test_sandbox.sh mix test test/file.exs) do not set this marker.
 # The wrapper names this VM through argv instead of an inherited Erlang flag, forces
 # OS-owned port allocation, and supplies the expected name so this seam can prove it
 # received the isolated invocation rather than merely trusting a marker.

@@ -1,8 +1,9 @@
-use std::process::Command;
+#[path = "../src/test_isolation.rs"]
+mod test_isolation;
 
 #[test]
 fn malformed_breathing_is_a_textual_exit_one_without_a_fake_json_answer() {
-    let output = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    let output = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args(["breathing", "turn", "tr_1", "--as-user", "owner"])
         .output()
         .expect("CLI starts");
