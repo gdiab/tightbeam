@@ -24,6 +24,16 @@ defmodule Tightbeam.TestSandboxPreflight do
 
   @forbidden_tools ~w(gh ssh scp sftp op codex claude cursor-agent pi harklight-agent)
 
+  # The launcher's ssh stand-in: something named ssh must resolve because the
+  # product resolves it for remote launch vectors, and this one only refuses.
+  @ssh_tripwire "tightbeam-test-sandbox ssh tripwire"
+
+  @doc "Whether `path` is the launcher's ssh tripwire inside the sandbox `root`."
+  def ssh_tripwire?(path, root) do
+    is_binary(root) and canonical(path) == canonical(Path.join(root, "bin/ssh")) and
+      File.read!(path) =~ @ssh_tripwire
+  end
+
   @doc "The allowed environment names, shared with Tightbeam.TestIsolation."
   def allowed_env, do: @allowed_env
 
@@ -50,6 +60,11 @@ defmodule Tightbeam.TestSandboxPreflight do
   def enforce!(repo) do
     case problems(repo) do
       [] ->
+        :persistent_term.put(
+          {__MODULE__, :sandbox_root},
+          System.get_env("TIGHTBEAM_TEST_SANDBOX")
+        )
+
         :ok
 
       problems ->
@@ -198,6 +213,7 @@ defmodule Tightbeam.TestSandboxPreflight do
     exposed =
       for tool <- @forbidden_tools,
           found = System.find_executable(tool),
+          not (tool == "ssh" and ssh_tripwire?(found, root)),
           do: "#{tool} resolves to #{found}"
 
     outside ++ tightbeam ++ exposed

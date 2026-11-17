@@ -128,6 +128,16 @@ reviewer = "s_ccb14ac2 (F1 code review, pending)"
     reviewer: reviewer
   },
 
+  # The CLI integration suite authenticates through its own fixture session.
+  %{
+    file: "test/cli_integration_test.exs",
+    function: "defp session_cli/3",
+    kind: "System.cmd",
+    reason:
+      "runs the CLI inside this test's fixture session tree only after checking the session file is inside the sandbox and names a loopback gateway, and after the isolation helper's env checks; every other launch delegates to Tightbeam.TestIsolation",
+    reviewer: reviewer
+  },
+
   # Scratch copies: the script runs from a copy the test made inside the sandbox.
   %{
     file: "test/harness_seam_test.exs",
