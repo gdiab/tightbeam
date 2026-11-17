@@ -316,7 +316,25 @@ defmodule Tightbeam.TestIsolationTest do
           {[{"TIGHTBEAM_URL", "http://10.1.2.3:9"}], "not a loopback address"},
           {[{"TIGHTBEAM_BASE_DIR", "/production/base"}], "outside the sandbox"},
           {[{"HOME", "/"}], "outside the sandbox"},
-          {[{"TIGHTBEAM_TOKEN", "t"}], "TIGHTBEAM_TOKEN is set without"}
+          {[{"TIGHTBEAM_TOKEN", "t"}], "TIGHTBEAM_TOKEN is set without"},
+          {[
+             {"GIT_CONFIG_COUNT", "1"},
+             {"GIT_CONFIG_KEY_0", "credential.helper"},
+             {"GIT_CONFIG_VALUE_0", "osxkeychain"}
+           ], "git config credential.helper"},
+          {[{"GIT_CONFIG_COUNT", "1"}, {"GIT_CONFIG_KEY_0", "http.extraHeader"}],
+           "git config http.extraHeader"},
+          {[{"GIT_CONFIG_COUNT", "1"}, {"GIT_CONFIG_KEY_0", "url.git@example.com:.insteadOf"}],
+           "insteadOf"},
+          {[{"GIT_CONFIG_COUNT", "1"}, {"GIT_CONFIG_KEY_0", "core.sshCommand"}],
+           "git config core.sshCommand"},
+          {[{"GIT_CONFIG_PARAMETERS", "'include.path=/etc/gitconfig'"}],
+           "git config include.path"},
+          {[{"GIT_ASKPASS", "/bin/echo"}], "GIT_ASKPASS=/bin/echo is not a fixture"},
+          {[{"SSH_ASKPASS", "/bin/echo"}], "SSH_ASKPASS=/bin/echo is not a fixture"},
+          {[{"GIT_SSH_COMMAND", "ssh -i key"}], "GIT_SSH_COMMAND=ssh -i key is not a fixture"},
+          {[{"GIT_CONFIG_NOSYSTEM", "0"}], "GIT_CONFIG_NOSYSTEM must stay 1"},
+          {[{"GIT_CONFIG_GLOBAL", "/etc/gitconfig"}], "GIT_CONFIG_GLOBAL=/etc/gitconfig"}
         ] do
       error =
         assert_raise TestIsolation.Refusal, fn -> TestIsolation.cmd("true", [], env: env) end
@@ -332,7 +350,11 @@ defmodule Tightbeam.TestIsolationTest do
                  {"TIGHTBEAM_BASE_DIR", fixture_base},
                  {"TIGHTBEAM_URL", "http://127.0.0.1:1"},
                  {"TIGHTBEAM_TOKEN", "fixture-token"},
-                 {"GH_FIXTURE_MODE", "synthetic"}
+                 {"GH_FIXTURE_MODE", "synthetic"},
+                 {"GIT_CONFIG_COUNT", "1"},
+                 {"GIT_CONFIG_KEY_0", "user.name"},
+                 {"GIT_CONFIG_VALUE_0", "fixture"},
+                 {"GIT_SSH_COMMAND", Path.join(fixture_base, "ssh-fixture")}
                ]
              )
   end
