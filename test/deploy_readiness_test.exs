@@ -133,7 +133,7 @@ defmodule Tightbeam.DeployReadinessTest do
     db = Path.join(dir, "state.db")
 
     {_, 0} =
-      System.cmd("sqlite3", [
+      Tightbeam.TestIsolation.cmd("sqlite3", [
         db,
         """
         CREATE TABLE turns(seq INTEGER, sessionKey TEXT, wakeId TEXT, messageId TEXT, status TEXT);
@@ -150,7 +150,7 @@ defmodule Tightbeam.DeployReadinessTest do
     assert [%{"replyId" => nil}] = Ready.observe!(db, "new-session", "new-wake")
 
     {_, 0} =
-      System.cmd("sqlite3", [
+      Tightbeam.TestIsolation.cmd("sqlite3", [
         db,
         "INSERT INTO messages VALUES('answer','new-session','prompt','assistant','DEPLOY READY test');"
       ])

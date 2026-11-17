@@ -91,13 +91,13 @@ defmodule Tightbeam.HarnessSeamTest do
     scan = Path.join(scan_root, "scripts/check_harness_seam.sh")
 
     assert {"", 0} =
-             System.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
+             Tightbeam.TestIsolation.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
 
     probe = Path.join(scan_root, "lib/tightbeam/harness_literal_probe.ex")
     File.write!(probe, ~s(defmodule Tightbeam.HarnessLiteralProbe, do: @value "CODEX_HOME"\n))
 
     assert {_output, 1} =
-             System.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
+             Tightbeam.TestIsolation.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
 
     File.rm!(probe)
 
@@ -113,13 +113,13 @@ defmodule Tightbeam.HarnessSeamTest do
     )
 
     assert {_output, 1} =
-             System.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
+             Tightbeam.TestIsolation.cmd(scan, [], cd: scan_root, stderr_to_stdout: true)
 
     File.rm!(probe)
 
     # grep, not rg: the test harness's System.cmd PATH carries no rg.
     {calls, 0} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         "grep",
         [
           "-RlE",
@@ -134,7 +134,7 @@ defmodule Tightbeam.HarnessSeamTest do
              ["lib/tightbeam/boot.ex", "lib/tightbeam/wire/router.ex"]
 
     assert {"", 1} =
-             System.cmd(
+             Tightbeam.TestIsolation.cmd(
                "grep",
                [
                  "-RnE",

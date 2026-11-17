@@ -312,7 +312,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
 
     Application.put_env(:tightbeam, :commit_ref_command, fn executable, args, opts ->
       send(parent, {:git_ran, executable, args, opts})
-      System.cmd(executable, args, opts)
+      Tightbeam.TestIsolation.cmd(executable, args, opts)
     end)
 
     assert %{code: "unknown_assignment"} = correct(ctx, {:session, "po-other"})
@@ -373,7 +373,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
 
     Application.put_env(:tightbeam, :commit_ref_command, fn executable, args, opts ->
       send(parent, {:git_ran, executable, args, opts})
-      System.cmd(executable, args, opts)
+      Tightbeam.TestIsolation.cmd(executable, args, opts)
     end)
 
     open = with_param(ctx, :assignment_id, "asg_open")
@@ -734,12 +734,12 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
   end
 
   defp git!(cwd, args) do
-    {_output, 0} = System.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
+    {_output, 0} = Tightbeam.TestIsolation.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
     :ok
   end
 
   defp git_output!(cwd, args) do
-    {output, 0} = System.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
     String.trim(output)
   end
 

@@ -151,7 +151,7 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
     assert {:error, _} = settle(ctx, row)
     refute File.exists?(row.identity_path)
     [exe | args] = options[:cmd]
-    assert {_, 0} = System.cmd(exe, args)
+    assert {_, 0} = Tightbeam.TestIsolation.cmd(exe, args)
     assert {:ok, %{proof: :process_group_absent}} = settle(ctx, row)
   end
 
@@ -376,7 +376,7 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
     File.write!(row.identity_path, "")
 
     unrelated =
-      Port.open({:spawn_executable, ~c"/bin/sh"}, [
+      Tightbeam.TestIsolation.port_open({:spawn_executable, ~c"/bin/sh"}, [
         :binary,
         :exit_status,
         {:args, ["-c", "read value", row.launch_id]}

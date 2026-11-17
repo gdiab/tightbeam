@@ -582,7 +582,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     ]
 
     cli = fn args ->
-      {output, status} = System.cmd(binary, args, cd: ctx.root, env: env)
+      {output, status} = Tightbeam.TestIsolation.cmd(binary, args, cd: ctx.root, env: env)
       assert status == 0, output
       JSON.decode!(output)
     end
@@ -671,7 +671,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     ])
 
     {legacy_output, legacy_status} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         binary,
         [
           "condition",
@@ -695,7 +695,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     matrix = Path.expand("../priv/kungfu/sentinels/sentinels/matrix", __DIR__)
 
     {output, code} =
-      System.cmd("python3", [matrix],
+      Tightbeam.TestIsolation.cmd("python3", [matrix],
         cd: Path.dirname(ctx.root),
         env: producer_env,
         stderr_to_stdout: true
@@ -718,7 +718,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
     landing = Path.expand("../priv/kungfu/agentic-engineering/sentinels/landing-watch", __DIR__)
 
     {output, code} =
-      System.cmd("python3", [landing, "--once"],
+      Tightbeam.TestIsolation.cmd("python3", [landing, "--once"],
         cd: Path.dirname(ctx.root),
         env: producer_env,
         stderr_to_stdout: true
@@ -874,7 +874,7 @@ defmodule Tightbeam.SentinelSubscriptionsTest do
 
   defp identity_refs!(identity_dir) do
     Enum.map(["main", "tightbeam/live", "tightbeam/upstream"], fn ref ->
-      {revision, 0} = System.cmd("git", ["-C", identity_dir, "rev-parse", ref])
+      {revision, 0} = Tightbeam.TestIsolation.cmd("git", ["-C", identity_dir, "rev-parse", ref])
       {ref, String.trim(revision)}
     end)
   end

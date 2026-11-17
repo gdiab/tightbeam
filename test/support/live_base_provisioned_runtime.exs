@@ -114,7 +114,7 @@ try do
   {:ok, {{_, 200, _}, _, _}} = :httpc.request(~c"http://127.0.0.1:#{port}/version")
 
   {output, 0} =
-    System.cmd(cli, ["add-user", "synthetic-admin", "--admin"],
+    Tightbeam.TestIsolation.cmd(cli, ["add-user", "synthetic-admin", "--admin"],
       env: [{"TIGHTBEAM_BASE_DIR", base}],
       stderr_to_stdout: true
     )

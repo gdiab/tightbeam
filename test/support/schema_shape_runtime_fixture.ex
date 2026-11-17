@@ -173,7 +173,9 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
     try do
       {output, status} =
-        System.cmd(prepared.executable, prepared.args ++ [proof, JSON.encode!(opts)],
+        Tightbeam.TestIsolation.cmd(
+          prepared.executable,
+          prepared.args ++ [proof, JSON.encode!(opts)],
           env: prepared.env,
           stderr_to_stdout: true
         )

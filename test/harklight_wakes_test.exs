@@ -222,7 +222,7 @@ defmodule Tightbeam.HarklightWakesTest do
       File.rm_rf!(root)
     end)
 
-    runner = fn args -> System.cmd(executable, args, stderr_to_stdout: true) end
+    runner = fn args -> Tightbeam.TestIsolation.cmd(executable, args, stderr_to_stdout: true) end
     legacy = start_supervised!({HarklightWakes, db: db, send_runner: runner})
     assert eventually(fn -> File.exists?(pid_file) end)
     origin = start_supervised!({Tightbeam.HarklightOriginListener, db: db, runner: runner})
@@ -258,7 +258,7 @@ defmodule Tightbeam.HarklightWakesTest do
     retained = Path.join(root, "retained")
     pipe = Path.join(root, "origin-pipe")
     starts = Path.join(root, "origin-starts")
-    assert {_, 0} = System.cmd("mkfifo", [pipe])
+    assert {_, 0} = Tightbeam.TestIsolation.cmd("mkfifo", [pipe])
     # The saved position is retained; only the aggregate process offers these
     # unacted entries after the legacy child has actually exited.
     assert {:ok, _} = DB.query(db, "UPDATE harklight_wake_handles SET lastCursor=5")
@@ -315,7 +315,7 @@ defmodule Tightbeam.HarklightWakesTest do
       File.rm_rf!(root)
     end)
 
-    runner = fn args -> System.cmd(executable, args, stderr_to_stdout: true) end
+    runner = fn args -> Tightbeam.TestIsolation.cmd(executable, args, stderr_to_stdout: true) end
     legacy = start_supervised!({HarklightWakes, db: db, send_runner: runner})
     assert eventually(fn -> File.exists?(pid_file) end)
     origin = start_supervised!({Tightbeam.HarklightOriginListener, db: db, runner: runner})
@@ -2212,12 +2212,16 @@ defmodule Tightbeam.HarklightWakesTest do
     assert calls =~ listen_call
 
     assert {_, 0} =
-             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+             Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(pid)],
+               stderr_to_stdout: true
+             )
 
     :ok = stop_supervised(HarklightWakes)
 
     assert {_, status} =
-             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+             Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(pid)],
+               stderr_to_stdout: true
+             )
 
     assert status != 0
     start_supervised!({HarklightWakes, db: db})
@@ -6190,7 +6194,7 @@ defmodule Tightbeam.HarklightWakesTest do
     assert eventually(fn ->
              match?(
                {_, status} when status != 0,
-               System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
+               Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
              )
            end)
 

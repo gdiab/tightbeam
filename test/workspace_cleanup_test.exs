@@ -489,7 +489,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
     assert Enum.any?(blockers, &(&1.reason == "archive_move_failed"))
     pid = File.read!(pid_file) |> String.trim()
-    assert {_, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
+    assert {_, status} = Tightbeam.TestIsolation.cmd("kill", ["-0", pid], stderr_to_stdout: true)
     assert status != 0
     assert File.read!(kept) == "preserve"
   end

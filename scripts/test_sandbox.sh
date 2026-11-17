@@ -154,7 +154,7 @@ for tool in bash erlc escript elixirc iex node python3 sqlite3 cargo rustc rustd
   printf echo test expr seq true false sleep kill ps pgrep pkill id uname date \
   tar gzip gunzip zcat mktemp mkfifo cmp diff od nohup timeout setsid flock \
   which hostname whoami sha256sum shasum md5sum file mount df du tty stty \
-  getconf locale perl install patch; do
+  getconf locale perl install patch curl; do
   [ -e "$root/bin/$tool" ] || link_tool "$tool"
 done
 

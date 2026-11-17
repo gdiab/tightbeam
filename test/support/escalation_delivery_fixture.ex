@@ -1125,7 +1125,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
       Tightbeam.GuardRuntimeFixture.prepare!(tmp, "escalation_delivery_runtime.exs")
 
     {output, status} =
-      System.cmd(executable, args,
+      Tightbeam.TestIsolation.cmd(executable, args,
         env: [{"DD36_SCENARIO", Integer.to_string(scenario)} | env],
         stderr_to_stdout: true
       )

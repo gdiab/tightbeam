@@ -27,7 +27,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
   # suite. The subprocess below finds the build current and only boots.
   setup_all do
     {out, status} =
-      System.cmd(System.find_executable("mix") || "mix", ["compile"],
+      Tightbeam.TestIsolation.cmd(System.find_executable("mix") || "mix", ["compile"],
         cd: File.cwd!(),
         env: [{"MIX_ENV", "prod"}],
         stderr_to_stdout: true
@@ -83,7 +83,9 @@ defmodule Tightbeam.ApplicationRefusalTest do
 
   defp boot_with(env, path, tmp) do
     {output, status} =
-      System.cmd(System.find_executable("elixir"), ["-S", "mix", "run", "--no-halt"],
+      Tightbeam.TestIsolation.cmd(
+        System.find_executable("elixir"),
+        ["-S", "mix", "run", "--no-halt"],
         cd: File.cwd!(),
         stderr_to_stdout: true,
         env:

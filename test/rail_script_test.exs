@@ -12,7 +12,11 @@ defmodule Tightbeam.RailScriptTest do
   # a cargo-less environment leaves whatever exists and the compile-time guard skips.
   setup_all do
     if File.exists?(@release_binary) do
-      _ = System.cmd("cargo", ["build", "--release"], cd: @cli_dir, stderr_to_stdout: true)
+      _ =
+        Tightbeam.TestIsolation.cmd("cargo", ["build", "--release"],
+          cd: @cli_dir,
+          stderr_to_stdout: true
+        )
     end
 
     :ok
@@ -47,7 +51,7 @@ defmodule Tightbeam.RailScriptTest do
       assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_master WHERE name='assignments'")
     end
 
-    {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
+    {tmp, 0} = Tightbeam.TestIsolation.cmd("/bin/realpath", [System.tmp_dir!()])
 
     base_dir =
       Path.join(String.trim(tmp), "tightbeam-rail-script-#{System.unique_integer([:positive])}")
@@ -1662,7 +1666,7 @@ defmodule Tightbeam.RailScriptTest do
 
       wait_for_exit = fn wait ->
         alive? = fn ->
-          {out, 0} = System.cmd("ps", ["-eo", "command="])
+          {out, 0} = Tightbeam.TestIsolation.cmd("ps", ["-eo", "command="])
           String.contains?(out, Path.join(ctx.base_dir, "identity/rails/scripts"))
         end
 

@@ -52,10 +52,13 @@ defmodule Tightbeam.LiveBasePayloadTest do
           elif mode == "ancestor": add("tightbeam/safe/child")
       """
 
-      assert {_, 0} = System.cmd("python3", ["-c", script, archive, unquote(mode)])
+      assert {_, 0} =
+               Tightbeam.TestIsolation.cmd("python3", ["-c", script, archive, unquote(mode)])
 
       assert {output, status} =
-               System.cmd("python3", ["packaging/extract-payload.py", archive, destination],
+               Tightbeam.TestIsolation.run_script!(
+                 "packaging/extract-payload.py",
+                 [archive, destination],
                  stderr_to_stdout: true
                )
 
@@ -111,10 +114,15 @@ defmodule Tightbeam.LiveBasePayloadTest do
         else: []
 
     assert {_, 0} =
-             System.cmd("tar", metadata_flags ++ ["-czf", archive, "-C", tmp, "tightbeam"])
+             Tightbeam.TestIsolation.cmd(
+               "tar",
+               metadata_flags ++ ["-czf", archive, "-C", tmp, "tightbeam"]
+             )
 
     assert {output, 0} =
-             System.cmd("sh", ["packaging/verify-payload.sh", archive], stderr_to_stdout: true)
+             Tightbeam.TestIsolation.run_script!("packaging/verify-payload.sh", [archive],
+               stderr_to_stdout: true
+             )
 
     assert String.trim(output) == identity
 
@@ -124,7 +132,7 @@ defmodule Tightbeam.LiveBasePayloadTest do
     File.ln_s!(scratch, alias_scratch)
 
     assert {alias_output, 0} =
-             System.cmd("sh", ["packaging/verify-payload.sh", archive],
+             Tightbeam.TestIsolation.run_script!("packaging/verify-payload.sh", [archive],
                env: [{"TMPDIR", alias_scratch}],
                stderr_to_stdout: true
              )

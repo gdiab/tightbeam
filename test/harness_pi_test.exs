@@ -120,7 +120,7 @@ defmodule Tightbeam.HarnessPiTest do
     # The launcher reports realpaths; macOS resolves the temp dir's /var through
     # /private, so expectations are built from the resolved root.
     {root, 0} =
-      System.cmd("node", [
+      Tightbeam.TestIsolation.cmd("node", [
         "-e",
         "process.stdout.write(require('fs').realpathSync(process.argv[1]))",
         tmp_dir!("pi-isolation")
@@ -165,7 +165,7 @@ defmodule Tightbeam.HarnessPiTest do
     env = [{"PI_CODING_AGENT_DIR", home}, {"PATH", bin <> ":" <> System.fetch_env!("PATH")}]
 
     run = fn ->
-      System.cmd("node", [launcher, "--mode", "rpc", "--no-themes"],
+      Tightbeam.TestIsolation.cmd("node", [launcher, "--mode", "rpc", "--no-themes"],
         cd: cwd,
         env: env,
         stderr_to_stdout: true
@@ -260,7 +260,7 @@ defmodule Tightbeam.HarnessPiTest do
       """
     )
 
-    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("node", [runner], cd: root, stderr_to_stdout: true)
     decoded = JSON.decode!(output)
 
     assert decoded["identity"]["systemPrompt"] == "BASE\n\nSERVED IDENTITY FIXTURE"
@@ -463,7 +463,7 @@ defmodule Tightbeam.HarnessPiTest do
       """
     )
 
-    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("node", [runner], cd: root, stderr_to_stdout: true)
     JSON.decode!(output)
   end
 
@@ -481,7 +481,7 @@ defmodule Tightbeam.HarnessPiTest do
       """
     )
 
-    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("node", [runner], cd: root, stderr_to_stdout: true)
     JSON.decode!(output)
   end
 

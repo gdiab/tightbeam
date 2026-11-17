@@ -253,7 +253,7 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
       "printf '%s' #{Tightbeam.Harness.Support.shell_quote(input)} | #{handler["command"]}"
 
     {output, 0} =
-      System.cmd("/bin/sh", ["-c", command], env: [{"TIGHTBEAM_HOME", base}])
+      Tightbeam.TestIsolation.cmd("/bin/sh", ["-c", command], env: [{"TIGHTBEAM_HOME", base}])
 
     JSON.decode!(output)
   end

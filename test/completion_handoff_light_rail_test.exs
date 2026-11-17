@@ -1293,10 +1293,10 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       "Current {child_session_state}; activity {your_last_activity}; finished {child_finished}"
     )
 
-    {_, 0} = System.cmd("git", ["add", "-A"], cd: dir)
+    {_, 0} = Tightbeam.TestIsolation.cmd("git", ["add", "-A"], cd: dir)
 
     {_, 0} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         "git",
         [
           "-c",
@@ -1310,7 +1310,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
         cd: dir
       )
 
-    {revision, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: dir)
+    {revision, 0} = Tightbeam.TestIsolation.cmd("git", ["rev-parse", "HEAD"], cd: dir)
 
     {:ok, _} =
       Identity.publish_live!(ctx.base, %{

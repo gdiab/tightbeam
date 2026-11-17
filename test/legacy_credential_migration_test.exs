@@ -487,7 +487,7 @@ defmodule Tightbeam.LegacyCredentialMigrationTest do
 
   defp run_local_ssh(command) do
     script = command |> Enum.drop(6) |> Enum.join(" ")
-    System.cmd("sh", ["-c", script], stderr_to_stdout: true)
+    Tightbeam.TestIsolation.cmd("sh", ["-c", script], stderr_to_stdout: true)
   end
 
   defp run_local_ssh_with_interleaved_write(command) do
@@ -501,6 +501,6 @@ defmodule Tightbeam.LegacyCredentialMigrationTest do
           "if ln \"$stage/credential\" \"$entry\" >/dev/null 2>&1; then"
       )
 
-    System.cmd("sh", ["-c", interleaved], stderr_to_stdout: true)
+    Tightbeam.TestIsolation.cmd("sh", ["-c", interleaved], stderr_to_stdout: true)
   end
 end

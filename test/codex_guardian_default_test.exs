@@ -117,7 +117,7 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
     command
     |> Enum.drop(6)
     |> Enum.join(" ")
-    |> then(&System.cmd("sh", ["-c", &1], stderr_to_stdout: true))
+    |> then(&Tightbeam.TestIsolation.cmd("sh", ["-c", &1], stderr_to_stdout: true))
   end
 
   defp run_remote_fixture(["rsync" | _] = command) do
@@ -126,7 +126,10 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
 
     if String.ends_with?(List.last(command), "/") do
       File.mkdir_p!(destination)
-      System.cmd("cp", ["-a", source <> "/.", destination], stderr_to_stdout: true)
+
+      Tightbeam.TestIsolation.cmd("cp", ["-a", source <> "/.", destination],
+        stderr_to_stdout: true
+      )
     else
       File.mkdir_p!(Path.dirname(destination))
       File.cp!(source, destination)
@@ -138,7 +141,7 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
     script = command |> Enum.drop(6) |> Enum.join(" ")
     path = shim_dir <> ":" <> System.fetch_env!("PATH")
 
-    System.cmd("sh", ["-c", script],
+    Tightbeam.TestIsolation.cmd("sh", ["-c", script],
       stderr_to_stdout: true,
       env: [{"PATH", path}]
     )

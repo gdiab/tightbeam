@@ -27,7 +27,7 @@ defmodule Tightbeam.RecoveryFixtureContractTest do
 
     for placeholder <- fixture.placeholders do
       assert {"recovery arena: non-fixture adapter invocation forbidden\n", 64} =
-               System.cmd(placeholder.binary, [], stderr_to_stdout: true)
+               Tightbeam.TestIsolation.cmd(placeholder.binary, [], stderr_to_stdout: true)
     end
 
     refute File.exists?(Path.join(arena, "auth/claude"))
