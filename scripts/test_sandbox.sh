@@ -49,30 +49,11 @@ case "$cwd" in
   *) refuse "run from inside the repository ($repo), not $cwd" ;;
 esac
 
-# A test may itself run this launcher (scripts/verify_mix.sh under test). That
-# nested run gets its own sandbox but must not touch the outer run's <repo>/tmp.
-nested=""
-outer=${TIGHTBEAM_TEST_SANDBOX:-}
-if [ -n "$outer" ] && [ -f "$outer/.tightbeam-test-sandbox" ]; then
-  nested=1
-fi
-
-# ExUnit's tmp_dir is <repo>/tmp. It must resolve inside the sandbox, so a test's
-# tmp dir is under the sandbox root like every other place a child may run.
-if [ -z "$nested" ]; then
-  if [ -L "$repo/tmp" ]; then
-    rm -f -- "$repo/tmp"
-  elif [ -e "$repo/tmp" ]; then
-    refuse "$repo/tmp is a real directory from an unsandboxed run; remove it and retry"
-  fi
-fi
-
-root=$(mktemp -d /tmp/tightbeam-test-sandbox.XXXXXXXX)
+# The caller's TMPDIR (macOS: /var/folders/..., where a new directory keeps its
+# setgid bit) or /tmp; either way the ancestry check below must pass.
+root=$(mktemp -d "${TMPDIR:-/tmp}/tightbeam-test-sandbox.XXXXXXXX")
 root=$(CDPATH= cd -- "$root" && pwd -P)
 cleanup() {
-  if [ -z "$nested" ] && [ -L "$repo/tmp" ]; then
-    rm -f -- "$repo/tmp"
-  fi
   rm -rf -- "$root"
 }
 trap cleanup EXIT HUP INT TERM
@@ -83,9 +64,7 @@ fi
 
 : >"$root/.tightbeam-test-sandbox"
 mkdir -p "$root/home" "$root/xdg/config" "$root/xdg/data" "$root/xdg/state" \
-  "$root/xdg/cache" "$root/bin" "$root/tmp" "$root/exunit-tmp" "$root/mix" \
-  "$root/hex" "$root/cargo"
-[ -n "$nested" ] || ln -s "$root/exunit-tmp" "$repo/tmp"
+  "$root/xdg/cache" "$root/bin" "$root/tmp" "$root/mix" "$root/hex" "$root/cargo"
 
 # Toolbox: each entry is a real install, never a mise or rustup shim (a shim
 # needs the real HOME to dispatch). Resolution happens here, before the swap.
@@ -179,6 +158,17 @@ ln -s "$repo/cli/target/release/tightbeam" "$root/bin/tightbeam"
 for forbidden in gh ssh scp sftp op codex claude cursor-agent pi harklight-agent; do
   [ ! -e "$root/bin/$forbidden" ] || refuse "toolbox would expose $forbidden"
 done
+
+# The product resolves an ssh executable when it prepares remote harness launch
+# vectors, so something named ssh must resolve. This one is a tripwire: it
+# never connects anywhere and can read no key (the HOME is empty).
+cat >"$root/bin/ssh" <<'TRIPWIRE'
+#!/bin/sh
+# tightbeam-test-sandbox ssh tripwire (wi_34a7be66)
+echo "ssh: tripwire in the Tightbeam test sandbox; no remote access" >&2
+exit 255
+TRIPWIRE
+chmod 755 "$root/bin/ssh"
 
 cat >"$root/gitconfig" <<'GITCONFIG'
 [user]

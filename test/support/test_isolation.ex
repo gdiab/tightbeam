@@ -34,13 +34,24 @@ defmodule Tightbeam.TestIsolation do
   @doc "The repository root."
   def repo, do: @repo
 
-  @doc "The sandbox root this VM booted in."
+  @doc """
+  The sandbox root this VM booted in: recorded by the preflight, else the
+  environment marker, else (a child whose environment library code scrubbed)
+  the parent of a HOME that carries the sandbox marker.
+  """
   def sandbox_root do
-    case System.get_env("TIGHTBEAM_TEST_SANDBOX") do
-      root when is_binary(root) and root != "" -> root
-      _ -> refuse!("TIGHTBEAM_TEST_SANDBOX is not set; tests run only inside the sandbox")
-    end
+    recorded = :persistent_term.get({Preflight, :sandbox_root}, nil)
+    from_env = System.get_env("TIGHTBEAM_TEST_SANDBOX")
+    from_home = System.get_env("HOME") && Path.dirname(System.get_env("HOME"))
+
+    Enum.find([recorded, from_env, from_home], fn root ->
+      is_binary(root) and root != "" and File.regular?(Path.join(root, ".tightbeam-test-sandbox"))
+    end) ||
+      refuse!("no test sandbox found; tests run only inside scripts/test_sandbox.sh")
   end
+
+  @doc "ExUnit's tmp root (<repo>/tmp): test-owned scratch, checked per call."
+  def test_tmp, do: Path.join(@repo, "tmp")
 
   @doc "The sandbox toolbox directory (real tools, no harness or credential tools)."
   def toolbox, do: Path.join(sandbox_root(), "bin")
@@ -177,7 +188,7 @@ defmodule Tightbeam.TestIsolation do
   end
 
   defp check_var("TIGHTBEAM_" <> _ = key, value, _env, _inherited?) do
-    if path_valued?(value), do: sandbox_path(key, value), else: []
+    if path_valued?(value), do: sandbox_or_test_tmp_path(key, value), else: []
   end
 
   defp check_var(key, value, _env, true = _inherited?) do
@@ -202,6 +213,9 @@ defmodule Tightbeam.TestIsolation do
       is_nil(found) ->
         []
 
+      inside?(Preflight.canonical(found), test_tmp()) ->
+        []
+
       Preflight.canonical(found) ==
           Preflight.canonical(Path.join(@repo, "cli/target/release/tightbeam")) ->
         []
@@ -220,7 +234,15 @@ defmodule Tightbeam.TestIsolation do
     real == Preflight.canonical(toolbox()) or
       real == Preflight.canonical(Path.join(@repo, "cli/target/release")) or
       real in Enum.map(Preflight.vm_bin_dirs(), &Preflight.canonical/1) or
-      inside?(real, sandbox_root())
+      inside?(real, sandbox_root()) or inside?(real, test_tmp())
+  end
+
+  defp sandbox_or_test_tmp_path(key, value) do
+    real = Preflight.canonical(Path.expand(value))
+
+    if inside?(real, sandbox_root()) or inside?(real, test_tmp()),
+      do: [],
+      else: ["#{key}=#{value} is outside the sandbox and the test tmp root"]
   end
 
   defp sandbox_path(key, value) do
@@ -239,9 +261,12 @@ defmodule Tightbeam.TestIsolation do
   end
 
   defp test_endpoint?(env) do
+    base = env["TIGHTBEAM_BASE_DIR"]
+
     (is_binary(env["TIGHTBEAM_URL"]) and loopback?(env["TIGHTBEAM_URL"])) or
-      (is_binary(env["TIGHTBEAM_BASE_DIR"]) and
-         inside?(Preflight.canonical(env["TIGHTBEAM_BASE_DIR"]), sandbox_root()))
+      (is_binary(base) and
+         (inside?(Preflight.canonical(base), sandbox_root()) or
+            inside?(Preflight.canonical(base), test_tmp())))
   end
 
   # "Unless test-scoped": a value that is a path inside the sandbox, a name that
@@ -251,7 +276,9 @@ defmodule Tightbeam.TestIsolation do
 
     String.contains?(upper, ["FIXTURE", "SYNTHETIC"]) or
       String.starts_with?(upper, ["GIT_AUTHOR_", "GIT_COMMITTER_"]) or
-      (path_valued?(value) and inside?(Preflight.canonical(Path.expand(value)), sandbox_root()))
+      (path_valued?(value) and
+         (inside?(Preflight.canonical(Path.expand(value)), sandbox_root()) or
+            inside?(Preflight.canonical(Path.expand(value)), test_tmp())))
   end
 
   defp credential_name?(key) do
