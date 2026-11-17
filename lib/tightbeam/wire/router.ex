@@ -329,6 +329,10 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  get "/agent/credential-health" do
+    Tightbeam.CredentialHealth.handle(conn, deps(conn))
+  end
+
   post "/agent/session-diagnose" do
     Tightbeam.SessionDiagnose.handle(conn, deps(conn))
   end
