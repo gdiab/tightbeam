@@ -88,7 +88,10 @@ defmodule Tightbeam.SentinelsTest do
 
       for bundle <- @bundles do
         path = "kungfu/#{bundle}/sentinels/watch"
-        {tree, 0} = System.cmd("git", ["-C", dir, "ls-tree", "tightbeam/live", "--", path])
+
+        {tree, 0} =
+          Tightbeam.TestIsolation.cmd("git", ["-C", dir, "ls-tree", "tightbeam/live", "--", path])
+
         assert tree =~ ~r/^100755 blob /
       end
 
@@ -305,7 +308,7 @@ defmodule Tightbeam.SentinelsTest do
 
       identity_dir = Path.join(ctx.base, "identity")
       File.write!(Path.join(identity_dir, role_guidance), "Organization's local guidance.\n")
-      {_, 0} = System.cmd("git", ["add", "--", role_guidance], cd: identity_dir)
+      {_, 0} = Tightbeam.TestIsolation.cmd("git", ["add", "--", role_guidance], cd: identity_dir)
 
       resolved =
         handlers["identity-relearn"].(%{

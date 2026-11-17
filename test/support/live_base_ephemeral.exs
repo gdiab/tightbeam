@@ -59,10 +59,10 @@ defmodule EphemeralRuntime do
             10_000 -> :ok
           end
 
-          System.cmd(command, args, stderr_to_stdout: true)
+          Tightbeam.TestIsolation.cmd(command, args, stderr_to_stdout: true)
           {"cleanup transport failed", 1}
         else
-          System.cmd(command, args, stderr_to_stdout: true)
+          Tightbeam.TestIsolation.cmd(command, args, stderr_to_stdout: true)
         end
       end
 

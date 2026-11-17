@@ -13,7 +13,7 @@ defmodule Tightbeam.CompletionHandoffRestartTest do
 
     for phase <- ~w(deliver restart) do
       {output, status} =
-        System.cmd(fixture.executable, fixture.args ++ [phase],
+        Tightbeam.TestIsolation.cmd(fixture.executable, fixture.args ++ [phase],
           env: fixture.env,
           stderr_to_stdout: true
         )

@@ -4231,7 +4231,7 @@ defmodule Tightbeam.HarnessHealthTest do
     script = RecoveryCheck.binary_selection_program(harness)
 
     {output, 0} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         node,
         ["-e", script, adapter_root, harness, pin],
         env: [{"PATH", path}],
@@ -4283,7 +4283,7 @@ defmodule Tightbeam.HarnessHealthTest do
     )
 
     File.write!(Path.join(sdk, "index.js"), "")
-    {runtime, 0} = System.cmd(node, ["-p", "process.platform + ' ' + process.arch"])
+    {runtime, 0} = Tightbeam.TestIsolation.cmd(node, ["-p", "process.platform + ' ' + process.arch"])
     [platform, arch] = String.split(String.trim(runtime))
 
     packages =

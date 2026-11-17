@@ -2230,7 +2230,7 @@ defmodule Tightbeam.ModelCatalogTest do
       sh = fn [command | args] = argv ->
         send(parent, {:probe, argv})
 
-        System.cmd(command, args,
+        Tightbeam.TestIsolation.cmd(command, args,
           env: [
             {"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")},
             {"CATALOG_BODY", body_path}
@@ -2276,7 +2276,7 @@ defmodule Tightbeam.ModelCatalogTest do
       File.chmod!(non_executable, 0o644)
 
       sh = fn [command | args] ->
-        System.cmd(command, args,
+        Tightbeam.TestIsolation.cmd(command, args,
           env: [{"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")}]
         )
       end

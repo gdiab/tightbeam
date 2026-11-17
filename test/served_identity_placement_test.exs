@@ -225,6 +225,6 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     command
     |> Enum.drop(6)
     |> Enum.join(" ")
-    |> then(&System.cmd("sh", ["-c", &1], stderr_to_stdout: true))
+    |> then(&Tightbeam.TestIsolation.cmd("sh", ["-c", &1], stderr_to_stdout: true))
   end
 end

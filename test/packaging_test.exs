@@ -1,10 +1,6 @@
 defmodule Tightbeam.PackagingTest do
   use ExUnit.Case, async: true
 
-  @smoke Path.expand("../packaging/version-smoke.sh", __DIR__)
-  @purity Path.expand("../packaging/purity-check.sh", __DIR__)
-  @finalize Path.expand("../packaging/finalize-artifact.sh", __DIR__)
-
   @repo_root Path.expand("..", __DIR__)
   @importer Path.join(@repo_root, "lib/tightbeam/credentials.ex")
   @runtime Path.join(@repo_root, "config/runtime.exs")
@@ -73,7 +69,10 @@ defmodule Tightbeam.PackagingTest do
   test "the extracted artifact refuses a stale gateway version" do
     artifact = artifact_fixture("0.1.6", "0.1.5")
 
-    {output, status} = System.cmd("sh", [@smoke, artifact, "0.1.6"], stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.run_script!("packaging/version-smoke.sh", [artifact, "0.1.6"],
+        stderr_to_stdout: true
+      )
 
     assert status == 1
     assert output =~ "gateway version 0.1.5 does not match package version 0.1.6"
@@ -82,7 +81,10 @@ defmodule Tightbeam.PackagingTest do
   test "the extracted artifact proves matching CLI and gateway versions" do
     artifact = artifact_fixture("0.1.6", "0.1.6")
 
-    {output, status} = System.cmd("sh", [@smoke, artifact, "0.1.6"], stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.run_script!("packaging/version-smoke.sh", [artifact, "0.1.6"],
+        stderr_to_stdout: true
+      )
 
     assert status == 0
     assert output =~ "version smoke: manifest=0.1.6 cli=0.1.6 gateway=0.1.6"
@@ -94,7 +96,11 @@ defmodule Tightbeam.PackagingTest do
     final = temporary <> ".final.tgz"
 
     {output, status} =
-      System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.run_script!(
+        "packaging/finalize-artifact.sh",
+        [temporary, final, "0.1.6"],
+        stderr_to_stdout: true
+      )
 
     assert status == 1
     assert output =~ "gateway version 0.1.5 does not match package version 0.1.6"
@@ -104,7 +110,10 @@ defmodule Tightbeam.PackagingTest do
   test "the extracted artifact refuses a wrong manifest version" do
     artifact = artifact_fixture("0.1.6", "0.1.6", "0.1.5")
 
-    {output, status} = System.cmd("sh", [@smoke, artifact, "0.1.6"], stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.run_script!("packaging/version-smoke.sh", [artifact, "0.1.6"],
+        stderr_to_stdout: true
+      )
 
     assert status == 1
     assert output =~ "manifest version 0.1.5 does not match package version 0.1.6"
@@ -113,7 +122,10 @@ defmodule Tightbeam.PackagingTest do
   test "the extracted artifact refuses a missing manifest" do
     artifact = artifact_fixture("0.1.6", "0.1.6", nil)
 
-    {output, status} = System.cmd("sh", [@smoke, artifact, "0.1.6"], stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.run_script!("packaging/version-smoke.sh", [artifact, "0.1.6"],
+        stderr_to_stdout: true
+      )
 
     assert status == 1
     assert output =~ "extracted artifact has no package.json"
@@ -122,7 +134,10 @@ defmodule Tightbeam.PackagingTest do
   test "package purity accepts an archive with only product entries" do
     artifact = artifact_fixture("0.1.6", "0.1.6")
 
-    {output, status} = System.cmd("sh", [@purity, artifact], stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.run_script!("packaging/purity-check.sh", [artifact],
+        stderr_to_stdout: true
+      )
 
     assert status == 0
     assert output =~ "package purity: clean"
@@ -131,7 +146,10 @@ defmodule Tightbeam.PackagingTest do
   test "package purity refuses an AppleDouble sidecar" do
     artifact = artifact_fixture("0.1.6", "0.1.6", "0.1.6", apple_double: true)
 
-    {output, status} = System.cmd("sh", [@purity, artifact], stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.run_script!("packaging/purity-check.sh", [artifact],
+        stderr_to_stdout: true
+      )
 
     assert status == 1
     assert output =~ "forbidden AppleDouble entry: tightbeam/._package.json"
@@ -148,7 +166,10 @@ defmodule Tightbeam.PackagingTest do
       header = unquote(header)
       poison_pax_header!(artifact, header)
 
-      {output, status} = System.cmd("sh", [@purity, artifact], stderr_to_stdout: true)
+      {output, status} =
+        Tightbeam.TestIsolation.run_script!("packaging/purity-check.sh", [artifact],
+          stderr_to_stdout: true
+        )
 
       assert status == 1
       assert output =~ "forbidden archive metadata header #{header}"
@@ -162,7 +183,11 @@ defmodule Tightbeam.PackagingTest do
     final = temporary <> ".final.tgz"
 
     {output, status} =
-      System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.run_script!(
+        "packaging/finalize-artifact.sh",
+        [temporary, final, "0.1.6"],
+        stderr_to_stdout: true
+      )
 
     assert status == 1
     assert output =~ "forbidden archive metadata header SCHILY.fflags"
@@ -176,7 +201,11 @@ defmodule Tightbeam.PackagingTest do
     final = temporary <> ".final.tgz"
 
     {output, status} =
-      System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.run_script!(
+        "packaging/finalize-artifact.sh",
+        [temporary, final, "0.1.6"],
+        stderr_to_stdout: true
+      )
 
     assert status == 0, output
     assert output =~ "version smoke: manifest=0.1.6 cli=0.1.6 gateway=0.1.6"
@@ -232,7 +261,9 @@ defmodule Tightbeam.PackagingTest do
     """
 
     {_, 0} =
-      System.cmd("python3", ["-c", script, artifact, package], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("python3", ["-c", script, artifact, package],
+        stderr_to_stdout: true
+      )
 
     on_exit(fn -> File.rm_rf!(root) end)
     artifact
@@ -265,7 +296,9 @@ defmodule Tightbeam.PackagingTest do
     """
 
     {_, 0} =
-      System.cmd("python3", ["-c", script, artifact, header], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("python3", ["-c", script, artifact, header],
+        stderr_to_stdout: true
+      )
 
     :ok
   end

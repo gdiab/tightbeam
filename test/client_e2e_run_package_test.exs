@@ -241,7 +241,7 @@ defmodule Tightbeam.ClientE2E.RunPackageTest do
   end
 
   defp git!(repo, args) do
-    {output, status} = System.cmd("git", args, cd: repo, stderr_to_stdout: true)
+    {output, status} = Tightbeam.TestIsolation.cmd("git", args, cd: repo, stderr_to_stdout: true)
     assert status == 0, output
   end
 end

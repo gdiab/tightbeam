@@ -182,7 +182,8 @@ defmodule Tightbeam.TestSandboxPreflight do
       end
 
     exposed =
-      for tool <- @forbidden_tools, found = System.find_executable(tool),
+      for tool <- @forbidden_tools,
+          found = System.find_executable(tool),
           do: "#{tool} resolves to #{found}"
 
     outside ++ tightbeam ++ exposed

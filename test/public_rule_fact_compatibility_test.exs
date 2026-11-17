@@ -2,7 +2,6 @@ defmodule Tightbeam.PublicRuleFactCompatibilityTest do
   use ExUnit.Case, async: true
 
   @root Path.expand("..", __DIR__)
-  @verifier Path.join(@root, "scripts/verify_public_rule_facts.py")
   @baseline "6c13efcbe9e1ae247b8aa7e91a374015c74dc947"
   @source "lib/tightbeam/rules.ex"
 
@@ -45,7 +44,10 @@ defmodule Tightbeam.PublicRuleFactCompatibilityTest do
     git!(repo, ["commit", "-m", "drop side-branch public fact at merge"])
 
     {output, status} =
-      System.cmd("python3", [@verifier], cd: repo, stderr_to_stdout: true)
+      Tightbeam.TestIsolation.run_script!("scripts/verify_public_rule_facts.py", [],
+        cd: repo,
+        stderr_to_stdout: true
+      )
 
     assert status == 1
     assert output =~ "public rule facts cannot be removed"
@@ -54,7 +56,7 @@ defmodule Tightbeam.PublicRuleFactCompatibilityTest do
 
   defp git!(repo, args) do
     {output, status} =
-      System.cmd("git", ["-C", repo | args], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("git", ["-C", repo | args], stderr_to_stdout: true)
 
     assert status == 0, "git #{Enum.join(args, " ")} failed:\n#{output}"
     String.trim(output)

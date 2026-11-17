@@ -199,7 +199,7 @@ defmodule Tightbeam.RemindersTest do
 
   defp git(dir, args) do
     {out, 0} =
-      System.cmd("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid" | args],
+      Tightbeam.TestIsolation.cmd("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid" | args],
         cd: dir,
         stderr_to_stdout: true
       )

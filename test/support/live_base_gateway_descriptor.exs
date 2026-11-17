@@ -47,7 +47,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{config: config, base: base} ->
     Gateway.children(config)
 
     {out, status} =
-      System.cmd(shim, ["rpc", "Foo.bar()"],
+      Tightbeam.TestIsolation.cmd(shim, ["rpc", "Foo.bar()"],
         env: [
           {"TIGHTBEAM_BASE_DIR", base},
           {"RELEASE_NODE", "tightbeam_gateway_11373"},

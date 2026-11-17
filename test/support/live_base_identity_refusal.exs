@@ -22,7 +22,7 @@ projection = File.read!(Path.join(base, "harnesses.json"))
 :ok = GenServer.stop(seed)
 
 {_, 0} =
-  System.cmd("git", ["update-ref", "-d", "refs/heads/tightbeam/live"],
+  Tightbeam.TestIsolation.cmd("git", ["update-ref", "-d", "refs/heads/tightbeam/live"],
     cd: Path.join(base, "identity")
   )
 
