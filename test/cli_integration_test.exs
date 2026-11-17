@@ -262,7 +262,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "retirement withdrawal crosses the CLI wire and requires a reason", ctx do
     run = fn args ->
-      Tightbeam.TestIsolation.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      session_cli(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
     end
 
     target =
