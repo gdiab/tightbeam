@@ -135,10 +135,12 @@ link_tool() {
   path=$(resolve "$1")
   if [ -n "$path" ]; then
     case "$1" in
-      # OTP's and Elixir's launch scripts find their install from their own
+      # OTP's and Elixir's shell launchers find their install from their own
       # path ($0) without following symlinks (setup-beam's macOS erl falls back
-      # to its build prefix), so these get an exec wrapper, not a symlink.
-      erl | erlc | escript | elixir | elixirc | iex | mix)
+      # to its build prefix), so these get an exec wrapper, not a symlink. mix
+      # stays a symlink: `elixir -S mix` evaluates the file found on PATH as
+      # Elixir source.
+      erl | erlc | escript | elixir | elixirc | iex)
         printf '#!/bin/sh\nexec "%s" "$@"\n' "$path" >"$root/bin/$1"
         chmod 755 "$root/bin/$1"
         ;;
@@ -164,7 +166,7 @@ for tool in bash erlc escript elixirc iex node python3 sqlite3 cargo rustc rustd
   tar gzip gunzip zcat mktemp mkfifo cmp diff od nohup timeout setsid flock \
   which hostname whoami sha256sum shasum md5sum file mount df du tty stty \
   getconf locale perl install patch curl jq rsync base64 unzip zip xxd nproc lsof getent \
-  iconv paste comm rev tac shuf truncate sync column nl fold; do
+  iconv paste comm rev tac shuf truncate sync column nl fold xcrun; do
   [ -e "$root/bin/$tool" ] || link_tool "$tool"
 done
 
