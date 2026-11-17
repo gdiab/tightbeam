@@ -618,7 +618,7 @@ defmodule Tightbeam.IdentityTest do
     alias Tightbeam.{DB, Gateway, Rails, RailScript, Schema}
 
     # Rail containment requires canonical write roots, including macOS /var aliases.
-    {root, 0} = Tightbeam.TestIsolation.cmd("/bin/realpath", [ctx.root])
+    {root, 0} = Tightbeam.TestIsolation.cmd("realpath", [ctx.root])
     ctx = %{ctx | base: Path.join(String.trim(root), "runtime")}
 
     for path <- ["rails/scripts", "rules"], do: File.mkdir_p!(Path.join(ctx.source, path))

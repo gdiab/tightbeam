@@ -7,7 +7,8 @@
 # runs at compile time (that can never be listed). Even a listed launch runs in
 # a VM that the preflight proved is inside the sandbox: empty HOME, allowlisted
 # environment, toolbox PATH, no .tightbeam-session above it.
-reviewer = "s_ccb14ac2 (F1 code review, pending)"
+reviewer =
+  "s_ccb14ac2 (F1 code review asg_fcccc59a, verdict att_b15f3a6f-6bec-4793-945e-54a7f2347ab0)"
 
 [
   # Operator scripts the suite loads into its VM. They also run standalone, where

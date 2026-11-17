@@ -357,7 +357,6 @@ impl CliRoot {
         )
         .arg(command)
         .args(identity)
-        .env_clear()
         .env("TIGHTBEAM_URL", format!("http://{addr}"))
         .env("TIGHTBEAM_TOKEN", "synthetic-loopback-token")
         .env("TIGHTBEAM_BASE_DIR", &self.0)

@@ -19,6 +19,8 @@ defmodule Tightbeam.TestIsolation do
   #          endpoint. Variables a test inherited through System.put_env that
   #          look like credentials are refused; values a call declares in env:
   #          are the test's own synthetic fixtures.
+  #   exe  - a bare name resolves through that checked PATH; a name containing
+  #          "/" bypasses PATH, so it is vetted itself (reviewer finding B1).
 
   alias Tightbeam.TestSandboxPreflight, as: Preflight
 
@@ -65,6 +67,7 @@ defmodule Tightbeam.TestIsolation do
   @doc "Drop-in for System.cmd/3 that refuses an unsafe launch."
   def cmd(command, args, opts \\ []) do
     cwd = cwd!(Keyword.get(opts, :cd))
+    executable!(command, cwd)
     declared = Keyword.get(opts, :env, [])
     check_env!(declared)
 
@@ -79,6 +82,7 @@ defmodule Tightbeam.TestIsolation do
   @doc "Drop-in for Port.open/2 that refuses an unsafe launch."
   def port_open(name, opts) do
     cwd = cwd!(port_cd(opts))
+    port_executable!(name, cwd)
 
     declared =
       for {key, value} <- Keyword.get(opts, :env, []),
@@ -145,6 +149,82 @@ defmodule Tightbeam.TestIsolation do
   def env!(declared \\ []) do
     check_env!(declared)
     effective_env(declared)
+  end
+
+  @doc """
+  Raise unless `executable` may be launched from `cwd`. A bare name resolves
+  through the child's PATH, which check_env!/1 vets. A name containing "/" is
+  resolved as the OS would (against the VM's cwd, and the child's cwd for a
+  port) and its realpath must be a toolbox tool's own target, or lie in the
+  repository (cli/target included), the VM's OTP bin dirs, the sandbox or the
+  test tmp root. A forbidden tool's name is refused wherever it lies, except
+  the launcher's ssh tripwire or a test's scratch fixture.
+  """
+  def executable!(executable, cwd) do
+    name = to_string(executable)
+
+    if String.contains?(name, "/") do
+      for base <- Enum.uniq([File.cwd!(), cwd]) do
+        path = Path.expand(name, base)
+        real = Preflight.canonical(path)
+
+        forbidden =
+          Enum.find(
+            [Path.basename(path), Path.basename(real)],
+            &(&1 in Preflight.forbidden_tools())
+          )
+
+        cond do
+          forbidden && not acceptable_stand_in?(forbidden, path) ->
+            refuse!("refusing to launch #{name}: #{forbidden} is a forbidden tool")
+
+          not allowed_executable?(real) ->
+            refuse!(
+              "refusing to launch #{name}: #{real} is not a toolbox tool, a repository " <>
+                "file, an OTP launcher or a sandbox fixture"
+            )
+
+          true ->
+            :ok
+        end
+      end
+    end
+
+    :ok
+  end
+
+  @doc "executable!/2 for the program a Port.open/2 name would start."
+  def port_executable!(name, cwd) do
+    case name do
+      {:spawn_executable, executable} -> executable!(executable, cwd)
+      {:spawn, command} -> command |> to_string() |> String.split() |> hd() |> executable!(cwd)
+      _ -> :ok
+    end
+  end
+
+  defp allowed_executable?(real) do
+    MapSet.member?(toolbox_targets(), real) or inside?(real, @repo) or
+      Enum.any?(Preflight.vm_bin_dirs(), &inside?(real, &1)) or scratch?(real)
+  end
+
+  # What each toolbox entry resolves to. The launcher builds the toolbox before
+  # the VM boots and nothing changes it, so this is read once per VM.
+  defp toolbox_targets do
+    key = {__MODULE__, :toolbox_targets, toolbox()}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        targets =
+          toolbox()
+          |> File.ls!()
+          |> MapSet.new(&Preflight.canonical(Path.join(toolbox(), &1)))
+
+        :persistent_term.put(key, targets)
+        targets
+
+      targets ->
+        targets
+    end
   end
 
   @doc "Raise unless `path` is an acceptable child cwd; return its realpath."

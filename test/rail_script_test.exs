@@ -51,7 +51,7 @@ defmodule Tightbeam.RailScriptTest do
       assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_master WHERE name='assignments'")
     end
 
-    {tmp, 0} = Tightbeam.TestIsolation.cmd("/bin/realpath", [System.tmp_dir!()])
+    {tmp, 0} = Tightbeam.TestIsolation.cmd("realpath", [System.tmp_dir!()])
 
     base_dir =
       Path.join(String.trim(tmp), "tightbeam-rail-script-#{System.unique_integer([:positive])}")
