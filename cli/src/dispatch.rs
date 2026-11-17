@@ -2102,7 +2102,32 @@ pub fn discover() -> Result<Endpoint, String> {
     #[allow(deprecated)]
     let home = std::env::home_dir().unwrap_or_default();
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    discover_with(|name| std::env::var(name).ok(), &cwd, &home)
+    let (endpoint, overridden) =
+        discover_with_override(|name| std::env::var(name).ok(), &cwd, &home)?;
+    if let Some(overridden) = overridden {
+        record_override(overridden);
+    }
+    Ok(endpoint)
+}
+
+/// The endpoint for a command that acts as the session itself (no `--as`,
+/// `--as-user` or `--as-process`). With nothing explicit and no session file this is
+/// today's identity refusal, never a fall-through to `gateway.json`; an explicit
+/// source that overrode a session file is refused in words that say so (F2-4).
+fn discover_session_identity() -> Result<Endpoint, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    match resolve_explicit_or_session(&|name| std::env::var(name).ok(), &cwd)? {
+        Resolution::Found(endpoint, overridden) => {
+            if let Some(overridden) = overridden {
+                record_override(overridden);
+            }
+            if endpoint.session_file().is_none() {
+                return Err(identity_required_after(&cwd, recorded_override()));
+            }
+            Ok(endpoint)
+        }
+        Resolution::Fallthrough => Err(identity_required(&cwd)),
+    }
 }
 
 pub fn discover_from(base_dir: &Path) -> Result<Endpoint, String> {
@@ -2120,59 +2145,221 @@ where
     crate::base_dir::resolve_with(get_env, home_dir).join("gateway.json")
 }
 
+#[cfg(test)]
 fn discover_with<F>(get_env: F, cwd: &Path, home_dir: &Path) -> Result<Endpoint, String>
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(endpoint) = discover_session_from(cwd)? {
-        return Ok(endpoint);
-    }
+    discover_with_override(get_env, cwd, home_dir).map(|(endpoint, _)| endpoint)
+}
 
+/// Discovery order (F2-1, wi_34a7be66): what the caller set explicitly wins over an
+/// ambient session file in a parent folder, which used to capture fixture and test
+/// runs and send them to the live gateway with the session's credential.
+///
+///   1. `TIGHTBEAM_URL` + `TIGHTBEAM_TOKEN`, both non-empty (`Named`);
+///   2. `$TIGHTBEAM_BASE_DIR/gateway.json`, the variable non-empty (`Provisioned`);
+///   2a. with a session file present, an incomplete explicit endpoint is refused;
+///   3. the nearest `.tightbeam-session` walking up from `cwd` (`Session`);
+///   4. `$TIGHTBEAM_HOME/gateway.json`, else `~/.tightbeam/gateway.json`.
+///
+/// An explicit source never falls back: its own error is the result. A pair equal
+/// to the session file's own pair keeps the session, and anything that overrode a
+/// session file is returned so the caller can say so once (F2-2).
+fn discover_with_override<F>(
+    get_env: F,
+    cwd: &Path,
+    home_dir: &Path,
+) -> Result<(Endpoint, Option<Overridden>), String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match resolve_explicit_or_session(&get_env, cwd)? {
+        Resolution::Found(endpoint, overridden) => Ok((endpoint, overridden)),
+        Resolution::Fallthrough => {
+            let path = gateway_config_path(&get_env, home_dir);
+            endpoint_from_gateway_file(&path).map(|endpoint| (endpoint, None))
+        }
+    }
+}
+
+/// Sources 1 to 3 of F2-1; `Fallthrough` leaves source 4 to the caller.
+enum Resolution {
+    Found(Endpoint, Option<Overridden>),
+    Fallthrough,
+}
+
+fn resolve_explicit_or_session<F>(get_env: &F, cwd: &Path) -> Result<Resolution, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let raw_token = get_env("TIGHTBEAM_TOKEN");
+    let raw_base = get_env("TIGHTBEAM_BASE_DIR");
     let url = get_env("TIGHTBEAM_URL").filter(|value| !value.is_empty());
-    let token = get_env("TIGHTBEAM_TOKEN").filter(|value| !value.is_empty());
-    if let (Some(base), Some(token)) = (url, token) {
-        return Ok(Endpoint {
+    let token = raw_token.clone().filter(|value| !value.is_empty());
+    let session = nearest_session_file(cwd);
+
+    // 1. The explicit endpoint.
+    if let (Some(base), Some(token)) = (url.clone(), token.clone()) {
+        let named = Endpoint {
             base,
             token,
             origin: Origin::Named,
+        };
+        let Some(path) = session else {
+            return Ok(Resolution::Found(named, None));
+        };
+        return Ok(match read_session_file(&path) {
+            Ok(session) if same_url(&session.base, &named.base) && session.token == named.token => {
+                Resolution::Found(session, None)
+            }
+            read => Resolution::Found(
+                named,
+                Some(Overridden {
+                    source: ExplicitSource::Endpoint,
+                    session: path,
+                    unreadable: read.is_err(),
+                }),
+            ),
         });
     }
 
-    let path = gateway_config_path(&get_env, home_dir);
-    endpoint_from_gateway_file(&path)
-}
-
-fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
-    for directory in cwd.ancestors() {
-        let path = directory.join(".tightbeam-session");
-        if !path.exists() {
-            continue;
-        }
-
-        let encoded = fs::read_to_string(&path)
-            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
-        let config: Value = serde_json::from_str(&encoded)
-            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
-        let base = config
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("malformed session file '{}': missing url", path.display()))?;
-        let token = config
-            .get("token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("malformed session file '{}': missing token", path.display()))?;
-        return Ok(Some(Endpoint {
-            // A satellite's session file carries the gateway's ADVERTISED (websocket)
-            // url; this base roots an HTTP `/agent/dispatch`. Same normalization the
-            // gateway.json reader applies (815d27e) -- the two readers of one url must
-            // agree, and this one was missed.
-            base: http_scheme(base),
-            token: token.to_owned(),
-            origin: Origin::Session(path),
-        }));
+    // 2. The explicit base. Its own error is the result: no fallback.
+    if let Some(base) = raw_base.as_deref().filter(|value| !value.is_empty()) {
+        let endpoint = endpoint_from_gateway_file(&Path::new(base).join("gateway.json"))?;
+        let overridden = session.map(|path| Overridden {
+            source: ExplicitSource::BaseDir,
+            unreadable: read_session_file(&path).is_err(),
+            session: path,
+        });
+        return Ok(Resolution::Found(endpoint, overridden));
     }
 
-    Ok(None)
+    let Some(path) = session else {
+        return Ok(Resolution::Fallthrough);
+    };
+
+    // 2a. An incomplete explicit endpoint would otherwise be captured by the session
+    // file: refuse it before any request, naming variables only.
+    // A lone URL equal to the session file's (what remote agents carry) is not
+    // explicit, so (ii) needs the session's URL to decide.
+    if raw_token.is_some() && url.is_none() {
+        return Err(INCOMPLETE_TOKEN_WITHOUT_URL.to_owned());
+    }
+    if let Some(url) = &url {
+        if !same_url(&read_session_file(&path)?.base, url) {
+            return Err(INCOMPLETE_URL_WITHOUT_TOKEN.to_owned());
+        }
+    }
+    if raw_base.as_deref() == Some("") {
+        return Err(INCOMPLETE_EMPTY_BASE_DIR.to_owned());
+    }
+
+    // 3. The ambient session file.
+    read_session_file(&path).map(|endpoint| Resolution::Found(endpoint, None))
+}
+
+const INCOMPLETE_TOKEN_WITHOUT_URL: &str = "tightbeam: incomplete explicit endpoint: TIGHTBEAM_TOKEN is set but TIGHTBEAM_URL is not; set both, or unset TIGHTBEAM_TOKEN";
+const INCOMPLETE_URL_WITHOUT_TOKEN: &str = "tightbeam: incomplete explicit endpoint: TIGHTBEAM_URL is set but TIGHTBEAM_TOKEN is empty or unset; set both, or unset TIGHTBEAM_URL";
+const INCOMPLETE_EMPTY_BASE_DIR: &str = "tightbeam: incomplete explicit endpoint: TIGHTBEAM_BASE_DIR is set but empty; set it to a directory, or unset it";
+
+/// Which explicit source overrode a session file (F2-1 rows 1 and 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExplicitSource {
+    Endpoint,
+    BaseDir,
+}
+
+impl ExplicitSource {
+    fn names(self) -> &'static str {
+        match self {
+            ExplicitSource::Endpoint => "TIGHTBEAM_URL and TIGHTBEAM_TOKEN",
+            ExplicitSource::BaseDir => "TIGHTBEAM_BASE_DIR",
+        }
+    }
+}
+
+/// An ambient session file an explicit source overrode. Notices built from it carry
+/// variable names, the session file's path and fixed text only, never a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Overridden {
+    source: ExplicitSource,
+    session: PathBuf,
+    unreadable: bool,
+}
+
+impl Overridden {
+    fn notice(&self) -> String {
+        format!(
+            "tightbeam: notice: using {} (explicit); ignoring the {}session file at {}",
+            self.source.names(),
+            if self.unreadable { "unreadable " } else { "" },
+            self.session.display()
+        )
+    }
+}
+
+static OVERRIDE: std::sync::OnceLock<Overridden> = std::sync::OnceLock::new();
+
+/// Write the conflict notice to stderr, at most once per process, and keep the
+/// override for the identity refusal.
+fn record_override(overridden: Overridden) {
+    if OVERRIDE.set(overridden).is_ok() {
+        if let Some(recorded) = OVERRIDE.get() {
+            eprintln!("{}", recorded.notice());
+        }
+    }
+}
+
+fn recorded_override() -> Option<&'static Overridden> {
+    OVERRIDE.get()
+}
+
+/// URL equality for discovery: today's websocket-to-http mapping on both sides, then
+/// one trailing `/` removed, then byte-exact.
+fn same_url(left: &str, right: &str) -> bool {
+    fn normalized(url: &str) -> String {
+        let url = http_scheme(url);
+        url.strip_suffix('/').map(str::to_owned).unwrap_or(url)
+    }
+    normalized(left) == normalized(right)
+}
+
+fn nearest_session_file(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .map(|directory| directory.join(".tightbeam-session"))
+        .find(|path| path.exists())
+}
+
+#[cfg(test)]
+fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
+    nearest_session_file(cwd)
+        .map(|path| read_session_file(&path))
+        .transpose()
+}
+
+fn read_session_file(path: &Path) -> Result<Endpoint, String> {
+    let encoded = fs::read_to_string(path)
+        .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+    let config: Value = serde_json::from_str(&encoded)
+        .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+    let base = config
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("malformed session file '{}': missing url", path.display()))?;
+    let token = config
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("malformed session file '{}': missing token", path.display()))?;
+    Ok(Endpoint {
+        // A satellite's session file carries the gateway's ADVERTISED (websocket)
+        // url; this base roots an HTTP `/agent/dispatch`. Same normalization the
+        // gateway.json reader applies (815d27e) -- the two readers of one url must
+        // agree, and this one was missed.
+        base: http_scheme(base),
+        token: token.to_owned(),
+        origin: Origin::Session(path.to_path_buf()),
+    })
 }
 
 /// The advertised url names the WEBSOCKET wire; this base roots an HTTP path.
@@ -3746,8 +3933,7 @@ pub fn run(command: Command) -> Result<(), String> {
         command,
         move || {
             if session_identity {
-                let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-                discover_session_from(&cwd)?.ok_or_else(|| identity_required(&cwd))
+                discover_session_identity()
             } else {
                 discover()
             }
@@ -3994,9 +4180,22 @@ fn add_user_endpoint_matches_local(endpoint: &Endpoint, provisioned: &Provisione
 fn require_session_endpoint(identity: &Identity, endpoint: &Endpoint) -> Result<(), String> {
     if matches!(identity, Identity::Session) && endpoint.session_file().is_none() {
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-        return Err(identity_required(&cwd));
+        return Err(identity_required_after(&cwd, recorded_override()));
     }
     Ok(())
+}
+
+/// The identity refusal, saying so when an explicit source was used instead of a
+/// session file (F2-4). Names and the session file's path only, never a value.
+fn identity_required_after(cwd: &Path, overridden: Option<&Overridden>) -> String {
+    match overridden {
+        Some(overridden) => format!(
+            "identity required: an explicit {source} was used instead of the session file at {path}; pass --as, --as-user or --as-process, or unset {source}",
+            source = overridden.source.names(),
+            path = overridden.session.display()
+        ),
+        None => identity_required(cwd),
+    }
 }
 
 fn identity_required(cwd: &Path) -> String {
@@ -6781,66 +6980,419 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn discovery_walks_up_to_the_nearest_session_file_before_env_or_gateway() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("tightbeam_cli_session_{unique}"));
-        let ancestor = root.join("ancestor");
-        let cwd = ancestor.join("work").join("nested");
-        let configured = root.join("configured");
-        for directory in [&cwd, &configured] {
-            fs::create_dir_all(directory).unwrap();
+    // F2 (wi_34a7be66, spec art_b74bd009 §6): explicit settings win over an ambient
+    // session file. This replaces the test that asserted the session file won over
+    // TIGHTBEAM_URL/TIGHTBEAM_TOKEN (M1), which is the defect F2 fixes. The tree is a
+    // session file B two folders above the working directory, gateway bases beside
+    // it, and a home whose default `.tightbeam/gateway.json` exists.
+    struct DiscoveryTree {
+        root: PathBuf,
+        cwd: PathBuf,
+        session: PathBuf,
+    }
+
+    const SESSION_B: &str = r#"{"url":"https://session-b","token":"session-b-token"}"#;
+
+    impl DiscoveryTree {
+        fn new(label: &str, session: Option<&str>) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("tightbeam_f2_{label}_{unique}"));
+            let cwd = root.join("tree").join("work").join("nested");
+            fs::create_dir_all(&cwd).unwrap();
+            let session_path = root.join("tree").join(".tightbeam-session");
+            if let Some(contents) = session {
+                fs::write(&session_path, contents).unwrap();
+            }
+            let tree = DiscoveryTree {
+                root,
+                cwd,
+                session: session_path,
+            };
+            tree.base(
+                ".tightbeam",
+                Some(r#"{"port":9876,"cliToken":"default-token"}"#),
+            );
+            tree
         }
-        fs::write(
-            ancestor.join(".tightbeam-session"),
-            r#"{"url":"https://ancestor-session","token":"ancestor-token"}"#,
-        )
-        .unwrap();
-        fs::write(
-            ancestor.join("work").join(".tightbeam-session"),
-            r#"{"url":"https://nearest-session","token":"nearest-token"}"#,
-        )
-        .unwrap();
-        fs::write(
-            configured.join("gateway.json"),
-            r#"{"port":4321,"cliToken":"configured"}"#,
-        )
-        .unwrap();
 
-        let env = HashMap::from([
-            ("TIGHTBEAM_URL".to_owned(), "https://env-gateway".to_owned()),
-            ("TIGHTBEAM_TOKEN".to_owned(), "env-token".to_owned()),
-            (
-                "TIGHTBEAM_HOME".to_owned(),
-                configured.display().to_string(),
-            ),
-        ]);
-        assert_eq!(
-            discover_with(|name| env.get(name).cloned(), &cwd, &root),
-            Ok(Endpoint {
-                base: "https://nearest-session".to_owned(),
-                token: "nearest-token".to_owned(),
-                origin: Origin::Session(ancestor.join("work").join(".tightbeam-session")),
+        fn base(&self, name: &str, gateway: Option<&str>) -> String {
+            let directory = self.root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            if let Some(contents) = gateway {
+                fs::write(directory.join("gateway.json"), contents).unwrap();
+            }
+            directory.display().to_string()
+        }
+
+        fn resolve(&self, env: &[(&str, &str)]) -> Result<(Endpoint, Option<Overridden>), String> {
+            let env: HashMap<String, String> = env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            discover_with_override(|name| env.get(name).cloned(), &self.cwd, &self.root)
+        }
+
+        fn session_b(&self) -> Endpoint {
+            Endpoint {
+                base: "https://session-b".to_owned(),
+                token: "session-b-token".to_owned(),
+                origin: Origin::Session(self.session.clone()),
+            }
+        }
+
+        fn overridden(&self, source: ExplicitSource, unreadable: bool) -> Option<Overridden> {
+            Some(Overridden {
+                source,
+                session: self.session.clone(),
+                unreadable,
             })
-        );
+        }
+    }
 
-        fs::write(ancestor.join("work").join(".tightbeam-session"), "{").unwrap();
-        let error = discover_with(|name| env.get(name).cloned(), &cwd, &root).unwrap_err();
-        assert!(error.starts_with("malformed session file"));
-        assert!(
-            error.contains(
-                &ancestor
-                    .join("work")
-                    .join(".tightbeam-session")
-                    .display()
-                    .to_string()
+    impl Drop for DiscoveryTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn named(base: &str, token: &str) -> Endpoint {
+        Endpoint {
+            base: base.to_owned(),
+            token: token.to_owned(),
+            origin: Origin::Named,
+        }
+    }
+
+    fn provisioned(port: u16, token: &str) -> Endpoint {
+        Endpoint {
+            base: format!("http://127.0.0.1:{port}"),
+            token: token.to_owned(),
+            origin: Origin::Provisioned,
+        }
+    }
+
+    #[test]
+    fn f2_p1_an_explicit_pair_wins_over_a_different_session_with_one_notice() {
+        let tree = DiscoveryTree::new("p1", Some(SESSION_B));
+        let (endpoint, overridden) = tree
+            .resolve(&[
+                ("TIGHTBEAM_URL", "https://fixture-a"),
+                ("TIGHTBEAM_TOKEN", "fixture-a-token"),
+            ])
+            .unwrap();
+        assert_eq!(endpoint, named("https://fixture-a", "fixture-a-token"));
+        assert_eq!(overridden, tree.overridden(ExplicitSource::Endpoint, false));
+        assert_eq!(
+            overridden.unwrap().notice(),
+            format!(
+                "tightbeam: notice: using TIGHTBEAM_URL and TIGHTBEAM_TOKEN (explicit); ignoring the session file at {}",
+                tree.session.display()
             )
         );
+    }
 
-        fs::remove_dir_all(root).unwrap();
+    #[test]
+    fn f2_p2_a_pair_equal_to_the_session_keeps_the_session_silently() {
+        let tree = DiscoveryTree::new("p2", Some(SESSION_B));
+        assert_eq!(
+            tree.resolve(&[
+                ("TIGHTBEAM_URL", "https://session-b/"),
+                ("TIGHTBEAM_TOKEN", "session-b-token"),
+            ]),
+            Ok((tree.session_b(), None))
+        );
+    }
+
+    #[test]
+    fn f2_p3_an_explicit_base_wins_over_the_session_with_a_notice() {
+        let tree = DiscoveryTree::new("p3", Some(SESSION_B));
+        let base = tree.base("base-c", Some(r#"{"port":4321,"cliToken":"base-c-token"}"#));
+        let (endpoint, overridden) = tree.resolve(&[("TIGHTBEAM_BASE_DIR", &base)]).unwrap();
+        assert_eq!(endpoint, provisioned(4321, "base-c-token"));
+        assert_eq!(overridden, tree.overridden(ExplicitSource::BaseDir, false));
+        assert_eq!(
+            overridden.unwrap().notice(),
+            format!(
+                "tightbeam: notice: using TIGHTBEAM_BASE_DIR (explicit); ignoring the session file at {}",
+                tree.session.display()
+            )
+        );
+    }
+
+    #[test]
+    fn f2_p4_a_missing_explicit_gateway_json_fails_without_reading_the_session() {
+        // A malformed session file proves it was never read: reading it would fail
+        // with "malformed session file", not ENOENT.
+        let tree = DiscoveryTree::new("p4", Some("{"));
+        let base = tree.base("base-missing", None);
+        let error = tree.resolve(&[("TIGHTBEAM_BASE_DIR", &base)]).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "ENOENT: no such file or directory, open '{}'",
+                Path::new(&base).join("gateway.json").display()
+            )
+        );
+    }
+
+    #[test]
+    fn f2_p5_the_pair_wins_over_the_base_and_the_session() {
+        let tree = DiscoveryTree::new("p5", Some(SESSION_B));
+        let base = tree.base("base-c", Some(r#"{"port":4321,"cliToken":"base-c-token"}"#));
+        let (endpoint, overridden) = tree
+            .resolve(&[
+                ("TIGHTBEAM_URL", "https://fixture-a"),
+                ("TIGHTBEAM_TOKEN", "fixture-a-token"),
+                ("TIGHTBEAM_BASE_DIR", &base),
+            ])
+            .unwrap();
+        assert_eq!(endpoint, named("https://fixture-a", "fixture-a-token"));
+        assert_eq!(overridden, tree.overridden(ExplicitSource::Endpoint, false));
+    }
+
+    #[test]
+    fn f2_p6_gateway_injected_agent_variables_keep_the_session() {
+        let tree = DiscoveryTree::new("p6", Some(SESSION_B));
+        let home = tree.base("org-home", Some(r#"{"port":5555,"cliToken":"org-token"}"#));
+        assert_eq!(
+            tree.resolve(&[
+                ("TIGHTBEAM_HOME", &home),
+                ("TIGHTBEAM_MACHINE", "machine-a"),
+                ("TIGHTBEAM_LINEAGE", "lineage-a"),
+            ]),
+            Ok((tree.session_b(), None))
+        );
+    }
+
+    #[test]
+    fn f2_p7a_a_lone_url_equal_to_the_session_keeps_the_session() {
+        let tree = DiscoveryTree::new("p7a", Some(SESSION_B));
+        assert_eq!(
+            tree.resolve(&[("TIGHTBEAM_URL", "https://session-b/")]),
+            Ok((tree.session_b(), None))
+        );
+    }
+
+    #[test]
+    fn f2_p7b_a_lone_different_url_beside_a_session_is_refused() {
+        let tree = DiscoveryTree::new("p7b", Some(SESSION_B));
+        assert_eq!(
+            tree.resolve(&[("TIGHTBEAM_URL", "https://fixture-a")]),
+            Err(INCOMPLETE_URL_WITHOUT_TOKEN.to_owned())
+        );
+    }
+
+    #[test]
+    fn f2_p7c_a_lone_token_beside_a_session_is_refused_even_empty() {
+        let tree = DiscoveryTree::new("p7c", Some(SESSION_B));
+        for token in ["fixture-a-token", ""] {
+            assert_eq!(
+                tree.resolve(&[("TIGHTBEAM_TOKEN", token)]),
+                Err(INCOMPLETE_TOKEN_WITHOUT_URL.to_owned()),
+                "{token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f2_p7d_a_url_with_an_empty_token_beside_a_session_is_refused() {
+        let tree = DiscoveryTree::new("p7d", Some(SESSION_B));
+        assert_eq!(
+            tree.resolve(&[
+                ("TIGHTBEAM_URL", "https://fixture-a"),
+                ("TIGHTBEAM_TOKEN", ""),
+            ]),
+            Err(INCOMPLETE_URL_WITHOUT_TOKEN.to_owned())
+        );
+    }
+
+    #[test]
+    fn f2_p7e_a_satellite_lone_url_matches_its_websocket_session_url() {
+        for (session_url, injected, base) in [
+            ("ws://h:1/", "http://h:1", "http://h:1/"),
+            ("wss://h:1", "https://h:1/", "https://h:1"),
+        ] {
+            let session = format!(r#"{{"url":"{session_url}","token":"sat-token"}}"#);
+            let tree = DiscoveryTree::new("p7e", Some(&session));
+            assert_eq!(
+                tree.resolve(&[("TIGHTBEAM_URL", injected)]),
+                Ok((
+                    Endpoint {
+                        base: base.to_owned(),
+                        token: "sat-token".to_owned(),
+                        origin: Origin::Session(tree.session.clone()),
+                    },
+                    None
+                )),
+                "{session_url} with {injected}"
+            );
+        }
+    }
+
+    #[test]
+    fn f2_p7f_incomplete_settings_without_a_session_behave_as_before() {
+        let tree = DiscoveryTree::new("p7f", None);
+        for env in [
+            vec![("TIGHTBEAM_URL", "https://fixture-a")],
+            vec![("TIGHTBEAM_TOKEN", "fixture-a-token")],
+            vec![
+                ("TIGHTBEAM_URL", "https://fixture-a"),
+                ("TIGHTBEAM_TOKEN", ""),
+            ],
+        ] {
+            assert_eq!(
+                tree.resolve(&env),
+                Ok((provisioned(9876, "default-token"), None)),
+                "{env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f2_p8_nothing_explicit_uses_the_session() {
+        let tree = DiscoveryTree::new("p8", Some(SESSION_B));
+        assert_eq!(tree.resolve(&[]), Ok((tree.session_b(), None)));
+    }
+
+    #[test]
+    fn f2_p9_nothing_explicit_and_no_session_uses_home_then_the_default() {
+        let tree = DiscoveryTree::new("p9", None);
+        let home = tree.base("org-home", Some(r#"{"port":5555,"cliToken":"org-token"}"#));
+        assert_eq!(
+            tree.resolve(&[("TIGHTBEAM_HOME", &home)]),
+            Ok((provisioned(5555, "org-token"), None))
+        );
+        assert_eq!(
+            tree.resolve(&[]),
+            Ok((provisioned(9876, "default-token"), None))
+        );
+    }
+
+    #[test]
+    fn f2_p10a_an_explicit_pair_over_a_malformed_session_notes_it_unreadable() {
+        let tree = DiscoveryTree::new("p10a", Some("{"));
+        let (endpoint, overridden) = tree
+            .resolve(&[
+                ("TIGHTBEAM_URL", "https://fixture-a"),
+                ("TIGHTBEAM_TOKEN", "fixture-a-token"),
+            ])
+            .unwrap();
+        assert_eq!(endpoint, named("https://fixture-a", "fixture-a-token"));
+        assert_eq!(overridden, tree.overridden(ExplicitSource::Endpoint, true));
+        assert_eq!(
+            overridden.unwrap().notice(),
+            format!(
+                "tightbeam: notice: using TIGHTBEAM_URL and TIGHTBEAM_TOKEN (explicit); ignoring the unreadable session file at {}",
+                tree.session.display()
+            )
+        );
+    }
+
+    #[test]
+    fn f2_p10b_nothing_explicit_keeps_the_malformed_session_error() {
+        let tree = DiscoveryTree::new("p10b", Some("{"));
+        let error = tree.resolve(&[]).unwrap_err();
+        assert!(error.starts_with("malformed session file"), "{error}");
+        assert!(
+            error.contains(&tree.session.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn f2_p11_an_empty_base_dir_beside_a_session_is_refused() {
+        let tree = DiscoveryTree::new("p11", Some(SESSION_B));
+        assert_eq!(
+            tree.resolve(&[("TIGHTBEAM_BASE_DIR", "")]),
+            Err(INCOMPLETE_EMPTY_BASE_DIR.to_owned())
+        );
+    }
+
+    #[test]
+    fn f2_p11b_an_empty_base_dir_without_a_session_resolves_as_before() {
+        let tree = DiscoveryTree::new("p11b", None);
+        assert_eq!(
+            tree.resolve(&[("TIGHTBEAM_BASE_DIR", "")]),
+            Err("ENOENT: no such file or directory, open 'gateway.json'".to_owned())
+        );
+    }
+
+    #[test]
+    fn f2_p12_the_identity_refusal_names_the_overriding_source() {
+        let tree = DiscoveryTree::new("p12", Some(SESSION_B));
+        let (endpoint, overridden) = tree
+            .resolve(&[
+                ("TIGHTBEAM_URL", "https://fixture-a"),
+                ("TIGHTBEAM_TOKEN", "fixture-a-token"),
+            ])
+            .unwrap();
+        assert_eq!(
+            identity_required_after(&tree.cwd, overridden.as_ref()),
+            format!(
+                "identity required: an explicit TIGHTBEAM_URL and TIGHTBEAM_TOKEN was used instead of the session file at {}; pass --as, --as-user or --as-process, or unset TIGHTBEAM_URL and TIGHTBEAM_TOKEN",
+                tree.session.display()
+            )
+        );
+        assert_eq!(
+            identity_required_after(&tree.cwd, None),
+            identity_required(&tree.cwd)
+        );
+        assert_eq!(
+            require_session_endpoint(&Identity::User("u".to_owned()), &endpoint),
+            Ok(())
+        );
+        assert_eq!(endpoint.origin, Origin::Named);
+    }
+
+    #[test]
+    fn f2_p13_notices_and_refusals_carry_no_value() {
+        let canaries = [
+            "canary-url-7f3a",
+            "canary-token-9b1c",
+            "canary-gateway-2d4e",
+            "canary-session-5e6f",
+        ];
+        let session = r#"{"url":"https://canary-session-5e6f","token":"canary-session-5e6f"}"#;
+        let tree = DiscoveryTree::new("p13", Some(session));
+        let base = tree.base(
+            "base-canary",
+            Some(r#"{"url":"https://canary-gateway-2d4e","cliToken":"canary-gateway-2d4e"}"#),
+        );
+        let pair = [
+            ("TIGHTBEAM_URL", "https://canary-url-7f3a"),
+            ("TIGHTBEAM_TOKEN", "canary-token-9b1c"),
+        ];
+        let mut texts = Vec::new();
+        for env in [pair.to_vec(), vec![("TIGHTBEAM_BASE_DIR", base.as_str())]] {
+            let (_, overridden) = tree.resolve(&env).unwrap();
+            let overridden = overridden.unwrap();
+            texts.push(overridden.notice());
+            texts.push(identity_required_after(&tree.cwd, Some(&overridden)));
+        }
+        for env in [
+            vec![("TIGHTBEAM_TOKEN", "canary-token-9b1c")],
+            vec![("TIGHTBEAM_URL", "https://canary-url-7f3a")],
+            vec![
+                ("TIGHTBEAM_URL", "https://canary-url-7f3a"),
+                ("TIGHTBEAM_TOKEN", ""),
+            ],
+            vec![("TIGHTBEAM_BASE_DIR", "")],
+        ] {
+            texts.push(tree.resolve(&env).unwrap_err());
+        }
+        fs::write(&tree.session, "{canary-session-5e6f").unwrap();
+        let (_, overridden) = tree.resolve(&pair).unwrap();
+        texts.push(overridden.unwrap().notice());
+
+        assert_eq!(texts.len(), 9);
+        for text in texts {
+            for canary in canaries {
+                assert!(!text.contains(canary), "{canary} leaked into: {text}");
+            }
+        }
     }
 
     // MIRROR of `a_satellite_url_written_as_a_websocket_scheme_dispatches_over_http`,

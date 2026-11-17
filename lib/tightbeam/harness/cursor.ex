@@ -537,7 +537,8 @@ defmodule Tightbeam.Harness.Cursor do
 
     script =
       "test -r #{Support.shell_quote(key_path)} && " <>
-        "exec env AGENT_CLI_CREDENTIAL_STORE=memory " <>
+        "exec env #{Enum.join(Support.remote_env_unset(), " ")} " <>
+        "AGENT_CLI_CREDENTIAL_STORE=memory " <>
         "CURSOR_API_KEY=\"$(cat #{Support.shell_quote(key_path)})\" " <>
         "#{Support.shell_quote(launcher)} --list-models"
 

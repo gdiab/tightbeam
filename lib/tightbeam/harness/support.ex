@@ -23,6 +23,15 @@ defmodule Tightbeam.Harness.Support do
 
   def ssh_opts, do: @ssh_opts
 
+  @doc """
+  The `env` options every remote harness launch puts immediately after `env`,
+  before any assignment (F2-5c, wi_34a7be66). A remote `env` keeps the satellite
+  user's login environment, which the local spawn scrub never reaches; there an
+  inherited TIGHTBEAM_TOKEN or TIGHTBEAM_BASE_DIR would outrank the agent's own
+  session file in CLI discovery. The launch sets TIGHTBEAM_URL itself.
+  """
+  def remote_env_unset, do: ["-u", "TIGHTBEAM_TOKEN", "-u", "TIGHTBEAM_BASE_DIR"]
+
   @doc false
   def reserved_overlay_env_vars, do: @reserved_overlay_env_vars
 
@@ -569,7 +578,7 @@ defmodule Tightbeam.Harness.Support do
       [
         cmd:
           [ssh | ssh_opts()] ++
-            ["vector@remote", "exec", env | remote_env] ++ [adapter],
+            ["vector@remote", "exec", env | remote_env_unset()] ++ remote_env ++ [adapter],
         env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
       ]
     end

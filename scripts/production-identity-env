@@ -21,5 +21,9 @@ prefix RELEASE_
 exact ROOTDIR
 exact BINDIR
 exact TIGHTBEAM_BASE_DIR
+# An explicit endpoint's credential: with TIGHTBEAM_URL it outranks a session
+# file in CLI discovery, so no agent may inherit or overlay it (F2-5b,
+# wi_34a7be66). Agents carry their identity in their session file instead.
+exact TIGHTBEAM_TOKEN
 exact TIGHTBEAM_PORT
 exact TIGHTBEAM_NODE
