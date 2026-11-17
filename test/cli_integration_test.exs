@@ -160,13 +160,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
 
-    File.write!(
+    fixture_session!(
       Path.join(base_dir, "work/session/.tightbeam-session"),
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{port}",
         token: session.cli_token,
         sessionKey: session.session_key
-      })
+      }
     )
 
     %{
@@ -1239,13 +1239,13 @@ defmodule Tightbeam.CliIntegrationTest do
     owner_workdir = Path.join(owner_root, "work")
     File.mkdir_p!(owner_workdir)
 
-    File.write!(
+    fixture_session!(
       Path.join(owner_root, ".tightbeam-session"),
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{ctx.port}",
         token: caller.cli_token,
         sessionKey: caller.session_key
-      })
+      }
     )
 
     cancel_args = fn session_key ->
@@ -1408,13 +1408,13 @@ defmodule Tightbeam.CliIntegrationTest do
   test "version refusal is distinguishable from auth and network failures", ctx do
     session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
 
-    File.write!(
+    fixture_session!(
       session_file,
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{ctx.port}",
         token: "wrong-token",
         sessionKey: ctx.session.session_key
-      })
+      }
     )
 
     {auth, 1} =
@@ -1427,13 +1427,13 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, {_address, unused_port}} = :inet.sockname(listener)
     :ok = :gen_tcp.close(listener)
 
-    File.write!(
+    fixture_session!(
       session_file,
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{unused_port}",
         token: ctx.session.cli_token,
         sessionKey: ctx.session.session_key
-      })
+      }
     )
 
     {network, 1} =
@@ -1469,13 +1469,13 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, {_address, port}} = :inet.sockname(listener)
     peer = Task.async(fn -> Enum.each(replies, &serve_one(listener, &1)) end)
 
-    File.write!(
+    fixture_session!(
       session_file,
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{port}",
         token: ctx.session.cli_token,
         sessionKey: ctx.session.session_key
-      })
+      }
     )
 
     [html, nested, truncated] =
@@ -1560,13 +1560,13 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, {_address, port}} = :inet.sockname(listener)
     peer = Task.async(fn -> Enum.each(replies, &serve_one(listener, &1)) end)
 
-    File.write!(
+    fixture_session!(
       session_file,
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{port}",
         token: ctx.session.cli_token,
         sessionKey: ctx.session.session_key
-      })
+      }
     )
 
     [undecodable, refusal, bare] =
@@ -1645,13 +1645,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
 
-    File.write!(
+    fixture_session!(
       Path.join(ctx.base_dir, "work/session/.tightbeam-session"),
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{port}",
         token: ctx.session.cli_token,
         sessionKey: ctx.session.session_key
-      })
+      }
     )
 
     {output, status} =
@@ -1703,13 +1703,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
 
-    File.write!(
+    fixture_session!(
       Path.join(ctx.base_dir, "work/session/.tightbeam-session"),
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{port}",
         token: ctx.session.cli_token,
         sessionKey: ctx.session.session_key
-      })
+      }
     )
 
     {output, status} =
@@ -2887,13 +2887,13 @@ defmodule Tightbeam.CliIntegrationTest do
     dir = Path.join([ctx.base_dir, "work", session.session_key])
     File.mkdir_p!(dir)
 
-    File.write!(
+    fixture_session!(
       Path.join(dir, ".tightbeam-session"),
-      JSON.encode!(%{
+      %{
         url: "http://127.0.0.1:#{ctx.port}",
         token: session.cli_token,
         sessionKey: session.session_key
-      })
+      }
     )
 
     dir
@@ -3850,12 +3850,109 @@ defmodule Tightbeam.CliIntegrationTest do
     assert usage =~ "usage: tightbeam breathing session|assignment|work-item <id>"
   end
 
-  # The CLI here authenticates through this test's own fixture session: the
-  # .tightbeam-session that setup writes under the sandbox, naming the test's
-  # loopback gateway. A launch from inside such a tree runs through this helper,
-  # which accepts only a session file inside the sandbox that names a loopback
-  # URL and still applies the isolation helper's environment checks. Any other
-  # launch goes through Tightbeam.TestIsolation unchanged (F1, wi_34a7be66).
+  describe "session_cli accepts only this test's recorded fixture session (F1)" do
+    defp counting_listener! do
+      {:ok, listen} =
+        :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
+      {:ok, port} = :inet.port(listen)
+      counter = :counters.new(1, [])
+      acceptor = spawn(fn -> count_accepts(listen, counter) end)
+
+      on_exit(fn ->
+        Process.exit(acceptor, :kill)
+        :gen_tcp.close(listen)
+      end)
+
+      %{url: "http://127.0.0.1:#{port}", counter: counter}
+    end
+
+    defp count_accepts(listen, counter) do
+      case :gen_tcp.accept(listen) do
+        {:ok, socket} ->
+          :counters.add(counter, 1, 1)
+
+          :gen_tcp.send(
+            socket,
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+          )
+
+          :gen_tcp.close(socket)
+          count_accepts(listen, counter)
+
+        {:error, _} ->
+          :ok
+      end
+    end
+
+    defp session_tree!(parent) do
+      inner = Path.join([parent, "a", "b"])
+      File.mkdir_p!(inner)
+      {Path.join(parent, ".tightbeam-session"), inner}
+    end
+
+    test "refuses outside the sandbox, an unrecorded loopback port and a remote URL", ctx do
+      decoy = counting_listener!()
+      fixture = counting_listener!()
+      fields = &%{url: &1, token: "decoy-token", sessionKey: "f1-session-cli"}
+
+      outside =
+        Path.join(
+          Tightbeam.TestIsolation.repo(),
+          "_build/f1-session-cli-#{System.unique_integer([:positive])}"
+        )
+
+      on_exit(fn -> File.rm_rf!(outside) end)
+      {session, inner} = session_tree!(outside)
+      fixture_session!(session, fields.(decoy.url))
+
+      assert_raise RuntimeError, ~r/outside the sandbox/, fn ->
+        session_cli(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      end
+
+      {session, inner} = session_tree!(Path.join(ctx.base_dir, "f1-session-cli"))
+      fixture_session!(session, fields.(fixture.url))
+      File.write!(session, JSON.encode!(fields.(decoy.url)))
+
+      assert_raise RuntimeError, ~r/not the fixture gateway/, fn ->
+        session_cli(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      end
+
+      fixture_session!(session, fields.("http://10.1.2.3:9"))
+
+      assert_raise RuntimeError, ~r/not a loopback address/, fn ->
+        session_cli(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      end
+
+      Process.sleep(200)
+      assert :counters.get(decoy.counter, 1) == 0
+
+      # Positive control: the recorded fixture session reaches the fixture listener.
+      fixture_session!(session, fields.(fixture.url))
+      {output, _status} = session_cli(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      assert :counters.get(fixture.counter, 1) >= 1, output
+    end
+  end
+
+  # The CLI here authenticates through this test's own fixture sessions:
+  # .tightbeam-session files the test writes under the sandbox, each naming one
+  # of the test's own loopback Bandit listeners (or a port it closed on
+  # purpose). fixture_session!/2 writes such a file and records its exact path
+  # and URL. A launch from inside a session tree runs through session_cli/3,
+  # which accepts the nearest session file only if it lies inside the sandbox
+  # and its URL equals what the test recorded for that file (the live gateway
+  # is on loopback too, so loopback alone is not enough), then applies the
+  # isolation helper's env and cwd rules. Any other launch goes through
+  # Tightbeam.TestIsolation unchanged (F1, wi_34a7be66).
+  @fixture_sessions {__MODULE__, :fixture_sessions}
+
+  defp fixture_session!(path, fields) do
+    File.write!(path, JSON.encode!(fields))
+    recorded = :persistent_term.get(@fixture_sessions, %{})
+    key = Tightbeam.TestSandboxPreflight.canonical(path)
+    :persistent_term.put(@fixture_sessions, Map.put(recorded, key, Map.fetch!(fields, :url)))
+  end
+
   defp session_cli(command, args, opts \\ []) do
     cd = Keyword.get(opts, :cd)
 
@@ -3864,18 +3961,40 @@ defmodule Tightbeam.CliIntegrationTest do
         Tightbeam.TestIsolation.cmd(command, args, opts)
 
       session ->
+        fixture_session_check!(session)
+
+        real_cd = Tightbeam.TestSandboxPreflight.canonical(cd)
         root = Tightbeam.TestIsolation.sandbox_root()
 
-        unless Tightbeam.TestSandboxPreflight.inside?(session, root),
-          do: raise("#{session} is not a fixture session inside the sandbox #{root}")
-
-        %{"url" => url} = session |> File.read!() |> JSON.decode!()
-
-        unless URI.parse(url).host in ["127.0.0.1", "::1", "localhost"],
-          do: raise("#{session} names #{url}, not a loopback fixture gateway")
+        unless Tightbeam.TestSandboxPreflight.inside?(real_cd, root) or
+                 Tightbeam.TestSandboxPreflight.inside?(real_cd, Tightbeam.TestIsolation.repo()),
+               do: raise("refusing to launch in #{cd}: neither the repository nor the sandbox")
 
         Tightbeam.TestIsolation.env!(Keyword.get(opts, :env, []))
         System.cmd(command, args, opts)
     end
+  end
+
+  defp fixture_session_check!(session) do
+    root = Tightbeam.TestIsolation.sandbox_root()
+    real = Tightbeam.TestSandboxPreflight.canonical(session)
+    recorded = :persistent_term.get(@fixture_sessions, %{}) |> Map.get(real)
+
+    unless Tightbeam.TestSandboxPreflight.inside?(real, root),
+      do: raise("refusing to launch: #{session} is outside the sandbox #{root}")
+
+    url = session |> File.read!() |> JSON.decode!() |> Map.get("url")
+
+    loopback? = is_binary(url) and URI.parse(url).host in ["127.0.0.1", "::1", "localhost"]
+
+    unless loopback?,
+      do: raise("refusing to launch: #{session} names #{inspect(url)}, not a loopback address")
+
+    unless is_binary(recorded) and url == recorded,
+      do:
+        raise(
+          "refusing to launch: #{session} names #{inspect(url)}, not the fixture " <>
+            "gateway this test recorded for it (#{inspect(recorded)})"
+        )
   end
 end

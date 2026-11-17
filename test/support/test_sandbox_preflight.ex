@@ -26,13 +26,31 @@ defmodule Tightbeam.TestSandboxPreflight do
 
   # The launcher's ssh stand-in: something named ssh must resolve because the
   # product resolves it for remote launch vectors, and this one only refuses.
-  @ssh_tripwire "tightbeam-test-sandbox ssh tripwire"
+  # The exact bytes scripts/test_sandbox.sh writes; it refuses and exits 255
+  # without executing anything.
+  @ssh_tripwire """
+  #!/bin/sh
+  # tightbeam-test-sandbox ssh tripwire (wi_34a7be66)
+  echo "ssh: tripwire in the Tightbeam test sandbox; no remote access" >&2
+  exit 255
+  """
 
-  @doc "Whether `path` is the launcher's ssh tripwire inside the sandbox `root`."
+  @doc "The exact content of the launcher's ssh tripwire."
+  def ssh_tripwire, do: @ssh_tripwire
+
+  @doc """
+  Whether `path` is the launcher's ssh tripwire: exactly `<root>/bin/ssh` with
+  exactly the tripwire's bytes. Nothing else named ssh is accepted.
+  """
   def ssh_tripwire?(path, root) do
-    is_binary(root) and canonical(path) == canonical(Path.join(root, "bin/ssh")) and
-      File.read!(path) =~ @ssh_tripwire
+    tripwire = is_binary(root) && Path.join(root, "bin/ssh")
+
+    is_binary(tripwire) and canonical(path) == canonical(tripwire) and
+      File.read(tripwire) == {:ok, @ssh_tripwire}
   end
+
+  @doc "The sandbox root the preflight recorded for this VM, or nil."
+  def recorded_root, do: :persistent_term.get({__MODULE__, :sandbox_root}, nil)
 
   @doc "The allowed environment names, shared with Tightbeam.TestIsolation."
   def allowed_env, do: @allowed_env
