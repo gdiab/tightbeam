@@ -163,6 +163,11 @@ defmodule Tightbeam.TestIsolationTest do
 
     # ssh resolves only to the launcher's tripwire, which refuses every use.
     ssh = System.find_executable("ssh")
+
+    assert TestSandboxPreflight.canonical(ssh) ==
+             TestSandboxPreflight.canonical(Path.join(TestIsolation.sandbox_root(), "bin/ssh"))
+
+    assert File.read!(ssh) == TestSandboxPreflight.ssh_tripwire()
     assert TestSandboxPreflight.ssh_tripwire?(ssh, TestIsolation.sandbox_root())
     assert {_, 255} = TestIsolation.cmd(ssh, ["example.invalid"], stderr_to_stdout: true)
 

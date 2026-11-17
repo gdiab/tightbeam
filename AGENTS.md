@@ -108,8 +108,9 @@ data shows whether the event path ever drops anything.
   A test that sees an ancestor `.tightbeam-session`, the real HOME or a
   credential variable reaches the live gateway with a real credential
   (wi_34a7be66), so the suite and the Rust test guard refuse to run anywhere
-  else, and nothing switches that off. Fetch crates first (`cargo fetch` in
-  `cli/`): the sandbox runs cargo offline.
+  else, and nothing switches that off. The sandbox lives under your `TMPDIR`
+  (or `/tmp`), so a `TMPDIR` inside a session tree also makes the run refuse.
+  Fetch crates first (`cargo fetch` in `cli/`): the sandbox runs cargo offline.
 - Tests launch processes only through `Tightbeam.TestIsolation` (Mix) or
   `test_isolation` (Rust), and run files outside `test/` only with
   `Tightbeam.TestIsolation.run_script!/3` and a literal path. The launch lints

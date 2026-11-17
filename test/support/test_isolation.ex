@@ -35,19 +35,25 @@ defmodule Tightbeam.TestIsolation do
   def repo, do: @repo
 
   @doc """
-  The sandbox root this VM booted in: recorded by the preflight, else the
-  environment marker, else (a child whose environment library code scrubbed)
-  the parent of a HOME that carries the sandbox marker.
+  The sandbox root. The suite VM uses only what its preflight recorded. A
+  child VM (which runs no preflight, and whose environment library code may
+  have scrubbed) may locate it only from its own HOME: HOME must be
+  `<root>/home` with the sandbox marker at `<root>`. Nothing else is walked.
   """
   def sandbox_root do
-    recorded = :persistent_term.get({Preflight, :sandbox_root}, nil)
-    from_env = System.get_env("TIGHTBEAM_TEST_SANDBOX")
-    from_home = System.get_env("HOME") && Path.dirname(System.get_env("HOME"))
+    case Preflight.recorded_root() do
+      root when is_binary(root) ->
+        root
 
-    Enum.find([recorded, from_env, from_home], fn root ->
-      is_binary(root) and root != "" and File.regular?(Path.join(root, ".tightbeam-test-sandbox"))
-    end) ||
-      refuse!("no test sandbox found; tests run only inside scripts/test_sandbox.sh")
+      nil ->
+        home = System.get_env("HOME")
+        root = home && Path.dirname(home)
+
+        if is_binary(home) and Path.basename(home) == "home" and
+             File.regular?(Path.join(root, ".tightbeam-test-sandbox")),
+           do: root,
+           else: refuse!("no test sandbox found; tests run only inside scripts/test_sandbox.sh")
+    end
   end
 
   @doc "ExUnit's tmp root (<repo>/tmp): test-owned scratch, checked per call."
@@ -160,7 +166,7 @@ defmodule Tightbeam.TestIsolation do
       Enum.flat_map(env, fn {key, value} ->
         inherited? = not MapSet.member?(declared_keys, key)
         check_var(key, value, env, inherited?)
-      end) ++ tightbeam_resolution(env)
+      end) ++ tightbeam_resolution(env) ++ forbidden_resolution(env)
 
     if problems != [] do
       refuse!("refusing to launch: " <> Enum.join(problems, "; "))
@@ -199,6 +205,38 @@ defmodule Tightbeam.TestIsolation do
   end
 
   defp check_var(_key, _value, _env, false), do: []
+
+  # A real harness or credential tool must never resolve for a child. The only
+  # toolbox entry with such a name is the launcher's exact ssh tripwire; a test's
+  # own fixture under the sandbox or the test tmp root is its synthetic stand-in.
+  defp forbidden_resolution(env) do
+    dirs = env |> Map.get("PATH", "") |> String.split(":", trim: true)
+
+    for tool <- Preflight.forbidden_tools(),
+        found = Enum.find_value(dirs, &executable(Path.join(&1, tool))),
+        not acceptable_stand_in?(tool, found) do
+      "#{tool} resolves to #{found}"
+    end
+  end
+
+  defp executable(path) do
+    case File.stat(path) do
+      {:ok, %{type: :regular}} -> path
+      _ -> nil
+    end
+  end
+
+  defp acceptable_stand_in?(tool, found) do
+    real = Preflight.canonical(found)
+
+    cond do
+      String.starts_with?(real, Preflight.canonical(toolbox()) <> "/") ->
+        tool == "ssh" and Preflight.ssh_tripwire?(found, sandbox_root())
+
+      true ->
+        inside?(real, sandbox_root()) or inside?(real, test_tmp())
+    end
+  end
 
   # Bare tightbeam must be this repository's build or a fixture inside the sandbox.
   defp tightbeam_resolution(env) do
