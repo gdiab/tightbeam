@@ -26,9 +26,12 @@
 //! behaviour neither platform documents as stable, the assertion is a plain band check,
 //! and the day darwin adopts the other reading this is already in place.
 
+#[path = "../src/test_isolation.rs"]
+mod test_isolation;
+
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::{fs, io};
 
 const PASS: i32 = 0;
@@ -54,7 +57,7 @@ fn an_inherited_sigchld_ignore_cannot_release_the_leaders_pid() {
     permissions.set_mode(0o755);
     fs::set_permissions(&path, permissions).unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tightbeam"));
+    let mut command = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"));
     command
         .args([
             "rail-exec",

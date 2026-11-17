@@ -134,9 +134,16 @@ export TIGHTBEAM_AUTHORITATIVE_GATE=1
 export TIGHTBEAM_GATE_NODE="$gate_node"
 export TIGHTBEAM_PORT=0
 
+# Both suites run inside the pre-boot test sandbox (F1, wi_34a7be66): an empty
+# HOME, an allowlisted environment and a toolbox PATH, so no test can resolve a
+# live gateway or a real credential. The sandbox resolves the real toolchain
+# itself (mise or rustup installs, never shims), so no mise exec is needed.
+# Cargo dependencies must already be fetched: the sandbox runs cargo offline.
+cd "$script_dir/.."
 printf 'Authoritative Mix gate: node=%s port=0\n' "$gate_node"
-if [ "$beam_runner" = mise ]; then
-  mise exec -- elixir --sname "$gate_node" -S mix test "$@"
-else
-  elixir --sname "$gate_node" -S mix test "$@"
-fi
+status=0
+"$script_dir/test_sandbox.sh" elixir --sname "$gate_node" -S mix test "$@" || status=$?
+cargo_status=0
+"$script_dir/test_sandbox.sh" cargo test --manifest-path cli/Cargo.toml || cargo_status=$?
+[ "$status" -ne 0 ] || status=$cargo_status
+exit "$status"

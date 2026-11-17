@@ -1515,7 +1515,7 @@ mod tests {
     /// again until this test acts on it.
     #[test]
     fn the_exit_poll_reports_the_leader_without_consuming_it() {
-        let child = std::process::Command::new("/bin/sh")
+        let child = crate::test_isolation::command("/bin/sh")
             .arg("-c")
             .arg("exit 0")
             .spawn()

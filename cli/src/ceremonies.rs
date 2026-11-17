@@ -4145,7 +4145,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
 
-        let mut command = ProcessCommand::new("sh");
+        let mut command = crate::test_isolation::command("sh");
         command
             .args([
                 "-c",
@@ -4186,7 +4186,7 @@ mod tests {
         // under load, where a spawn is most likely to fail, is exactly when the swallow
         // fires. Same principle as the forged `child exit:` line in #43: a channel that
         // cannot report must not be allowed to report success.
-        let alive = ProcessCommand::new("ps")
+        let alive = crate::test_isolation::command("ps")
             .args(["-o", "pid=", "-p", grandchild.trim()])
             .output()
             .map(|out| !out.stdout.trim_ascii().is_empty())
@@ -4281,7 +4281,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut inner = ProcessCommand::new(std::env::current_exe().unwrap());
+        let mut inner = crate::test_isolation::command(std::env::current_exe().unwrap());
         inner
             .args([
                 "--exact",
@@ -4389,7 +4389,7 @@ mod tests {
     /// buffer so the write CANNOT complete: the deadline is the only thing that can end it.
     #[test]
     fn a_child_that_never_reads_its_key_cannot_outlive_the_lease() {
-        let mut command = ProcessCommand::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", "sleep 5"])
             .stdin(Stdio::piped())
@@ -4435,7 +4435,7 @@ mod tests {
         fs::create_dir_all(staging.join("tmp")).unwrap();
         let staging_path = staging.display().to_string();
 
-        let exited_zero = ProcessCommand::new("/bin/sh")
+        let exited_zero = crate::test_isolation::command("/bin/sh")
             .args(["-c", "exit 0"])
             .status()
             .unwrap();
@@ -4470,7 +4470,7 @@ mod tests {
 
         // A non-zero exit still reports the STATUS. The artifact check must not take over
         // the message for a failure the exit code already explained.
-        let exited_three = ProcessCommand::new("/bin/sh")
+        let exited_three = crate::test_isolation::command("/bin/sh")
             .args(["-c", "exit 3"])
             .status()
             .unwrap();
@@ -4492,7 +4492,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
 
-        let mut command = ProcessCommand::new("sh");
+        let mut command = crate::test_isolation::command("sh");
         command
             .args([
                 "-c",
@@ -4564,7 +4564,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let before = openai_delivery_files(&cwd);
 
-        let mut command = ProcessCommand::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", &format!("cat {fixture}; sleep 0.2; exit 0")])
             .stdin(Stdio::null())
@@ -4776,7 +4776,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let before = openai_delivery_files(&cwd);
 
-        let mut command = ProcessCommand::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", &format!("cat {fixture}; sleep 0.2; exit 0")])
             .stdin(Stdio::null())
@@ -5045,7 +5045,7 @@ mod tests {
     /// proves the interrupt path through this same drive against a real child.
     #[test]
     fn the_teed_openai_drive_expires_on_the_lease() {
-        let mut command = ProcessCommand::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", "sleep 5"])
             .stdin(Stdio::null())
@@ -5290,7 +5290,7 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = fs::remove_file(&marker);
-        let mut command = ProcessCommand::new("sh");
+        let mut command = crate::test_isolation::command("sh");
         command
             .args(["-c", &format!("touch '{}'", marker.display())])
             .stdin(Stdio::null())
@@ -5508,7 +5508,7 @@ mod tests {
         )
         .unwrap();
         let archive_path = directory.0.join("darwin.tgz");
-        let output = ProcessCommand::new("tar")
+        let output = crate::test_isolation::command("tar")
             .args([
                 "-czf",
                 archive_path.to_str().unwrap(),
@@ -5704,7 +5704,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn promotion_test_sha256(path: &Path) -> String {
-        let output = ProcessCommand::new("shasum")
+        let output = crate::test_isolation::command("shasum")
             .args(["-a", "256"])
             .arg(path)
             .output()
@@ -5786,7 +5786,7 @@ mod tests {
         fs::set_permissions(&mv_path, permissions).unwrap();
         let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", shims.display());
 
-        let first = ProcessCommand::new("/bin/sh")
+        let first = crate::test_isolation::command("/bin/sh")
             .arg("-c")
             .arg(promotion_script(
                 cli_bin.to_str().unwrap(),
@@ -5809,7 +5809,7 @@ mod tests {
             );
         }
 
-        let second = ProcessCommand::new("/bin/sh")
+        let second = crate::test_isolation::command("/bin/sh")
             .arg("-c")
             .arg(promotion_script(
                 cli_bin.to_str().unwrap(),
@@ -5881,7 +5881,7 @@ mod tests {
         make_executable(&mv_path);
         let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", shims.display());
 
-        let mut first = ProcessCommand::new("/bin/sh")
+        let mut first = crate::test_isolation::command("/bin/sh")
             .arg("-c")
             .arg(promotion_script(
                 cli_bin.to_str().unwrap(),
@@ -5903,7 +5903,7 @@ mod tests {
 
         let interrupted = unsafe { libc::kill(first.id() as i32, libc::SIGKILL) };
         let first_status = first.wait().unwrap();
-        let blocked_retry = ProcessCommand::new("/bin/sh")
+        let blocked_retry = crate::test_isolation::command("/bin/sh")
             .arg("-c")
             .arg(promotion_script(
                 cli_bin.to_str().unwrap(),
@@ -5922,7 +5922,7 @@ mod tests {
         let mut retry_completed = false;
         if !blocked_retry.status.success() {
             for _ in 0..500 {
-                let retry = ProcessCommand::new("/bin/sh")
+                let retry = crate::test_isolation::command("/bin/sh")
                     .arg("-c")
                     .arg(promotion_script(
                         cli_bin.to_str().unwrap(),
@@ -5993,7 +5993,7 @@ mod tests {
             version: "0.1.8".to_owned(),
             sha256: promotion_test_sha256(&failed_stage),
         };
-        let failed = ProcessCommand::new("/bin/sh")
+        let failed = crate::test_isolation::command("/bin/sh")
             .arg("-c")
             .arg(promotion_script(
                 cli_bin.to_str().unwrap(),
@@ -6009,7 +6009,7 @@ mod tests {
 
         fs::write(&retry_stage, b"retry candidate").unwrap();
         make_executable(&retry_stage);
-        let retry = ProcessCommand::new("/bin/sh")
+        let retry = crate::test_isolation::command("/bin/sh")
             .arg("-c")
             .arg(promotion_script(
                 cli_bin.to_str().unwrap(),
@@ -6225,9 +6225,8 @@ mod tests {
             .map(PathBuf::from)
             .expect("set the exact candidate Darwin executable staged on the macOS scratch host");
         let binary_bytes = fs::read(&candidate_binary).expect("read candidate Darwin CLI");
-        let git = ProcessCommand::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
+        let git = crate::test_isolation::command("git")
+            .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
             .output()
             .unwrap();
         assert!(git.status.success());
@@ -6756,7 +6755,7 @@ mod tests {
             std::env::temp_dir().join(format!("tightbeam-ceremony-sigchld-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
 
-        let mut command = ProcessCommand::new(std::env::current_exe().unwrap());
+        let mut command = crate::test_isolation::command(std::env::current_exe().unwrap());
         command
             .args([
                 "--exact",

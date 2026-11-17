@@ -830,7 +830,7 @@ mod tests {
         if std::env::var_os(&variable).is_some() {
             return true;
         }
-        let status = Command::new(std::env::current_exe().unwrap())
+        let status = crate::test_isolation::command(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 &format!("child_process::tests::{test}"),
@@ -859,7 +859,7 @@ mod tests {
         forward_to_active_group(libc::SIGTERM);
         assert_eq!(forwarding.caught(), Some(libc::SIGTERM));
 
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", "while :; do sleep 1; done"])
             .stdin(Stdio::null())
@@ -902,7 +902,7 @@ mod tests {
             return;
         }
 
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", "exit 0"])
             .stdin(Stdio::null())
@@ -956,7 +956,7 @@ mod tests {
             return;
         }
 
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", "sleep 5"])
             .stdin(Stdio::null())
@@ -1264,7 +1264,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
 
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args([
                 "-c",
@@ -1312,7 +1312,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         // Absence from the process table, not elapsed time -- the same reason as the
         // watchdog's grandchild check.
-        let listed = Command::new("ps")
+        let listed = crate::test_isolation::command("ps")
             .args(["-o", "pid=", "-p", child.trim()])
             .output()
             .expect("ps must run, or this test learned nothing");
