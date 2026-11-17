@@ -178,9 +178,7 @@ defmodule Tightbeam.TestIsolation do
 
   # The repository, the sandbox and its toolbox, the test tmp root and the VM's
   # OTP bin dirs are fixed for the VM's life, so each is resolved once. Every
-  # path a launch names is still resolved on every call. Resolving the roots on
-  # every check queued enough read_link calls on the VM's single file server to
-  # time out an async test with many launches on a loaded macOS runner.
+  # path a launch names is still resolved on every call.
   defp real_root(path) do
     key = {__MODULE__, :real_root, path}
 
@@ -314,10 +312,7 @@ defmodule Tightbeam.TestIsolation do
   end
 
   defp executable(path) do
-    case File.stat(path) do
-      {:ok, %{type: :regular}} -> path
-      _ -> nil
-    end
+    if Preflight.file_type(path) == :regular, do: path
   end
 
   defp acceptable_stand_in?(tool, found) do
@@ -339,7 +334,7 @@ defmodule Tightbeam.TestIsolation do
       |> Map.get("PATH", "")
       |> String.split(":", trim: true)
       |> Enum.map(&Path.join(&1, "tightbeam"))
-      |> Enum.find(&File.exists?/1)
+      |> Enum.find(&(Preflight.file_type(&1) != nil))
 
     real = found && Preflight.canonical(found)
 
