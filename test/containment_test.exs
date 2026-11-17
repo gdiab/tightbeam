@@ -275,7 +275,7 @@ defmodule Tightbeam.ContainmentTest do
   end
 
   defp canonical(path) do
-    {resolved, 0} = Tightbeam.TestIsolation.cmd("/bin/realpath", [path])
+    {resolved, 0} = Tightbeam.TestIsolation.cmd("realpath", [path])
     String.trim(resolved)
   end
 end
