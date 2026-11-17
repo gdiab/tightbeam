@@ -107,7 +107,7 @@ defmodule Tightbeam.TestSandboxPreflight do
     |> canonical()
     |> ancestors()
     |> Enum.map(&Path.join(&1, ".tightbeam-session"))
-    |> Enum.find(&File.exists?/1)
+    |> Enum.find(&(file_type(&1) != nil))
   end
 
   @doc "Whether `path` resolves inside the sandbox `root`."
@@ -128,9 +128,28 @@ defmodule Tightbeam.TestSandboxPreflight do
   end
 
   defp resolve(path, depth) when depth < 40 do
-    case File.read_link(path) do
-      {:ok, target} -> target |> Path.expand(Path.dirname(path)) |> canonical_depth(depth + 1)
-      {:error, _} -> path
+    case :prim_file.read_link(path) do
+      {:ok, target} ->
+        target
+        |> IO.chardata_to_string()
+        |> Path.expand(Path.dirname(path))
+        |> canonical_depth(depth + 1)
+
+      {:error, _} ->
+        path
+    end
+  end
+
+  # Path resolution reads the filesystem through :prim_file, in the calling
+  # process, rather than through the VM's single file server. Every async test
+  # shares that server, and a launch check makes on the order of a hundred of
+  # these reads; queued behind the async phase's file traffic they timed out a
+  # test with many launches on a loaded macOS runner.
+  @doc "The type File.stat/1 would report for `path` (following links), or nil."
+  def file_type(path) do
+    case :prim_file.read_file_info(path) do
+      {:ok, info} -> elem(info, 2)
+      {:error, _} -> nil
     end
   end
 
