@@ -5,7 +5,7 @@ defmodule Tightbeam.TestIsolationTest do
   # Every guarded case has a positive control: the same launch done raw DOES
   # reach the decoy, so a mis-wired decoy cannot pass vacuously. The only
   # gateway anywhere is a listener this test owns; it counts TCP accepts.
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{LaunchIsolationLint, TestIsolation, TestSandboxPreflight}
 
@@ -206,6 +206,9 @@ defmodule Tightbeam.TestIsolationTest do
   defp preflight_child(cd, env, scratch \\ "") do
     paths = Enum.flat_map(:code.get_path(), &["-pa", to_string(&1)])
 
+    env =
+      if List.keymember?(env, "HOME", 0), do: env, else: [{"HOME", scratch!("child-home")} | env]
+
     System.cmd(
       System.find_executable("elixir"),
       paths ++ ["-e", @preflight_script, TestIsolation.repo(), scratch],
@@ -216,8 +219,10 @@ defmodule Tightbeam.TestIsolationTest do
   end
 
   describe "T6: the preflight refuses a session above each root it checks" do
+    # Each child gets a fresh sandbox HOME: the suite's own HOME may already hold
+    # what tests wrote there, which the preflight rightly refuses.
     test "baseline: an unchanged child passes" do
-      assert {output, 0} = preflight_child(scratch!("t6-base"), [])
+      assert {output, 0} = preflight_child(scratch!("t6-base"), [{"HOME", scratch!("t6-home")}])
       assert output =~ "PREFLIGHT-PASSED"
     end
 

@@ -216,7 +216,7 @@ defmodule Tightbeam.CliIntegrationTest do
            {:process, "external-client"}}
         ] do
       port =
-        Tightbeam.TestIsolation.port_open({:spawn_executable, ctx.binary}, [
+        session_port_open({:spawn_executable, ctx.binary}, [
           :binary,
           :exit_status,
           :stderr_to_stdout,
@@ -3996,6 +3996,33 @@ defmodule Tightbeam.CliIntegrationTest do
 
         Tightbeam.TestIsolation.env!(Keyword.get(opts, :env, []))
         System.cmd(command, args, opts)
+    end
+  end
+
+  # Port.open twin of session_cli/3, with the same fixture-session checks.
+  defp session_port_open(name, opts) do
+    cd = opts |> List.keyfind(:cd, 0) |> then(&(&1 && to_string(elem(&1, 1))))
+
+    case cd && Tightbeam.TestSandboxPreflight.session_ancestor(cd) do
+      nil ->
+        Tightbeam.TestIsolation.port_open(name, opts)
+
+      session ->
+        fixture_session_check!(session)
+
+        real_cd = Tightbeam.TestSandboxPreflight.canonical(cd)
+        root = Tightbeam.TestIsolation.sandbox_root()
+
+        unless Tightbeam.TestSandboxPreflight.inside?(real_cd, root) or
+                 Tightbeam.TestSandboxPreflight.inside?(real_cd, Tightbeam.TestIsolation.repo()),
+               do: raise("refusing to launch in #{cd}: neither the repository nor the sandbox")
+
+        declared =
+          for {key, value} <- opts |> List.keyfind(:env, 0) |> then(&((&1 && elem(&1, 1)) || [])),
+              do: {to_string(key), if(value in [false, nil], do: nil, else: to_string(value))}
+
+        Tightbeam.TestIsolation.env!(declared)
+        Port.open(name, opts)
     end
   end
 
