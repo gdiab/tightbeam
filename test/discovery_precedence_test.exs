@@ -332,7 +332,19 @@ defmodule Tightbeam.DiscoveryPrecedenceTest do
         Placement.adapter_opts!(spawn_config(base_dir, db), {:codex, "default", "worker"})
       end)
 
-      assert_received {:inventory_command, command}
+      # sh_out also runs the gate-probe workdir setup; the inventory is node -e.
+      command =
+        Stream.repeatedly(fn ->
+          receive do
+            {:inventory_command, command} -> command
+          after
+            0 -> nil
+          end
+        end)
+        |> Enum.take_while(& &1)
+        |> Enum.find(&("node" in &1 and "-e" in &1))
+
+      assert command, "no skill inventory command was run"
       env = Enum.find_index(command, &(&1 == "env"))
       assert env, inspect(command)
 
