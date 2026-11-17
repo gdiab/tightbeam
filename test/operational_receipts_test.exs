@@ -191,63 +191,7 @@ defmodule Tightbeam.OperationalReceiptsTest do
     end
 
     test "4: every failing receipt is named and nothing is written", ctx do
-      item = item(ctx)
-      other_item = item(ctx)
-      card = card(ctx, item.id, "live_mutation")
-      good = receipt(ctx, item.id)
-      other = receipt(ctx, other_item.id)
-
-      missing = %{id: "art_missing_#{System.unique_integer([:positive])}", hash: good.hash}
-
-      assert %{code: "operational_receipt_missing", message: message} =
-               refused(verify(ctx, card, [good, missing, other]))
-
-      assert message =~ "#{missing.id}: operational_receipt_missing"
-      assert message =~ "#{other.id}: operational_receipt_unlinked"
-      assert message =~ other_item.id
-      assert message =~ item.id
-      refute message =~ "#{good.id}:"
-
-      released = receipt(ctx, item.id)
-
-      {:ok, _} =
-        DB.query(ctx.db, "UPDATE artifacts SET state='released' WHERE artifactId=?1", [
-          released.id
-        ])
-
-      assert %{code: "operational_receipt_missing", message: message} =
-               refused(verify(ctx, card, [released]))
-
-      assert message =~ "released"
-
-      assert %{code: "operational_receipt_hash_mismatch", message: message} =
-               refused(verify(ctx, card, [%{good | hash: String.duplicate("0", 64)}]))
-
-      assert message =~ "recorded hash is #{good.hash}"
-
-      unhashed = receipt(ctx, item.id, hash: nil)
-
-      assert %{code: "operational_receipt_hash_mismatch", message: message} =
-               refused(verify(ctx, card, [%{unhashed | hash: good.hash}]))
-
-      assert message =~ "records no hash"
-
-      for malformed <- ["#{good.id}:#{String.upcase(good.hash)}", good.id, ":#{good.hash}"] do
-        assert %{code: "operational_receipt_malformed"} =
-                 refused(
-                   attest(ctx, ctx.holder, %{verified_params(card, []) | receipts: [malformed]})
-                 )
-      end
-
-      unlinked_card = card(ctx, nil, "live_mutation")
-
-      assert %{code: "operational_receipt_unlinked", message: message} =
-               refused(verify(ctx, unlinked_card, [good]))
-
-      assert message =~ "none"
-
-      assert attests(ctx, card) == []
-      assert attests(ctx, unlinked_card) == []
+      receipt_failures_refuse(ctx)
     end
   end
 
@@ -330,6 +274,202 @@ defmodule Tightbeam.OperationalReceiptsTest do
       assert {:ok, %{operationalVerification: %{review: ^expected_review}}} =
                complete(ctx, card)
     end
+  end
+
+  # Amendment A2 r2 (art_567d7cbf): policy cards join the receipt route; code,
+  # coordination, release and review cards keep their gates.
+  describe "A2: policy cards verify from receipts" do
+    test "T-P1: a receipt-verified policy card still needs its review to complete", ctx do
+      item = item(ctx)
+      card = card(ctx, item.id, "policy")
+      receipt = receipt(ctx, item.id)
+
+      # Unverified and unreviewed, the shipped review rule answers first; T-U5
+      # shows completion-requires-verification refusing once the review exists.
+      assert {:error, %{reason: "remedy_fired", rule: "completion-requires-review"}} =
+               complete(ctx, card)
+
+      refute Map.has_key?(get(ctx, card), :operationalVerification)
+
+      assert {:ok, %{attest: %{verdictKind: "verified", commitRefs: nil} = verified}} =
+               verify(ctx, card, [receipt])
+
+      assert {:error, refusal} = complete(ctx, card)
+      assert %{reason: "remedy_fired", rule: "completion-requires-review"} = refusal
+      refute inspect(refusal) =~ "operational_receipt"
+      assert rule_text(ctx, "completion-requires-review") =~ "policy"
+
+      review = card(ctx, item.id, "review", holder: ctx.reviewer, reviews: card.id)
+
+      assert {:ok, %{attest: clean}} =
+               attest(ctx, ctx.reviewer, %{
+                 assignment_id: review.id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed-clean"
+               })
+
+      assert {:ok, %{operationalVerification: shown}} = complete(ctx, card)
+
+      assert shown == %{
+               verifiedAttestId: verified.id,
+               receipts: [%{artifactId: receipt.id, sha256: receipt.hash}],
+               review: %{
+                 attestId: clean.id,
+                 assignmentId: review.id,
+                 holderKey: ctx.reviewer,
+                 linked: true
+               }
+             }
+    end
+
+    test "T-P2m: a bare verified on a policy card stays accepted", ctx do
+      item = item(ctx)
+      card = card(ctx, item.id, "policy")
+
+      assert {:ok, %{attest: %{verdictKind: "verified"} = bare}} = verify(ctx, card, [])
+      refute Map.has_key?(bare, :receipts)
+      assert is_nil(get(ctx, card)[:operationalVerification])
+    end
+
+    test "T-P3: every receipt failure on a policy card is named and nothing is written", ctx do
+      receipt_failures_refuse(ctx, "policy")
+
+      item = item(ctx)
+      card = card(ctx, item.id, "policy")
+      receipt = receipt(ctx, item.id)
+
+      assert %{code: "operational_receipt_malformed", message: message} =
+               refused(verify(ctx, card, [receipt, receipt]))
+
+      assert message =~ "duplicate receipt"
+      assert attests(ctx, card) == []
+    end
+
+    test "T-U4: coordination and release cards keep their gates", ctx do
+      for effect_kind <- ["coordination", "release"] do
+        item = item(ctx)
+        card = card(ctx, item.id, effect_kind)
+        receipt = receipt(ctx, item.id)
+
+        assert %{code: "operational_receipts_not_applicable", message: message} =
+                 refused(verify(ctx, card, [receipt]))
+
+        assert message =~ "effect kind #{effect_kind} is not operational"
+        assert attests(ctx, card) == []
+
+        assert {:ok, %{attest: %{verdictKind: "verified"} = bare}} = verify(ctx, card, [])
+        refute Map.has_key?(bare, :receipts)
+
+        case effect_kind do
+          "coordination" ->
+            assert {:ok, %{assignment: %{state: "closed"}} = completed} = complete(ctx, card)
+            refute Map.has_key?(completed, :operationalVerification)
+
+          "release" ->
+            assert {:error, %{reason: "remedy_fired", rule: "completion-requires-review"}} =
+                     complete(ctx, card)
+        end
+      end
+    end
+
+    test "T-U5: a review alone does not verify a policy card", ctx do
+      item = item(ctx)
+      card = card(ctx, item.id, "policy")
+      review = card(ctx, item.id, "review", holder: ctx.reviewer, reviews: card.id)
+
+      assert {:ok, _} =
+               attest(ctx, ctx.reviewer, %{
+                 assignment_id: review.id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed-clean"
+               })
+
+      assert {:error, %{reason: "remedy_fired", rule: "completion-requires-verification"}} =
+               complete(ctx, card)
+
+      assert Enum.all?(attests(ctx, card), &(&1.verdictKind != "verified"))
+    end
+
+    test "T-U6: the refusal and the served manual name exactly the three kinds", ctx do
+      assert Enum.filter(
+               ~w(code live_mutation evidence policy coordination release review),
+               &Tightbeam.OperationalReceipts.operational?/1
+             ) == ~w(live_mutation evidence policy)
+
+      item = item(ctx)
+      code = card(ctx, item.id, "code")
+
+      assert %{code: "operational_receipts_not_applicable", message: message} =
+               refused(verify(ctx, code, [receipt(ctx, item.id)]))
+
+      assert message =~ "receipts verify live_mutation, evidence and policy assignments"
+
+      manual =
+        Archetypes.builtin_fragments()["operating-manual.md"]
+        |> String.replace(~r/\s+/, " ")
+
+      assert manual =~ "`--effect-kind live_mutation`, `evidence` or `policy`"
+    end
+  end
+
+  # Test 4, reused by amendment A2's T-P3 for policy cards.
+  defp receipt_failures_refuse(ctx, effect_kind \\ "live_mutation") do
+    item = item(ctx)
+    other_item = item(ctx)
+    card = card(ctx, item.id, effect_kind)
+    good = receipt(ctx, item.id)
+    other = receipt(ctx, other_item.id)
+
+    missing = %{id: "art_missing_#{System.unique_integer([:positive])}", hash: good.hash}
+
+    assert %{code: "operational_receipt_missing", message: message} =
+             refused(verify(ctx, card, [good, missing, other]))
+
+    assert message =~ "#{missing.id}: operational_receipt_missing"
+    assert message =~ "#{other.id}: operational_receipt_unlinked"
+    assert message =~ other_item.id
+    assert message =~ item.id
+    refute message =~ "#{good.id}:"
+
+    released = receipt(ctx, item.id)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE artifacts SET state='released' WHERE artifactId=?1", [
+        released.id
+      ])
+
+    assert %{code: "operational_receipt_missing", message: message} =
+             refused(verify(ctx, card, [released]))
+
+    assert message =~ "released"
+
+    assert %{code: "operational_receipt_hash_mismatch", message: message} =
+             refused(verify(ctx, card, [%{good | hash: String.duplicate("0", 64)}]))
+
+    assert message =~ "recorded hash is #{good.hash}"
+
+    unhashed = receipt(ctx, item.id, hash: nil)
+
+    assert %{code: "operational_receipt_hash_mismatch", message: message} =
+             refused(verify(ctx, card, [%{unhashed | hash: good.hash}]))
+
+    assert message =~ "records no hash"
+
+    for malformed <- ["#{good.id}:#{String.upcase(good.hash)}", good.id, ":#{good.hash}"] do
+      assert %{code: "operational_receipt_malformed"} =
+               refused(
+                 attest(ctx, ctx.holder, %{verified_params(card, []) | receipts: [malformed]})
+               )
+    end
+
+    unlinked_card = card(ctx, nil, effect_kind)
+
+    assert %{code: "operational_receipt_unlinked", message: message} =
+             refused(verify(ctx, unlinked_card, [good]))
+
+    assert message =~ "none"
+
+    assert attests(ctx, card) == []
   end
 
   defp item(ctx) do

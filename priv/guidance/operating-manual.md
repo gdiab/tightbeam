@@ -259,8 +259,8 @@ the work through the lawful assignment path. Custody never transfers silently be
     tightbeam attest <assignmentId> --kind verdict --verdict confirmed --note "…"
 
 - Verify operational work from receipts. An assignment whose opener recorded
-  `--effect-kind live_mutation` or `evidence` did its work outside a repository. Its holder
-  verifies it by citing artifacts recorded on the assignment's work item by their recorded hash:
+  `--effect-kind live_mutation`, `evidence` or `policy` delivered an operation or a document
+  rather than commits. Its holder verifies it by citing artifacts recorded on the assignment's work item by their recorded hash:
 
     tightbeam attest <assignmentId> --kind verdict --verdict verified --receipt <artifactId>:<sha256>
 

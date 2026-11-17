@@ -2,9 +2,9 @@ defmodule Tightbeam.OperationalReceipts do
   @moduledoc """
   Receipt verification for operational assignments.
 
-  An assignment whose recorded effect kind is `live_mutation` or `evidence` does
-  its work outside a repository. Its holder may verify it by citing recorded
-  artifacts as receipts, `<artifactId>:<sha256>`. Each receipt must be in
+  An assignment whose recorded effect kind is `live_mutation`, `evidence` or
+  `policy` delivers an operation or a document rather than repository commits.
+  Its holder may verify it by citing recorded artifacts as receipts, `<artifactId>:<sha256>`. Each receipt must be in
   tracked custody, recorded on the assignment's work item, and match the hash
   recorded on its row. The receipts are stored with the verdict in the same
   transaction and shown with it.
@@ -18,7 +18,7 @@ defmodule Tightbeam.OperationalReceipts do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @operational_kinds ~w(live_mutation evidence)
+  @operational_kinds ~w(live_mutation evidence policy)
   @receipt ~r/\A([^:\s]+):([0-9a-f]{64})\z/
 
   @ddl """
@@ -89,7 +89,7 @@ defmodule Tightbeam.OperationalReceipts do
           not operational?(effect_kind) ->
             not_applicable(
               "effect kind #{effect_kind} is not operational; receipts verify " <>
-                "live_mutation and evidence assignments, never code"
+                "live_mutation, evidence and policy assignments, never code"
             )
 
           true ->

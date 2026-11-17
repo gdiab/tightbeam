@@ -932,7 +932,7 @@ COMMANDS:
       cannot-proceed requires a non-empty --note, keeps the card open, and
       accepts the three release-fact flags only as one complete tuple. A key is
       valid only for completion.
-      --receipt verifies a live_mutation or evidence assignment without commits:
+      --receipt verifies a live_mutation, evidence or policy assignment without commits:
       its holder files --kind verdict --verdict verified citing artifacts recorded
       on the assignment's work item by their recorded hash; code keeps its commit
       evidence, and review rules are unchanged.
@@ -3711,7 +3711,7 @@ mod tests {
 
         for required in [
             "[--receipt <artifactId>:<sha256> ...]",
-            "--receipt verifies a live_mutation or evidence assignment without commits",
+            "--receipt verifies a live_mutation, evidence or policy assignment without commits",
             "code keeps its commit",
             "review rules are unchanged",
         ] {
@@ -3720,7 +3720,15 @@ mod tests {
                 "missing {required:?} from:\n{entry}"
             );
         }
-        assert!(!entry.contains("policy"), "{entry}");
+        // R8: no help text mentions policy activation. "policy" itself is now
+        // a receipt-eligible effect kind (amendment A2).
+        for forbidden in [
+            "attest-operational-evidence",
+            "evidence policy",
+            "policy selected",
+        ] {
+            assert!(!entry.contains(forbidden), "{forbidden:?} in:\n{entry}");
+        }
     }
 
     #[test]
