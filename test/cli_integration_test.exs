@@ -39,7 +39,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # Other suites rebuild target/release. This suite owns its parser executable.
     {output, status} =
-      session_cli("cargo", ["build", "--release"],
+      Tightbeam.FixtureSession.cmd("cargo", ["build", "--release"],
         cd: cli_dir,
         env: [{"CARGO_TARGET_DIR", target_dir}],
         stderr_to_stdout: true
@@ -160,7 +160,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       Path.join(base_dir, "work/session/.tightbeam-session"),
       %{
         url: "http://127.0.0.1:#{port}",
@@ -195,7 +195,7 @@ defmodule Tightbeam.CliIntegrationTest do
     args = ["session-connect", "--session", ctx.worker.session_key]
 
     assert {error, 1} =
-             session_cli(ctx.binary, args,
+             Tightbeam.FixtureSession.cmd(ctx.binary, args,
                cd: ctx.outside,
                env: env,
                stderr_to_stdout: true
@@ -211,7 +211,7 @@ defmodule Tightbeam.CliIntegrationTest do
            {:process, "external-client"}}
         ] do
       port =
-        session_port_open({:spawn_executable, ctx.binary}, [
+        Tightbeam.FixtureSession.port_open({:spawn_executable, ctx.binary}, [
           :binary,
           :exit_status,
           :stderr_to_stdout,
@@ -322,7 +322,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do
     run = fn args ->
-      session_cli(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
     end
 
     assert {created, 0} =
@@ -403,7 +403,7 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     run = fn args ->
-      session_cli(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
     end
 
     assert {assigned, 0} =
@@ -477,7 +477,7 @@ defmodule Tightbeam.CliIntegrationTest do
     other_dir = session_workdir!(ctx, ctx.worker)
 
     assert {refused, 1} =
-             session_cli(ctx.binary, args, cd: other_dir, stderr_to_stdout: true)
+             Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: other_dir, stderr_to_stdout: true)
 
     assert refused =~ "not_authorized"
 
@@ -516,7 +516,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "real CLI scheduled wakes retain their assignment link", ctx do
     {assignment_output, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["assign", "--session", "cli-holder", "--subject", "scheduled wake link"],
         cd: ctx.workdir,
@@ -544,7 +544,7 @@ defmodule Tightbeam.CliIntegrationTest do
       prompt = "scheduled wake link: #{name}"
 
       {output, 0} =
-        session_cli(
+        Tightbeam.FixtureSession.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
             timing_args ++ ["--prompt", prompt],
@@ -575,7 +575,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "real CLI sends an invalid immediate assignment reference to the gateway", ctx do
     {output, status} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "wake",
@@ -609,7 +609,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "holder's dated CLI wake admits one exact assignment continuation", ctx do
     {assignment_output, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["assign", "--session", "cli-holder", "--subject", "dated continuation"],
         cd: ctx.workdir,
@@ -621,7 +621,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     for timing <- [["--after", "1h"], ["--at", future]] do
       {output, 0} =
-        session_cli(
+        Tightbeam.FixtureSession.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
             timing ++ ["--prompt", "continue the same assignment"],
@@ -645,7 +645,7 @@ defmodule Tightbeam.CliIntegrationTest do
     end
 
     {output, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "wake",
@@ -667,7 +667,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert other_target.obligation_ref == nil
 
     {output, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "wake",
@@ -690,7 +690,7 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "manual obligation continuation examples register rows and deliver intact prompts", ctx do
-    {help, 0} = session_cli(ctx.binary, ["wake", "--help"])
+    {help, 0} = Tightbeam.FixtureSession.cmd(ctx.binary, ["wake", "--help"])
     assert help =~ "--after-turn"
     assert help =~ "--predicate"
     assert help =~ "--fallback-after"
@@ -733,7 +733,7 @@ defmodule Tightbeam.CliIntegrationTest do
     ids =
       for {key, subject} <- [{"cli-holder", "A"}, {"cli-worker", "R"}, {"cli-worker", "V"}] do
         {output, 0} =
-          session_cli(
+          Tightbeam.FixtureSession.cmd(
             ctx.binary,
             ["assign", "--session", key, "--subject", subject],
             cd: ctx.workdir,
@@ -747,7 +747,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     schedule_assignment_wake = fn timing_args, prompt ->
       {output, 0} =
-        session_cli(
+        Tightbeam.FixtureSession.cmd(
           ctx.binary,
           ["wake", "--session", "cli-holder", "--assignment", assignment] ++
             timing_args ++ ["--prompt", prompt],
@@ -764,7 +764,7 @@ defmodule Tightbeam.CliIntegrationTest do
     immediate_prompt = "The assignment is ready for review"
 
     {immediate_output, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "wake",
@@ -820,7 +820,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert Wakes.get(ctx.db, immediate_id).state == "fired"
 
     {timed_output, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "wake",
@@ -949,7 +949,7 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     {_, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["revoke-assignment", resolver, "--reason", "Resolver disposition"],
         cd: ctx.workdir,
@@ -989,11 +989,11 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "real CLI states its built version when it connects", ctx do
-    {version, 0} = session_cli(ctx.binary, ["version"])
+    {version, 0} = Tightbeam.FixtureSession.cmd(ctx.binary, ["version"])
     version = String.trim(version)
 
     {listed, 0} =
-      session_cli(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
 
     assert version != ""
     assert listed =~ "cli-holder"
@@ -1001,7 +1001,7 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "real CLI build is the exact gateway-required version", ctx do
-    {version, 0} = session_cli(ctx.binary, ["version"])
+    {version, 0} = Tightbeam.FixtureSession.cmd(ctx.binary, ["version"])
     version = String.trim(version)
 
     assert version == CliCompatibility.required_version()
@@ -1031,7 +1031,7 @@ defmodule Tightbeam.CliIntegrationTest do
     digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
     {recorded, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "artifact-record",
@@ -1057,7 +1057,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert recorded["producedByAssignmentId"] == assignment.id
 
     {fetched, 0} =
-      session_cli(ctx.binary, ["artifact-content-fetch", recorded["artifactId"]],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["artifact-content-fetch", recorded["artifactId"]],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -1101,7 +1101,7 @@ defmodule Tightbeam.CliIntegrationTest do
     record = "work_item:#{item.id}"
 
     {written, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["memento-set", "--record", record, "--name", "example/receipt", "--value", "observed"],
         cd: ctx.workdir,
@@ -1114,7 +1114,7 @@ defmodule Tightbeam.CliIntegrationTest do
            }
 
     {read, 0} =
-      session_cli(ctx.binary, ["mementos", "--record", record],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["mementos", "--record", record],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -1134,7 +1134,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "test-identity-revision")
 
     run = fn args ->
-      session_cli(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
     end
 
     assert {created, 0} =
@@ -1236,7 +1236,7 @@ defmodule Tightbeam.CliIntegrationTest do
     owner_workdir = Path.join(owner_root, "work")
     File.mkdir_p!(owner_workdir)
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       Path.join(owner_root, ".tightbeam-session"),
       %{
         url: "http://127.0.0.1:#{ctx.port}",
@@ -1250,7 +1250,7 @@ defmodule Tightbeam.CliIntegrationTest do
     end
 
     {foreign_output, foreign_status} =
-      session_cli(ctx.binary, cancel_args.(foreign.session_key),
+      Tightbeam.FixtureSession.cmd(ctx.binary, cancel_args.(foreign.session_key),
         cd: ctx.outside,
         env: [
           {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
@@ -1299,7 +1299,7 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     {canceled_output, 0} =
-      session_cli(ctx.binary, cancel_args.(target.session_key),
+      Tightbeam.FixtureSession.cmd(ctx.binary, cancel_args.(target.session_key),
         cd: owner_workdir,
         stderr_to_stdout: true
       )
@@ -1322,7 +1322,7 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     {not_running_output, not_running_status} =
-      session_cli(ctx.binary, cancel_args.(target.session_key),
+      Tightbeam.FixtureSession.cmd(ctx.binary, cancel_args.(target.session_key),
         cd: owner_workdir,
         stderr_to_stdout: true
       )
@@ -1334,7 +1334,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "real tune CLI uses session identity, typed fields, and structured refusals", ctx do
     {output, 1} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "tune",
@@ -1361,7 +1361,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {_effort, 1} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["tune", "--session", ctx.worker.session_key, "--effort", "high"],
         cd: ctx.workdir,
@@ -1376,7 +1376,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {_fast, 1} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["tune", "--session", ctx.worker.session_key, "--fast", "on"],
         cd: ctx.workdir,
@@ -1391,7 +1391,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {usage, 1} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["tune", "--session", ctx.worker.session_key, "--fast", "on", "--effort", "high"],
         cd: ctx.workdir,
@@ -1405,7 +1405,7 @@ defmodule Tightbeam.CliIntegrationTest do
   test "version refusal is distinguishable from auth and network failures", ctx do
     session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       session_file,
       %{
         url: "http://127.0.0.1:#{ctx.port}",
@@ -1415,7 +1415,7 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     {auth, 1} =
-      session_cli(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
 
     assert auth =~ "auth_failed"
     refute auth =~ "incompatible_cli"
@@ -1424,7 +1424,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, {_address, unused_port}} = :inet.sockname(listener)
     :ok = :gen_tcp.close(listener)
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       session_file,
       %{
         url: "http://127.0.0.1:#{unused_port}",
@@ -1434,7 +1434,7 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     {network, 1} =
-      session_cli(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
 
     refute network =~ "auth_failed"
     refute network =~ "incompatible_cli"
@@ -1466,7 +1466,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, {_address, port}} = :inet.sockname(listener)
     peer = Task.async(fn -> Enum.each(replies, &serve_one(listener, &1)) end)
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       session_file,
       %{
         url: "http://127.0.0.1:#{port}",
@@ -1478,7 +1478,7 @@ defmodule Tightbeam.CliIntegrationTest do
     [html, nested, truncated] =
       Enum.map(replies, fn _reply ->
         {output, status} =
-          session_cli(ctx.binary, ["list"],
+          Tightbeam.FixtureSession.cmd(ctx.binary, ["list"],
             cd: ctx.workdir,
             stderr_to_stdout: true
           )
@@ -1557,7 +1557,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, {_address, port}} = :inet.sockname(listener)
     peer = Task.async(fn -> Enum.each(replies, &serve_one(listener, &1)) end)
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       session_file,
       %{
         url: "http://127.0.0.1:#{port}",
@@ -1569,7 +1569,7 @@ defmodule Tightbeam.CliIntegrationTest do
     [undecodable, refusal, bare] =
       Enum.map(replies, fn _reply ->
         {output, status} =
-          session_cli(ctx.binary, ["list"],
+          Tightbeam.FixtureSession.cmd(ctx.binary, ["list"],
             cd: ctx.workdir,
             stderr_to_stdout: true
           )
@@ -1642,7 +1642,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       Path.join(ctx.base_dir, "work/session/.tightbeam-session"),
       %{
         url: "http://127.0.0.1:#{port}",
@@ -1652,7 +1652,7 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     {output, status} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-create", "--title", "crash", "--as-user", "flynn"],
         cd: ctx.workdir,
@@ -1700,7 +1700,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       Path.join(ctx.base_dir, "work/session/.tightbeam-session"),
       %{
         url: "http://127.0.0.1:#{port}",
@@ -1710,7 +1710,7 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     {output, status} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-create", "--title", "db-failure", "--as-user", "flynn"],
         cd: ctx.workdir,
@@ -1805,20 +1805,20 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "real CLI discovers a session token, dispatches, and loses access at retire", ctx do
     {listed, 0} =
-      session_cli(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
 
     assert listed =~ "cli-holder"
     assert_receive {:cli_call, %{origin: "agent:cli-holder", principal: {:session, "cli-holder"}}}
 
     {outside, 1} =
-      session_cli(ctx.binary, ["list"], cd: ctx.outside, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.outside, stderr_to_stdout: true)
 
     assert outside =~ "identity required"
     assert outside =~ ".tightbeam-session"
     assert outside =~ ctx.outside
 
     {woken, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["wake", "--session", "cli-holder", "--prompt", "hello", "--after", "1h"],
         cd: ctx.workdir,
@@ -1836,7 +1836,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {_listed_as_owner, 0} =
-      session_cli(ctx.binary, ["list", "--as-user", "flynn"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list", "--as-user", "flynn"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -1846,7 +1846,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Org.retire(ctx.db, ctx.session.session_key, "user:flynn", 1_000)
 
     {refused, 1} =
-      session_cli(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
 
     assert refused =~ "auth_failed"
   end
@@ -1878,7 +1878,7 @@ defmodule Tightbeam.CliIntegrationTest do
     other_dir = session_workdir!(ctx, other)
 
     {assigned, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["assign", "--subject", "admin revocation", "--session", "cli-worker"],
         cd: other_dir,
@@ -1895,7 +1895,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {verdicted, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "attest",
@@ -1928,7 +1928,7 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     {revoked, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["revoke-assignment", assignment_id, "--reason", "CLI disposition", "--as-user", "flynn"],
         cd: ctx.workdir,
@@ -1966,7 +1966,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "real CLI round-trips assign, dispatch, and attest through gateway handlers", ctx do
     {assigned, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "assign",
@@ -1997,7 +1997,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {dispatched, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "dispatch",
@@ -2034,7 +2034,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {attested, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["attest", assignment_id, "--kind", "completion", "--note", "ready"],
         cd: ctx.workdir,
@@ -2054,7 +2054,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {attests, 0} =
-      session_cli(ctx.binary, ["attests", assignment_id],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["attests", assignment_id],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -2063,7 +2063,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "attests", params: %{assignment_id: ^assignment_id}}}
 
     {verdicted, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["attest", dispatch_id, "--kind", "verdict", "--verdict", "tests-passed"],
         cd: ctx.workdir,
@@ -2083,7 +2083,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {revoked, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["revoke-assignment", dispatch_id, "--reason", "CLI disposition"],
         cd: ctx.workdir,
@@ -2096,7 +2096,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     %{verb: "revoke-assignment", params: %{assignment_id: ^dispatch_id}}}
 
     {listed, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["assignments", "--session", "cli-worker", "--state", "all"],
         cd: ctx.workdir,
@@ -2201,7 +2201,7 @@ defmodule Tightbeam.CliIntegrationTest do
     reviewer_dir = session_workdir!(ctx, reviewer)
 
     {created, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-create", "--title", "papertrail e2e", "--as-user", "flynn"],
         cd: ctx.workdir,
@@ -2213,7 +2213,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Roles.create!(ctx.db, "product-owner:papertrail", "flynn", product_owner.session_key)
 
     assert {association_output, 0} =
-             session_cli(
+             Tightbeam.FixtureSession.cmd(
                ctx.binary,
                [
                  "session-po-set",
@@ -2231,7 +2231,7 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     assert {_owner_output, 0} =
-             session_cli(
+             Tightbeam.FixtureSession.cmd(
                ctx.binary,
                [
                  "work-item-update",
@@ -2256,7 +2256,7 @@ defmodule Tightbeam.CliIntegrationTest do
     finish_cli_delivery!(ctx.db, "cli-holder", association_delivery.seq)
 
     {topology, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "assign",
@@ -2278,7 +2278,7 @@ defmodule Tightbeam.CliIntegrationTest do
     topology_id = JSON.decode!(topology)["id"]
 
     assert {_verdict, 0} =
-             session_cli(
+             Tightbeam.FixtureSession.cmd(
                ctx.binary,
                [
                  "attest",
@@ -2310,7 +2310,7 @@ defmodule Tightbeam.CliIntegrationTest do
     # The posture gate refuses a coder card on an unpostured work item, so the
     # slice is ruled first, through the same real CLI.
     {_postured, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "attest",
@@ -2345,7 +2345,7 @@ defmodule Tightbeam.CliIntegrationTest do
     finish_cli_delivery!(ctx.db, "cli-holder", posture_delivery.seq)
 
     {assigned, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "assign",
@@ -2367,7 +2367,7 @@ defmodule Tightbeam.CliIntegrationTest do
     work_id = JSON.decode!(assigned)["id"]
 
     repo = Path.expand("..", __DIR__)
-    {commit, 0} = session_cli("git", ["rev-parse", "HEAD"], cd: repo)
+    {commit, 0} = Tightbeam.FixtureSession.cmd("git", ["rev-parse", "HEAD"], cd: repo)
 
     commit_refs =
       JSON.encode!([
@@ -2378,7 +2378,7 @@ defmodule Tightbeam.CliIntegrationTest do
       ])
 
     {_receipt, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "attest",
@@ -2401,7 +2401,7 @@ defmodule Tightbeam.CliIntegrationTest do
     # The router aliases it to `:reviews_assignment_id` now, so the bypass that
     # stood in for it is gone.
     {reviewed, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "assign",
@@ -2427,7 +2427,7 @@ defmodule Tightbeam.CliIntegrationTest do
     review_id = JSON.decode!(reviewed)["id"]
 
     {_verdict, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "attest",
@@ -2462,7 +2462,7 @@ defmodule Tightbeam.CliIntegrationTest do
     # A1 first denial: the completion is refused and the wake names the
     # missing verification verdict.
     {denied, denied_status} =
-      session_cli(ctx.binary, completion_args,
+      Tightbeam.FixtureSession.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -2492,7 +2492,7 @@ defmodule Tightbeam.CliIntegrationTest do
     finish_cli_delivery!(ctx.db, "cli-holder", receipt_delivery.seq)
 
     {_verified, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "attest",
@@ -2512,7 +2512,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # A1 second denial: the artifact statute prods next, naming its own record.
     {denied_again, denied_again_status} =
-      session_cli(ctx.binary, completion_args,
+      Tightbeam.FixtureSession.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -2574,7 +2574,7 @@ defmodule Tightbeam.CliIntegrationTest do
            ) == 0
 
     {recorded, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "artifact-record",
@@ -2597,7 +2597,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # A2: the papertrail stands — the completion passes and the episodes close.
     {completed, 0} =
-      session_cli(ctx.binary, completion_args,
+      Tightbeam.FixtureSession.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -2616,7 +2616,7 @@ defmodule Tightbeam.CliIntegrationTest do
     # An absent work item is refused by name over the real wire, never as the
     # insert's foreign-key MatchError.
     {refused, status} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "artifact-record",
@@ -2672,7 +2672,7 @@ defmodule Tightbeam.CliIntegrationTest do
     coder_dir = session_workdir!(ctx, coder)
 
     {created, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-create", "--title", "neutral e2e", "--as-user", "flynn"],
         cd: ctx.workdir,
@@ -2682,7 +2682,7 @@ defmodule Tightbeam.CliIntegrationTest do
     item_id = JSON.decode!(created)["id"]
 
     {assigned, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "assign",
@@ -2702,7 +2702,7 @@ defmodule Tightbeam.CliIntegrationTest do
     work_id = JSON.decode!(assigned)["id"]
 
     {denied, denied_status} =
-      session_cli(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -2766,7 +2766,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert fire_observation_hook(ctx, coder_dir, "ls -la && make build") == 0
 
     {recorded, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "artifact-record",
@@ -2870,7 +2870,7 @@ defmodule Tightbeam.CliIntegrationTest do
     File.write!(payload_path, payload)
 
     {_output, status} =
-      session_cli("sh", ["-c", "cat #{payload_path} | #{hook_command}"],
+      Tightbeam.FixtureSession.cmd("sh", ["-c", "cat #{payload_path} | #{hook_command}"],
         cd: cwd,
         stderr_to_stdout: true,
         env: [{"PATH", Path.dirname(ctx.binary) <> ":" <> System.get_env("PATH")}]
@@ -2890,7 +2890,7 @@ defmodule Tightbeam.CliIntegrationTest do
     dir = Path.join([ctx.base_dir, "work", session.session_key])
     File.mkdir_p!(dir)
 
-    fixture_session!(
+    Tightbeam.FixtureSession.write!(
       Path.join(dir, ".tightbeam-session"),
       %{
         url: "http://127.0.0.1:#{ctx.port}",
@@ -2910,7 +2910,7 @@ defmodule Tightbeam.CliIntegrationTest do
   # the DB stayed green while every real caller of an escalating verb hard-failed.
   # That is why this one runs the REAL binary and asserts on what it PRINTS.
   test "real CLI renders an escalated verb as decision_pending instead of dying on EOF", ctx do
-    {cli_version, 0} = session_cli(ctx.binary, ["version"])
+    {cli_version, 0} = Tightbeam.FixtureSession.cmd(ctx.binary, ["version"])
     cli_version = String.trim(cli_version)
 
     File.mkdir_p!(Path.join([ctx.base_dir, "identity", "rules"]))
@@ -2961,7 +2961,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert pending["code"] == "decision_pending"
 
     {output, status} =
-      session_cli(ctx.binary, ["assignments", "--session", "cli-holder"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["assignments", "--session", "cli-holder"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -2990,7 +2990,7 @@ defmodule Tightbeam.CliIntegrationTest do
   test "real CLI retired producer verbs are unknown commands", ctx do
     for verb <- ["run-tests", "run-smoke", "cancel-producer-job"] do
       {output, status} =
-        session_cli(ctx.binary, [verb, "asg_1"],
+        Tightbeam.FixtureSession.cmd(ctx.binary, [verb, "asg_1"],
           cd: ctx.workdir,
           stderr_to_stdout: true
         )
@@ -3006,7 +3006,7 @@ defmodule Tightbeam.CliIntegrationTest do
     worker_dir = session_workdir!(ctx, ctx.worker)
 
     {requests, 0} =
-      session_cli(ctx.binary, ["decision-requests", "--status", "open"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["decision-requests", "--status", "open"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3021,7 +3021,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {worker_requests, 0} =
-      session_cli(ctx.binary, ["decision-requests", "--status", "open"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["decision-requests", "--status", "open"],
         cd: worker_dir,
         stderr_to_stdout: true
       )
@@ -3029,7 +3029,9 @@ defmodule Tightbeam.CliIntegrationTest do
     refute worker_requests =~ continue_request
 
     {exact, 0} =
-      session_cli(ctx.binary, ["decision-request", "--request", continue_request],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["decision-request", "--request", continue_request],
         cd: worker_dir,
         stderr_to_stdout: true
       )
@@ -3058,7 +3060,7 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     {continued, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["effort-rule", "--request", continue_request, "--action", "continue"],
         cd: worker_dir,
@@ -3080,7 +3082,7 @@ defmodule Tightbeam.CliIntegrationTest do
              ])
 
     {replayed, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["effort-rule", "--request", continue_request, "--action", "continue"],
         cd: worker_dir,
@@ -3099,7 +3101,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert count_after_replay == generation_count
 
     {refused_replay, refused_status} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["effort-rule", "--request", continue_request, "--action", "continue"],
         cd: ctx.workdir,
@@ -3112,7 +3114,7 @@ defmodule Tightbeam.CliIntegrationTest do
     dismiss_request = open_effort_request(ctx, "dismiss")
 
     {dismissed, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["effort-rule", "--request", dismiss_request, "--action", "dismiss"],
         cd: ctx.workdir,
@@ -3150,13 +3152,13 @@ defmodule Tightbeam.CliIntegrationTest do
       })
 
     {detail_bytes, 0} =
-      session_cli(ctx.binary, ["decision-request", "--request", request.id],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["decision-request", "--request", request.id],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
     {list_bytes, 0} =
-      session_cli(ctx.binary, ["decision-requests", "--status", "ruled"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["decision-requests", "--status", "ruled"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3197,7 +3199,7 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     {refusal, exit_status} =
-      session_cli(ctx.binary, ["decision-request", "--request", request.id],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["decision-request", "--request", request.id],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3233,7 +3235,7 @@ defmodule Tightbeam.CliIntegrationTest do
     sha = String.duplicate("a", 64)
 
     {created, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "work-item-create",
@@ -3258,7 +3260,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {got, 0} =
-      session_cli(ctx.binary, ["work-item-get", work_item_id],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-get", work_item_id],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3268,7 +3270,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "work-item-get", params: %{work_item_id: ^work_item_id}}}
 
     {pairing, 1} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-create", "--title", "x", "--spec-ref", "spec.md"],
         cd: ctx.workdir,
@@ -3280,7 +3282,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "real CLI records an out-of-range priority as a gateway denial", ctx do
     {refusal, status} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-create", "--title", "Priority refusal", "--priority", "9"],
         cd: ctx.workdir,
@@ -3303,7 +3305,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "real CLI records an unknown spawn harness as a gateway denial", ctx do
     {refusal, status} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "spawn",
@@ -3373,7 +3375,7 @@ defmodule Tightbeam.CliIntegrationTest do
         ],
         {verb, args} <- commands do
       {refusal, status} =
-        session_cli(
+        Tightbeam.FixtureSession.cmd(
           ctx.binary,
           args ++ [flag, identity],
           cd: ctx.outside,
@@ -3449,7 +3451,7 @@ defmodule Tightbeam.CliIntegrationTest do
       {cwd, env} = credential_source
 
       {refusal, status} =
-        session_cli(ctx.binary, args ++ [flag, identity],
+        Tightbeam.FixtureSession.cmd(ctx.binary, args ++ [flag, identity],
           cd: cwd,
           env: env,
           stderr_to_stdout: true
@@ -3466,7 +3468,7 @@ defmodule Tightbeam.CliIntegrationTest do
     sha2 = String.duplicate("b", 64)
 
     {created, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "work-item-create",
@@ -3487,7 +3489,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "work-item-create"}}
 
     {priority_only, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-update", work_item_id, "--priority", "5"],
         cd: ctx.workdir,
@@ -3508,7 +3510,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {metadata_only, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-update", work_item_id, "--title", "After"],
         cd: ctx.workdir,
@@ -3525,7 +3527,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {combined, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-update", work_item_id, "--spec-sha256", sha2, "--priority", "6"],
         cd: ctx.workdir,
@@ -3550,7 +3552,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {noop, 0} =
-      session_cli(ctx.binary, ["work-item-update", work_item_id],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-update", work_item_id],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3561,7 +3563,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     %{verb: "work-item-update", params: %{work_item_id: ^work_item_id}}}
 
     {cleared, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-update", work_item_id, "--clear-spec-ref"],
         cd: ctx.workdir,
@@ -3582,7 +3584,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {incomplete, 1} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-update", work_item_id, "--spec-ref", "next.md"],
         cd: ctx.workdir,
@@ -3598,7 +3600,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {set, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "work-item-update",
@@ -3625,7 +3627,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {replayed, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "work-item-update",
@@ -3643,7 +3645,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "work-item-update"}}
 
     {conflict, 1} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         ["work-item-update", work_item_id, "--clear-spec-ref", "--spec-ref", "next.md"],
         cd: ctx.workdir,
@@ -3654,7 +3656,7 @@ defmodule Tightbeam.CliIntegrationTest do
     refute_receive {:cli_call, %{verb: "work-item-update"}}, 50
 
     {got, 0} =
-      session_cli(ctx.binary, ["work-item-get", work_item_id],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-get", work_item_id],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3670,7 +3672,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "work-item-get"}}
 
     {combined, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "work-item-update",
@@ -3712,7 +3714,7 @@ defmodule Tightbeam.CliIntegrationTest do
     key = "effort-#{action}-#{System.unique_integer([:positive])}"
 
     {dispatched, 0} =
-      session_cli(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "dispatch",
@@ -3780,7 +3782,7 @@ defmodule Tightbeam.CliIntegrationTest do
           ["topline-placement-list", "--history"]
         ] do
       {output, status} =
-        session_cli(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+        Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
 
       assert status != 0
       assert output =~ "does not accept"
@@ -3796,7 +3798,7 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     {output, 0} =
-      session_cli(ctx.binary, ["breathing", "session", "cli-holder"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["breathing", "session", "cli-holder"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3840,7 +3842,7 @@ defmodule Tightbeam.CliIntegrationTest do
     refute payload =~ ~s("breathing":true)
 
     {missing, 0} =
-      session_cli(ctx.binary, ["breathing", "session", "missing"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["breathing", "session", "missing"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3848,7 +3850,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert %{"breathing" => false, "reason" => "session_missing"} = JSON.decode!(missing)
 
     {usage, 1} =
-      session_cli(ctx.binary, ["breathing", "session"],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["breathing", "session"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3856,7 +3858,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert usage =~ "usage: tightbeam breathing session|assignment|work-item <id>"
   end
 
-  describe "session_cli accepts only this test's recorded fixture session (F1)" do
+  describe "fixture-session launches accept only the recorded fixture session (F1)" do
     defp counting_listener! do
       {:ok, listen} =
         :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
@@ -3910,124 +3912,36 @@ defmodule Tightbeam.CliIntegrationTest do
 
       on_exit(fn -> File.rm_rf!(outside) end)
       {session, inner} = session_tree!(outside)
-      fixture_session!(session, fields.(decoy.url))
+      Tightbeam.FixtureSession.write!(session, fields.(decoy.url))
 
-      assert_raise RuntimeError, ~r/outside the sandbox/, fn ->
-        session_cli(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      assert_raise Tightbeam.TestIsolation.Refusal, ~r/outside the sandbox/, fn ->
+        Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
       end
 
       {session, inner} = session_tree!(Path.join(ctx.base_dir, "f1-session-cli"))
-      fixture_session!(session, fields.(fixture.url))
+      Tightbeam.FixtureSession.write!(session, fields.(fixture.url))
       File.write!(session, JSON.encode!(fields.(decoy.url)))
 
-      assert_raise RuntimeError, ~r/not the fixture gateway/, fn ->
-        session_cli(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      assert_raise Tightbeam.TestIsolation.Refusal, ~r/not the fixture gateway/, fn ->
+        Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
       end
 
-      fixture_session!(session, fields.("http://10.1.2.3:9"))
+      Tightbeam.FixtureSession.write!(session, fields.("http://10.1.2.3:9"))
 
-      assert_raise RuntimeError, ~r/not a loopback address/, fn ->
-        session_cli(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      assert_raise Tightbeam.TestIsolation.Refusal, ~r/not a loopback address/, fn ->
+        Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
       end
 
       Process.sleep(200)
       assert :counters.get(decoy.counter, 1) == 0
 
       # Positive control: the recorded fixture session reaches the fixture listener.
-      fixture_session!(session, fields.(fixture.url))
-      {output, _status} = session_cli(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.write!(session, fields.(fixture.url))
+
+      {output, _status} =
+        Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+
       assert :counters.get(fixture.counter, 1) >= 1, output
     end
-  end
-
-  # The CLI here authenticates through this test's own fixture sessions:
-  # .tightbeam-session files the test writes under the sandbox, each naming one
-  # of the test's own loopback Bandit listeners (or a port it closed on
-  # purpose). fixture_session!/2 writes such a file and records its exact path
-  # and URL. A launch from inside a session tree runs through session_cli/3,
-  # which accepts the nearest session file only if it lies inside the sandbox
-  # and its URL equals what the test recorded for that file (the live gateway
-  # is on loopback too, so loopback alone is not enough), then applies the
-  # isolation helper's env and cwd rules. Any other launch goes through
-  # Tightbeam.TestIsolation unchanged (F1, wi_34a7be66).
-  @fixture_sessions {__MODULE__, :fixture_sessions}
-
-  defp fixture_session!(path, fields) do
-    File.write!(path, JSON.encode!(fields))
-    recorded = :persistent_term.get(@fixture_sessions, %{})
-    key = Tightbeam.TestSandboxPreflight.canonical(path)
-    :persistent_term.put(@fixture_sessions, Map.put(recorded, key, Map.fetch!(fields, :url)))
-  end
-
-  defp session_cli(command, args, opts \\ []) do
-    cd = Keyword.get(opts, :cd)
-
-    case cd && Tightbeam.TestSandboxPreflight.session_ancestor(cd) do
-      nil ->
-        Tightbeam.TestIsolation.cmd(command, args, opts)
-
-      session ->
-        fixture_session_check!(session)
-
-        real_cd = Tightbeam.TestSandboxPreflight.canonical(cd)
-        root = Tightbeam.TestIsolation.sandbox_root()
-
-        unless Tightbeam.TestSandboxPreflight.inside?(real_cd, root) or
-                 Tightbeam.TestSandboxPreflight.inside?(real_cd, Tightbeam.TestIsolation.repo()),
-               do: raise("refusing to launch in #{cd}: neither the repository nor the sandbox")
-
-        Tightbeam.TestIsolation.env!(Keyword.get(opts, :env, []))
-        System.cmd(command, args, opts)
-    end
-  end
-
-  # Port.open twin of session_cli/3, with the same fixture-session checks.
-  defp session_port_open(name, opts) do
-    cd = opts |> List.keyfind(:cd, 0) |> then(&(&1 && to_string(elem(&1, 1))))
-
-    case cd && Tightbeam.TestSandboxPreflight.session_ancestor(cd) do
-      nil ->
-        Tightbeam.TestIsolation.port_open(name, opts)
-
-      session ->
-        fixture_session_check!(session)
-
-        real_cd = Tightbeam.TestSandboxPreflight.canonical(cd)
-        root = Tightbeam.TestIsolation.sandbox_root()
-
-        unless Tightbeam.TestSandboxPreflight.inside?(real_cd, root) or
-                 Tightbeam.TestSandboxPreflight.inside?(real_cd, Tightbeam.TestIsolation.repo()),
-               do: raise("refusing to launch in #{cd}: neither the repository nor the sandbox")
-
-        declared =
-          for {key, value} <- opts |> List.keyfind(:env, 0) |> then(&((&1 && elem(&1, 1)) || [])),
-              do: {to_string(key), if(value in [false, nil], do: nil, else: to_string(value))}
-
-        Tightbeam.TestIsolation.env!(declared)
-        Port.open(name, opts)
-    end
-  end
-
-  defp fixture_session_check!(session) do
-    root = Tightbeam.TestIsolation.sandbox_root()
-    real = Tightbeam.TestSandboxPreflight.canonical(session)
-    recorded = :persistent_term.get(@fixture_sessions, %{}) |> Map.get(real)
-
-    unless Tightbeam.TestSandboxPreflight.inside?(real, root),
-      do: raise("refusing to launch: #{session} is outside the sandbox #{root}")
-
-    url = session |> File.read!() |> JSON.decode!() |> Map.get("url")
-
-    loopback? = is_binary(url) and URI.parse(url).host in ["127.0.0.1", "::1", "localhost"]
-
-    unless loopback?,
-      do: raise("refusing to launch: #{session} names #{inspect(url)}, not a loopback address")
-
-    unless is_binary(recorded) and url == recorded,
-      do:
-        raise(
-          "refusing to launch: #{session} names #{inspect(url)}, not the fixture " <>
-            "gateway this test recorded for it (#{inspect(recorded)})"
-        )
   end
 end
