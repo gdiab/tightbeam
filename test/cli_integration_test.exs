@@ -3906,13 +3906,26 @@ defmodule Tightbeam.CliIntegrationTest do
 
       on_exit(fn -> File.rm_rf!(outside) end)
       {session, inner} = session_tree!(outside)
-      Tightbeam.FixtureSession.write!(session, fields.(decoy.url))
+
+      assert_raise Tightbeam.TestIsolation.Refusal, ~r/may not be written/, fn ->
+        Tightbeam.FixtureSession.write!(session, fields.(decoy.url))
+      end
+
+      File.write!(session, JSON.encode!(fields.(decoy.url)))
 
       assert_raise Tightbeam.TestIsolation.Refusal, ~r/outside the sandbox/, fn ->
         Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
       end
 
       {session, inner} = session_tree!(Path.join(ctx.base_dir, "f1-session-cli"))
+
+      # Present inside the sandbox but never recorded by write!/2.
+      File.write!(session, JSON.encode!(fields.(fixture.url)))
+
+      assert_raise Tightbeam.TestIsolation.Refusal, ~r/not the fixture gateway/, fn ->
+        Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: inner, stderr_to_stdout: true)
+      end
+
       Tightbeam.FixtureSession.write!(session, fields.(fixture.url))
       File.write!(session, JSON.encode!(fields.(decoy.url)))
 

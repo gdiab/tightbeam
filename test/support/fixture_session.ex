@@ -17,8 +17,17 @@ defmodule Tightbeam.FixtureSession do
 
   @recorded {__MODULE__, :recorded}
 
-  @doc "Write a fixture .tightbeam-session at `path` and record its URL."
+  @doc """
+  Write a fixture .tightbeam-session at `path` and record its URL. The file
+  may only be written inside the sandbox or the test tmp root.
+  """
   def write!(path, fields) do
+    dir = path |> Path.expand() |> Path.dirname() |> TestSandboxPreflight.canonical()
+
+    unless TestSandboxPreflight.inside?(dir, TestIsolation.sandbox_root()) or
+             TestSandboxPreflight.inside?(dir, TestIsolation.test_tmp()),
+           do: refuse!("a fixture session may not be written at #{path}")
+
     File.write!(path, JSON.encode!(fields))
     recorded = :persistent_term.get(@recorded, %{})
     key = TestSandboxPreflight.canonical(path)
