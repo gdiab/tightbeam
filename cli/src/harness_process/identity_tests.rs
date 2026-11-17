@@ -3,7 +3,7 @@ use std::io::BufRead;
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// An actual session leader and its detached child. Children use only async-signal-safe
@@ -130,7 +130,7 @@ impl Drop for OwnedTree {
 
 #[test]
 fn freeze_wait_accepts_a_slow_normally_exiting_multi_process_tree() {
-    let mut leader = Command::new("/bin/sh")
+    let mut leader = crate::test_isolation::command("/bin/sh")
         .args(["-c", "sleep 2.5 & echo $!; wait"])
         .process_group(0)
         .stdin(Stdio::null())

@@ -72,11 +72,15 @@ defmodule Tightbeam.LaunchIsolationLint do
         "stale #{@allowlist} entry: #{entry.file} #{entry.function} #{entry.kind}"
       end
 
+    # The reviewer field names the reviewing session and its verdict; an entry
+    # still awaiting review is not reviewed (reviewer finding B4).
     malformed =
       for entry <- allowlist,
           not (is_binary(entry[:reason]) and entry.reason != "" and
-                 is_binary(entry[:reviewer]) and entry.reviewer != "") do
-        "#{@allowlist} entry #{entry.file} #{entry.function} needs a reason and a reviewer"
+                 is_binary(entry[:reviewer]) and entry.reviewer != "" and
+                 not (entry.reviewer =~ ~r/pending/i)) do
+        "#{@allowlist} entry #{entry.file} #{entry.function} needs a reason and a reviewer " <>
+          "that is not pending"
       end
 
     fatal = for f <- fatal, do: "#{f.file}:#{f.line} #{f.kind}; it cannot be allowlisted"

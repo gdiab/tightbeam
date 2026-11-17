@@ -93,7 +93,11 @@ data shows whether the event path ever drops anything.
   `test/support/process_launch_allowlist.exs` or
   `cli/tests/fixtures/launch_allowlist.txt`. Real harness tools (`codex`,
   `claude`, `cursor-agent`, `pi`, `harklight-agent`, `gh`, `ssh`, `op`) never
-  resolve in the sandbox: tests use fixture binaries.
+  resolve in the sandbox: tests use fixture binaries. A program named by path
+  must be a toolbox tool, a repository file, an OTP launcher or a sandbox
+  fixture; prefer the bare name. A Rust test never strips the environment
+  `test_isolation::command` set (`env_clear`, `env_remove("HOME"|"PATH")`).
+  Allowlist entries name their reviewer and verdict, never "pending".
 - Make the requested change first, then run the focused checks that exercise it.
   Do not run a full-suite baseline before writing code; an untouched-tree replay
   delays the change without proving its result.

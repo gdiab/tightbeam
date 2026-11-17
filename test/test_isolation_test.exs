@@ -359,6 +359,41 @@ defmodule Tightbeam.TestIsolationTest do
              )
   end
 
+  test "B1: an executable named by path must be a toolbox tool, a repository file or a fixture" do
+    outside = "/usr/bin/yes"
+
+    for launch <- [
+          fn -> TestIsolation.cmd(outside, []) end,
+          fn -> Tightbeam.TestIsolation.port_open({:spawn_executable, outside}, [:binary]) end,
+          fn -> Tightbeam.TestIsolation.port_open({:spawn, "#{outside} y"}, [:binary]) end,
+          fn ->
+            Tightbeam.TestIsolation.run_script!("scripts/verify_mix.sh", [], runner: outside)
+          end
+        ] do
+      error = assert_raise TestIsolation.Refusal, launch
+      assert error.message =~ "is not a toolbox tool"
+    end
+
+    for forbidden <- [
+          "/usr/local/bin/codex",
+          "/usr/bin/ssh",
+          Path.join(TestIsolation.repo(), "gh")
+        ] do
+      error = assert_raise TestIsolation.Refusal, fn -> TestIsolation.cmd(forbidden, []) end
+      assert error.message =~ "is a forbidden tool", forbidden
+    end
+
+    repo = TestIsolation.repo()
+    assert :ok = TestIsolation.executable!("/bin/sh", repo)
+    assert :ok = TestIsolation.executable!(cli(), repo)
+    assert :ok = TestIsolation.executable!(Path.join(TestIsolation.toolbox(), "ssh"), repo)
+
+    fixture = Path.join(scratch!("b1"), "gh")
+    File.write!(fixture, "#!/bin/sh\necho fixture-gh\n")
+    File.chmod!(fixture, 0o755)
+    assert {"fixture-gh\n", 0} = TestIsolation.cmd(fixture, [])
+  end
+
   describe "T8 and T11: the launch lint fails closed" do
     test "T8: every launch form outside the helper is reported; the real tree is clean" do
       source = ~S"""
