@@ -67,7 +67,13 @@ defmodule Tightbeam.TestIsolation do
     cwd = cwd!(Keyword.get(opts, :cd))
     declared = Keyword.get(opts, :env, [])
     check_env!(declared)
-    System.cmd(command, args, Keyword.put(opts, :cd, cwd))
+
+    env =
+      if List.keymember?(declared, "GIT_CONFIG_NOSYSTEM", 0),
+        do: declared,
+        else: [{"GIT_CONFIG_NOSYSTEM", "1"} | declared]
+
+    System.cmd(command, args, opts |> Keyword.put(:cd, cwd) |> Keyword.put(:env, env))
   end
 
   @doc "Drop-in for Port.open/2 that refuses an unsafe launch."
@@ -79,7 +85,23 @@ defmodule Tightbeam.TestIsolation do
           do: {to_string(key), if(value in [false, nil], do: nil, else: to_string(value))}
 
     check_env!(declared)
-    Port.open(name, List.keystore(opts, :cd, 0, {:cd, String.to_charlist(cwd)}))
+
+    env =
+      with {:env, list} <- List.keyfind(opts, :env, 0), do: list
+
+    env = env || []
+
+    env =
+      if Enum.any?(env, fn {key, _} -> to_string(key) == "GIT_CONFIG_NOSYSTEM" end),
+        do: env,
+        else: [{~c"GIT_CONFIG_NOSYSTEM", ~c"1"} | env]
+
+    opts =
+      opts
+      |> List.keystore(:cd, 0, {:cd, String.to_charlist(cwd)})
+      |> List.keystore(:env, 0, {:env, env})
+
+    Port.open(name, opts)
   end
 
   @doc """
@@ -166,7 +188,7 @@ defmodule Tightbeam.TestIsolation do
       Enum.flat_map(env, fn {key, value} ->
         inherited? = not MapSet.member?(declared_keys, key)
         check_var(key, value, env, inherited?)
-      end) ++ tightbeam_resolution(env) ++ forbidden_resolution(env)
+      end) ++ tightbeam_resolution(env) ++ forbidden_resolution(env) ++ git_problems(env)
 
     if problems != [] do
       refuse!("refusing to launch: " <> Enum.join(problems, "; "))
@@ -205,6 +227,57 @@ defmodule Tightbeam.TestIsolation do
   end
 
   defp check_var(_key, _value, _env, false), do: []
+
+  # git config injected through the environment can reach real credentials
+  # whatever HOME is (credential.helper=osxkeychain reads the login keychain),
+  # or route traffic and prompts elsewhere. Reviewer ruling (B) on GIT_CONFIG_*.
+  @git_config_refused ~r/\A(credential(\.|\z)|core\.sshcommand\z|core\.askpass\z|http\.|url\..*\.(pushinsteadof|insteadof)\z|include\.path\z|includeif\.|gpg\.|user\.signingkey\z)/i
+  @git_programs ~w(GIT_ASKPASS SSH_ASKPASS GIT_SSH GIT_SSH_COMMAND)
+
+  defp git_problems(env) do
+    keys =
+      for {name, value} <- env, Regex.match?(~r/\AGIT_CONFIG_KEY_\d+\z/, name), do: value
+
+    parameter_keys =
+      ~r/'([^'=]+)=/
+      |> Regex.scan(env["GIT_CONFIG_PARAMETERS"] || "", capture: :all_but_first)
+      |> List.flatten()
+
+    refused_keys =
+      for key <- keys ++ parameter_keys,
+          Regex.match?(@git_config_refused, String.trim(key)),
+          do: "git config #{key} may not be injected into a test child"
+
+    programs =
+      for name <- @git_programs,
+          value = env[name],
+          is_binary(value) and value != "",
+          not sandbox_program?(value),
+          do: "#{name}=#{value} is not a fixture inside the sandbox or the test tmp root"
+
+    # The helper sets GIT_CONFIG_NOSYSTEM=1 on every child; a test may not
+    # turn it off.
+    nosystem =
+      if env["GIT_CONFIG_NOSYSTEM"] in [nil, "1"],
+        do: [],
+        else: ["GIT_CONFIG_NOSYSTEM must stay 1 for a test child"]
+
+    global =
+      case env["GIT_CONFIG_GLOBAL"] do
+        nil -> []
+        path -> sandbox_or_test_tmp_path("GIT_CONFIG_GLOBAL", path)
+      end
+
+    refused_keys ++ programs ++ nosystem ++ global
+  end
+
+  defp sandbox_program?(value) do
+    program = value |> String.trim() |> String.split(~r/\s+/, parts: 2) |> hd()
+
+    path_valued?(program) and
+      (inside?(Preflight.canonical(Path.expand(program)), sandbox_root()) or
+         inside?(Preflight.canonical(Path.expand(program)), test_tmp()))
+  end
 
   # A real harness or credential tool must never resolve for a child. The only
   # toolbox entry with such a name is the launcher's exact ssh tripwire; a test's
@@ -309,7 +382,8 @@ defmodule Tightbeam.TestIsolation do
 
   # "Unless test-scoped": a value that is a path inside the sandbox, a name that
   # declares itself a fixture, git's commit identity (AUTHOR is not AUTH) or
-  # git's config plumbing (GIT_CONFIG_KEY_n names a config key, not a secret).
+  # git's config plumbing (GIT_CONFIG_KEY_n names a config key, not a secret;
+  # the credential-reaching keys themselves are refused by git_problems/1).
   defp test_scoped?(key, value) do
     upper = String.upcase(key)
 
