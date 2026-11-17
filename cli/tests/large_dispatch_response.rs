@@ -137,7 +137,6 @@ fn exchange(status: u16, body: Vec<u8>, framing: Framing) -> (bool, Vec<u8>, Str
         std::path::Path::new(&scratch.0),
     )
     .args(["artifacts", "--as-user", "large-response-fixture"])
-    .env_clear()
     .env("TIGHTBEAM_URL", format!("http://{address}"))
     .env("TIGHTBEAM_TOKEN", "synthetic-loopback-token")
     .env("TIGHTBEAM_BASE_DIR", &scratch.0)

@@ -42,6 +42,7 @@ defmodule Tightbeam.FixtureSession do
 
       {session, cd} ->
         check!(session, cd)
+        TestIsolation.executable!(command, cd)
         TestIsolation.env!(Keyword.get(opts, :env, []))
         System.cmd(command, args, opts)
     end
@@ -57,6 +58,8 @@ defmodule Tightbeam.FixtureSession do
 
       {session, cd} ->
         check!(session, cd)
+
+        TestIsolation.port_executable!(name, cd)
 
         declared =
           for {key, value} <- with({:env, env} <- List.keyfind(opts, :env, 0), do: env) || [],
