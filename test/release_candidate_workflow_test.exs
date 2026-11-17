@@ -250,8 +250,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert proof_job =~ "release-candidate-stage-${{ needs.metadata.outputs.candidate_sha }}"
 
     assert workflow =~
-             ("Neither candidate artifact exists unless metadata, both test jobs, " <>
-                "and both package jobs passed.")
+             "Neither candidate artifact exists unless metadata, both test jobs, " <>
+               "and both package jobs passed."
   end
 
   test "manifest verifier accepts complete exact evidence", evidence do
@@ -429,7 +429,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   end
 
   defp create_manifest(fixture) do
-    manifest_verifier(["create",
+    manifest_verifier([
+      "create",
       "--candidate-input",
       fixture.candidate_input,
       "--evidence-root",
@@ -446,7 +447,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   defp verify_manifest(fixture, options \\ []) do
     source = Keyword.get(options, :expected_source_sha, fixture.f2)
 
-    manifest_verifier(["verify",
+    manifest_verifier([
+      "verify",
       "--manifest",
       fixture.manifest,
       "--evidence-root",
@@ -465,7 +467,9 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   end
 
   defp stage_command(fixture, stage_root, operation, tag) do
-    stage_verifier([operation,
+    stage_verifier(
+      [
+        operation,
         "--proof-manifest",
         fixture.manifest,
         "--evidence-root",

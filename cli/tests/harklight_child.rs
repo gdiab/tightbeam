@@ -1,5 +1,8 @@
+#[path = "../src/test_isolation.rs"]
+mod test_isolation;
+
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -28,7 +31,7 @@ fn start(script: &str) -> Running {
         ))
         .to_string_lossy()
         .into_owned();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    let mut child = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args([
             "harklight-child",
             "--lock",
@@ -61,7 +64,7 @@ fn start(script: &str) -> Running {
 }
 
 fn barrier(lock: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args(["harklight-child", "--lock", lock, "--wait"])
         .stdin(Stdio::null())
         .spawn()

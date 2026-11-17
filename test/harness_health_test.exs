@@ -4207,7 +4207,10 @@ defmodule Tightbeam.HarnessHealthTest do
     )
 
     File.write!(Path.join(sdk, "index.js"), "")
-    {runtime, 0} = Tightbeam.TestIsolation.cmd(node, ["-p", "process.platform + ' ' + process.arch"])
+
+    {runtime, 0} =
+      Tightbeam.TestIsolation.cmd(node, ["-p", "process.platform + ' ' + process.arch"])
+
     [platform, arch] = String.split(String.trim(runtime))
 
     packages =

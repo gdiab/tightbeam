@@ -47,7 +47,8 @@ defmodule Tightbeam.SentinelMatrixWatcherTest do
       {"TIGHTBEAM_POST_ARGS", post_args}
     ]
 
-    {output, status} = Tightbeam.TestIsolation.cmd(python, [watcher], env: env, stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.cmd(python, [watcher], env: env, stderr_to_stdout: true)
 
     # The sample stream ends, so the long-running watcher must report the
     # matrix-commander exit to the existing supervisor.
@@ -124,7 +125,9 @@ defmodule Tightbeam.SentinelMatrixWatcherTest do
 
     python = System.find_executable("python3")
     watcher = Path.expand("../priv/kungfu/sentinels/sentinels/matrix", __DIR__)
-    {output, status} = Tightbeam.TestIsolation.cmd(python, [watcher], env: env, stderr_to_stdout: true)
+
+    {output, status} =
+      Tightbeam.TestIsolation.cmd(python, [watcher], env: env, stderr_to_stdout: true)
 
     assert status != 0
     assert output =~ "malformed JSON"
