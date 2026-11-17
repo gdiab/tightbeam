@@ -139,7 +139,8 @@ defmodule Tightbeam.Harness.Codex do
         [
           cmd:
             ["ssh" | Support.ssh_opts()] ++
-              [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+              [target.host_config.ssh, "exec", "env" | Support.remote_env_unset()] ++
+              remote_env ++ [binary],
           env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
         ]
       end
@@ -208,7 +209,8 @@ defmodule Tightbeam.Harness.Codex do
         ["env" | env] ++ ["node", "-e", script]
       else
         ["ssh" | Support.ssh_opts()] ++
-          [target.host_config.ssh, "env" | Keyword.fetch!(opts, :remote_env)] ++
+          [target.host_config.ssh, "env" | Support.remote_env_unset()] ++
+          Keyword.fetch!(opts, :remote_env) ++
           ["node", "-e", Support.shell_quote(script)]
       end
 
