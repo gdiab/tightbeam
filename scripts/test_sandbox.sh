@@ -211,11 +211,34 @@ if [ -e "$root/bin/cargo" ]; then
   smoke cargo --version
 fi
 
+# b0's conditions on the passthrough (asg_b30d5c78), enforced again by the
+# preflight: the test gateway port is pinned to 0 (OS-assigned), so no suite
+# gateway takes a fixed or production port such as 11373; the gate node is
+# only the name scripts/verify_mix.sh makes for its own run (the same pattern
+# as TestSandboxPreflight.gate_node_pattern/0), never a live node's; the gate
+# claim is the literal 1.
+case "${TIGHTBEAM_PORT-0}" in
+  0) ;;
+  *) refuse "TIGHTBEAM_PORT=$TIGHTBEAM_PORT: the test sandbox pins the gateway port to 0" ;;
+esac
+an='[A-Za-z0-9]'
+if [ "${TIGHTBEAM_GATE_NODE+set}" = set ]; then
+  # shellcheck disable=SC2254 # $an is a deliberate pattern, matched whole.
+  case "$TIGHTBEAM_GATE_NODE" in
+    tightbeam_mix_gate_$an$an$an$an$an$an$an$an) ;;
+    *) refuse "TIGHTBEAM_GATE_NODE=$TIGHTBEAM_GATE_NODE is not a node scripts/verify_mix.sh made" ;;
+  esac
+fi
+case "${TIGHTBEAM_AUTHORITATIVE_GATE-1}" in
+  1) ;;
+  *) refuse "TIGHTBEAM_AUTHORITATIVE_GATE=$TIGHTBEAM_AUTHORITATIVE_GATE is not the gate claim 1" ;;
+esac
+
 # Named, credential-free variables inherited only when the caller set them: the
 # locale, the authoritative-gate claim (scripts/verify_mix.sh) and the macOS CI
 # diagnostic (test/test_helper.exs). They go before the command, after env -i.
 for name in LC_ALL LC_CTYPE TERM TIGHTBEAM_AUTHORITATIVE_GATE TIGHTBEAM_GATE_NODE \
-  TIGHTBEAM_PORT DD36_DARWIN_DIAGNOSTIC_DIR RUNNER_TEMP CANDIDATE_SHA; do
+  DD36_DARWIN_DIAGNOSTIC_DIR RUNNER_TEMP CANDIDATE_SHA; do
   eval "set_flag=\${$name+set}"
   if [ "$set_flag" = set ]; then
     eval "value=\${$name}"
@@ -245,5 +268,6 @@ env -i \
   CARGO_NET_OFFLINE=true \
   CARGO_TARGET_DIR="$repo/cli/target" \
   TIGHTBEAM_TEST_SANDBOX="$root" \
+  TIGHTBEAM_PORT=0 \
   "$@" || status=$?
 exit "$status"
