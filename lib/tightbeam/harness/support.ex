@@ -23,6 +23,10 @@ defmodule Tightbeam.Harness.Support do
 
   def ssh_opts, do: @ssh_opts
 
+  @doc "The launch refusal for a remote launch on a gateway with no absolute ssh on PATH."
+  def ssh_not_found_refusal,
+    do: %{code: "SSH-NOT-FOUND", message: "no ssh executable on the gateway's PATH"}
+
   @doc false
   def reserved_overlay_env_vars, do: @reserved_overlay_env_vars
 
@@ -490,7 +494,8 @@ defmodule Tightbeam.Harness.Support do
       end
 
     plan =
-      if profile.railed_probe and (railed? or Map.get(profile, :always_probe, false)) do
+      if is_list(plan) and profile.railed_probe and
+           (railed? or Map.get(profile, :always_probe, false)) do
         Keyword.merge(plan,
           probe_cwd: Path.join(base, "work/gate-probe"),
           probe_model:
@@ -527,24 +532,34 @@ defmodule Tightbeam.Harness.Support do
         env: home_entries ++ [{"COMMON", "1"} | extra]
       ]
     else
-      ssh = if profile.wire_name == "pi", do: System.find_executable("ssh"), else: "ssh"
-      env = if profile.wire_name == "pi", do: "/usr/bin/env", else: "env"
-
-      remote_env =
-        profile.remote_prefix.(base, home, kind) ++
-          ["REMOTE=1"] ++
-          if(profile.remote_rails_env,
-            do: [profile.remote_rails_env],
-            else: []
-          )
-
-      [
-        cmd:
-          [ssh | ssh_opts()] ++
-            ["vector@remote", "exec", env | remote_env] ++ [adapter],
-        env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
-      ]
+      if profile.wire_name == "pi" do
+        # Pi launches remote adapters through an absolute ssh and refuses when
+        # PATH has none.
+        case System.find_executable("ssh") do
+          nil -> {:error, ssh_not_found_refusal()}
+          ssh -> expected_remote_launch(profile, kind, base, home, adapter, ssh, "/usr/bin/env")
+        end
+      else
+        expected_remote_launch(profile, kind, base, home, adapter, "ssh", "env")
+      end
     end
+  end
+
+  defp expected_remote_launch(profile, kind, base, home, adapter, ssh, env) do
+    remote_env =
+      profile.remote_prefix.(base, home, kind) ++
+        ["REMOTE=1"] ++
+        if(profile.remote_rails_env,
+          do: [profile.remote_rails_env],
+          else: []
+        )
+
+    [
+      cmd:
+        [ssh | ssh_opts()] ++
+          ["vector@remote", "exec", env | remote_env] ++ [adapter],
+      env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
+    ]
   end
 
   defp launch_observation({:error, _refusal} = error), do: error

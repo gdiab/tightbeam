@@ -84,14 +84,17 @@ defmodule Tightbeam.Harness.Pi do
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
 
-    ssh =
-      if Support.local?(target) do
-        nil
-      else
-        {:ok, ssh} = absolute_executable(target, "ssh")
-        ssh
+    if Support.local?(target) do
+      launch_plan(target, home, opts, binary, nil)
+    else
+      case absolute_executable(target, "ssh") do
+        {:ok, ssh} -> launch_plan(target, home, opts, binary, ssh)
+        :error -> {:error, Support.ssh_not_found_refusal()}
       end
+    end
+  end
 
+  defp launch_plan(target, home, opts, binary, ssh) do
     probe =
       if Keyword.fetch!(opts, :statutes) do
         probe_cwd = Path.join(target.host_config.base_dir, "work/gate-probe")
