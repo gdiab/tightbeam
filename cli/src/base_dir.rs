@@ -55,6 +55,17 @@ where
         .unwrap_or_else(|| default_in(home_dir))
 }
 
+/// `TIGHTBEAM_BASE_DIR` exactly as the caller set it (`Some("")` when set but
+/// empty). CLI discovery treats a set base as an explicit choice that outranks an
+/// ambient session file (F2, wi_34a7be66); WHERE that base is stays
+/// `resolve_with`'s answer, so there is still one resolver.
+pub fn explicit_with<F>(get_env: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get_env("TIGHTBEAM_BASE_DIR")
+}
+
 /// The default when neither variable is set.
 pub fn default_in(home_dir: &Path) -> PathBuf {
     home_dir.join(".tightbeam")
