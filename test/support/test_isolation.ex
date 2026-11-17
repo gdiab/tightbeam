@@ -170,7 +170,30 @@ defmodule Tightbeam.TestIsolation do
     end
   end
 
-  defp inside?(path, root), do: Preflight.inside?(path, Preflight.canonical(root))
+  # `real` is an already-resolved path; `root` is one of the fixed roots below.
+  defp inside?(real, root) do
+    root = real_root(root)
+    real == root or String.starts_with?(real, root <> "/")
+  end
+
+  # The repository, the sandbox and its toolbox, the test tmp root and the VM's
+  # OTP bin dirs are fixed for the VM's life, so each is resolved once. Every
+  # path a launch names is still resolved on every call. Resolving the roots on
+  # every check queued enough read_link calls on the VM's single file server to
+  # time out an async test with many launches on a loaded macOS runner.
+  defp real_root(path) do
+    key = {__MODULE__, :real_root, path}
+
+    case :persistent_term.get(key, nil) do
+      nil ->
+        real = Preflight.canonical(path)
+        :persistent_term.put(key, real)
+        real
+
+      real ->
+        real
+    end
+  end
 
   defp effective_env(declared) do
     Enum.reduce(declared, System.get_env(), fn
@@ -274,9 +297,7 @@ defmodule Tightbeam.TestIsolation do
   defp sandbox_program?(value) do
     program = value |> String.trim() |> String.split(~r/\s+/, parts: 2) |> hd()
 
-    path_valued?(program) and
-      (inside?(Preflight.canonical(Path.expand(program)), sandbox_root()) or
-         inside?(Preflight.canonical(Path.expand(program)), test_tmp()))
+    path_valued?(program) and scratch?(Preflight.canonical(Path.expand(program)))
   end
 
   # A real harness or credential tool must never resolve for a child. The only
@@ -303,11 +324,11 @@ defmodule Tightbeam.TestIsolation do
     real = Preflight.canonical(found)
 
     cond do
-      String.starts_with?(real, Preflight.canonical(toolbox()) <> "/") ->
+      String.starts_with?(real, real_root(toolbox()) <> "/") ->
         tool == "ssh" and Preflight.ssh_tripwire?(found, sandbox_root())
 
       true ->
-        inside?(real, sandbox_root()) or inside?(real, test_tmp())
+        scratch?(real)
     end
   end
 
@@ -320,38 +341,29 @@ defmodule Tightbeam.TestIsolation do
       |> Enum.map(&Path.join(&1, "tightbeam"))
       |> Enum.find(&File.exists?/1)
 
-    cond do
-      is_nil(found) ->
-        []
+    real = found && Preflight.canonical(found)
 
-      inside?(Preflight.canonical(found), test_tmp()) ->
-        []
-
-      inside?(Preflight.canonical(found), Path.join(@repo, "cli/target")) ->
-        []
-
-      inside?(Preflight.canonical(found), sandbox_root()) ->
-        []
-
-      true ->
-        ["tightbeam resolves to #{found}, not the repository build or a sandbox fixture"]
-    end
+    if is_nil(found) or scratch?(real) or inside?(real, Path.join(@repo, "cli/target")),
+      do: [],
+      else: ["tightbeam resolves to #{found}, not the repository build or a sandbox fixture"]
   end
 
   defp allowed_path_entry?(entry) do
     real = Preflight.canonical(Path.expand(entry))
 
-    real == Preflight.canonical(toolbox()) or
-      real == Preflight.canonical(Path.join(@repo, "cli/target/release")) or
+    real == real_root(toolbox()) or
       inside?(real, Path.join(@repo, "cli/target")) or
-      real in Enum.map(Preflight.vm_bin_dirs(), &Preflight.canonical/1) or
-      inside?(real, sandbox_root()) or inside?(real, test_tmp())
+      real in Enum.map(Preflight.vm_bin_dirs(), &real_root/1) or
+      scratch?(real)
   end
+
+  # Inside the sandbox or the test tmp root.
+  defp scratch?(real), do: inside?(real, sandbox_root()) or inside?(real, test_tmp())
 
   defp sandbox_or_test_tmp_path(key, value) do
     real = Preflight.canonical(Path.expand(value))
 
-    if inside?(real, sandbox_root()) or inside?(real, test_tmp()),
+    if scratch?(real),
       do: [],
       else: ["#{key}=#{value} is outside the sandbox and the test tmp root"]
   end
@@ -375,9 +387,7 @@ defmodule Tightbeam.TestIsolation do
     base = env["TIGHTBEAM_BASE_DIR"]
 
     (is_binary(env["TIGHTBEAM_URL"]) and loopback?(env["TIGHTBEAM_URL"])) or
-      (is_binary(base) and
-         (inside?(Preflight.canonical(base), sandbox_root()) or
-            inside?(Preflight.canonical(base), test_tmp())))
+      (is_binary(base) and scratch?(Preflight.canonical(base)))
   end
 
   # "Unless test-scoped": a value that is a path inside the sandbox, a name that
@@ -389,9 +399,7 @@ defmodule Tightbeam.TestIsolation do
 
     String.contains?(upper, ["FIXTURE", "SYNTHETIC"]) or
       String.starts_with?(upper, ["GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_"]) or
-      (path_valued?(value) and
-         (inside?(Preflight.canonical(Path.expand(value)), sandbox_root()) or
-            inside?(Preflight.canonical(Path.expand(value)), test_tmp())))
+      (path_valued?(value) and scratch?(Preflight.canonical(Path.expand(value))))
   end
 
   defp credential_name?(key) do
