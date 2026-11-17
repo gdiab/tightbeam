@@ -3440,24 +3440,27 @@ defmodule Tightbeam.CliIntegrationTest do
       JSON.encode!(%{port: ctx.port, cliToken: "tbc_cli_integration"})
     )
 
+    # The session identity is the workdir's session file with nothing explicit set:
+    # since F2 (wi_34a7be66) an explicit TIGHTBEAM_BASE_DIR wins over an ambient
+    # session file, so only the organization cases name the base.
+    unset = [{"TIGHTBEAM_URL", nil}, {"TIGHTBEAM_TOKEN", nil}]
+    organization = [{"TIGHTBEAM_BASE_DIR", ctx.base_dir} | unset]
+
     calls = [
-      {ctx.workdir, [], "agent:cli-holder", {:session, "cli-holder"}},
-      {ctx.outside, ["--as-user", "fixture-user"], "user:fixture-user", {:user, "fixture-user"}},
-      {ctx.outside, ["--as-process", "fixture-process"], "process:fixture-process",
+      {ctx.workdir, unset, [], "agent:cli-holder", {:session, "cli-holder"}},
+      {ctx.outside, organization, ["--as-user", "fixture-user"], "user:fixture-user",
+       {:user, "fixture-user"}},
+      {ctx.outside, organization, ["--as-process", "fixture-process"], "process:fixture-process",
        {:process, "fixture-process"}}
     ]
 
-    for {cwd, flags, origin, principal} <- calls do
+    for {cwd, env, flags, origin, principal} <- calls do
       {output, 0} =
         Tightbeam.FixtureSession.cmd(
           ctx.binary,
           ["harklight-retry", "--all"] ++ flags,
           cd: cwd,
-          env: [
-            {"TIGHTBEAM_BASE_DIR", ctx.base_dir},
-            {"TIGHTBEAM_URL", nil},
-            {"TIGHTBEAM_TOKEN", nil}
-          ],
+          env: env,
           stderr_to_stdout: true
         )
 

@@ -2115,8 +2115,10 @@ pub fn discover() -> Result<Endpoint, String> {
 /// today's identity refusal, never a fall-through to `gateway.json`; an explicit
 /// source that overrode a session file is refused in words that say so (F2-4).
 fn discover_session_identity() -> Result<Endpoint, String> {
+    #[allow(deprecated)]
+    let home = std::env::home_dir().unwrap_or_default();
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    match resolve_explicit_or_session(&|name| std::env::var(name).ok(), &cwd)? {
+    match resolve_explicit_or_session(&|name| std::env::var(name).ok(), &cwd, &home)? {
         Resolution::Found(endpoint, overridden) => {
             if let Some(overridden) = overridden {
                 record_override(overridden);
@@ -2174,7 +2176,7 @@ fn discover_with_override<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    match resolve_explicit_or_session(&get_env, cwd)? {
+    match resolve_explicit_or_session(&get_env, cwd, home_dir)? {
         Resolution::Found(endpoint, overridden) => Ok((endpoint, overridden)),
         Resolution::Fallthrough => {
             let path = gateway_config_path(&get_env, home_dir);
@@ -2189,12 +2191,16 @@ enum Resolution {
     Fallthrough,
 }
 
-fn resolve_explicit_or_session<F>(get_env: &F, cwd: &Path) -> Result<Resolution, String>
+fn resolve_explicit_or_session<F>(
+    get_env: &F,
+    cwd: &Path,
+    home_dir: &Path,
+) -> Result<Resolution, String>
 where
     F: Fn(&str) -> Option<String>,
 {
     let raw_token = get_env("TIGHTBEAM_TOKEN");
-    let raw_base = get_env("TIGHTBEAM_BASE_DIR");
+    let raw_base = crate::base_dir::explicit_with(get_env);
     let url = get_env("TIGHTBEAM_URL").filter(|value| !value.is_empty());
     let token = raw_token.clone().filter(|value| !value.is_empty());
     let session = nearest_session_file(cwd);
@@ -2225,8 +2231,8 @@ where
     }
 
     // 2. The explicit base. Its own error is the result: no fallback.
-    if let Some(base) = raw_base.as_deref().filter(|value| !value.is_empty()) {
-        let endpoint = endpoint_from_gateway_file(&Path::new(base).join("gateway.json"))?;
+    if raw_base.as_deref().is_some_and(|value| !value.is_empty()) {
+        let endpoint = endpoint_from_gateway_file(&gateway_config_path(get_env, home_dir))?;
         let overridden = session.map(|path| Overridden {
             source: ExplicitSource::BaseDir,
             unreadable: read_session_file(&path).is_err(),
