@@ -3873,6 +3873,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert usage =~ "usage: tightbeam breathing session|assignment|work-item <id>"
   end
+
   # The CLI here authenticates through this test's own fixture session: the
   # .tightbeam-session that setup writes under the sandbox, naming the test's
   # loopback gateway. A launch from inside such a tree runs through this helper,
@@ -3901,5 +3902,4 @@ defmodule Tightbeam.CliIntegrationTest do
         System.cmd(command, args, opts)
     end
   end
-
 end
