@@ -79,7 +79,7 @@ defmodule Tightbeam.TestIsolation do
           do: {to_string(key), if(value in [false, nil], do: nil, else: to_string(value))}
 
     check_env!(declared)
-    Port.open(name, Keyword.put(opts, :cd, String.to_charlist(cwd)))
+    Port.open(name, List.keystore(opts, :cd, 0, {:cd, String.to_charlist(cwd)}))
   end
 
   @doc """
@@ -254,8 +254,7 @@ defmodule Tightbeam.TestIsolation do
       inside?(Preflight.canonical(found), test_tmp()) ->
         []
 
-      Preflight.canonical(found) ==
-          Preflight.canonical(Path.join(@repo, "cli/target/release/tightbeam")) ->
+      inside?(Preflight.canonical(found), Path.join(@repo, "cli/target")) ->
         []
 
       inside?(Preflight.canonical(found), sandbox_root()) ->
@@ -271,6 +270,7 @@ defmodule Tightbeam.TestIsolation do
 
     real == Preflight.canonical(toolbox()) or
       real == Preflight.canonical(Path.join(@repo, "cli/target/release")) or
+      inside?(real, Path.join(@repo, "cli/target")) or
       real in Enum.map(Preflight.vm_bin_dirs(), &Preflight.canonical/1) or
       inside?(real, sandbox_root()) or inside?(real, test_tmp())
   end
@@ -308,12 +308,13 @@ defmodule Tightbeam.TestIsolation do
   end
 
   # "Unless test-scoped": a value that is a path inside the sandbox, a name that
-  # declares itself a fixture, or git's commit identity (AUTHOR is not AUTH).
+  # declares itself a fixture, git's commit identity (AUTHOR is not AUTH) or
+  # git's config plumbing (GIT_CONFIG_KEY_n names a config key, not a secret).
   defp test_scoped?(key, value) do
     upper = String.upcase(key)
 
     String.contains?(upper, ["FIXTURE", "SYNTHETIC"]) or
-      String.starts_with?(upper, ["GIT_AUTHOR_", "GIT_COMMITTER_"]) or
+      String.starts_with?(upper, ["GIT_AUTHOR_", "GIT_COMMITTER_", "GIT_CONFIG_"]) or
       (path_valued?(value) and
          (inside?(Preflight.canonical(Path.expand(value)), sandbox_root()) or
             inside?(Preflight.canonical(Path.expand(value)), test_tmp())))

@@ -78,7 +78,18 @@ defmodule Tightbeam.ApplicationRefusalTest do
       end
     end
 
-    [bin, "/usr/bin", "/bin"]
+    # The system tools come from the test sandbox's toolbox (F1, wi_34a7be66),
+    # minus its fixture harness CLI, never from /usr/bin and /bin.
+    system = Path.join(System.tmp_dir!(), "tb-system-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(system)
+    on_exit_rm(system)
+    toolbox = Tightbeam.TestIsolation.toolbox()
+
+    for tool <- File.ls!(toolbox), tool not in ["fixture", "tightbeam"] do
+      File.ln_s!(Path.join(toolbox, tool), Path.join(system, tool))
+    end
+
+    [bin, system]
   end
 
   defp boot_with(env, path, tmp) do
