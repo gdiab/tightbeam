@@ -153,7 +153,10 @@ defmodule Tightbeam.CodexGuardianDefaultTest do
 
     if String.ends_with?(List.last(command), "/") do
       File.mkdir_p!(destination)
-      Tightbeam.TestIsolation.cmd("cp", ["-a", source <> "/.", destination], stderr_to_stdout: true)
+
+      Tightbeam.TestIsolation.cmd("cp", ["-a", source <> "/.", destination],
+        stderr_to_stdout: true
+      )
     else
       File.mkdir_p!(Path.dirname(destination))
       File.cp!(source, destination)

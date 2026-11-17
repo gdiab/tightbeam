@@ -1920,7 +1920,9 @@ defmodule Tightbeam.HarnessProcessFixture do
   end
 
   defp process_alive?(pid) when is_integer(pid) do
-    case Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+    case Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(pid)],
+           stderr_to_stdout: true
+         ) do
       {_, 0} -> true
       _ -> false
     end
