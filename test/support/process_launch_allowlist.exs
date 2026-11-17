@@ -127,30 +127,33 @@ reviewer = "s_ccb14ac2 (F1 code review, pending)"
       "T6/T7: runs the preflight in a child VM from a decoy tree or with one injected fault; the helper would refuse the decoy cwd by design",
     reviewer: reviewer
   },
-
-  # The CLI integration suite authenticates through its own fixture session.
-  %{
-    file: "test/cli_integration_test.exs",
-    function: "defp session_cli/3",
-    kind: "System.cmd",
-    reason:
-      "runs the CLI inside this test's fixture session tree only after checking the session file is inside the sandbox and names a loopback gateway, and after the isolation helper's env checks; every other launch delegates to Tightbeam.TestIsolation",
-    reviewer: reviewer
-  },
-  %{
-    file: "test/cli_integration_test.exs",
-    function: "defp session_port_open/2",
-    kind: "Port.open",
-    reason:
-      "the Port.open twin of session_cli/3 (session-connect streams lines): the same fixture-session, cwd and env checks before the launch",
-    reviewer: reviewer
-  },
   %{
     file: "test/cli_integration_test.exs",
     function:
       "test session-connect composes explicit organization identity with automatic session identity",
     kind: "{:spawn_executable, _} port",
-    reason: "the spawn tuple this test hands to session_port_open/2, which runs the checks",
+    reason:
+      "the spawn tuple this test hands to Tightbeam.FixtureSession.port_open/2, which runs the checks",
+    reviewer: reviewer
+  },
+
+  # Tests of the CLI's own session discovery run it from inside their fixture
+  # session trees through Tightbeam.FixtureSession (reviewer ruling on
+  # session_cli): the session file must be inside the sandbox, loopback, and
+  # exactly the URL the test recorded for that file; then the helper's cwd and
+  # env rules apply.
+  %{
+    file: "test/support/fixture_session.ex",
+    function: "def cmd/3",
+    kind: "System.cmd",
+    reason: "runs the CLI inside a test's recorded fixture session tree after those checks",
+    reviewer: reviewer
+  },
+  %{
+    file: "test/support/fixture_session.ex",
+    function: "def port_open/2",
+    kind: "Port.open",
+    reason: "the Port.open twin of cmd/3 (session-connect streams lines), same checks",
     reviewer: reviewer
   },
 
