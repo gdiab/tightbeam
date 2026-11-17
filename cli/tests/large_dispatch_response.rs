@@ -1,11 +1,14 @@
 //! Complete artifacts output through the compiled CLI and real HTTP framing.
 //! All records, identities and tokens here are synthetic; no gateway is booted.
+#[path = "../src/test_isolation.rs"]
+mod test_isolation;
+
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -129,18 +132,20 @@ fn exchange(status: u16, body: Vec<u8>, framing: Framing) -> (bool, Vec<u8>, Str
     // retaining a bounded test watchdog and the complete output for assertions.
     let stdout = scratch.0.join("stdout");
     let stderr = scratch.0.join("stderr");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
-        .args(["artifacts", "--as-user", "large-response-fixture"])
-        .env_clear()
-        .env("TIGHTBEAM_URL", format!("http://{address}"))
-        .env("TIGHTBEAM_TOKEN", "synthetic-loopback-token")
-        .env("TIGHTBEAM_BASE_DIR", &scratch.0)
-        .current_dir(&scratch.0)
-        .stdin(Stdio::null())
-        .stdout(File::create(&stdout).unwrap())
-        .stderr(File::create(&stderr).unwrap())
-        .spawn()
-        .unwrap();
+    let mut child = test_isolation::command_in(
+        env!("CARGO_BIN_EXE_tightbeam"),
+        std::path::Path::new(&scratch.0),
+    )
+    .args(["artifacts", "--as-user", "large-response-fixture"])
+    .env_clear()
+    .env("TIGHTBEAM_URL", format!("http://{address}"))
+    .env("TIGHTBEAM_TOKEN", "synthetic-loopback-token")
+    .env("TIGHTBEAM_BASE_DIR", &scratch.0)
+    .stdin(Stdio::null())
+    .stdout(File::create(&stdout).unwrap())
+    .stderr(File::create(&stderr).unwrap())
+    .spawn()
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
