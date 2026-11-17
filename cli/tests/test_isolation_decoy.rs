@@ -156,8 +156,10 @@ fn t10_home_gateway_json_fallback_is_never_used() {
     let decoy = Decoy::start();
     let home = decoy.decoy_home();
 
+    // Without a session the CLI needs an explicit identity before discovery runs.
+    let args = ["list", "--as-process", "f1-decoy"];
     let mut guarded = test_isolation::command(CLI);
-    guarded.arg("list");
+    guarded.args(args);
     let output = run(guarded);
     assert_eq!(
         decoy.accepts(),
@@ -168,7 +170,7 @@ fn t10_home_gateway_json_fallback_is_never_used() {
     );
 
     let cwd = test_isolation::fresh_dir("raw-cwd");
-    let output = run(raw(&["list"], &cwd, &home));
+    let output = run(raw(&args, &cwd, &home));
     assert!(
         decoy.accepts() >= 1,
         "positive control: the raw launch with the decoy HOME reaches the decoy \

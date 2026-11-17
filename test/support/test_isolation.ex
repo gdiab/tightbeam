@@ -219,6 +219,7 @@ defmodule Tightbeam.TestIsolation do
 
     real == Preflight.canonical(toolbox()) or
       real == Preflight.canonical(Path.join(@repo, "cli/target/release")) or
+      real in Enum.map(Preflight.vm_bin_dirs(), &Preflight.canonical/1) or
       inside?(real, sandbox_root())
   end
 

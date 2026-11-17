@@ -161,8 +161,22 @@ defmodule Tightbeam.TestSandboxPreflight do
     end
   end
 
+  @doc """
+  PATH directories a child may see besides the toolbox and the repository CLI
+  build: the running VM's own OTP bin directories, which OTP's erl launcher
+  prepends to PATH. They hold only OTP's executables.
+  """
+  def vm_bin_dirs do
+    root = :code.root_dir() |> to_string()
+    erts = Path.join(root, "erts-#{:erlang.system_info(:version)}/bin")
+    [Path.join(root, "bin"), erts]
+  end
+
   defp path_problems(repo, root, path) do
-    allowed = [Path.join(root || "/nonexistent", "bin"), Path.join(repo, "cli/target/release")]
+    allowed =
+      [Path.join(root || "/nonexistent", "bin"), Path.join(repo, "cli/target/release")] ++
+        vm_bin_dirs()
+
     entries = String.split(path || "", ":", trim: true)
 
     outside =

@@ -194,10 +194,13 @@ done
 
 # Smoke-run the toolchain under the sandbox environment; refuse if any fails.
 smoke() {
-  env -i HOME="$root/home" PATH="$root/bin:$repo/cli/target/release" \
-    MIX_HOME="$root/mix" HEX_HOME="$root/hex" HEX_OFFLINE=1 \
+  if ! output=$(env -i HOME="$root/home" PATH="$root/bin:$repo/cli/target/release" \
+    LANG="${LANG:-C.UTF-8}" MIX_HOME="$root/mix" HEX_HOME="$root/hex" HEX_OFFLINE=1 \
     CARGO_HOME="$root/cargo" CARGO_NET_OFFLINE=true TMPDIR="$root/tmp" \
-    "$@" >/dev/null 2>&1 || refuse "toolchain smoke failed in the sandbox: $*"
+    "$@" 2>&1); then
+    printf '%s\n' "$output" | tail -20 >&2
+    refuse "toolchain smoke failed in the sandbox: $* (output above)"
+  fi
 }
 smoke elixir --version
 smoke mix --version
