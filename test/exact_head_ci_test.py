@@ -249,7 +249,11 @@ class ExactHeadCI(unittest.TestCase):
         test_job = self.jobs['test']
         release_job = self.jobs['release']
         self.assertIn("if: env.FULL_SUITE == 'true'\n        run: scripts/verify_mix.sh", test_job)
-        self.assertIn("if: env.FULL_SUITE == 'true'\n        working-directory: cli\n        run: cargo test", test_job)
+        # The gate runs cargo test too, inside the test sandbox (F1, wi_34a7be66),
+        # offline from crates fetched by this FULL_SUITE step.
+        self.assertIn("if: env.FULL_SUITE == 'true'\n        working-directory: cli\n        run: cargo fetch", test_job)
+        gate = (Path(__file__).resolve().parent.parent / 'scripts' / 'verify_mix.sh').read_text()
+        self.assertIn('"$script_dir/test_sandbox.sh" cargo test --manifest-path cli/Cargo.toml', gate)
         self.assertIn('    needs: test', release_job)
 
     def test_docs_dispatch_is_hosted_read_only_and_subject_bound(self):
