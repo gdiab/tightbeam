@@ -272,7 +272,7 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
               assert argv in [check, patch]
               send(parent, {:remote_command, argv})
               script = argv |> Enum.drop(6) |> Enum.join(" ")
-              System.cmd("sh", ["-c", script], stderr_to_stdout: true)
+              Tightbeam.TestIsolation.cmd("sh", ["-c", script], stderr_to_stdout: true)
             end
         }
 
@@ -335,7 +335,7 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
       "printf '%s' #{Tightbeam.Harness.Support.shell_quote(input)} | #{handler["command"]}"
 
     {output, 0} =
-      System.cmd("/bin/sh", ["-c", command], env: [{"TIGHTBEAM_HOME", base}])
+      Tightbeam.TestIsolation.cmd("/bin/sh", ["-c", command], env: [{"TIGHTBEAM_HOME", base}])
 
     JSON.decode!(output)
   end

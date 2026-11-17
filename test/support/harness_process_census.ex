@@ -37,7 +37,9 @@ defmodule Tightbeam.HarnessProcessCensus do
 
   defp capture(identity_paths, fixture_command) do
     output =
-      case System.cmd("ps", ["-axo", "pid=,pgid=,command="], stderr_to_stdout: true) do
+      case Tightbeam.TestIsolation.cmd("ps", ["-axo", "pid=,pgid=,command="],
+             stderr_to_stdout: true
+           ) do
         {output, 0} ->
           output
 

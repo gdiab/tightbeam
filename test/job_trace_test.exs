@@ -576,12 +576,12 @@ defmodule Tightbeam.JobTraceTest do
   end
 
   defp git!(path, args) do
-    {_output, 0} = System.cmd("git", ["-C", path | args], stderr_to_stdout: true)
+    {_output, 0} = Tightbeam.TestIsolation.cmd("git", ["-C", path | args], stderr_to_stdout: true)
     :ok
   end
 
   defp git_output!(path, args) do
-    {output, 0} = System.cmd("git", ["-C", path | args], stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("git", ["-C", path | args], stderr_to_stdout: true)
     String.trim(output)
   end
 

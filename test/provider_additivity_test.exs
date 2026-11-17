@@ -4,14 +4,22 @@ defmodule Tightbeam.ProviderAdditivityTest do
   alias Tightbeam.{Credentials, DB, Devices, Gateway, Harness, Homes, Schema}
 
   test "provider literal scan is closed and detects an unreported consumer" do
-    scan = Path.expand("scripts/check_provider_literals.sh")
-    assert {"", 0} = System.cmd(scan, [], stderr_to_stdout: true)
+    assert {"", 0} =
+             Tightbeam.TestIsolation.run_script!("scripts/check_provider_literals.sh", [],
+               runner: :direct,
+               stderr_to_stdout: true
+             )
 
     probe = "lib/tightbeam/provider_literal_probe.ex"
     File.write!(probe, ~s(defmodule Tightbeam.ProviderLiteralProbe, do: @provider :openai\n))
     on_exit(fn -> File.rm(probe) end)
 
-    assert {_output, 1} = System.cmd(scan, [], stderr_to_stdout: true)
+    assert {_output, 1} =
+             Tightbeam.TestIsolation.run_script!("scripts/check_provider_literals.sh", [],
+               runner: :direct,
+               stderr_to_stdout: true
+             )
+
     File.rm!(probe)
   end
 
@@ -67,7 +75,7 @@ defmodule Tightbeam.ProviderAdditivityTest do
     refute File.exists?(Path.join(base, "auth"))
 
     {reported, 0} =
-      System.cmd(Path.expand("scripts/check_provider_literals.sh"), ["--print"])
+      Tightbeam.TestIsolation.cmd(Path.expand("scripts/check_provider_literals.sh"), ["--print"])
 
     reported = MapSet.new(String.split(reported, "\n", trim: true))
 

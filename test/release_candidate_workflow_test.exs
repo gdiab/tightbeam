@@ -2,9 +2,6 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   use Tightbeam.TestCase, async: false
 
   @root Path.expand("..", __DIR__)
-  @branch_resolver Path.join(@root, "scripts/highest_0_1_branch.sh")
-  @script Path.join(@root, "scripts/release_candidate.sh")
-  @verifier Path.join(@root, "scripts/verify_release_candidate_manifest.py")
   @workflow Path.join(@root, ".github/workflows/release-candidate.yml")
   @ci_workflow Path.join(@root, ".github/workflows/ci.yml")
 
@@ -58,7 +55,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     fixture = git_fixture!()
 
     {manifest, 0} =
-      command("sh", [@script, "release-candidate/test", fixture.base, fixture.f1, fixture.f2],
+      release_candidate(["release-candidate/test", fixture.base, fixture.f1, fixture.f2],
         cd: fixture.repo
       )
 
@@ -75,7 +72,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     File.write!(Path.join(fixture.repo, "untracked"), "dirt")
 
     {output, status} =
-      command("sh", [@script, "release-candidate/dirty", fixture.base, fixture.f1, fixture.f2],
+      release_candidate(["release-candidate/dirty", fixture.base, fixture.f1, fixture.f2],
         cd: fixture.repo
       )
 
@@ -95,9 +92,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
 
     for {features, index} <- Enum.with_index(cases) do
       {output, status} =
-        command(
-          "sh",
-          [@script, "release-candidate/refusal-#{index}", fixture.base | features],
+        release_candidate(["release-candidate/refusal-#{index}", fixture.base | features],
           cd: fixture.repo
         )
 
@@ -116,7 +111,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     unrelated = git!(fixture.repo, ["rev-parse", "HEAD"])
 
     {output, status} =
-      command("sh", [@script, "release-candidate/unrelated", fixture.base, unrelated],
+      release_candidate(["release-candidate/unrelated", fixture.base, unrelated],
         cd: fixture.repo
       )
 
@@ -130,14 +125,14 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     git!(fixture.repo, ["fetch", "origin", "+refs/heads/0.1.*:refs/remotes/origin/0.1.*"])
 
     assert {"refs/remotes/origin/0.1.10\n", 0} =
-             command("sh", [@branch_resolver], cd: fixture.repo)
+             branch_resolver([], cd: fixture.repo)
   end
 
   test "highest maintenance branch refuses when no numeric 0.1 branch exists" do
     fixture = git_fixture!()
     git!(fixture.repo, ["update-ref", "-d", "refs/remotes/origin/0.1.9"])
 
-    {output, status} = command("sh", [@branch_resolver], cd: fixture.repo)
+    {output, status} = branch_resolver([], cd: fixture.repo)
 
     assert status != 0
 
@@ -151,9 +146,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     git!(fixture.repo, ["fetch", "origin", "0.1.9"])
 
     {stale_output, stale_status} =
-      command(
-        "sh",
-        [@script, "release-candidate/stale-base", fixture.base, fixture.f1, fixture.f2],
+      release_candidate(["release-candidate/stale-base", fixture.base, fixture.f1, fixture.f2],
         cd: fixture.repo
       )
 
@@ -175,7 +168,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     git!(fixture.repo, ["push", "origin", "#{fixture.f1}:refs/heads/#{remote_branch}"])
 
     {local_output, local_status} =
-      command("sh", [@script, local_branch, fixture.base, fixture.f1, fixture.f2],
+      release_candidate([local_branch, fixture.base, fixture.f1, fixture.f2],
         cd: fixture.repo
       )
 
@@ -186,7 +179,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert git!(fixture.repo, ["rev-parse", "HEAD"]) == fixture.f2
 
     {remote_output, remote_status} =
-      command("sh", [@script, remote_branch, fixture.base, fixture.f1, fixture.f2],
+      release_candidate([remote_branch, fixture.base, fixture.f1, fixture.f2],
         cd: fixture.repo
       )
 
@@ -303,9 +296,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     ])
 
     {candidate_input, 0} =
-      command(
-        "sh",
-        [@script, "--check", "release-candidate/proof", fixture.base, fixture.f1, fixture.f2],
+      release_candidate(
+        ["--check", "release-candidate/proof", fixture.base, fixture.f1, fixture.f2],
         cd: fixture.repo
       )
 
@@ -339,8 +331,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   end
 
   defp create_manifest(fixture) do
-    command("python3", [
-      @verifier,
+    manifest_verifier([
       "create",
       "--candidate-input",
       fixture.candidate_input,
@@ -358,8 +349,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   defp verify_manifest(fixture, options \\ []) do
     source = Keyword.get(options, :expected_source_sha, fixture.f2)
 
-    command("python3", [
-      @verifier,
+    manifest_verifier([
       "verify",
       "--manifest",
       fixture.manifest,
@@ -441,8 +431,37 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     command_options =
       Keyword.merge([stderr_to_stdout: true, env: [{"LC_ALL", "C"}]], options)
 
-    System.cmd(executable, arguments, command_options)
+    Tightbeam.TestIsolation.cmd(executable, arguments, command_options)
   end
+
+  # Scripts outside test/ run only through run_script!/3 with a literal path
+  # (F1, wi_34a7be66), with this module's usual command options.
+  defp release_candidate(arguments, options \\ []) do
+    Tightbeam.TestIsolation.run_script!(
+      "scripts/release_candidate.sh",
+      arguments,
+      command_options(options)
+    )
+  end
+
+  defp branch_resolver(arguments, options) do
+    Tightbeam.TestIsolation.run_script!(
+      "scripts/highest_0_1_branch.sh",
+      arguments,
+      command_options(options)
+    )
+  end
+
+  defp manifest_verifier(arguments, options \\ []) do
+    Tightbeam.TestIsolation.run_script!(
+      "scripts/verify_release_candidate_manifest.py",
+      arguments,
+      command_options(options)
+    )
+  end
+
+  defp command_options(options),
+    do: Keyword.merge([stderr_to_stdout: true, env: [{"LC_ALL", "C"}]], options)
 
   defp toolchain_record! do
     assert {elixir, 0} = command("elixir", ["--version"])

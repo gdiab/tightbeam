@@ -2,24 +2,23 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
   use Tightbeam.TestCase, async: false
 
   @root Path.expand("..", __DIR__)
-  @script Path.join(@root, "scripts/validate_release_tag.sh")
   @workflow Path.join(@root, ".github/workflows/ci.yml")
 
   test "a 0.1 release tag binds its version, build count, and canonical branch" do
     fixture = git_fixture!("0.1.8", "0.1.8")
 
     assert {_, 0} =
-             command("sh", [@script, "v0.1.8+#{fixture.build}", fixture.head], cd: fixture.repo)
+             validate_release_tag(["v0.1.8+#{fixture.build}", fixture.head], cd: fixture.repo)
 
     for invalid <- ["v0.1.8", "v0.1.8+#{fixture.build + 1}", "v0.1.9+#{fixture.build}"] do
-      {_output, status} = command("sh", [@script, invalid, fixture.head], cd: fixture.repo)
+      {_output, status} = validate_release_tag([invalid, fixture.head], cd: fixture.repo)
       assert status != 0
     end
 
     advance_canonical!(fixture)
 
     {_output, status} =
-      command("sh", [@script, "v0.1.8+#{fixture.build}", fixture.head], cd: fixture.repo)
+      validate_release_tag(["v0.1.8+#{fixture.build}", fixture.head], cd: fixture.repo)
 
     assert status != 0
   end
@@ -29,12 +28,12 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
     git!(fixture.repo, ["push", "origin", "#{fixture.parent}:refs/heads/0.2.0"])
 
     assert {_, 0} =
-             command("sh", [@script, "v0.2.0+#{fixture.build}", fixture.head], cd: fixture.repo)
+             validate_release_tag(["v0.2.0+#{fixture.build}", fixture.head], cd: fixture.repo)
 
     advance_canonical!(fixture)
 
     {_output, status} =
-      command("sh", [@script, "v0.2.0+#{fixture.build}", fixture.head], cd: fixture.repo)
+      validate_release_tag(["v0.2.0+#{fixture.build}", fixture.head], cd: fixture.repo)
 
     assert status != 0
   end
@@ -89,6 +88,20 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
   end
 
   defp command(executable, arguments, options) do
-    System.cmd(executable, arguments, Keyword.merge([stderr_to_stdout: true], options))
+    Tightbeam.TestIsolation.cmd(
+      executable,
+      arguments,
+      Keyword.merge([stderr_to_stdout: true], options)
+    )
+  end
+
+  # Scripts outside test/ run only through run_script!/3 with a literal path
+  # (F1, wi_34a7be66).
+  defp validate_release_tag(arguments, options) do
+    Tightbeam.TestIsolation.run_script!(
+      "scripts/validate_release_tag.sh",
+      arguments,
+      Keyword.merge([stderr_to_stdout: true], options)
+    )
   end
 end

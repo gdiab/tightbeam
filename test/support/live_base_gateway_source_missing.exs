@@ -19,7 +19,10 @@ Tightbeam.GuardGatewayFixture.run!(fn %{base: base, config: config} ->
     assert body =~ "cargo build --release --manifest-path cli/Cargo.toml"
     assert body =~ rust_cli
     assert File.stat!(fallback).mode |> Bitwise.band(0o777) == 0o755
-    assert {refusal, 127} = System.cmd(fallback, ["list"], stderr_to_stdout: true)
+
+    assert {refusal, 127} =
+             Tightbeam.TestIsolation.cmd(fallback, ["list"], stderr_to_stdout: true)
+
     assert refusal =~ "tightbeam CLI is not installed"
     assert refusal =~ "cargo build --release"
   end)

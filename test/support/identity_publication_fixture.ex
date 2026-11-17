@@ -866,7 +866,7 @@ defmodule Tightbeam.IdentityPublicationFixture do
   end
 
   defp git!(dir, args) do
-    case System.cmd("git", args, cd: dir, stderr_to_stdout: true) do
+    case Tightbeam.TestIsolation.cmd("git", args, cd: dir, stderr_to_stdout: true) do
       {output, 0} -> String.trim(output)
       {output, status} -> raise "git #{Enum.join(args, " ")} failed #{status}: #{output}"
     end
@@ -895,7 +895,7 @@ defmodule Tightbeam.IdentityPublicationFixture do
     child_env = [{"DD36_SCENARIO", Integer.to_string(scenario)}] ++ diagnostic_env ++ env
 
     {output, status} =
-      System.cmd(executable, args,
+      Tightbeam.TestIsolation.cmd(executable, args,
         env: child_env,
         stderr_to_stdout: true
       )
@@ -923,7 +923,7 @@ defmodule Tightbeam.IdentityPublicationFixture do
       ] ++ env
 
     port =
-      Port.open(
+      Tightbeam.TestIsolation.port_open(
         {:spawn_executable, String.to_charlist(executable)},
         [
           :binary,

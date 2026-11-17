@@ -5,8 +5,14 @@ defmodule Tightbeam.HomesTest do
 
   @hollow_vendor_record ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":0,"scopes":[],"subscriptionType":"","rateLimitTier":""}})
   @healthy_vendor_record ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}})
-  @primary_gid System.cmd("id", ["-g"]) |> elem(0) |> String.trim() |> String.to_integer()
-  @groups System.cmd("id", ["-G"]) |> elem(0) |> String.split() |> Enum.map(&String.to_integer/1)
+  @primary_gid Tightbeam.TestIsolation.cmd("id", ["-g"])
+               |> elem(0)
+               |> String.trim()
+               |> String.to_integer()
+  @groups Tightbeam.TestIsolation.cmd("id", ["-G"])
+          |> elem(0)
+          |> String.split()
+          |> Enum.map(&String.to_integer/1)
   @projection_gid Enum.find(@groups, &(&1 != @primary_gid))
 
   setup do
@@ -474,7 +480,7 @@ defmodule Tightbeam.HomesTest do
     command
     |> Enum.drop(6)
     |> Enum.join(" ")
-    |> then(&System.cmd("sh", ["-c", &1], stderr_to_stdout: true))
+    |> then(&Tightbeam.TestIsolation.cmd("sh", ["-c", &1], stderr_to_stdout: true))
   end
 
   defp snapshot_files(root) do

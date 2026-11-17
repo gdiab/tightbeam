@@ -150,7 +150,10 @@ defmodule Tightbeam.HarnessProcessTest do
 
     assert base == Tightbeam.Harness.Cursor.execution_base(nil)
     assert org_base == @helper |> Path.dirname() |> Path.dirname()
-    assert operator_uid == System.cmd("/usr/bin/id", ["-u"]) |> elem(0) |> String.trim()
+
+    assert operator_uid ==
+             Tightbeam.TestIsolation.cmd("/usr/bin/id", ["-u"]) |> elem(0) |> String.trim()
+
     assert operator_home == System.user_home!()
     assert rails_sha256 == String.duplicate("a", 64)
     assert identity_path =~ "/harness-processes/"

@@ -210,7 +210,7 @@ defmodule Tightbeam.ReadinessTest do
     File.chmod!(npm, 0o755)
 
     assert {"", 0} =
-             System.cmd("sh", ["-c", command],
+             Tightbeam.TestIsolation.cmd("sh", ["-c", command],
                env: [
                  {"PATH", fake_bin <> ":" <> System.fetch_env!("PATH")},
                  {"TIGHTBEAM_TEST_ARGS", args_file}

@@ -62,7 +62,7 @@ if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
     :directory = File.lstat!(directory).type
     candidate = System.fetch_env!("CANDIDATE_SHA")
     true = Regex.match?(~r/\A[0-9a-f]{40}\z/, candidate)
-    {executable, 0} = System.cmd("/bin/ps", ["-p", System.pid(), "-o", "comm="])
+    {executable, 0} = Tightbeam.TestIsolation.cmd("/bin/ps", ["-p", System.pid(), "-o", "comm="])
     executable = Tightbeam.LiveBaseAdmission.canonical!(String.trim(executable))
     "beam.smp" = Path.basename(executable)
 
@@ -116,7 +116,7 @@ missing =
     # identity gets {:conflict, []} — a conflict with no conflicting paths.
     result =
       try do
-        System.cmd("git", ["var", "GIT_COMMITTER_IDENT"], stderr_to_stdout: true)
+        Tightbeam.TestIsolation.cmd("git", ["var", "GIT_COMMITTER_IDENT"], stderr_to_stdout: true)
       rescue
         _ -> {"", :git_missing}
       end

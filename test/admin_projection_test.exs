@@ -965,7 +965,7 @@ defmodule Tightbeam.AdminProjectionTest do
        do: refs["name"]
 
   defp git!(dir, args) do
-    case System.cmd("git", args, cd: dir, stderr_to_stdout: true) do
+    case Tightbeam.TestIsolation.cmd("git", args, cd: dir, stderr_to_stdout: true) do
       {output, 0} -> String.trim(output)
       {output, status} -> raise "git #{Enum.join(args, " ")} failed #{status}: #{output}"
     end

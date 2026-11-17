@@ -170,7 +170,7 @@ defmodule Tightbeam.HarnessPiTest do
       """
     )
 
-    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("node", [runner], cd: root, stderr_to_stdout: true)
     decoded = JSON.decode!(output)
 
     assert decoded["identity"]["systemPrompt"] == "BASE\n\nSERVED IDENTITY FIXTURE"
@@ -373,7 +373,7 @@ defmodule Tightbeam.HarnessPiTest do
       """
     )
 
-    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("node", [runner], cd: root, stderr_to_stdout: true)
     JSON.decode!(output)
   end
 
@@ -391,7 +391,7 @@ defmodule Tightbeam.HarnessPiTest do
       """
     )
 
-    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("node", [runner], cd: root, stderr_to_stdout: true)
     JSON.decode!(output)
   end
 

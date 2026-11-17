@@ -4574,7 +4574,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp verified_code_refs(ctx, producer, holder, reviewer) do
-    {sha, 0} = System.cmd("git", ["rev-parse", "HEAD"])
+    {sha, 0} = Tightbeam.TestIsolation.cmd("git", ["rev-parse", "HEAD"])
 
     refs = [
       %{

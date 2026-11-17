@@ -54,7 +54,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
 
     # The EXACT incident env: an inherited production node/port/name.
     {out, status} =
-      System.cmd(@shim, ["stop"],
+      Tightbeam.TestIsolation.cmd(@shim, ["stop"],
         env: [
           {"TIGHTBEAM_BASE_DIR", iso_dir},
           {"RELEASE_NODE", "tightbeam_gateway_11373"},
@@ -99,7 +99,10 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     end)
 
     {out, status} =
-      System.cmd(@shim, ["stop"], env: [{"TIGHTBEAM_BASE_DIR", iso_dir}], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(@shim, ["stop"],
+        env: [{"TIGHTBEAM_BASE_DIR", iso_dir}],
+        stderr_to_stdout: true
+      )
 
     assert status != 0, "stop must refuse a recycled pid"
     assert out =~ "recycled"
@@ -137,7 +140,10 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     })
 
     {out, status} =
-      System.cmd(@shim, ["stop"], env: [{"TIGHTBEAM_BASE_DIR", iso_dir}], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(@shim, ["stop"],
+        env: [{"TIGHTBEAM_BASE_DIR", iso_dir}],
+        stderr_to_stdout: true
+      )
 
     assert status != 0, "stop must refuse when only the command matches, got: #{out}"
     assert out =~ "recycled"
@@ -167,7 +173,10 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     })
 
     {out, status} =
-      System.cmd(@shim, ["stop"], env: [{"TIGHTBEAM_BASE_DIR", iso_dir}], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(@shim, ["stop"],
+        env: [{"TIGHTBEAM_BASE_DIR", iso_dir}],
+        stderr_to_stdout: true
+      )
 
     assert status != 0, "stop must refuse a descriptor with no ownedStart"
     assert out =~ "ownedStart"
@@ -196,7 +205,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     })
 
     {out, status} =
-      System.cmd(@shim, ["stop"],
+      Tightbeam.TestIsolation.cmd(@shim, ["stop"],
         env: [
           {"TIGHTBEAM_BASE_DIR", iso_dir},
           {"LC_ALL", "de_DE.UTF-8"},
@@ -226,7 +235,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
 
   test "R1: an empty environment is refused — no ~/.tightbeam default" do
     {out, status} =
-      System.cmd(@shim, ["stop"],
+      Tightbeam.TestIsolation.cmd(@shim, ["stop"],
         env: [{"TIGHTBEAM_BASE_DIR", nil}, {"TIGHTBEAM_HOME", nil}],
         stderr_to_stdout: true
       )
@@ -239,7 +248,10 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
 
   test "F1: restart is removed and names its two replacements" do
     {out, status} =
-      System.cmd(@shim, ["restart"], env: [{"TIGHTBEAM_BASE_DIR", nil}], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(@shim, ["restart"],
+        env: [{"TIGHTBEAM_BASE_DIR", nil}],
+        stderr_to_stdout: true
+      )
 
     assert status != 0
     assert out =~ "`restart` verb was removed"
@@ -330,7 +342,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     })
 
     {out, status} =
-      System.cmd(shim, ["rpc", "Foo.bar()"],
+      Tightbeam.TestIsolation.cmd(shim, ["rpc", "Foo.bar()"],
         env: [
           {"TIGHTBEAM_BASE_DIR", base},
           # the exact incident vector, now aimed at a debug verb:
@@ -366,7 +378,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     write_descriptor(base, %{port: 11_484, cliToken: "tbc_iso", ownedPid: "1", ownedCommand: "x"})
 
     {out, status} =
-      System.cmd(shim, ["rpc", "Foo.bar()"],
+      Tightbeam.TestIsolation.cmd(shim, ["rpc", "Foo.bar()"],
         env: [{"TIGHTBEAM_BASE_DIR", base}, {"RELEASE_NODE", "tightbeam_gateway_11373"}],
         stderr_to_stdout: true
       )
@@ -419,7 +431,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
 
   defp spawn_standin do
     port =
-      Port.open({:spawn_executable, System.find_executable("sh")}, [
+      Tightbeam.TestIsolation.port_open({:spawn_executable, System.find_executable("sh")}, [
         :binary,
         {:args, ["-c", "exec sleep 300"]}
       ])
@@ -443,7 +455,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
   defp process_start(pid), do: ps_field(pid, "lstart")
 
   defp ps_field(pid, field) do
-    case System.cmd("ps", ["-ww", "-o", field <> "=", "-p", to_string(pid)],
+    case Tightbeam.TestIsolation.cmd("ps", ["-ww", "-o", field <> "=", "-p", to_string(pid)],
            env: [{"LC_ALL", "C"}],
            stderr_to_stdout: true
          ) do
@@ -460,7 +472,8 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     path
   end
 
-  defp kill(pid), do: System.cmd("kill", ["-KILL", to_string(pid)], stderr_to_stdout: true)
+  defp kill(pid),
+    do: Tightbeam.TestIsolation.cmd("kill", ["-KILL", to_string(pid)], stderr_to_stdout: true)
 
   # A signalled stand-in exits, which auto-closes its port; closing an
   # already-closed port raises, so guard it.

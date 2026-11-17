@@ -556,12 +556,12 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
   end
 
   defp git!(cwd, args) do
-    {_output, 0} = System.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
+    {_output, 0} = Tightbeam.TestIsolation.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
     :ok
   end
 
   defp git_output!(cwd, args) do
-    {output, 0} = System.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
+    {output, 0} = Tightbeam.TestIsolation.cmd("git", ["-C", cwd | args], stderr_to_stdout: true)
     String.trim(output)
   end
 

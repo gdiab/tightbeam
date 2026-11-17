@@ -14,8 +14,8 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
     File.mkdir_p!(arena)
     File.write!(Path.join(arena, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
     fixture = Tightbeam.GuardRuntimeFixture.prepare!(arena, "full_gateway_recovery.exs")
-    {head, 0} = System.cmd("git", ["rev-parse", "HEAD"])
-    {tree, 0} = System.cmd("git", ["rev-parse", "HEAD^{tree}"])
+    {head, 0} = Tightbeam.TestIsolation.cmd("git", ["rev-parse", "HEAD"])
+    {tree, 0} = Tightbeam.TestIsolation.cmd("git", ["rev-parse", "HEAD^{tree}"])
     candidate = candidate_identity!(arena)
 
     File.write!(
@@ -37,7 +37,7 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
       {:os_pid, old_pid} = Port.info(first, :os_pid)
       assert Integer.to_string(old_pid) == old["pid"]
       assert old["base"] == fixture.base
-      assert {"", 0} = System.cmd("kill", ["-KILL", Integer.to_string(old_pid)])
+      assert {"", 0} = Tightbeam.TestIsolation.cmd("kill", ["-KILL", Integer.to_string(old_pid)])
       exit_status = await_exit!(first, arena, "prepare")
 
       File.write!(
@@ -270,13 +270,13 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
     env = [{"GIT_INDEX_FILE", Path.join(arena, "candidate.index")}]
 
     git = fn args ->
-      {output, 0} = System.cmd("git", args, env: env, stderr_to_stdout: true)
+      {output, 0} = Tightbeam.TestIsolation.cmd("git", args, env: env, stderr_to_stdout: true)
       output
     end
 
     # Include the composer's staged new source paths, not only HEAD paths and
     # the historical recovery fixture manifest. The temporary index stays private.
-    {index_tree, 0} = System.cmd("git", ["write-tree"])
+    {index_tree, 0} = Tightbeam.TestIsolation.cmd("git", ["write-tree"])
     git.(["read-tree", String.trim(index_tree)])
     git.(["add", "-u"])
 
@@ -338,7 +338,10 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
     if info = Port.info(port, :os_pid) do
       {:os_pid, pid} = info
       assert pid > 1
-      System.cmd("kill", ["-TERM", Integer.to_string(pid)], stderr_to_stdout: true)
+
+      Tightbeam.TestIsolation.cmd("kill", ["-TERM", Integer.to_string(pid)],
+        stderr_to_stdout: true
+      )
 
       status =
         case shutdown_exit(port, arena, phase, System.monotonic_time(:millisecond) + 2_000) do
@@ -348,7 +351,11 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
             )
 
             {:os_pid, ^pid} = Port.info(port, :os_pid)
-            System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+
+            Tightbeam.TestIsolation.cmd("kill", ["-KILL", Integer.to_string(pid)],
+              stderr_to_stdout: true
+            )
+
             shutdown_exit(port, arena, phase, System.monotonic_time(:millisecond) + 5_000)
 
           exit ->
@@ -385,7 +392,10 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
 
     Enum.each(census.processes, fn process ->
       assert process.pid > 1
-      System.cmd("kill", ["-TERM", Integer.to_string(process.pid)], stderr_to_stdout: true)
+
+      Tightbeam.TestIsolation.cmd("kill", ["-TERM", Integer.to_string(process.pid)],
+        stderr_to_stdout: true
+      )
     end)
 
     deadline = System.monotonic_time(:millisecond) + 5_000
@@ -408,7 +418,10 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
       not killed? ->
         Enum.each(census.processes, fn process ->
           assert process.pid > 1
-          System.cmd("kill", ["-KILL", Integer.to_string(process.pid)], stderr_to_stdout: true)
+
+          Tightbeam.TestIsolation.cmd("kill", ["-KILL", Integer.to_string(process.pid)],
+            stderr_to_stdout: true
+          )
         end)
 
         await_fixture_exit!(arena, System.monotonic_time(:millisecond) + 5_000, true)
@@ -431,17 +444,21 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
           {"RECOVERY_PHASE", phase}
         ]
 
-    Port.open({:spawn_executable, String.to_charlist(fixture.executable)}, [
-      :binary,
-      :exit_status,
-      :stderr_to_stdout,
-      args: Enum.map(fixture.args, &String.to_charlist/1),
-      cd: String.to_charlist(File.cwd!()),
-      env:
-        Enum.map(env, fn {key, value} ->
-          {String.to_charlist(key), if(is_nil(value), do: false, else: String.to_charlist(value))}
-        end)
-    ])
+    Tightbeam.TestIsolation.port_open(
+      {:spawn_executable, String.to_charlist(fixture.executable)},
+      [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        args: Enum.map(fixture.args, &String.to_charlist/1),
+        cd: String.to_charlist(File.cwd!()),
+        env:
+          Enum.map(env, fn {key, value} ->
+            {String.to_charlist(key),
+             if(is_nil(value), do: false, else: String.to_charlist(value))}
+          end)
+      ]
+    )
   end
 
   defp await_receipt!(port, arena, phase, deadline \\ nil) do

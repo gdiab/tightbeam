@@ -21,7 +21,7 @@ defmodule Tightbeam.GithubAuthE2ETest do
 
   setup_all do
     {output, status} =
-      System.cmd("cargo", ["build", "--release"],
+      Tightbeam.TestIsolation.cmd("cargo", ["build", "--release"],
         cd: @cli_dir,
         env: [{"CARGO_TARGET_DIR", @e2e_target_dir}],
         stderr_to_stdout: true
@@ -486,7 +486,7 @@ defmodule Tightbeam.GithubAuthE2ETest do
         File.write!(input_path, input)
 
         try do
-          System.cmd(
+          Tightbeam.TestIsolation.cmd(
             "/bin/sh",
             [
               "-c",
@@ -502,7 +502,7 @@ defmodule Tightbeam.GithubAuthE2ETest do
         end
 
       :error ->
-        System.cmd(ctx.cli, args, env: env, stderr_to_stdout: stderr_to_stdout)
+        Tightbeam.TestIsolation.cmd(ctx.cli, args, env: env, stderr_to_stdout: stderr_to_stdout)
     end
   end
 
@@ -523,7 +523,7 @@ defmodule Tightbeam.GithubAuthE2ETest do
 
   defp fixture_env(ctx, base_dir, mode, machine) do
     [
-      {"PATH", "#{ctx.bin}:/usr/bin:/bin"},
+      {"PATH", "#{ctx.bin}:#{Tightbeam.TestIsolation.toolbox()}"},
       {"HOME", ctx.home},
       {"TIGHTBEAM_BASE_DIR", base_dir},
       {"TIGHTBEAM_MACHINE", machine},

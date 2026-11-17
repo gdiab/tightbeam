@@ -203,7 +203,9 @@ defmodule Tightbeam.ContainmentTest do
   # as a denial, because "containment was not applied" must never look like enforcement.
   if @darwin? do
     defp contained(profile, script) do
-      case System.cmd("/usr/bin/sandbox-exec", ["-p", profile, "/bin/sh", "-c", script],
+      case Tightbeam.TestIsolation.cmd(
+             "/usr/bin/sandbox-exec",
+             ["-p", profile, "/bin/sh", "-c", script],
              stderr_to_stdout: true
            ) do
         {output, 0} -> {output, :allowed}
@@ -226,7 +228,7 @@ defmodule Tightbeam.ContainmentTest do
       File.write!(input, "{}\n")
 
       {output, status} =
-        System.cmd("/bin/sh", [
+        Tightbeam.TestIsolation.cmd("/bin/sh", [
           "-c",
           ~s(exec "$1" rail-exec --profile "$2" --timeout-ms 10000 -- "$3" < "$4" 2>&1),
           "tb-contained",
@@ -246,7 +248,7 @@ defmodule Tightbeam.ContainmentTest do
         30 ->
           # Reproduce the exact refusal against the exact profile, in the same binary, so
           # a CI-only failure is diagnosed from the runner's own per-root breakdown.
-          {stage, _} = System.cmd(@release_binary, ["contain-stage", profile])
+          {stage, _} = Tightbeam.TestIsolation.cmd(@release_binary, ["contain-stage", profile])
           flunk("containment was REFUSED, not applied: #{output}\nprofile=#{profile}\n#{stage}")
 
         other ->
@@ -273,7 +275,7 @@ defmodule Tightbeam.ContainmentTest do
   end
 
   defp canonical(path) do
-    {resolved, 0} = System.cmd("/bin/realpath", [path])
+    {resolved, 0} = Tightbeam.TestIsolation.cmd("/bin/realpath", [path])
     String.trim(resolved)
   end
 end
