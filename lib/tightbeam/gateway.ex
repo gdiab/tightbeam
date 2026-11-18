@@ -88,6 +88,7 @@ defmodule Tightbeam.Gateway do
     Idempotency,
     LaneManager,
     Ledger,
+    LimitFallback,
     Model,
     ModelCatalog,
     NoticeBatcher,
@@ -3492,6 +3493,7 @@ defmodule Tightbeam.Gateway do
       ])
       |> Map.merge(published_identity(session.model))
       |> Map.put(:capabilities, StateResources.session(session)["capabilities"])
+      |> Map.merge(Payloads.limit_fallback_fields(session))
 
     Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
   end
@@ -7902,9 +7904,14 @@ defmodule Tightbeam.Gateway do
       caller ->
         prior = Idempotency.get(db, caller.owner_user_id, "spawn", p.idempotency_key)
 
+        limit_fallback_denial = spawn_limit_fallback_denial(p)
+
         case prior do
           %{session_key: session_key} ->
             spawn_replay(db, session_key)
+
+          nil when not is_nil(limit_fallback_denial) ->
+            limit_fallback_denial
 
           nil ->
             case held_spawn_name_refusal(db, p[:handle]) do
@@ -7923,6 +7930,35 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  # Contract c R10: `spawn --limit-fallback off` creates the session already
+  # restricted. `on` is the default and is not a spawn value.
+  defp spawn_limit_fallback_denial(p) do
+    cond do
+      Map.has_key?(p, :limit_fallback) and p.limit_fallback != "off" ->
+        %{code: "invalid_limit_fallback", message: "spawn accepts only limitFallback \"off\""}
+
+      Map.has_key?(p, :limit_fallback_reason) and not Map.has_key?(p, :limit_fallback) ->
+        %{
+          code: "invalid_limit_fallback_reason",
+          message: "a reason is recorded only when the limit fallback is turned off"
+        }
+
+      not (is_nil(p[:limit_fallback_reason]) or is_binary(p[:limit_fallback_reason])) ->
+        %{
+          code: "invalid_limit_fallback_reason",
+          message: "limitFallbackReason must be a string"
+        }
+
+      true ->
+        nil
+    end
+  end
+
+  defp spawn_limit_fallback_marker(%{params: %{limit_fallback: "off"} = p} = call),
+    do: LimitFallback.restriction_marker(call_principal_ref(call), p[:limit_fallback_reason])
+
+  defp spawn_limit_fallback_marker(_call), do: nil
 
   defp spawn_caller(_db, %{principal: {:remedy, %{action: "spawn", owner: owner}}})
        when is_binary(owner),
@@ -8291,7 +8327,8 @@ defmodule Tightbeam.Gateway do
         host: host,
         harness: harness_string,
         provider: routed.provider,
-        model: model
+        model: model,
+        limit_fallback_off: spawn_limit_fallback_marker(call)
       }
 
       session_result =
@@ -8323,6 +8360,7 @@ defmodule Tightbeam.Gateway do
                   case staffing do
                     :ok ->
                       session = Org.create_in_txn(txn, input)
+                      :ok = LimitFallback.record_spawn_restriction_in_txn(txn, session)
 
                       if is_nil(caller.caller_session) and
                            String.starts_with?(call.origin, "user:") and
@@ -8824,6 +8862,15 @@ defmodule Tightbeam.Gateway do
             apply_fast_change(config, db, session, p.fastMode)
         end
 
+      p[:setting] == "set_limit_fallback" and p[:limit_fallback] in ["on", "off"] ->
+        case runtime_tune_session(db, call) do
+          {:error, denial} ->
+            denial
+
+          {:ok, session} ->
+            apply_limit_fallback_marker(db, call, session)
+        end
+
       true ->
         %{ok: false, code: "unsupported", message: "tune does not support #{p[:setting]} yet"}
     end
@@ -8848,6 +8895,52 @@ defmodule Tightbeam.Gateway do
   end
 
   defp reap_old_pi_session_worker(_config, _db, _session), do: :ok
+
+  # Contract c R10: `tune --limit-fallback off|on` sets or clears the session's
+  # fallback-off marker with the tune's own principal. It changes no engine, so
+  # it needs no turn boundary and does not clear fallback-active.
+  defp apply_limit_fallback_marker(db, call, session) do
+    p = call.params
+    reason = p[:limit_fallback_reason]
+
+    cond do
+      not (is_nil(reason) or is_binary(reason)) ->
+        tune_error("invalid_limit_fallback_reason", "limitFallbackReason must be a string")
+
+      is_binary(reason) and p.limit_fallback == "on" ->
+        tune_error(
+          "invalid_limit_fallback_reason",
+          "a reason is recorded only when the limit fallback is turned off"
+        )
+
+      true ->
+        state = if p.limit_fallback == "off", do: :off, else: :on
+
+        {:ok, updated} =
+          DB.transaction(db, fn txn ->
+            LimitFallback.set_restriction_in_txn(
+              txn,
+              session.session_key,
+              state,
+              call_principal_ref(call),
+              reason
+            )
+          end)
+
+        stream = Payloads.stream_session(updated)
+        broadcast(db, updated.owner_user_id, Payloads.stream_updated(stream))
+
+        %{ok: true, session_key: updated.session_key, limit_fallback: p.limit_fallback}
+        |> Map.merge(Payloads.limit_fallback_fields(updated))
+    end
+  end
+
+  # The principal a record names as its actor: the router-proved principal,
+  # else the call origin (device calls carry no principal tuple).
+  defp call_principal_ref(%{principal: {:user, id}}), do: "user:" <> id
+  defp call_principal_ref(%{principal: {:session, key}}), do: "session:" <> key
+  defp call_principal_ref(%{principal: {:process, name}}), do: "process:" <> name
+  defp call_principal_ref(%{origin: origin}) when is_binary(origin), do: origin
 
   defp runtime_tune_session(db, call) do
     session = Org.get(db, call.session_key)
