@@ -677,6 +677,30 @@ defmodule Tightbeam.ConditionFactsTest do
            }).code == "reserved_kind"
   end
 
+  # Contract c R14: the limit-fallback outcome facts are the substrate's own.
+  test "session-model-fallback facts are process-only", ctx do
+    for kind <- ["session-model-fallback-applied", "session-model-fallback-withheld"] do
+      for origin <- ["user:flynn", "agent:someone", "process:ci"] do
+        assert {:error, %{code: "reserved_kind"}} =
+                 ConditionFacts.file(ctx.db, ctx.scheduler, %{
+                   kind: kind,
+                   scope: "agent:main:clawline:flynn:main s_coder01",
+                   origin: origin
+                 })
+      end
+
+      filed =
+        ConditionFacts.file(ctx.db, ctx.scheduler, %{
+          kind: kind,
+          scope: "agent:main:clawline:flynn:main s_coder01",
+          origin: "process:tightbeam"
+        })
+
+      assert filed.kind == kind
+      assert ConditionFacts.substrate_defined_kind?(kind)
+    end
+  end
+
   test "credential-present is a substrate-only transition fact scoped host:provider (O4/I5)",
        ctx do
     # It marks the credential-commit transition, so only the substrate may file

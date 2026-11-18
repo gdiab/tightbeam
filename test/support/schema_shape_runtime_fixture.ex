@@ -2,7 +2,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
   alias Tightbeam.{DB, NoticeBatcher, Schema}
-  @shape "user-removal-v1-016"
+  @shape "limit-fallback-v1-016"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -1197,7 +1197,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     assert {:ok, _} =
              DB.query(
                db,
-               "UPDATE schema_stamp SET shape='artifact-process-attribution-v1-015' WHERE shape='user-removal-v1-016'"
+               "UPDATE schema_stamp SET shape='artifact-process-attribution-v1-015' WHERE shape='limit-fallback-v1-016'"
              )
 
     :ok
