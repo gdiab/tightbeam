@@ -1396,12 +1396,20 @@ defmodule Tightbeam.Assignments do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts, byProcess FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
         [assignment_id]
       )
 
+    # A process-authored attest names its author; every other row is unchanged.
     rows
-    |> Enum.map(fn row -> attest(row) |> then(&Mementos.attach(db, "attest", &1)) end)
+    |> Enum.map(fn row ->
+      {fields, [by_process]} = Enum.split(row, 16)
+
+      fields
+      |> attest()
+      |> then(&if(by_process, do: Map.put(&1, :byProcess, by_process), else: &1))
+      |> then(&Mementos.attach(db, "attest", &1))
+    end)
     |> then(&OperationalReceipts.attach(db, &1))
   end
 
@@ -4533,6 +4541,61 @@ defmodule Tightbeam.Assignments do
 
   defp append_substrate(txn, session_key, text) do
     best_effort(fn -> Projection.append_substrate_in_txn(txn, session_key, text) end)
+  end
+
+  @doc """
+  Write the one process-authored progress attest of an applied limit-fallback
+  switch (contract c R12) on an open assignment. The note must start with
+  `model-fallback applied ` and is at most 2,000 characters; the attests CHECK
+  admits exactly this shape, authored by `process:tightbeam`, and nothing
+  else without a session or user author. Phase 2 calls this inside the swap
+  transaction, once per open assignment the session holds. Returns the attest.
+  """
+  @spec record_model_fallback_attest_in_txn(Txn.t(), String.t(), String.t()) :: map()
+  def record_model_fallback_attest_in_txn(%Txn{} = txn, assignment_id, note)
+      when is_binary(assignment_id) and is_binary(note) do
+    prefix = Tightbeam.LimitFallback.attest_note_prefix()
+    principal = Tightbeam.LimitFallback.process_principal()
+
+    unless String.starts_with?(note, prefix) and String.length(note) <= 2000 do
+      raise ArgumentError,
+            "a model-fallback attest note starts with #{inspect(prefix)} and is at most 2000 characters"
+    end
+
+    id = id("att_")
+    ts = now()
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO attests (id, assignmentId, kind, note, byProcess, ts)
+      SELECT ?1, ?2, 'progress', ?3, ?4, ?5
+      WHERE EXISTS (SELECT 1 FROM assignments WHERE id = ?2 AND state = 'open')
+      """,
+      [id, assignment_id, note, principal, ts]
+    )
+
+    if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
+    attest([
+      id,
+      assignment_id,
+      "progress",
+      nil,
+      note,
+      nil,
+      nil,
+      nil,
+      nil,
+      nil,
+      nil,
+      nil,
+      nil,
+      nil,
+      nil,
+      ts
+    ])
+    |> Map.put(:byProcess, principal)
   end
 
   defp insert_attest(txn, call, assignment_id, allow_closed \\ false) do

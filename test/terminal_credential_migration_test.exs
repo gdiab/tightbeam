@@ -7,7 +7,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
   @terminal_shape "terminal-credential-failure-v1-019"
   @artifact_origin_shape "artifact-origin-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
-  @successor "user-removal-v1-016"
+  @successor "limit-fallback-v1-016"
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
 
   @terminal_objects ~w(
@@ -109,8 +109,10 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             "user-removal-v1-016",
              "artifact-process-attribution-v1-015",
              "user-removal-v1-0114",
+             "limit-fallback-v1-0114",
              "user-removal-v1-015",
              "closed-assignment-cannot-proceed-reconciliation-v1-015",
              "session-identity-v1-0114",

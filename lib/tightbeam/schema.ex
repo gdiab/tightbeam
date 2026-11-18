@@ -426,6 +426,13 @@ defmodule Tightbeam.Schema do
   @user_removal_shape "user-removal-v1-016"
   @user_removal_0114_shape "user-removal-v1-0114"
   @user_removal_015_shape "user-removal-v1-015"
+  # Item 6 c1, the per-archetype limit fallback (contract c v1.4 §12; cross-line
+  # contract v3.1, art_669dd19a). This line's own step stamps
+  # limit-fallback-v1-016 after user-removal-v1-016 (R7). The 0.1.14 stamp is
+  # adopted with the user-removal stamps: its objects and PR622's columns are
+  # validated and it returns to session-identity (R2, R8).
+  @limit_fallback_shape "limit-fallback-v1-016"
+  @limit_fallback_0114_shape "limit-fallback-v1-0114"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -457,6 +464,7 @@ defmodule Tightbeam.Schema do
     @closed_assignment_reconciliation_shape,
     @artifact_process_attribution_shape,
     @user_removal_shape,
+    @limit_fallback_shape,
     @evidence_release_shape,
     @decision_request_row_schema_shape,
     @assignment_source_replacement_shape,
@@ -1824,12 +1832,15 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     # The head is this build's final stamp (publish_marker!/1). The adoptable
-    # user-removal stamps follow this line's predecessor so the guarded boot
-    # admits them before ensure_all/1 adopts them (contract v2 R1b).
+    # stamps follow this line's user-removal step and its predecessor so the
+    # guarded boot admits them before ensure_all/1 adopts them (contract v3.1
+    # R1b).
     [
+      @limit_fallback_shape,
       @user_removal_shape,
       @artifact_process_attribution_shape,
       @user_removal_0114_shape,
+      @limit_fallback_0114_shape,
       @user_removal_015_shape,
       @closed_assignment_reconciliation_shape,
       @session_identity_shape,
@@ -1982,6 +1993,7 @@ defmodule Tightbeam.Schema do
             @closed_assignment_reconciliation_shape,
             @artifact_process_attribution_shape,
             @user_removal_shape,
+            @limit_fallback_shape,
             @evidence_release_shape,
             @decision_request_row_schema_shape,
             @assignment_source_replacement_shape,
@@ -2136,6 +2148,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_artifact_process_attribution(db)
     :ok = upgrade_user_removal(db)
     :ok = Tightbeam.OwnerAlerts.ensure_schema(db)
+    :ok = upgrade_limit_fallback(db)
     :ok = upgrade_retirement_parent_moves(db)
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
@@ -2763,6 +2776,7 @@ defmodule Tightbeam.Schema do
                       @closed_assignment_reconciliation_shape,
                       @artifact_process_attribution_shape,
                       @user_removal_shape,
+                      @limit_fallback_shape,
                       @evidence_release_shape
                     ] ->
                  validate_notice_source_payload_in_txn!(txn)
@@ -3717,7 +3731,8 @@ defmodule Tightbeam.Schema do
                  [[@session_identity_shape]],
                  [[@closed_assignment_reconciliation_shape]],
                  [[@artifact_process_attribution_shape]],
-                 [[@user_removal_shape]]
+                 [[@user_removal_shape]],
+                 [[@limit_fallback_shape]]
                ],
                do: process_actor_table_sql(object.name, object.sql),
                else: object.sql
@@ -3760,7 +3775,8 @@ defmodule Tightbeam.Schema do
            [[@session_identity_shape]],
            [[@closed_assignment_reconciliation_shape]],
            [[@artifact_process_attribution_shape]],
-           [[@user_removal_shape]]
+           [[@user_removal_shape]],
+           [[@limit_fallback_shape]]
          ],
          do: process_actor_table_sql(name, expected),
          else: expected
@@ -3811,6 +3827,7 @@ defmodule Tightbeam.Schema do
                  @closed_assignment_reconciliation_shape,
                  @artifact_process_attribution_shape,
                  @user_removal_shape,
+                 @limit_fallback_shape,
                  @evidence_release_shape,
                  @decision_request_row_schema_shape
                ],
@@ -3827,6 +3844,7 @@ defmodule Tightbeam.Schema do
           @closed_assignment_reconciliation_shape,
           @artifact_process_attribution_shape,
           @user_removal_shape,
+          @limit_fallback_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape
         ] ->
@@ -3920,6 +3938,7 @@ defmodule Tightbeam.Schema do
           @closed_assignment_reconciliation_shape,
           @artifact_process_attribution_shape,
           @user_removal_shape,
+          @limit_fallback_shape,
           @evidence_release_shape,
           @decision_request_row_schema_shape,
           @assignment_source_replacement_shape,
@@ -3946,6 +3965,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] and
@@ -4818,7 +4838,8 @@ defmodule Tightbeam.Schema do
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
-                    @user_removal_shape
+                    @user_removal_shape,
+                    @limit_fallback_shape
                   ] ->
                # A stamped successor missing its required columns is corruption, not a
                # second opportunity to migrate an inferred shape.
@@ -4928,7 +4949,8 @@ defmodule Tightbeam.Schema do
                       @session_identity_shape,
                       @closed_assignment_reconciliation_shape,
                       @artifact_process_attribution_shape,
-                      @user_removal_shape
+                      @user_removal_shape,
+                      @limit_fallback_shape
                     ] ->
                  :ok
 
@@ -4977,7 +4999,7 @@ defmodule Tightbeam.Schema do
             [[@artifact_process_attribution_shape]] ->
               :current
 
-            [[@user_removal_shape]] ->
+            [[shape]] when shape in [@user_removal_shape, @limit_fallback_shape] ->
               :current
 
             rows ->
@@ -5125,7 +5147,8 @@ defmodule Tightbeam.Schema do
                     @session_identity_shape,
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
-                    @user_removal_shape
+                    @user_removal_shape,
+                    @limit_fallback_shape
                   ] ->
                Tightbeam.EvidenceSchemaRelease.validate_in_txn!(txn)
 
@@ -5174,6 +5197,7 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
                     @user_removal_shape,
+                    @limit_fallback_shape,
                     @evidence_release_shape
                   ] ->
                :ok =
@@ -5291,6 +5315,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] do
@@ -5472,6 +5497,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape
            ] ->
@@ -5635,6 +5661,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape
            ] ->
         if effort_holder_activity_cancellation_active?(txn) do
@@ -6045,6 +6072,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape
            ] ->
         :ok = check_work_item_owner_link_shape(db)
@@ -6156,7 +6184,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@user_removal_shape}
+          this build: #{@limit_fallback_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -6173,8 +6201,9 @@ defmodule Tightbeam.Schema do
         and #{@notice_source_payload_shape}, #{@decision_request_row_schema_shape},
         then #{@launch_preparation_boot_shape}, followed by #{@evidence_release_shape} and
         #{@closed_assignment_reconciliation_shape}, followed by
-        #{@artifact_process_attribution_shape} and #{@user_removal_shape}.
-        It adopts #{@user_removal_0114_shape} and #{@user_removal_015_shape}.
+        #{@artifact_process_attribution_shape}, #{@user_removal_shape} and
+        #{@limit_fallback_shape}. It adopts #{@user_removal_0114_shape},
+        #{@limit_fallback_0114_shape} and #{@user_removal_015_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -6187,7 +6216,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@user_removal_shape}
+          this build: #{@limit_fallback_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -6279,6 +6308,7 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
                     @user_removal_shape,
+                    @limit_fallback_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -6393,6 +6423,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6427,6 +6458,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -6555,6 +6587,7 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
                     @user_removal_shape,
+                    @limit_fallback_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -6742,6 +6775,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7870,6 +7904,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -7913,6 +7948,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8034,6 +8070,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8301,6 +8338,7 @@ defmodule Tightbeam.Schema do
              @closed_assignment_reconciliation_shape,
              @artifact_process_attribution_shape,
              @user_removal_shape,
+             @limit_fallback_shape,
              @evidence_release_shape,
              @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
@@ -8332,6 +8370,7 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
                     @user_removal_shape,
+                    @limit_fallback_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8376,6 +8415,7 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
                     @user_removal_shape,
+                    @limit_fallback_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8447,6 +8487,7 @@ defmodule Tightbeam.Schema do
                       @closed_assignment_reconciliation_shape,
                       @artifact_process_attribution_shape,
                       @user_removal_shape,
+                      @limit_fallback_shape,
                       @evidence_release_shape,
                       @decision_request_row_schema_shape,
                       @assignment_source_replacement_shape,
@@ -8508,6 +8549,7 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
                     @user_removal_shape,
+                    @limit_fallback_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -8580,7 +8622,11 @@ defmodule Tightbeam.Schema do
   # R2: a database another line migrated to user removal returns to that stamp's
   # recorded predecessor once its columns validate. This line's chain then runs
   # unchanged from there, and upgrade_user_removal/1 meets the columns already
-  # present. Any other stamp is left for check_shape/1 to judge.
+  # present. A 0.1.14 limit-fallback database carries PR622's columns and c1's
+  # objects; both are validated, CHECK texts included, before it returns to
+  # session-identity, and upgrade_limit_fallback/1 later meets the objects
+  # already present (contract v3.1 R2, R8). Any other stamp is left for
+  # check_shape/1 to judge.
   defp adopt_user_removal(db) do
     case DB.migration_transaction(
            db,
@@ -8589,8 +8635,16 @@ defmodule Tightbeam.Schema do
            [],
            fn txn ->
              case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-               [[shape]] when shape in [@user_removal_0114_shape, @user_removal_015_shape] ->
+               [[shape]]
+               when shape in [
+                      @user_removal_0114_shape,
+                      @limit_fallback_0114_shape,
+                      @user_removal_015_shape
+                    ] ->
                  validate_user_removal!(txn)
+
+                 if shape == @limit_fallback_0114_shape,
+                   do: :ok = Tightbeam.LimitFallback.validate_in_txn!(txn)
 
                  Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
                    user_removal_predecessor(shape),
@@ -8620,6 +8674,7 @@ defmodule Tightbeam.Schema do
   end
 
   defp user_removal_predecessor(@user_removal_0114_shape), do: @session_identity_shape
+  defp user_removal_predecessor(@limit_fallback_0114_shape), do: @session_identity_shape
 
   defp user_removal_predecessor(@user_removal_015_shape),
     do: @closed_assignment_reconciliation_shape
@@ -8663,7 +8718,7 @@ defmodule Tightbeam.Schema do
 
                  :ok
 
-               [[@user_removal_shape]] ->
+               [[shape]] when shape in [@user_removal_shape, @limit_fallback_shape] ->
                  validate_user_removal!(txn)
 
                rows ->
@@ -8680,6 +8735,65 @@ defmodule Tightbeam.Schema do
 
       {:error, error} ->
         raise ShapeError, message: "user removal migration rolled back: #{inspect(error)}"
+    end
+  end
+
+  # The limit-fallback successor (contract c v1.4 c1; cross-line contract v3.1
+  # R7) changes two production tables and adds one: sessions gain the
+  # fallback-off marker and the fallback-active state, attests admit exactly
+  # one process-authored progress shape, and the per-trigger evaluation record
+  # holds the claim hold and the one outcome. Present objects are accepted only
+  # when exact, so an adopted 0.1.14 database is validated, never altered. The
+  # stamp moves with them, so a build that does not know this shape refuses
+  # the database instead of reading it.
+  defp upgrade_limit_fallback(db) do
+    case DB.migration_transaction(
+           db,
+           :limit_fallback,
+           [],
+           ["PRAGMA writable_schema = OFF"],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@user_removal_shape]] ->
+                 :ok = Tightbeam.LimitFallback.migrate_in_txn!(txn)
+
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                   @limit_fallback_shape,
+                   System.system_time(:millisecond),
+                   @user_removal_shape
+                 ])
+
+                 if Txn.changes(txn) != 1,
+                   do:
+                     raise(ShapeError,
+                       message: "limit fallback migration lost its exact stamp transition"
+                     )
+
+                 :applied
+
+               [[@limit_fallback_shape]] ->
+                 :ok = Tightbeam.LimitFallback.validate_in_txn!(txn)
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message: "incompatible limit fallback predecessor: #{inspect(rows)}"
+             end
+           end
+         ) do
+      {:ok, :applied} ->
+        Logger.info("database migration limit_fallback committed shape=#{@limit_fallback_shape}")
+        :ok
+
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "limit fallback migration rolled back: #{Exception.message(error)}"
     end
   end
 
@@ -8737,7 +8851,12 @@ defmodule Tightbeam.Schema do
               stamp_artifact_process_attribution!(txn, @closed_assignment_reconciliation_shape)
               :migrated
 
-            [[shape]] when shape in [@artifact_process_attribution_shape, @user_removal_shape] ->
+            [[shape]]
+            when shape in [
+                   @artifact_process_attribution_shape,
+                   @user_removal_shape,
+                   @limit_fallback_shape
+                 ] ->
               validate_artifact_process_schema!(
                 txn,
                 Tightbeam.Artifacts.current_table_definition()
@@ -8985,6 +9104,7 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
                     @user_removal_shape,
+                    @limit_fallback_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
@@ -9038,6 +9158,7 @@ defmodule Tightbeam.Schema do
                     @closed_assignment_reconciliation_shape,
                     @artifact_process_attribution_shape,
                     @user_removal_shape,
+                    @limit_fallback_shape,
                     @evidence_release_shape,
                     @decision_request_row_schema_shape
                   ] ->

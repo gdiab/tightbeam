@@ -56,7 +56,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert :ok = Schema.ensure_all(db)
 
     assert rows(db, "SELECT shape FROM schema_stamp") ==
-             [["user-removal-v1-016"]]
+             [["limit-fallback-v1-016"]]
 
     for {table, column} <- [
           {"assignments", "reminderState"},

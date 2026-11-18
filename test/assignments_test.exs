@@ -3,7 +3,7 @@ defmodule Tightbeam.AssignmentsTest do
   alias Tightbeam.Model
 
   @session_identity_shape "session-identity-v1-0114"
-  @current_stamp "user-removal-v1-016"
+  @current_stamp "limit-fallback-v1-016"
 
   alias Tightbeam.{
     Assignments,

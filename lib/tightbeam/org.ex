@@ -212,8 +212,23 @@ defmodule Tightbeam.Org do
           cleared_through_seq: integer(),
           state: String.t(),
           mechanical_status: String.t(),
+          limit_fallback_off: limit_fallback_off() | nil,
+          fallback_active: fallback_active() | nil,
           created_at: integer(),
           updated_at: integer()
+        }
+
+  @typedoc "The fallback-off marker (contract c R10): who set it, when, and why."
+  @type limit_fallback_off :: %{by: String.t(), at: integer(), reason: String.t() | nil}
+
+  @typedoc """
+  Fallback-active state (contract c R8a): since when, the tuple the switch
+  moved the session from, and the trigger (`turn:<seq>` or `incident:<id>`).
+  """
+  @type fallback_active :: %{
+          since: integer(),
+          from: %{harness: String.t(), model: Model.t()},
+          trigger: String.t()
         }
 
   @typedoc "One link in a session's append-only harness-session pointer chain."
@@ -318,7 +333,8 @@ defmodule Tightbeam.Org do
     mechanicalStatus TEXT NOT NULL DEFAULT 'idle'
                      CHECK (mechanicalStatus IN ('idle','running')),
     createdAt     INTEGER NOT NULL,
-    updatedAt     INTEGER NOT NULL
+    updatedAt     INTEGER NOT NULL,
+    __TIGHTBEAM_LIMIT_FALLBACK_COLUMNS__
   );
   CREATE INDEX IF NOT EXISTS sessions_owner ON sessions (ownerUserId, state);
   CREATE TABLE IF NOT EXISTS harness_pointers (
@@ -401,6 +417,10 @@ defmodule Tightbeam.Org do
       schema_ddl
       |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
       |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
+      |> String.replace(
+        "__TIGHTBEAM_LIMIT_FALLBACK_COLUMNS__",
+        Enum.join(Tightbeam.LimitFallback.sessions_column_ddl(), ",\n    ")
+      )
 
     result = DB.execute(db, ddl)
 
@@ -618,9 +638,10 @@ defmodule Tightbeam.Org do
         INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
           identityRevision, cliToken,
-          harness, provider, model, thinkingLevel, modelContext, host, state, createdAt, updatedAt)
+          harness, provider, model, thinkingLevel, modelContext, host, state, createdAt, updatedAt,
+          limitFallbackOff)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-          ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'active', ?22, ?22)
+          ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'active', ?22, ?22, ?23)
       """,
       [
         session_key,
@@ -644,7 +665,8 @@ defmodule Tightbeam.Org do
         model.effort,
         model.context,
         Map.fetch!(input, :host),
-        now
+        now,
+        encode_limit_fallback_off(Map.get(input, :limit_fallback_off))
       ]
     )
 
@@ -1233,6 +1255,27 @@ defmodule Tightbeam.Org do
   @spec set_cleared_through_in_txn(Txn.t(), String.t(), integer()) :: session()
   def set_cleared_through_in_txn(%Txn{} = txn, session_key, seq) do
     update_in_txn(txn, session_key, "clearedThroughSeq = ?2", [seq])
+  end
+
+  @doc """
+  Store or clear (nil) the fallback-off marker. `Tightbeam.LimitFallback` owns
+  when it is written; this is the dumb recorder. Returns the updated session.
+  """
+  @spec set_limit_fallback_off_in_txn(Txn.t(), String.t(), limit_fallback_off() | nil) ::
+          session()
+  def set_limit_fallback_off_in_txn(%Txn{} = txn, session_key, marker) do
+    update_in_txn(txn, session_key, "limitFallbackOff = ?2", [
+      encode_limit_fallback_off(marker)
+    ])
+  end
+
+  @doc """
+  Store or clear (nil) the fallback-active state. `Tightbeam.LimitFallback`
+  owns when it is written. Returns the updated session.
+  """
+  @spec set_fallback_active_in_txn(Txn.t(), String.t(), fallback_active() | nil) :: session()
+  def set_fallback_active_in_txn(%Txn{} = txn, session_key, state) do
+    update_in_txn(txn, session_key, "fallbackActive = ?2", [encode_fallback_active(state)])
   end
 
   @doc """
@@ -2035,7 +2078,7 @@ defmodule Tightbeam.Org do
            identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
            mechanicalStatus, createdAt, updatedAt, #{current_parent_sql("sessions")},
-           #{topology_parent_sql("sessions")}
+           #{topology_parent_sql("sessions")}, limitFallbackOff, fallbackActive
     FROM sessions
     """
   end
@@ -2070,7 +2113,9 @@ defmodule Tightbeam.Org do
          created_at,
          updated_at,
          current_parent,
-         topology_parent
+         topology_parent,
+         limit_fallback_off,
+         fallback_active
        ]) do
     %{
       session_key: session_key,
@@ -2099,9 +2144,65 @@ defmodule Tightbeam.Org do
       cleared_through_seq: cleared_through_seq,
       state: state,
       mechanical_status: mechanical_status,
+      limit_fallback_off: decode_limit_fallback_off(limit_fallback_off),
+      fallback_active: decode_fallback_active(fallback_active),
       created_at: created_at,
       updated_at: updated_at
     }
+  end
+
+  defp decode_limit_fallback_off(nil), do: nil
+
+  defp decode_limit_fallback_off(json) do
+    %{"by" => by, "at" => at, "reason" => reason} = JSON.decode!(json)
+    %{by: by, at: at, reason: reason}
+  end
+
+  defp encode_limit_fallback_off(nil), do: nil
+
+  defp encode_limit_fallback_off(%{by: by, at: at, reason: reason})
+       when is_binary(by) and is_integer(at) and (is_nil(reason) or is_binary(reason)),
+       do: JSON.encode!(%{"by" => by, "at" => at, "reason" => reason})
+
+  defp decode_fallback_active(nil), do: nil
+
+  defp decode_fallback_active(json) do
+    %{
+      "since" => since,
+      "trigger" => trigger,
+      "from" => %{
+        "harness" => harness,
+        "model" => model,
+        "effort" => effort,
+        "context" => context
+      }
+    } = JSON.decode!(json)
+
+    %{
+      since: since,
+      trigger: trigger,
+      from: %{harness: harness, model: %Model{family: model, effort: effort, context: context}}
+    }
+  end
+
+  defp encode_fallback_active(nil), do: nil
+
+  defp encode_fallback_active(%{
+         since: since,
+         trigger: trigger,
+         from: %{harness: harness, model: %Model{} = model}
+       })
+       when is_integer(since) and is_binary(trigger) and is_binary(harness) do
+    JSON.encode!(%{
+      "since" => since,
+      "trigger" => trigger,
+      "from" => %{
+        "harness" => harness,
+        "model" => model.family,
+        "effort" => model.effort,
+        "context" => model.context
+      }
+    })
   end
 
   defp transaction!(db, fun) do

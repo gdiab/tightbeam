@@ -10,6 +10,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
   alias Tightbeam.{DB, LiveBaseAdmission, LiveBaseGuard, Schema, UserAdmin}
 
   @u_l "user-removal-v1-016"
+  @lf_l "limit-fallback-v1-016"
   @p_l "artifact-process-attribution-v1-015"
   @f0_dir Path.expand("fixtures/user_removal/f0", __DIR__)
   @removal_check "removedBy TEXT CHECK ((removedAt IS NULL) = (removedBy IS NULL))"
@@ -67,7 +68,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
   end
 
   describe "T: the adoption path" do
-    test "T1 and T3: ported 0.1.16 boots F0 to user-removal-v1-016, keeps every row, twice",
+    test "T1 and T3: ported 0.1.16 boots F0 to its head limit-fallback-v1-016, keeps every row, twice",
          ctx do
       stage_f0!(ctx.base)
       path = db_path(ctx.base)
@@ -79,7 +80,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
       db = guarded_boot!(ctx)
 
       try do
-        assert {:ok, [[@u_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+        assert {:ok, [[@lf_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
         assert marker(ctx.base) == owner_marker(ctx.identity)
         assert_preserved!(db, before)
 
@@ -100,7 +101,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
       db = guarded_boot!(ctx)
 
       try do
-        assert {:ok, [[@u_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+        assert {:ok, [[@lf_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
       after
         :ok = GenServer.stop(db)
       end
@@ -130,7 +131,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
         db = guarded_boot!(ctx)
 
         try do
-          assert {:ok, [[@u_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+          assert {:ok, [[@lf_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
           assert {:ok, ^users} =
                    DB.query(db, "SELECT userId, isAdmin, createdAt FROM users ORDER BY userId")
@@ -180,7 +181,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
       db = guarded_boot!(ctx)
 
       try do
-        assert {:ok, [[@u_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+        assert {:ok, [[@lf_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
         assert marker(ctx.base) == owner_marker(ctx.identity)
         assert_preserved!(db, before)
       after
@@ -249,7 +250,8 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
       assert stamp in Schema.guard_compatible_stamps()
 
       without_adoption =
-        Schema.guard_compatible_stamps() -- ["user-removal-v1-0114", "user-removal-v1-015"]
+        Schema.guard_compatible_stamps() --
+          ["user-removal-v1-0114", "limit-fallback-v1-0114", "user-removal-v1-015"]
 
       assert {:error, %{code: "incompatible_schema"}} =
                LiveBaseGuard.qualify_schema(%{expected_schema: nil}, stamp, without_adoption)
@@ -275,11 +277,13 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
   end
 
   describe "R1b and R3" do
-    test "the guard list is U_L, P_L, the adoption set, then the existing list" do
+    test "the guard list is LF_L, U_L, P_L, the adoption set, then the existing list" do
       assert [
+               @lf_l,
                @u_l,
                @p_l,
                "user-removal-v1-0114",
+               "limit-fallback-v1-0114",
                "user-removal-v1-015",
                "closed-assignment-cannot-proceed-reconciliation-v1-015",
                "session-identity-v1-0114" | _
