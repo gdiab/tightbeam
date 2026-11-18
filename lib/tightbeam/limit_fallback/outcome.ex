@@ -43,6 +43,18 @@ defmodule Tightbeam.LimitFallback.Outcome do
     defexception message: "limit fallback trigger already has an outcome"
   end
 
+  defmodule Withheld do
+    @moduledoc false
+    # Raised in the swap transaction when the evaluation's premise no longer
+    # holds under the tune lock. It rolls the swap back; `reason` is the
+    # withheld outcome the evaluation then commits.
+    defexception [:reason]
+
+    @impl true
+    def message(%{reason: reason}),
+      do: "limit fallback premise changed before the swap: #{reason}"
+  end
+
   @process "process:tightbeam"
   @class "rate-limit-dead"
 
@@ -125,14 +137,49 @@ defmodule Tightbeam.LimitFallback.Outcome do
   ## Applied (R5, R8a, R9b, R12-R15)
 
   @doc """
-  Commit the applied outcome inside the swap transaction, after the swap.
-  `ctx` carries `:session_key`, `:turn_seq`, `:evidence`, `:disposition`, the
-  pre-switch `:from` (`harness`, `model`, `provider`) and the configured `:to`
-  (`harness`, `model`). Raises `Duplicate` when the trigger already has an
-  outcome, which rolls the swap back: one trigger never switches twice.
+  The engine tuple an evaluation judges and records as the switch's `from`:
+  the session's harness, model and provider.
   """
-  @spec applied_in_txn(Txn.t(), map()) :: :ok
-  def applied_in_txn(%Txn{} = txn, %{session_key: session_key, turn_seq: turn_seq} = ctx) do
+  @spec engine_tuple(Org.session()) :: %{
+          harness: String.t(),
+          model: Model.t() | nil,
+          provider: String.t()
+        }
+  def engine_tuple(session),
+    do: %{
+      harness: session.harness,
+      model: session.model,
+      provider: to_string(session.provider)
+    }
+
+  @doc """
+  Commit the applied outcome inside the swap transaction, after the swap.
+  `predecessor` is the sessions row the swap replaced, read in the same
+  transaction. `ctx` carries `:session_key`, `:turn_seq`, `:evidence`,
+  `:disposition`, the pre-switch `:from` (`engine_tuple/1` of the
+  evaluation's read) and the configured `:to` (`harness`, `model`).
+
+  The evaluation read `from` and the marker before the tune lock, so both are
+  re-judged here against `predecessor`. A marker set since raises `Withheld`
+  with `restricted` (R4.2 as the evaluation would have judged it). Any other
+  engine than `from` (a tune landed in between) raises `Withheld` with
+  `switch-failed:stale`: R4.5, `fallbackActive.from` and the switch-back
+  command would all name an engine the session no longer had. Raises
+  `Duplicate` when the trigger already has an outcome. Each raise rolls the
+  swap back: one trigger never switches twice, or from a stale premise.
+  """
+  @spec applied_in_txn(Txn.t(), Org.session(), map()) :: :ok
+  def applied_in_txn(
+        %Txn{} = txn,
+        predecessor,
+        %{session_key: session_key, turn_seq: turn_seq} = ctx
+      ) do
+    cond do
+      LimitFallback.restricted?(predecessor) -> raise Withheld, reason: "restricted"
+      engine_tuple(predecessor) != ctx.from -> raise Withheld, reason: "switch-failed:stale"
+      true -> :ok
+    end
+
     trigger = {:turn, turn_seq}
 
     case LimitFallback.record_outcome_in_txn(txn, session_key, trigger, :applied) do
@@ -544,6 +591,11 @@ defmodule Tightbeam.LimitFallback.Outcome do
     do:
       "the fallback did not pass the harness-change checks on this host (credential, catalog " <>
         "or readiness)"
+
+  defp reason_sentence("switch-failed:stale"),
+    do:
+      "the session's engine changed after the evaluation read it and before the swap, so " <>
+        "nothing was swapped"
 
   defp reason_sentence("switch-failed:" <> failure),
     do: "the switch to the fallback failed (#{failure}) and nothing was swapped"
