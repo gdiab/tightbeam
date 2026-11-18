@@ -1,11 +1,13 @@
 defmodule Tightbeam.OwnerAlertsTest do
   @moduledoc """
-  Owner alerts (b): usage-limit turn failures reach the alert owner through a
-  gateway-originated Harklight send from Main, with no agent turn or wake.
+  Owner alerts: usage-limit turn failures (b) and four-hour stalls (a) reach
+  the alert owner through a gateway-originated Harklight send from Main, with
+  no agent turn or wake.
 
   The Harklight Agent is the injected runner (`:harklight_send_runner`); it
   answers only for properties on our side of that seam. Time is injected:
-  `OwnerAlerts.deliver_due/2` takes the clock as `:now`.
+  `OwnerAlerts.deliver_due/2` and `OwnerAlerts.detect_stalls/2` take the clock
+  as `:now`, and stall fixtures write their record times directly.
   """
 
   use Tightbeam.TestCase, async: false
@@ -21,12 +23,16 @@ defmodule Tightbeam.OwnerAlertsTest do
     Model,
     Org,
     OwnerAlerts,
-    Placement
+    Placement,
+    Supervision,
+    Wakes,
+    WorkItems
   }
 
   @owner "george"
   @minute 60_000
   @hour 3_600_000
+  @stall 4 * @hour
   @codex_limit %{
     "code" => -32_603,
     "message" => "Internal error",
@@ -37,8 +43,14 @@ defmodule Tightbeam.OwnerAlertsTest do
   }
 
   setup do
+    db = world_db()
+    %{db: db, main: Org.personal_session_key(@owner), host: Placement.local_host_name()}
+  end
+
+  # One database with the two users and the owner's Main placed on this host.
+  defp world_db do
     db = :"owner_alerts_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db})
+    start_supervised!({DB, path: ":memory:", name: db}, id: db)
     :ok = ensure_all_schemas(db)
 
     for user <- [@owner, "other"] do
@@ -46,24 +58,21 @@ defmodule Tightbeam.OwnerAlertsTest do
         DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES(?1,0,1)", [user])
     end
 
-    host = Placement.local_host_name()
+    Org.create(db, %{
+      session_key: Org.personal_session_key(@owner),
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: @owner,
+      origin: "user:#{@owner}",
+      archetype: "default",
+      host: Placement.local_host_name(),
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-5.6-sol")
+    })
 
-    main =
-      Org.create(db, %{
-        session_key: Org.personal_session_key(@owner),
-        display_name: "Main",
-        kind: "main",
-        is_built_in: true,
-        owner_user_id: @owner,
-        origin: "user:#{@owner}",
-        archetype: "default",
-        host: host,
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol")
-      })
-
-    %{db: db, main: main.session_key, host: host}
+    db
   end
 
   test "T1: a Codex usage-limit failure reaches Harklight from parked Main with no turn or wake",
@@ -832,6 +841,629 @@ defmodule Tightbeam.OwnerAlertsTest do
     end
   end
 
+  ## (a) four-hour stall
+
+  test "T5: an item whose only assignment has a running turn alerts at the threshold",
+       %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:runner", name: "Runner")
+    t0 = now_ms() - 2 * @stall
+    item(db, "wi_t5", title: "Ship the parser")
+    assignment(db, "asg_t5", "wi_t5", holder, t0, subject: "Write the parser")
+
+    # A live turn is not progress and does not quiet the item.
+    seq = enqueue(db, holder, %{assignment_id: "asg_t5"})
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, holder, "test-owner")
+
+    assert %{created: 0, next_at: next} = OwnerAlerts.detect_stalls(db, now: t0 + @stall - 1)
+    assert next == t0 + @stall
+    assert stall_alerts(db) == []
+
+    before = record_counts(db)
+    assert %{created: 1} = OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+
+    assert [%{work_item_id: "wi_t5", anchor_at: ^t0, state: "pending"} = alert] =
+             stall_alerts(db)
+
+    assert alert.dedupe_key == "stall:wi_t5:#{t0}"
+    assert alert.title == "No progress for 4h: Ship the parser"
+    assert alert.body =~ "'Write the parser' (asg_t5), held by 'Runner'"
+    assert alert.body =~ "running a turn since"
+    assert alert.created_at == t0 + @stall
+
+    # Creating the alert queued, started and changed no turn and no wake.
+    assert record_counts(db) == before
+  end
+
+  test "T5: the process alerts at the predicted stall time with no further event",
+       %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    # The stall comes due a few seconds after boot; the boot pass must not
+    # find it, so only the timer it arms can create the alert.
+    t0 = now_ms() - @stall + 3_000
+    item(db, "wi_timer")
+    assignment(db, "asg_timer", "wi_timer", holder, t0)
+
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner})
+    :sys.get_state(OwnerAlerts)
+    assert stall_alerts(db) == []
+
+    assert_receive {:harklight, ["send", "--prepare", "--op-id", op | _]}, 15_000
+    assert_receive {:harklight, ["send", "--execute", "--op-id", ^op]}, 5_000
+    :sys.get_state(OwnerAlerts)
+
+    assert [%{work_item_id: "wi_timer", state: "sent", op_id: ^op, created_at: created}] =
+             stall_alerts(db)
+
+    assert created >= t0 + @stall
+    assert created < t0 + @stall + 10 * @minute
+  end
+
+  test "S7: a stall that came due while the gateway was down alerts at boot", %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 3 * @stall
+    item(db, "wi_down")
+    assignment(db, "asg_down", "wi_down", holder, t0)
+
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner})
+    assert_receive {:harklight, ["send", "--prepare", "--op-id", op | _]}, 5_000
+    :sys.get_state(OwnerAlerts)
+
+    assert [%{work_item_id: "wi_down", anchor_at: ^t0, state: "sent", op_id: ^op}] =
+             stall_alerts(db)
+  end
+
+  test "S7: enabling the alert owner alerts an already-stalled item at once", %{db: db} do
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 3 * @stall
+    item(db, "wi_enable")
+    assignment(db, "asg_enable", "wi_enable", holder, t0)
+
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner})
+    :sys.get_state(OwnerAlerts)
+    assert stall_alerts(db) == []
+
+    # With alerts off the process holds no timer; only the setting's own
+    # commit can make it look again.
+    config = config_handler(db)
+
+    assert %{changed: true} =
+             config.(%{action: "set", setting: "owner-alerts-user", value: @owner})
+
+    :sys.get_state(OwnerAlerts)
+    assert [%{work_item_id: "wi_enable", state: "sent"}] = stall_alerts(db)
+    assert_received {:harklight, ["send", "--prepare" | _]}
+  end
+
+  test "S7: reopening an iceboxed stalled item alerts at once", %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 3 * @stall
+    item(db, "wi_reopen", state: "iceboxed")
+    assignment(db, "asg_reopen", "wi_reopen", holder, t0)
+
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner})
+    :sys.get_state(OwnerAlerts)
+    assert stall_alerts(db) == []
+
+    assert %{workItem: %{state: "open"}} =
+             WorkItems.__handle__(db, "work-item-reopen", %{
+               verb: "work-item-reopen",
+               principal: {:user, @owner},
+               origin: "user:#{@owner}",
+               session_key: nil,
+               params: %{work_item_id: "wi_reopen"}
+             })
+
+    :sys.get_state(OwnerAlerts)
+    assert [%{work_item_id: "wi_reopen", anchor_at: ^t0}] = stall_alerts(db)
+  end
+
+  test "T6: held or waiting items never alert", %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:holder")
+    other = session(db, "agent:george:other")
+    t0 = now_ms() - 20 * @stall
+
+    for id <- ~w(wi_c1 wi_c2_fact wi_c2_dep wi_c3 wi_c4 wi_control), do: item(db, id)
+
+    # C1: a standing cannot-proceed.
+    assignment(db, "asg_c1", "wi_c1", holder, t0)
+    cannot_proceed(db, "asg_c1", holder, t0)
+
+    # C2: a condition wake, and a dependency wait, naming the assignment.
+    assignment(db, "asg_c2_fact", "wi_c2_fact", holder, t0)
+    wait_on(db, "asg_c2_fact", holder, t0, condition_kind: "pr-merged")
+    assignment(db, "asg_c2_dep", "wi_c2_dep", holder, t0)
+    wait_on(db, "asg_c2_dep", holder, t0, wait_mode: "dependency")
+
+    # C3: an open decision request on the assignment.
+    assignment(db, "asg_c3", "wi_c3", holder, t0)
+    decision_request(db, "asg_c3", holder, other, t0)
+
+    # C4 (0.1.14 form): the holder delegated a child on the same item, opened
+    # no earlier than the covered assignment; the child itself waits on a fact.
+    assignment(db, "asg_c4", "wi_c4", holder, t0)
+    assignment(db, "asg_c4_child", "wi_c4", other, t0, opened_by_session: holder)
+    wait_on(db, "asg_c4_child", other, t0, condition_kind: "pr-merged")
+
+    assignment(db, "asg_control", "wi_control", holder, t0)
+
+    for k <- 1..10, do: OwnerAlerts.detect_stalls(db, now: t0 + k * @stall)
+
+    assert Enum.map(stall_alerts(db), & &1.work_item_id) == ["wi_control"]
+  end
+
+  test "T7: the alert lists only uncovered assignments and counts the covered ones",
+       %{db: db} do
+    enable(db)
+    idle = session(db, "agent:george:idle", name: "Idle holder")
+    waiting = session(db, "agent:george:waiting", name: "Waiting holder")
+    t0 = now_ms() - 2 * @stall
+    item(db, "wi_t7", title: "Mixed item")
+    assignment(db, "asg_idle", "wi_t7", idle, t0, subject: "Idle work")
+    assignment(db, "asg_wait", "wi_t7", waiting, t0, subject: "Waiting work")
+    wait_on(db, "asg_wait", waiting, t0, condition_kind: "pr-merged")
+
+    OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+
+    assert [%{work_item_id: "wi_t7", body: body}] = stall_alerts(db)
+    assert body =~ "- 'Idle work' (asg_idle), held by 'Idle holder'"
+    refute body =~ "Waiting work"
+    refute body =~ "Waiting holder"
+    assert body =~ "1 other open assignment is held or waiting."
+  end
+
+  test "S8: the body names the last progress event and each holder's visible state",
+       %{db: db} do
+    System.put_env("TZ", "UTC")
+    enable(db)
+
+    runner_key = session(db, "agent:george:running", name: "Runner")
+    queued = session(db, "agent:george:queued", name: "Queuer")
+
+    paused =
+      session(db, "agent:george:paused",
+        name: "Pauser",
+        harness: "claude",
+        provider: "anthropic",
+        model: "claude-fable-5"
+      )
+
+    idle = session(db, "agent:george:idle", name: "Idler")
+
+    t0 = now_ms() - 3 * @stall
+    item(db, "wi_s8", title: "Content item")
+    assignment(db, "asg_running", "wi_s8", runner_key, t0, subject: "Running work")
+    assignment(db, "asg_queued", "wi_s8", queued, t0, subject: "Queued work")
+    assignment(db, "asg_paused", "wi_s8", paused, t0, subject: "Paused work")
+    assignment(db, "asg_idle", "wi_s8", idle, t0, subject: "Idle work")
+
+    t1 = t0 + @hour
+    attest(db, "asg_running", runner_key, t1)
+
+    seq = enqueue(db, runner_key, %{})
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, runner_key, "test-owner")
+    started = count(db, "SELECT startedAt FROM turns WHERE seq=?1", [seq])
+    enqueue(db, queued, %{})
+    pause(db, paused)
+    ended = ended_at(db, deliver_turn(db, idle))
+
+    OwnerAlerts.detect_stalls(db, now: t1 + @stall)
+
+    assert [%{title: title, body: body, anchor_at: ^t1}] = stall_alerts(db)
+    assert title == "No progress for 4h: Content item"
+
+    for part <- [
+          "Work item wi_s8.",
+          "Last progress: a progress attest at #{utc_text(t1)} (4h 0m ago) on 'Running work' (asg_running), filed by 'Runner'.",
+          "- 'Running work' (asg_running), held by 'Runner' on Codex, model gpt-5.6-sol: running a turn since #{utc_text(started)}.",
+          "- 'Queued work' (asg_queued), held by 'Queuer' on Codex, model gpt-5.6-sol: queued.",
+          "- 'Paused work' (asg_paused), held by 'Pauser' on Claude, model claude-fable-5: its harness is paused by a usage limit.",
+          "- 'Idle work' (asg_idle), held by 'Idler' on Codex, model gpt-5.6-sol: idle since #{utc_text(ended)}.",
+          "No other open assignments are held or waiting.",
+          "No reply needed. This alert repeats only if the work moves and then stalls again."
+        ] do
+      assert body =~ part, "missing #{inspect(part)} in #{inspect(body)}"
+    end
+  end
+
+  test "S8: an item with no attest says so", %{db: db} do
+    enable(db)
+    t0 = now_ms() - 2 * @stall
+    item(db, "wi_fresh")
+    assignment(db, "asg_fresh", "wi_fresh", session(db, "agent:george:idle"), t0)
+
+    OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+    assert [%{body: body}] = stall_alerts(db)
+    assert body =~ "Last progress: none yet."
+  end
+
+  test "T8: a stall alerts once across ten thresholds and restarts", %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 10 * @stall - @hour
+    item(db, "wi_t8")
+    assignment(db, "asg_t8", "wi_t8", holder, t0)
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+
+    for k <- 1..5, do: OwnerAlerts.detect_stalls(db, now: t0 + k * @stall)
+    assert [alert] = stall_alerts(db)
+    assert OwnerAlerts.deliver_due(db, now: alert.created_at, runner: runner) == 0
+    assert_received {:harklight, ["send", "--prepare", "--op-id", op | _]}
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^op]}
+
+    # A restart mid-way: the boot pass finds the same stall and dedupes it.
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner}, id: :first_boot)
+    :sys.get_state(OwnerAlerts)
+    :ok = stop_supervised!(:first_boot)
+
+    for k <- 6..10, do: OwnerAlerts.detect_stalls(db, now: t0 + k * @stall)
+
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner}, id: :second_boot)
+    :sys.get_state(OwnerAlerts)
+
+    refute_received {:harklight, _}
+    assert [%{state: "sent", op_id: ^op, dedupe_key: key}] = stall_alerts(db)
+    assert key == "stall:wi_t8:#{t0}"
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 1
+  end
+
+  test "T9: progress moves the anchor, and the item alerts again only a threshold later",
+       %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_t9")
+    assignment(db, "asg_t9", "wi_t9", holder, t0)
+
+    OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+    assert [%{anchor_at: ^t0}] = stall_alerts(db)
+
+    t1 = t0 + 2 * @stall
+    attest(db, "asg_t9", holder, t1)
+
+    assert %{created: 0, next_at: next} = OwnerAlerts.detect_stalls(db, now: t1 + @stall - 1)
+    assert next == t1 + @stall
+    assert length(stall_alerts(db)) == 1
+
+    assert %{created: 1} = OwnerAlerts.detect_stalls(db, now: t1 + @stall)
+    assert [%{anchor_at: ^t0}, %{anchor_at: ^t1, dedupe_key: key}] = stall_alerts(db)
+    assert key == "stall:wi_t9:#{t1}"
+  end
+
+  test "T9: a condition wait that fires after ten hours restarts the clock at its firing",
+       %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_wait")
+    assignment(db, "asg_wait", "wi_wait", holder, t0)
+    wake_id = wait_on(db, "asg_wait", holder, t0, condition_kind: "pr-merged")
+
+    fired_at = t0 + 10 * @hour
+
+    for at <- [t0 + @stall, t0 + 2 * @stall, fired_at - 1] do
+      assert %{created: 0, next_at: nil} = OwnerAlerts.detect_stalls(db, now: at)
+    end
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE wakes SET state='fired', firedAt=?2, firedBy='condition' WHERE wakeId=?1",
+        [wake_id, fired_at]
+      )
+
+    assert %{created: 0, next_at: next} =
+             OwnerAlerts.detect_stalls(db, now: fired_at + @stall - 1)
+
+    assert next == fired_at + @stall
+    assert stall_alerts(db) == []
+
+    OwnerAlerts.detect_stalls(db, now: fired_at + @stall)
+    assert [%{anchor_at: ^fired_at}] = stall_alerts(db)
+  end
+
+  test "T10: other owners' items, iceboxed items and items with no open assignment never alert",
+       %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    foreign = session(db, "agent:other:idle", owner: "other")
+    t0 = now_ms() - 20 * @stall
+
+    item(db, "wi_foreign", owner: "other")
+    assignment(db, "asg_foreign", "wi_foreign", foreign, t0)
+
+    item(db, "wi_ice", state: "iceboxed")
+    assignment(db, "asg_ice", "wi_ice", holder, t0)
+
+    item(db, "wi_empty")
+    assignment(db, "asg_done", "wi_empty", holder, t0)
+    close_assignment(db, "asg_done", holder, t0 + @minute)
+
+    item(db, "wi_control")
+    assignment(db, "asg_control", "wi_control", holder, t0)
+
+    OwnerAlerts.detect_stalls(db, now: t0 + 10 * @stall)
+    assert Enum.map(stall_alerts(db), & &1.work_item_id) == ["wi_control"]
+  end
+
+  test "T11: a stall alert whose item moved before its retry is withdrawn, not sent",
+       %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_t11")
+    assignment(db, "asg_t11", "wi_t11", holder, t0)
+    OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+    [alert] = stall_alerts(db)
+
+    parent = self()
+
+    failing = fn args ->
+      send(parent, {:harklight, args})
+      {"harklight-agent: network unreachable", 1}
+    end
+
+    assert OwnerAlerts.deliver_due(db, now: alert.created_at, runner: failing) == 0
+    assert_received {:harklight, ["send", "--prepare" | _]}
+    assert [%{state: "pending", attempts: 1, next_attempt_at: next}] = stall_alerts(db)
+
+    attest(db, "asg_t11", holder, alert.created_at + @minute)
+
+    assert OwnerAlerts.deliver_due(db, now: next, runner: failing) == 0
+    refute_received {:harklight, _}
+    assert [%{state: "withdrawn", attempts: 1, next_attempt_at: nil}] = stall_alerts(db)
+    assert withdrawn_reasons(db, alert.alert_id) == ["work-moved"]
+
+    assert OwnerAlerts.deliver_due(db, now: next + 2 * @hour, runner: failing) == 0
+    refute_received {:harklight, _}
+  end
+
+  test "A7: a stall alert whose item became held is withdrawn before its first send",
+       %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    other = session(db, "agent:george:other")
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_held")
+    assignment(db, "asg_held", "wi_held", holder, t0)
+    OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+    [alert] = stall_alerts(db)
+
+    # An open decision request covers the assignment without moving the anchor.
+    decision_request(db, "asg_held", holder, other, alert.created_at)
+
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    assert OwnerAlerts.deliver_due(db, now: alert.created_at, runner: runner) == 0
+    refute_received {:harklight, _}
+    assert [%{state: "withdrawn", attempts: 0, op_id: nil}] = stall_alerts(db)
+    assert withdrawn_reasons(db, alert.alert_id) == ["held-or-waiting"]
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 0
+  end
+
+  test "T14: a two-hour threshold alerts at two hours", %{db: db} do
+    enable(db)
+    :ok = Org.put_setting(db, "owner-alert-stall-ms", "7200000")
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 10 * @stall
+    item(db, "wi_t14", title: "Short fuse")
+    assignment(db, "asg_t14", "wi_t14", holder, t0)
+
+    assert %{created: 0, next_at: next} = OwnerAlerts.detect_stalls(db, now: t0 + 2 * @hour - 1)
+    assert next == t0 + 2 * @hour
+    assert stall_alerts(db) == []
+
+    assert %{created: 1} = OwnerAlerts.detect_stalls(db, now: t0 + 2 * @hour)
+    assert [%{title: "No progress for 2h: Short fuse"}] = stall_alerts(db)
+  end
+
+  test "T14: with the owner setting unset no stall alert is created", %{db: db} do
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 10 * @stall
+    item(db, "wi_off")
+    assignment(db, "asg_off", "wi_off", holder, t0)
+
+    assert %{owner: nil, created: 0} = OwnerAlerts.detect_stalls(db, now: t0 + 5 * @stall)
+    assert stall_alerts(db) == []
+  end
+
+  test "T18: alerts off withdraw a failed stall alert and skip new stalls; re-enabling alerts a still-stalled item once",
+       %{db: db} do
+    enable(db)
+    config = config_handler(db)
+
+    set_owner = fn value ->
+      config.(%{action: "set", setting: "owner-alerts-user", value: value})
+    end
+
+    holder = session(db, "agent:george:idle")
+
+    # A stall alert queued for its retry after a definite failure.
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_queued")
+    assignment(db, "asg_queued", "wi_queued", holder, t0)
+    assert %{created: 1} = OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+    [queued] = stall_alerts(db)
+    assert OwnerAlerts.deliver_due(db, now: queued.created_at, runner: failing(self())) == 0
+    assert_received {:harklight, ["send", "--prepare" | _]}
+    assert [%{state: "pending", attempts: 1, next_attempt_at: retry_at}] = stall_alerts(db)
+
+    assert %{setting: "owner-alerts-user", value: nil, changed: true} = set_owner.("")
+
+    # An item that stalls while alerts are off gets no row.
+    t1 = now_ms() - 2 * @stall
+    item(db, "wi_new")
+    assignment(db, "asg_new", "wi_new", holder, t1)
+    assert %{owner: nil, created: 0} = OwnerAlerts.detect_stalls(db, now: t1 + @stall)
+    assert [%{work_item_id: "wi_queued"}] = stall_alerts(db)
+
+    # The queued alert's retry withdraws it instead of minting an operation,
+    # although its stall is still current.
+    assert OwnerAlerts.deliver_due(db, now: retry_at, runner: failing(self())) == 0
+    refute_received {:harklight, _}
+
+    assert [%{state: "withdrawn", attempts: 1, next_attempt_at: nil}] = stall_alerts(db)
+    assert withdrawn_reasons(db, queued.alert_id) == ["alerts-off"]
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 0
+
+    assert %{value: nil, changed: false} = set_owner.("")
+
+    # The boot pass while alerts are off creates nothing either.
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner})
+    :sys.get_state(OwnerAlerts)
+    assert [%{work_item_id: "wi_queued"}] = stall_alerts(db)
+    refute_received {:harklight, _}
+
+    # Re-enabling: the setting's commit makes the process look at once. The
+    # still-stalled item alerts once; the queued item's stall identity was
+    # already alerted (S6), so it gets no second alert.
+    enabled_at = now_ms()
+    assert %{value: @owner, changed: true} = set_owner.(@owner)
+    :sys.get_state(OwnerAlerts)
+
+    assert_received {:harklight, ["send", "--prepare", "--op-id", op | _]}
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^op]}
+    refute_received {:harklight, _}
+
+    assert [
+             %{work_item_id: "wi_queued", state: "withdrawn"},
+             %{work_item_id: "wi_new", anchor_at: ^t1, state: "sent", op_id: ^op} = alert
+           ] = stall_alerts(db)
+
+    assert alert.created_at >= enabled_at
+    assert alert.created_at < enabled_at + 10 * @minute
+  end
+
+  test "T15: a stall alert created before a restart is sent once after it", %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - @stall - @minute
+    item(db, "wi_t15")
+    assignment(db, "asg_t15", "wi_t15", holder, t0)
+
+    assert %{created: 1} = OwnerAlerts.detect_stalls(db)
+    assert [%{state: "pending", attempts: 0}] = stall_alerts(db)
+
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner}, id: :first_boot)
+    assert_receive {:harklight, ["send", "--prepare", "--op-id", op | _]}, 5_000
+    assert_receive {:harklight, ["send", "--execute", "--op-id", ^op]}, 5_000
+    :sys.get_state(OwnerAlerts)
+    assert [%{state: "sent", op_id: ^op}] = stall_alerts(db)
+
+    :ok = stop_supervised!(:first_boot)
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner}, id: :second_boot)
+    :sys.get_state(OwnerAlerts)
+
+    refute_received {:harklight, _}
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 1
+    assert [%{state: "sent", op_id: ^op, attempts: 1}] = stall_alerts(db)
+  end
+
+  test "T16: the inactivity ladder runs unchanged beside a stall alert" do
+    opened_at = now_ms() - 10_000
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+
+    control = ladder_run(false, opened_at, runner)
+    enabled = ladder_run(true, opened_at, runner)
+
+    assert enabled.ladder == control.ladder
+    assert control.stall_alerts == []
+    assert [%{work_item_id: "wi_ladder", state: "sent"}] = enabled.stall_alerts
+
+    # The ladder really climbed: a reminder ended on the owner's Main.
+    main = Org.personal_session_key(@owner)
+
+    assert Enum.any?(control.ladder.wakes, fn
+             ["prompt", ^main, _state, prompt, _ref] -> is_binary(prompt)
+             _ -> false
+           end)
+  end
+
+  test "T17: a child on another item neither covers the parent nor restarts its clock",
+       %{db: db} do
+    enable(db)
+    parent = session(db, "agent:george:parent")
+    child = session(db, "agent:george:child")
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_w")
+    item(db, "wi_v")
+    assignment(db, "asg_w", "wi_w", parent, t0, subject: "Parent work")
+
+    assignment(db, "asg_v", "wi_v", child, t0 + @minute,
+      opened_by_session: parent,
+      subject: "Child work"
+    )
+
+    OwnerAlerts.detect_stalls(db, now: t0 + @stall - 1)
+    assert w_alerts(db) == []
+
+    OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+    assert [%{anchor_at: ^t0}] = w_alerts(db)
+
+    closed_at = t0 + @stall + @hour
+    close_assignment(db, "asg_v", child, closed_at)
+
+    for at <- [closed_at + @stall, closed_at + 3 * @stall] do
+      OwnerAlerts.detect_stalls(db, now: at)
+      assert [%{anchor_at: ^t0}] = w_alerts(db)
+    end
+  end
+
+  test "T17: the same child on the parent's item covers the parent", %{db: db} do
+    enable(db)
+    parent = session(db, "agent:george:parent")
+    child = session(db, "agent:george:child")
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_w")
+    assignment(db, "asg_w", "wi_w", parent, t0, subject: "Parent work")
+
+    assignment(db, "asg_wc", "wi_w", child, t0 + @minute,
+      opened_by_session: parent,
+      subject: "Child work"
+    )
+
+    OwnerAlerts.detect_stalls(db, now: t0 + 10 * @stall)
+
+    # The idle child itself still alerts; the parent waiting on it does not.
+    assert [%{body: body}] = w_alerts(db)
+    assert body =~ "'Child work' (asg_wc)"
+    refute body =~ "Parent work"
+    assert body =~ "1 other open assignment is held or waiting."
+  end
+
+  test "a stall found by a later pass after it came due is logged as a missed event",
+       %{db: db} do
+    enable(db)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_missed")
+    assignment(db, "asg_missed", "wi_missed", holder, t0)
+    item(db, "wi_planned")
+    assignment(db, "asg_planned", "wi_planned", holder, t0 + 2 * @stall)
+
+    # The previous pass ran after wi_missed came due, so its alert now is a
+    # miss; wi_planned comes due after that pass and is not.
+    previous_pass = t0 + 2 * @stall
+    OwnerAlerts.detect_stalls(db, now: t0 + 3 * @stall, missed_before: previous_pass)
+
+    details =
+      Map.new(stall_alerts(db), fn alert ->
+        {alert.work_item_id, created_detail(db, alert.alert_id)}
+      end)
+
+    assert details["wi_missed"]["missedEvent"] == true
+    refute Map.has_key?(details["wi_planned"], "missedEvent")
+  end
+
   ## Fixtures
 
   defp enable(db), do: :ok = Org.put_setting(db, "owner-alerts-user", @owner)
@@ -1016,7 +1648,397 @@ defmodule Tightbeam.OwnerAlertsTest do
 
   defp flag(args, name), do: args |> Enum.drop_while(&(&1 != name)) |> Enum.at(1)
 
+  defp now_ms, do: System.system_time(:millisecond)
+
+  defp uid, do: System.unique_integer([:positive])
+
+  defp item(db, id, opts \\ []) do
+    owner = Keyword.get(opts, :owner, @owner)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?3, 1)
+        """,
+        [id, Keyword.get(opts, :title, "Item #{id}"), owner, Keyword.get(opts, :state, "open")]
+      )
+
+    id
+  end
+
+  defp assignment(db, id, work_item_id, holder, opened_at, opts \\ []) do
+    {by_user, by_session} =
+      case Keyword.get(opts, :opened_by_session) do
+        nil -> {@owner, nil}
+        session_key -> {nil, session_key}
+      end
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO assignments
+          (id, subject, holderKey, openedByUser, openedBySession, openedAt, state, workItemId)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)
+        """,
+        [
+          id,
+          Keyword.get(opts, :subject, "Work #{id}"),
+          holder,
+          by_user,
+          by_session,
+          opened_at,
+          work_item_id
+        ]
+      )
+
+    id
+  end
+
+  defp attest(db, assignment_id, by_session, ts, kind \\ "progress") do
+    id = "att_#{uid()}"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+        [id, assignment_id, kind, by_session, ts]
+      )
+
+    id
+  end
+
+  defp close_assignment(db, id, holder, closed_at) do
+    attest_id = attest(db, id, holder, closed_at, "surrender")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        UPDATE assignments
+        SET state='closed', outcome='surrendered', closedAt=?2, closedBySession=?3,
+            closingAttestId=?4
+        WHERE id=?1
+        """,
+        [id, closed_at, holder, attest_id]
+      )
+  end
+
+  # A pending wait naming the assignment: a condition wake or a dependency wait.
+  defp wait_on(db, assignment_id, session_key, created_at, opts) do
+    id = "w_wait_#{uid()}"
+    condition_kind = Keyword.get(opts, :condition_kind)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO wakes
+          (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt,
+           conditionKind, conditionScope, waitMode, assignmentId)
+        VALUES (?1, ?2, ?3, 'resume', ?4, 'pending', ?5, ?6, ?7, ?8, ?9)
+        """,
+        [
+          id,
+          session_key,
+          "session:#{session_key}",
+          created_at + 1_000 * @stall,
+          created_at,
+          condition_kind,
+          condition_kind && "pr:1",
+          Keyword.get(opts, :wait_mode),
+          assignment_id
+        ]
+      )
+
+    id
+  end
+
+  defp cannot_proceed(db, assignment_id, holder, ts) do
+    n = uid()
+    attest_id = attest(db, assignment_id, holder, ts, "cannot-proceed")
+    wake_id = "w_cp_#{n}"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO wakes (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt)
+        VALUES (?1, ?2, 'process:tightbeam', 'decide', ?3, 'pending', ?3)
+        """,
+        [wake_id, Org.personal_session_key(@owner), ts]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO assignment_cannot_proceed
+          (id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+           disposerRef, reason, state, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'blocked on access', 'standing', ?8)
+        """,
+        [
+          "cp_#{n}",
+          assignment_id,
+          attest_id,
+          "dr_cp_#{n}",
+          wake_id,
+          "session:#{holder}",
+          "user:#{@owner}",
+          ts
+        ]
+      )
+  end
+
+  defp decision_request(db, assignment_id, asker, asked, raised_at) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO decision_requests
+          (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+           expecterSessionKey, expecterUserId, raisedAt, deadlineAt,
+           question, context, status, rowSchemaRevision)
+        VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?4, ?7, NULL, 'Which schema?', '{}', 'open', 2)
+        """,
+        ["dr_#{uid()}", "session:" <> asker, asker, @owner, assignment_id, asked, raised_at]
+      )
+  end
+
+  # An open usage-limit incident the session belongs to: its harness is paused.
+  defp pause(db, session_key) do
+    n = uid()
+    at = now_ms()
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO harness_health_observations
+          (id, correlationId, harness, host, failureClass, evidenceKind, sessionKey,
+           observedAt, cause, principal)
+        VALUES (?1, ?2, 'claude', 'testhost', 'rate-limit-dead', 'terminal-failure', ?3,
+                ?4, 'usage limit', 'process:tightbeam')
+        """,
+        ["hho_#{n}", "test-pause:#{n}", session_key, at]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO harness_health_incidents
+          (id, harness, host, failureClass, state, openedAt, openObservationId)
+        VALUES (?1, 'claude', 'testhost', 'rate-limit-dead', 'open', ?2, ?3)
+        """,
+        ["hhi_#{n}", at, "hho_#{n}"]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO harness_health_members (incidentId, sessionKey) VALUES (?1, ?2)",
+        [
+          "hhi_#{n}",
+          session_key
+        ]
+      )
+  end
+
+  # T16: one world runs the 0.1.14 inactivity ladder for an idle assignment,
+  # with the stall alert pass and delivery between every ladder step when
+  # alerts are enabled. Returns what the ladder wrote, minus random ids.
+  defp ladder_run(enabled?, opened_at, runner) do
+    db = world_db()
+    main = Org.personal_session_key(@owner)
+    parent = ladder_session(db, "agent:george:parent", main)
+    holder = ladder_session(db, "agent:george:holder", parent)
+    :ok = Org.put_setting(db, "owner-alert-stall-ms", "5000")
+    if enabled?, do: enable(db)
+
+    item(db, "wi_ladder", title: "Ladder item")
+    assignment(db, "asg_inactive", "wi_ladder", holder, opened_at, subject: "ship it")
+
+    alerts_pass = fn ->
+      if enabled? do
+        OwnerAlerts.detect_stalls(db)
+        assert OwnerAlerts.deliver_due(db, runner: runner) == 0
+      end
+    end
+
+    interval_ms = 1_000
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Supervision.assignment_opened_in_txn(txn, "asg_inactive", opened_at, interval_ms)
+             end)
+
+    alerts_pass.()
+
+    assert {:ok, :ok} =
+             Supervision.deadline(db, ladder_wake(db, "assignment_inactivity_deadline"))
+
+    alerts_pass.()
+
+    [first] = ladder_notices(db)
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [first, now_ms()])
+
+    ladder_climb(db, first, interval_ms)
+    alerts_pass.()
+    [^first, second] = ladder_notices(db)
+
+    for _rung <- 1..3 do
+      ladder_climb(db, second, interval_ms)
+      alerts_pass.()
+    end
+
+    {:ok, wakes} =
+      DB.query(db, """
+      SELECT consumer, sessionKey, state,
+             CASE WHEN consumer='prompt' THEN prompt END,
+             CASE WHEN obligationRef IS NULL THEN NULL
+                  ELSE substr(obligationRef, 1, instr(obligationRef, ':')) END
+      FROM wakes ORDER BY rowid
+      """)
+
+    {:ok, reminders} = DB.query(db, "SELECT id, reminderState FROM assignments ORDER BY id")
+
+    %{
+      ladder: %{
+        wakes: wakes,
+        reminders: reminders,
+        turns: count(db, "SELECT count(*) FROM turns")
+      },
+      stall_alerts: stall_alerts(db)
+    }
+  end
+
+  defp ladder_session(db, key, spawned_by) do
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      owner_user_id: @owner,
+      origin: "user:#{@owner}",
+      spawned_by: spawned_by,
+      kind: "custom",
+      is_built_in: false,
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable"),
+      host: "testhost"
+    }).session_key
+  end
+
+  defp ladder_wake(db, consumer) do
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               db,
+               """
+               SELECT wakeId FROM wakes
+               WHERE consumer=?1 AND assignmentId='asg_inactive' AND state='pending'
+               ORDER BY dueAt, wakeId LIMIT 1
+               """,
+               [consumer]
+             )
+
+    Wakes.get(db, wake_id)
+  end
+
+  defp ladder_notices(db) do
+    {:ok, rows} =
+      DB.query(db, """
+      SELECT wakeId FROM wakes
+      WHERE assignmentId='asg_inactive' AND consumer='prompt'
+        AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'
+      ORDER BY rowid
+      """)
+
+    Enum.map(rows, &hd/1)
+  end
+
+  defp ladder_climb(db, previous_wake_id, interval_ms) do
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET createdAt=?2 WHERE wakeId=?1", [
+        previous_wake_id,
+        now_ms() - interval_ms - 1
+      ])
+
+    climb = ladder_wake(db, "assignment_inactivity_climb")
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [climb.wake_id])
+    assert {:ok, :ok} = Supervision.climb(db, Wakes.get(db, climb.wake_id))
+  end
+
   ## Reads
+
+  defp stall_alerts(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT alertId, workItemId, anchorAt, dedupeKey, title, body, state, createdAt,
+               opId, attempts, nextAttemptAt
+        FROM owner_alerts WHERE kind='stall' ORDER BY createdAt, alertId
+        """
+      )
+
+    Enum.map(rows, fn [
+                        id,
+                        work_item_id,
+                        anchor_at,
+                        dedupe_key,
+                        title,
+                        body,
+                        state,
+                        created_at,
+                        op_id,
+                        attempts,
+                        next_attempt_at
+                      ] ->
+      %{
+        alert_id: id,
+        work_item_id: work_item_id,
+        anchor_at: anchor_at,
+        dedupe_key: dedupe_key,
+        title: title,
+        body: body,
+        state: state,
+        created_at: created_at,
+        op_id: op_id,
+        attempts: attempts,
+        next_attempt_at: next_attempt_at
+      }
+    end)
+  end
+
+  defp w_alerts(db), do: Enum.filter(stall_alerts(db), &(&1.work_item_id == "wi_w"))
+
+  defp withdrawn_reasons(db, alert_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT detail FROM lifecycle_events WHERE kind='owner_alert_withdrawn' AND subject=?1",
+        [alert_id]
+      )
+
+    Enum.map(rows, fn [detail] -> JSON.decode!(detail)["reason"] end)
+  end
+
+  defp created_detail(db, alert_id) do
+    {:ok, [[detail]]} =
+      DB.query(
+        db,
+        "SELECT detail FROM lifecycle_events WHERE kind='owner_alert_created' AND subject=?1",
+        [alert_id]
+      )
+
+    JSON.decode!(detail)
+  end
 
   defp alerts(db) do
     {:ok, rows} =
@@ -1070,17 +2092,6 @@ defmodule Tightbeam.OwnerAlertsTest do
 
   defp owner_of(db, alert_id),
     do: count(db, "SELECT ownerUserId FROM owner_alerts WHERE alertId=?1", [alert_id])
-
-  defp withdrawn_reasons(db, alert_id) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT detail FROM lifecycle_events WHERE kind='owner_alert_withdrawn' AND subject=?1",
-        [alert_id]
-      )
-
-    Enum.map(rows, fn [detail] -> JSON.decode!(detail)["reason"] end)
-  end
 
   defp withdrawn_as(db, alert_id),
     do: count(db, "SELECT withdrawnAs FROM owner_alerts WHERE alertId=?1", [alert_id])
