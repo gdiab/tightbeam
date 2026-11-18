@@ -902,6 +902,19 @@ defmodule Tightbeam.HarnessHealth do
   def unavailable?(db \\ DB, harness, host),
     do: ConditionFacts.harness_unavailable?(db, harness, host)
 
+  @doc """
+  The typed carrier of a usage-limit turn failure, or nil. Only the protocol's
+  typed fields count: Codex `codexErrorInfo == "usageLimitExceeded"` and
+  Claude `errorKind == "rate_limit"`. A limit recognized only from text is not
+  a typed limit (contract c: text never switches a session to its fallback).
+  """
+  @spec typed_limit_evidence(term()) :: String.t() | nil
+  def typed_limit_evidence(%{"data" => %{"codexErrorInfo" => "usageLimitExceeded"}}),
+    do: "usageLimitExceeded"
+
+  def typed_limit_evidence(%{"data" => %{"errorKind" => "rate_limit"}}), do: "rate_limit"
+  def typed_limit_evidence(_reason), do: nil
+
   @doc "Classify a terminal turn reason without collapsing auth and rate limiting."
   @spec classify_turn_failure(term()) :: String.t() | nil
   def classify_turn_failure(%{
@@ -1083,9 +1096,9 @@ defmodule Tightbeam.HarnessHealth do
   defp typed_redelivery_failure_class(_reason), do: nil
 
   @doc "Record classified turn-failure evidence inside the turn's terminal transaction."
-  @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
+  @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term(), keyword()) ::
           nil | (-> :ok)
-  def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+  def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason, opts \\ []) do
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
@@ -1138,11 +1151,17 @@ defmodule Tightbeam.HarnessHealth do
             _ -> "unclassified"
           end
 
-        Wakes.record_health_redelivery_source_in_txn(
-          txn,
-          turn.seq,
-          redelivery_failure_class
-        )
+        # A turn held for a limit-fallback evaluation (contract c R5) gets its
+        # redelivery row from that evaluation's outcome instead: kept as today
+        # when the session is not switched or the turn is replayed, never
+        # written when the switched turn's effects are unknown (R9b).
+        unless Keyword.get(opts, :defer_redelivery, false) do
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            turn.seq,
+            redelivery_failure_class
+          )
+        end
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 

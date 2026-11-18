@@ -1537,6 +1537,145 @@ defmodule Tightbeam.Wakes do
     {"process", name}
   end
 
+  # The terminal-notice candidate walk. On this line terminal notices are
+  # addressed by the row-reaction rule (row-reaction-handoff.toml,
+  # `candidates` and `recipient`); this is the same walk, in the same order,
+  # for an open assignment's delivery owner (contract c R13).
+  defp terminal_notice_recipient_in_txn(txn, event) do
+    personal = Tightbeam.Org.personal_session_key(event.owner_user_id)
+
+    current =
+      case Tightbeam.DeliveryResponsibilities.current_owner_in_txn(txn, event.work_item_id) do
+        %{
+          "ownerUserId" => owner_user_id,
+          "accountableSessionKey" => session_key,
+          "deliveryState" => "current"
+        }
+        when owner_user_id == event.owner_user_id ->
+          session_key
+
+        _ ->
+          nil
+      end
+
+    delegated_opener =
+      if event.opened_by_kind == "session" and
+           Tightbeam.DeliveryResponsibilities.responsibility_in_txn(
+             txn,
+             event.opened_by_id,
+             event.work_item_id
+           ) == "delegated",
+         do: event.opened_by_id,
+         else: nil
+
+    candidates =
+      case event.opened_by_kind do
+        "session" ->
+          [delegated_opener, current, event.opened_by_id, personal]
+
+        "process" ->
+          [
+            Tightbeam.SessionReparent.current_coordination_parent(txn, event.assignment_id),
+            current,
+            personal
+          ]
+
+        "user" ->
+          [current, personal]
+      end
+
+    recipient =
+      candidates
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.find(fn key ->
+        Txn.q(
+          txn,
+          "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+          [key, event.owner_user_id]
+        ) == [[1]]
+      end)
+
+    if recipient do
+      {:ok, recipient}
+    else
+      wait_error(
+        "terminal_notification_recipient_unavailable",
+        "no active accountable recipient for the durable terminal relation"
+      )
+    end
+  end
+
+  @doc """
+  The delivery owner of an OPEN assignment: the recipient the terminal-notice
+  candidate walk (`terminal_notice_recipient_in_txn/2`) would choose for it.
+  The limit-fallback outcome notice (contract c R13) addresses this session.
+  """
+  @spec delivery_owner_in_txn(Txn.t(), String.t()) :: {:ok, String.t()} | {:error, map()}
+  def delivery_owner_in_txn(%Txn{} = txn, assignment_id) when is_binary(assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.id,a.workItemId,owner.userId,a.openedByUser,a.openedBySession
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id=a.workItemId
+           LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
+           LEFT JOIN users owner ON owner.userId=CASE
+             WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
+           ELSE COALESCE(a.openedByUser, w.ownerUserId) END
+           WHERE a.id=?1 AND a.state='open'
+           """,
+           [assignment_id]
+         ) do
+      [[id, work_item, owner, opened_user, opened_session]] ->
+        {opener_kind, opener_id} = terminal_opener_in_txn(txn, id, opened_user, opened_session)
+
+        terminal_notice_recipient_in_txn(txn, %{
+          assignment_id: id,
+          work_item_id: work_item,
+          owner_user_id: terminal_owner_in_txn(txn, id, owner),
+          opened_by_kind: opener_kind,
+          opened_by_id: opener_id
+        })
+
+      _ ->
+        wait_error("assignment_not_open", "assignment #{assignment_id} is not open")
+    end
+  rescue
+    # An assignment whose opener or owner relation cannot be read has no
+    # delivery owner; the caller names its fallback recipient.
+    error in [MatchError, KeyError] ->
+      wait_error("delivery_owner_unavailable", Exception.message(error))
+  end
+
+  @doc """
+  Settle a failed wake turn's own retry attempt, when it is one, as failed and
+  not replayed: the attempt keeps no successor. The limit-fallback switch calls
+  this for a turn whose effects are unknown (contract c R9b), in place of the
+  rate-limit retry the terminal transaction would otherwise schedule.
+  """
+  @spec settle_unreplayed_failure_in_txn(Txn.t(), pos_integer()) :: :ok
+  def settle_unreplayed_failure_in_txn(%Txn{} = txn, turn_seq)
+      when is_integer(turn_seq) and turn_seq > 0 do
+    case Txn.q(txn, "SELECT wakeId, endedAt FROM turns WHERE seq=?1", [turn_seq]) do
+      [[wake_id, ended_at]] when is_binary(wake_id) ->
+        Txn.q(
+          txn,
+          """
+          UPDATE wake_retry_attempts
+          SET sourceTurnSeq=COALESCE(sourceTurnSeq, ?2), outcome='failed', observedAt=?3
+          WHERE wakeId=?1 AND outcome='pending'
+          """,
+          [wake_id, turn_seq, ended_at || now()]
+        )
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
   @doc "Persist a pending wake (id minted here, prefix `w_`). Returns the row."
   @spec schedule(db(), %{
           session_key: String.t(),
