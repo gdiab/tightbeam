@@ -915,6 +915,50 @@ defmodule Tightbeam.HarnessHealth do
   def typed_limit_evidence(%{"data" => %{"errorKind" => "rate_limit"}}), do: "rate_limit"
   def typed_limit_evidence(_reason), do: nil
 
+  @doc """
+  The seq of the first failed turn of the session's current limit episode.
+  A limit episode runs from the session's first usage-limit failure to its
+  next delivered turn; a failure after that starts a new one. Its first
+  failure is the earliest `rate-limit-dead` failure after the session's latest
+  delivered turn, or `seq` when none is recorded. A session's lane runs one
+  turn at a time and claims the lowest queued seq, so seq order is the order
+  its turns ended.
+
+  This one definition keys both the owner usage-limit alert (`usage-limit:`,
+  contract b B2) and the withheld limit-fallback outcome (contract c R11,
+  R15), so the two cannot disagree on what one episode is.
+  """
+  @spec limit_episode_first_seq_in_txn(Txn.t(), String.t(), pos_integer()) :: pos_integer()
+  def limit_episode_first_seq_in_txn(%Txn{} = txn, session_key, seq) do
+    delivered =
+      case Txn.q(
+             txn,
+             """
+             SELECT seq FROM turns WHERE sessionKey=?1 AND status='delivered'
+             ORDER BY seq DESC LIMIT 1
+             """,
+             [session_key]
+           ) do
+        [[delivered]] -> delivered
+        [] -> 0
+      end
+
+    case Txn.q(
+           txn,
+           """
+           SELECT t.seq FROM turns t
+           JOIN harness_health_observations o
+             ON o.correlationId = 'harness-turn:' || t.seq || ':rate-limit-dead'
+           WHERE t.sessionKey=?1 AND t.seq>?2 AND t.status IN ('failed','failed_unknown')
+           ORDER BY t.seq LIMIT 1
+           """,
+           [session_key, delivered]
+         ) do
+      [[first]] -> first
+      [] -> seq
+    end
+  end
+
   @doc "Classify a terminal turn reason without collapsing auth and rate limiting."
   @spec classify_turn_failure(term()) :: String.t() | nil
   def classify_turn_failure(%{

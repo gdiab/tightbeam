@@ -8945,7 +8945,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  ## Limit-fallback switch (contract c v1.3, phase c1)
+  ## Limit-fallback switch (contract c v1.4, phase c1)
   #
   # T1: a session's own turn ends as a TYPED usage-limit failure and its
   # archetype declares `[limit_fallback]`. The failed turn's terminal
