@@ -326,6 +326,35 @@ defmodule Tightbeam.OwnerAlertsTest do
     assert message_id == "msg-" <> op
   end
 
+  test "A3: an undelivered alert adopts a later commit of its own uncertain send", %{db: db} do
+    enable(db)
+    fail_turn(db, session(db, "agent:george:worker"), @codex_limit)
+    [alert] = alerts(db)
+
+    uncertain =
+      runner(self(), fn
+        {:execute, op} -> unknown(op)
+        {:retry, op} -> unknown(op)
+      end)
+
+    assert OwnerAlerts.deliver_due(db, now: alert.created_at, runner: uncertain) == 0
+    assert_received {:harklight, ["send", "--prepare", "--op-id", op | _]}
+
+    day = alert.created_at + 24 * 60 * @minute
+    assert OwnerAlerts.deliver_due(db, now: day, runner: uncertain) == 0
+    assert [%{state: "undelivered", op_id: ^op}] = alerts(db)
+
+    # Boot recovery settles the pending send by its own op id.
+    committing = runner(self(), fn {:retry, op} -> committed(op, "retry") end)
+    :ok = Tightbeam.HarklightSend.recover_pending(db, runner: committing)
+    assert_received {:harklight, ["retry", "--op-id", ^op]}
+
+    assert OwnerAlerts.deliver_due(db, now: day + 1, runner: committing) == 0
+    assert [%{state: "sent", op_id: ^op, message_id: message_id}] = alerts(db)
+    assert message_id == "msg-" <> op
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 1
+  end
+
   for variant <- [:send_fails, :origin_inactive] do
     @tag variant: variant
     test "T13: definite failures retry on schedule, then the alert is undelivered (#{variant})",
