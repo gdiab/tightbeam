@@ -5355,6 +5355,93 @@ defmodule Tightbeam.GatewayTest do
     refute Enum.any?(visible, &(&1.content =~ "[engine swap]"))
   end
 
+  # Contract c R8a: a later tune ends fallback-active; the limit-fallback
+  # switch's own tune sets it again inside its swap interlock, after the clear.
+  test "a later tune clears fallback-active and the switch's own interlock keeps it", ctx do
+    base_dir = role_test_base("limit-fallback-active")
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+    candidate = start_supervised!({CandidateAdapterStub, self()})
+    start_supervised!({CoordinatorStub, candidate})
+
+    start_supervised!(%{
+      id: :limit_fallback_active_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    before = Model.new("before-model")
+
+    for key <- ["owner-tuned", "switched"] do
+      Org.create(ctx.db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: before
+      })
+
+      start_lane!(ctx.db, key)
+    end
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.LimitFallback.set_fallback_active_in_txn(txn, "owner-tuned", %{
+          since: 1,
+          from: %{harness: "fixture", model: Model.new("fixture-model")},
+          trigger: {:turn, 7}
+        })
+      end)
+
+    assert Payloads.stream_session(Org.get(ctx.db, "owner-tuned"))["fallbackActive"]["trigger"] ==
+             "turn:7"
+
+    assert %{ok: true} =
+             handlers["tune"].(%{
+               origin: "user:flynn",
+               session_key: "owner-tuned",
+               params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+             })
+
+    refute Tightbeam.LimitFallback.fallback_active?(Org.get(ctx.db, "owner-tuned"))
+
+    since = System.system_time(:millisecond)
+
+    assert %{ok: true} =
+             handlers["tune"].(%{
+               origin: "process:tightbeam",
+               principal: {:process, "tightbeam"},
+               session_key: "switched",
+               on_swap_interlock: fn txn ->
+                 Tightbeam.LimitFallback.set_fallback_active_in_txn(txn, "switched", %{
+                   since: since,
+                   from: %{harness: "claude", model: before},
+                   trigger: {:turn, 9}
+                 })
+               end,
+               params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+             })
+
+    switched = Org.get(ctx.db, "switched")
+    assert switched.harness == "fixture"
+
+    assert switched.fallback_active == %{
+             since: since,
+             from: %{harness: "claude", model: before},
+             trigger: "turn:9"
+           }
+  end
+
   # Contract c R10: the fallback-off marker is set and cleared by tune with the
   # tune's own principal, and shows in `list` (inspect) and the session status.
   test "tune --limit-fallback off|on records the marker shown in list and status", ctx do
