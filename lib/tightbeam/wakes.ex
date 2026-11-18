@@ -3277,17 +3277,29 @@ defmodule Tightbeam.Wakes do
 
   @doc false
   @spec record_health_redelivery_source_in_txn(Txn.t(), integer(), String.t()) :: :ok
-  def record_health_redelivery_source_in_txn(%Txn{} = txn, source_turn_seq, failure_class)
-      when is_integer(source_turn_seq) and
-             failure_class in [
-               "auth-dead",
-               "rate-limit-dead",
-               "adapter_unavailable",
-               "model_unavailable",
-               "task_crash",
-               "interrupted-outcome-unknown",
-               "unclassified"
-             ] do
+  def record_health_redelivery_source_in_txn(%Txn{} = txn, source_turn_seq, "rate-limit-dead")
+      when is_integer(source_turn_seq) do
+    # Companion v1.1 B5: no redelivery row for a quota-failed turn that had
+    # started work (contract c R9a `:unknown_effect`).
+    if post_activity_quota_failure?(txn, source_turn_seq),
+      do: :ok,
+      else: record_health_redelivery_row_in_txn(txn, source_turn_seq, "rate-limit-dead")
+  end
+
+  def record_health_redelivery_source_in_txn(%Txn{} = txn, source_turn_seq, failure_class),
+    do: record_health_redelivery_row_in_txn(txn, source_turn_seq, failure_class)
+
+  defp record_health_redelivery_row_in_txn(%Txn{} = txn, source_turn_seq, failure_class)
+       when is_integer(source_turn_seq) and
+              failure_class in [
+                "auth-dead",
+                "rate-limit-dead",
+                "adapter_unavailable",
+                "model_unavailable",
+                "task_crash",
+                "interrupted-outcome-unknown",
+                "unclassified"
+              ] do
     case Txn.q(
            txn,
            """
@@ -3646,38 +3658,78 @@ defmodule Tightbeam.Wakes do
        when (is_integer(marker) and is_nil(cycle_release_correlation)) or
               (is_tuple(marker) and tuple_size(marker) == 2 and elem(marker, 0) == :cycle_release and
                  is_binary(elem(marker, 1)) and elem(marker, 1) == cycle_release_correlation) do
-    if Ledger.enqueueable_in_txn?(txn, session_key) do
-      case Ledger.enqueue_in_txn(txn, %{
-             session_key: session_key,
-             message_id: message_id,
-             origin: origin,
-             prompt: prompt,
-             role_ref: role_ref,
-             role_fallback: role_fallback == 1,
-             assignment_id: assignment_id,
-             job_ref: job_ref,
-             request_ref: request_ref
-           }) do
-        {:ok, redelivery_turn_seq} ->
-          mark_health_redelivery_enqueued_in_txn(
-            txn,
-            idempotency_key,
-            marker,
-            cycle_release_correlation,
-            redelivery_turn_seq
-          )
+    cond do
+      # Companion B5 and v1.6 C2: no redelivery path, a cycle release's
+      # included, replays a quota-failed turn that had started work.
+      quota_row?(txn, idempotency_key) and post_activity_quota_failure?(txn, source_turn_seq) ->
+        0
 
-          if Txn.changes(txn) != 1,
-            do: raise("health redelivery attempt lost its enqueue")
+      Ledger.enqueueable_in_txn?(txn, session_key) ->
+        enqueue_health_redelivery_in_txn(
+          txn,
+          [idempotency_key, session_key, message_id, origin, prompt, role_ref, role_fallback] ++
+            [assignment_id, job_ref, request_ref, cycle_release_correlation],
+          marker
+        )
 
-          Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
-          1
+      true ->
+        0
+    end
+  end
 
-        {:error, :no_session} ->
-          0
-      end
-    else
-      0
+  defp quota_row?(txn, idempotency_key) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM health_redelivery_attempts WHERE idempotencyKey=?1 AND failureClass='rate-limit-dead'",
+      [idempotency_key]
+    ) == [[1]]
+  end
+
+  defp enqueue_health_redelivery_in_txn(
+         txn,
+         [
+           idempotency_key,
+           session_key,
+           message_id,
+           origin,
+           prompt,
+           role_ref,
+           role_fallback,
+           assignment_id,
+           job_ref,
+           request_ref,
+           cycle_release_correlation
+         ],
+         marker
+       ) do
+    case Ledger.enqueue_in_txn(txn, %{
+           session_key: session_key,
+           message_id: message_id,
+           origin: origin,
+           prompt: prompt,
+           role_ref: role_ref,
+           role_fallback: role_fallback == 1,
+           assignment_id: assignment_id,
+           job_ref: job_ref,
+           request_ref: request_ref
+         }) do
+      {:ok, redelivery_turn_seq} ->
+        mark_health_redelivery_enqueued_in_txn(
+          txn,
+          idempotency_key,
+          marker,
+          cycle_release_correlation,
+          redelivery_turn_seq
+        )
+
+        if Txn.changes(txn) != 1,
+          do: raise("health redelivery attempt lost its enqueue")
+
+        Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
+        1
+
+      {:error, :no_session} ->
+        0
     end
   end
 
@@ -3749,6 +3801,13 @@ defmodule Tightbeam.Wakes do
             settle_retry_attempt_in_txn(txn, wake_id, turn.seq, "canceled", turn.ended_at)
             :settled
 
+          # Companion v1.1 B5: a quota-failed turn that had started work
+          # (contract c R9a `:unknown_effect`) is never replayed by its retry.
+          turn.status == "failed" and failure_class == "rate-limit-dead" and
+              post_activity_quota_failure?(txn, turn.seq) ->
+            settle_unreplayed_failure_in_txn(txn, turn.seq)
+            :not_retryable
+
           turn.status == "failed" and failure_class == "rate-limit-dead" and
               retryable_prompt_wake?(wake, turn) ->
             schedule_retry_in_txn(txn, wake, turn)
@@ -3761,6 +3820,11 @@ defmodule Tightbeam.Wakes do
         :not_wake
     end
   end
+
+  defp post_activity_quota_failure?(txn, turn_seq) when is_integer(turn_seq) and turn_seq > 0,
+    do: Tightbeam.LimitFallback.Outcome.classify_in_txn(txn, turn_seq) == :unknown_effect
+
+  defp post_activity_quota_failure?(_txn, _turn_seq), do: false
 
   defp retry_attempt?(txn, wake_id) do
     Txn.q(txn, "SELECT 1 FROM wake_retry_attempts WHERE wakeId=?1", [wake_id]) != []
@@ -5240,7 +5304,6 @@ defmodule Tightbeam.Wakes do
 
   defp inactivity_policy_action_cancellation?(_command, _outcome, _wake, _primary),
     do: false
-
 
   defp retirement_no_replacement_without_liveness?(
          %{
