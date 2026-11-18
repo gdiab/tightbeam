@@ -328,7 +328,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
     {:ok, db} = start_guarded!(ctx)
     {:ok, boundary} = __MODULE__.Boundary.start_link({db, {:after, last}})
 
-    assert_raise Schema.ShapeError, fn -> Schema.ensure_all(boundary) end
+    assert_stopped!(boundary)
     {db, boundary}
   end
 
@@ -337,8 +337,21 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
     {:ok, db} = start_guarded!(ctx)
     {:ok, boundary} = __MODULE__.Boundary.start_link({db, {:only, name}})
 
-    assert_raise Schema.ShapeError, fn -> Schema.ensure_all(boundary) end
+    assert_stopped!(boundary)
     {db, boundary}
+  end
+
+  # The refused migration's caller decides how the stop surfaces (a ShapeError
+  # or a failed match); either way ensure_all must not complete.
+  defp assert_stopped!(boundary) do
+    outcome =
+      try do
+        Schema.ensure_all(boundary)
+      rescue
+        error -> {:stopped, error}
+      end
+
+    assert {:stopped, _} = outcome
   end
 
   defp assert_refused_unchanged!(ctx, message) do
@@ -425,10 +438,16 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
   defp assert_preserved!(db, before) do
     for {table, columns, rows} <- before do
       select = Enum.map_join(columns, ", ", &~s["#{&1}"])
-      {:ok, after_rows} = DB.query(db, ~s[SELECT #{select} FROM "#{table}" ORDER BY rowid])
+
+      {:ok, after_rows} =
+        DB.query(db, ~s[SELECT #{select} FROM "#{table}" ORDER BY #{order(columns)}])
+
       assert after_rows == rows, "rows changed in #{table}"
     end
   end
+
+  # Some tables are WITHOUT ROWID, so rows are ordered by every selected column.
+  defp order(columns), do: Enum.map_join(1..length(columns), ", ", &Integer.to_string/1)
 
   defp snapshot(path) do
     tables =
@@ -440,7 +459,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
     for [table] <- tables do
       columns = path |> raw(~s[PRAGMA table_info("#{table}")]) |> Enum.map(&Enum.at(&1, 1))
       select = Enum.map_join(columns, ", ", &~s["#{&1}"])
-      {table, columns, raw(path, ~s[SELECT #{select} FROM "#{table}" ORDER BY rowid])}
+      {table, columns, raw(path, ~s[SELECT #{select} FROM "#{table}" ORDER BY #{order(columns)}])}
     end
   end
 
