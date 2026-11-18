@@ -69,6 +69,30 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     def handle_cast(_message, state), do: {:noreply, state}
   end
 
+  defmodule ReadinessDrain do
+    # Stands in for the wake scheduler's one duty these tests reach: a lane's
+    # turn terminal casts `{:recipient_ready, key}`, and the scheduler admits
+    # that session's ready staged sources (a post staged behind a running
+    # turn) through NoticeBatcher, as `Tightbeam.Wakes` does.
+    use GenServer
+
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    def init(db), do: {:ok, db}
+
+    def handle_cast({:recipient_ready, key}, db) do
+      Tightbeam.NoticeBatcher.recover(
+        db,
+        System.system_time(:millisecond),
+        [conn_registry: Tightbeam.ConnRegistry, lane_manager: Tightbeam.LaneManager],
+        key
+      )
+
+      {:noreply, db}
+    end
+
+    def handle_cast(_message, db), do: {:noreply, db}
+  end
+
   defmodule CatalogStub do
     use GenServer
 
@@ -165,13 +189,21 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       deliver!(ctx, key, "failed-original")
       assert_receive {:prompted, :codex, 1, _text}, 15_000
 
-      # Queued behind the failed turn while it runs.
-      queued =
-        for token <- ~w(queued-alpha queued-bravo queued-charlie), do: deliver!(ctx, key, token)
+      # Posted behind the failed turn while it runs: each is staged, no turn.
+      queued_tokens = ~w(queued-alpha queued-bravo queued-charlie)
+      staged = for token <- queued_tokens, do: stage!(ctx, key, token)
 
       send(ctx.codex, :release_prompt)
 
       {evaluation, seq} = await_hold!(ctx, key)
+
+      # The failed turn's terminal readies the recipient, which admits each
+      # staged post as its own queued turn, in posting order.
+      queued = for token <- queued_tokens, do: await_turn_seq!(ctx.db, key, token)
+      assert queued == Enum.sort(queued)
+
+      for {wake_id, turn} <- Enum.zip(staged, queued),
+          do: assert(delivered_turn(ctx.db, wake_id) == turn)
 
       # Test 16: no park opened, and the lane claims nothing while held.
       SessionLane.nudge(key)
@@ -259,9 +291,10 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       # Test 5 and test 3 (message turn): the queue runs once, in order, on the
       # fallback; the replayed turn is redelivered once by its existing
       # vehicle after the first normal turn there.
-      tokens = ~w(queued-alpha queued-bravo queued-charlie failed-original)
+      tokens = queued_tokens ++ ["failed-original"]
       assert ordered_tokens(:claude, tokens) == tokens
       await_turns_settled!(ctx.db, key)
+      assert_ran_once!(ctx.db, key, queued_tokens)
 
       assert {:ok, [[2]]} =
                DB.query(
@@ -306,11 +339,14 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
           due_at: System.system_time(:millisecond)
         })
 
+      # Its delivery consumes the wake with the turn. A delivered wake left
+      # pending stays a ready source, and every later post stages behind it.
       assert :appended =
                Gateway.deliver_prompt(key, "user:" <> @owner, "wake-original",
                  db: ctx.db,
                  wake_id: wake.wake_id,
                  sender: "user:" <> @owner,
+                 fire_wake_in_txn: true,
                  lane_manager: Tightbeam.LaneManager,
                  conn_registry: ConnRegistry
                )
@@ -383,7 +419,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
       deliver!(ctx, key, "failed-original")
       assert_receive :codex_blocked, 15_000
-      for token <- ~w(queued-alpha queued-bravo queued-charlie), do: deliver!(ctx, key, token)
+      tokens = ~w(queued-alpha queued-bravo queued-charlie)
+      for token <- tokens, do: stage!(ctx, key, token)
       send(ctx.codex, :release_prompt)
 
       {evaluation, seq} = await_hold!(ctx, key)
@@ -411,9 +448,9 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
                  [seq]
                )
 
-      tokens = ~w(queued-alpha queued-bravo queued-charlie)
       assert ordered_tokens(:claude, tokens) == tokens
       await_turns_settled!(ctx.db, key)
+      assert_ran_once!(ctx.db, key, tokens)
 
       assert {:ok, [[1]]} =
                DB.query(
@@ -940,6 +977,7 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
     start_supervised!({LaneDoorbell, nil})
+    scheduler = start_supervised!({ReadinessDrain, db})
     task_sup = start_supervised!({Task.Supervisor, []}, id: :limit_switch_lane_tasks)
 
     codex =
@@ -1008,6 +1046,7 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       config: config,
       runner: runner,
       task_sup: task_sup,
+      scheduler: scheduler,
       codex: codex,
       claude: claude,
       parent: parent
@@ -1042,31 +1081,85 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       id: {:lane, key},
       start:
         {SessionLane, :start_link,
-         [[session_key: key, db: ctx.db, task_sup: ctx.task_sup, runner: ctx.runner]]}
+         [
+           [
+             session_key: key,
+             db: ctx.db,
+             task_sup: ctx.task_sup,
+             runner: ctx.runner,
+             wake_scheduler: ctx.scheduler
+           ]
+         ]}
     })
   end
 
+  # The owner's client post (the `post` verb's delivery) to a session with no
+  # turn in flight: appended as one turn. Returns that turn's seq.
   defp deliver!(ctx, key, text) do
-    assert :appended =
-             Gateway.deliver_prompt(key, "user:" <> @owner, text,
-               db: ctx.db,
-               lane_manager: Tightbeam.LaneManager,
-               conn_registry: ConnRegistry,
-               client_message_id: "#{key}-#{text}-#{System.unique_integer([:positive])}"
+    assert :appended = post(ctx, key, text)
+    seq = turn_seq(ctx.db, key, text)
+    assert is_integer(seq)
+    seq
+  end
+
+  # The same post while the session has a turn in flight: staged as a pending
+  # prompt wake behind it, with no turn yet. Returns the staged wake's id.
+  defp stage!(ctx, key, text) do
+    assert :queued = post(ctx, key, text)
+
+    assert {:ok, [[wake_id, "pending", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT wakeId, state, deliveredTurnSeq FROM wakes
+               WHERE sessionKey=?1 AND consumer='prompt' AND prompt=?2
+               """,
+               [key, text]
              )
 
-    {:ok, [[seq]]} =
-      DB.query(
-        ctx.db,
-        """
-        SELECT t.seq FROM turns t JOIN messages m ON m.id=t.messageId
-        WHERE t.sessionKey=?1 AND m.content LIKE '%' || ?2 || '%'
-        ORDER BY t.seq DESC LIMIT 1
-        """,
-        [key, text]
-      )
+    assert turn_seq(ctx.db, key, text) == nil
+    wake_id
+  end
 
-    seq
+  defp post(ctx, key, text) do
+    Gateway.deliver_prompt(key, "user:" <> @owner, text,
+      db: ctx.db,
+      device_id: "synthetic-device",
+      client_message_id: "#{key}-#{text}-#{System.unique_integer([:positive])}",
+      creator_session_key: key,
+      lane_manager: Tightbeam.LaneManager,
+      conn_registry: ConnRegistry
+    )
+  end
+
+  defp await_turn_seq!(db, key, text, attempts \\ 300) do
+    case turn_seq(db, key, text) do
+      seq when is_integer(seq) ->
+        seq
+
+      nil when attempts == 0 ->
+        flunk("#{key} has no turn for #{text}")
+
+      nil ->
+        # Polled: the readiness drain admits staged posts on its own schedule.
+        Process.sleep(50)
+        await_turn_seq!(db, key, text, attempts - 1)
+    end
+  end
+
+  # Each token's post ran as exactly one turn, which delivered.
+  defp assert_ran_once!(db, key, tokens) do
+    for token <- tokens do
+      assert {:ok, [["delivered"]]} =
+               DB.query(
+                 db,
+                 """
+                 SELECT t.status FROM turns t JOIN messages m ON m.id=t.messageId
+                 WHERE t.sessionKey=?1 AND m.content=?2
+                 """,
+                 [key, token]
+               )
+    end
   end
 
   defp block_first_codex_prompt!(ctx) do
@@ -1171,9 +1264,35 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
   ## Reads
 
+  # The latest turn carrying `text`'s message, or nil while it has none.
+  defp turn_seq(db, key, text) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT t.seq FROM turns t JOIN messages m ON m.id=t.messageId
+        WHERE t.sessionKey=?1 AND m.content LIKE '%' || ?2 || '%'
+        ORDER BY t.seq DESC LIMIT 1
+        """,
+        [key, text]
+      )
+
+    case rows do
+      [[seq]] -> seq
+      [] -> nil
+    end
+  end
+
   defp turn_status(db, seq) do
     {:ok, [[status]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [seq])
     status
+  end
+
+  defp delivered_turn(db, wake_id) do
+    {:ok, [[seq]]} =
+      DB.query(db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id])
+
+    seq
   end
 
   defp message_count(db, key, content) do
