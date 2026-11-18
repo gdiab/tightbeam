@@ -111,7 +111,7 @@ defmodule Tightbeam.F0UserRemovalFixtureGeneratorTest do
     assert {:ok, %{user: %{"state" => "removed"}}} =
              run(db, handlers, "remove-user", "admin", %{user_id: "departed"})
 
-    assert {:ok, [["departed", "admin"]]} =
+    assert {:ok, [["departed", "user:admin"]]} =
              DB.query(db, "SELECT userId, removedBy FROM users WHERE removedAt IS NOT NULL")
 
     {:ok, _} = DB.query(db, "PRAGMA wal_checkpoint(TRUNCATE)")
