@@ -553,6 +553,7 @@ defmodule Tightbeam.OwnerAlerts do
   @spec deliver_due(DB.server(), keyword()) :: non_neg_integer()
   def deliver_due(db \\ DB, opts \\ []) do
     now = Keyword.get_lazy(opts, :now, fn -> System.system_time(:millisecond) end)
+    adopt_late_commits(db, now)
 
     {:ok, rows} =
       DB.query(
@@ -574,6 +575,43 @@ defmodule Tightbeam.OwnerAlerts do
           Logger.error("owner alert #{alert_id} attempt failed: #{Exception.message(error)}")
           true
       end
+    end)
+  end
+
+  # A3: the alert follows its operation row. An alert that became undelivered
+  # while its last send was uncertain adopts a later definite commit (boot
+  # recovery settles pending sends on its own), so the two never disagree.
+  defp adopt_late_commits(db, now) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT a.alertId, a.kind, a.opId, s.messageId FROM owner_alerts a
+        JOIN harklight_send_operations s ON s.opId=a.opId
+        WHERE a.state='undelivered' AND s.state='bound'
+        """
+      )
+
+    Enum.each(rows, fn [alert_id, kind, op_id, message_id] ->
+      {:ok, _} =
+        DB.transaction(db, fn txn ->
+          Txn.q(
+            txn,
+            """
+            UPDATE owner_alerts SET state='sent', messageId=?2, updatedAt=?3
+            WHERE alertId=?1 AND state='undelivered'
+            """,
+            [alert_id, message_id, now]
+          )
+
+          if Txn.changes(txn) == 1 do
+            lifecycle_in_txn(txn, "owner_alert_sent", alert_id, kind, "sent", %{
+              opId: op_id,
+              messageId: message_id,
+              afterUndelivered: true
+            })
+          end
+        end)
     end)
   end
 
