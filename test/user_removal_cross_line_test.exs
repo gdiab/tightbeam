@@ -94,6 +94,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
       end
 
       after_first = snapshot(path)
+      first_schema = schema_sql(path)
 
       # T3: a second guarded boot changes nothing.
       db = guarded_boot!(ctx)
@@ -104,7 +105,16 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
         :ok = GenServer.stop(db)
       end
 
-      assert snapshot(path) == after_first
+      # The second boot makes no schema change, keeps every users row and
+      # every row of the first boot's result, and leaves the stamp at U_L.
+      assert schema_sql(path) == first_schema
+      second = snapshot(path)
+      assert List.keyfind(second, "users", 0) == List.keyfind(after_first, "users", 0)
+
+      for {table, _columns, rows} <- after_first do
+        {^table, _, now} = List.keyfind(second, table, 0)
+        assert rows -- now == [], "second boot changed or lost rows in #{table}"
+      end
     end
 
     test "T2 and T3: a pre-removal 0.1.16 database gains null columns and is unchanged after",
@@ -433,8 +443,10 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
     sql
   end
 
-  # R4: every users row is byte-for-byte the same, and every table F0 had keeps
-  # its rows on F0's columns (the 0.1.16 chain may add columns, never rows).
+  # R4: every users row is byte-for-byte the same, and no row F0 had in any
+  # other table is changed or lost (on F0's columns). The 0.1.16 chain may add
+  # columns, and its own features may add rows (the record-event feed's
+  # activation keys in org_settings), but never touch F0's.
   defp assert_preserved!(db, before) do
     for {table, columns, rows} <- before do
       select = Enum.map_join(columns, ", ", &~s["#{&1}"])
@@ -442,9 +454,17 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
       {:ok, after_rows} =
         DB.query(db, ~s[SELECT #{select} FROM "#{table}" ORDER BY #{order(columns)}])
 
-      assert after_rows == rows, "rows changed in #{table}"
+      if table == "users" do
+        assert after_rows == rows, "rows changed in users"
+      else
+        missing = rows -- after_rows
+        assert missing == [], "rows changed or lost in #{table}: #{inspect(missing)}"
+      end
     end
   end
+
+  defp schema_sql(path),
+    do: raw(path, "SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
 
   # Some tables are WITHOUT ROWID, so rows are ordered by every selected column.
   defp order(columns), do: Enum.map_join(1..length(columns), ", ", &Integer.to_string/1)
