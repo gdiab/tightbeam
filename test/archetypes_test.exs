@@ -804,6 +804,92 @@ defmodule Tightbeam.ArchetypesTest do
     end)
   end
 
+  # Contract c R1/R2: the fallback is configured from the role's own
+  # preferences, refused by name otherwise, and read from the loaded set.
+  test "limit_fallback is one of the archetype's own model preferences", ctx do
+    path = Path.join(manifests_dir!(ctx.base_dir), "coderish.toml")
+
+    preferences = """
+    name = "coderish"
+
+    [[model_preferences]]
+    model = "gpt-6-luna"
+    effort = "max"
+
+    [[model_preferences]]
+    model = "claude-opus-5-5"
+    effort = "high"
+    """
+
+    File.write!(path, preferences)
+    assert Archetypes.load!(ctx.base_dir)["coderish"].limit_fallback == nil
+    assert Archetypes.limit_fallback("coderish") == nil
+    assert Archetypes.builtin_default().limit_fallback == nil
+
+    opus = Tightbeam.Model.new("claude-opus-5-5", effort: "high")
+
+    File.write!(
+      path,
+      preferences <>
+        """
+
+        [limit_fallback]
+        model = "claude-opus-5-5"
+        effort = "high"
+        """
+    )
+
+    assert Archetypes.load!(ctx.base_dir)["coderish"].limit_fallback == %{
+             model: opus,
+             harness: nil
+           }
+
+    assert Archetypes.limit_fallback("coderish") == %{model: opus, harness: nil}
+
+    File.write!(
+      path,
+      preferences <>
+        """
+
+        [limit_fallback]
+        model = "claude-opus-5-5"
+        effort = "high"
+        harness = "claude"
+        """
+    )
+
+    assert Archetypes.load!(ctx.base_dir)["coderish"].limit_fallback == %{
+             model: opus,
+             harness: "claude"
+           }
+
+    for {table, reason} <- [
+          {~s(model = "claude-opus-5-5"\neffort = "low"),
+           ~r/limit_fallback claude-opus-5-5 \(effort low\) is not one of its model_preferences/},
+          {~s(model = "claude-opus-5-5"\neffort = "high"\ncontext = "1m"),
+           ~r/is not one of its model_preferences/},
+          {~s(model = "claude-sonnet-4-6"\neffort = "high"),
+           ~r/is not one of its model_preferences/},
+          {~s(model = "claude-opus-5-5"), ~r/limit_fallback.effort must be a non-empty string/},
+          {~s(effort = "high"), ~r/limit_fallback.model must be a non-empty string/},
+          {~s(model = "claude-opus-5-5"\neffort = "high"\nprovider = "anthropic"),
+           ~r/unknown limit_fallback keys in .*: provider/},
+          {~s(model = "claude-opus-5-5"\neffort = "high"\nharness = "nonesuch"),
+           ~r/unknown harness "nonesuch"/}
+        ] do
+      File.write!(path, preferences <> "\n[limit_fallback]\n" <> table <> "\n")
+
+      assert_unavailable(reason, fn -> Archetypes.load!(ctx.base_dir) end)
+      assert Archetypes.limit_fallback("coderish") == nil
+    end
+
+    File.write!(path, ~s(name = "coderish"\nlimit_fallback = "claude-opus-5-5"\n))
+
+    assert_unavailable(~r/limit_fallback must be a table/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end)
+  end
+
   test "the engineering bundle resolves current defaults", ctx do
     Identity.init!(ctx.base_dir)
     assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
