@@ -4,7 +4,9 @@ defmodule Tightbeam.OwnerAlerts do
   through Harklight, never through an agent turn.
 
   One row is one alert. A row is created in the transaction that finds its
-  trigger, and its `dedupeKey` makes a second creation write nothing. Delivery
+  trigger, and its `dedupeKey` makes a second creation write nothing, unless
+  the row holding that key was withdrawn as `off`: such an alert never reached
+  the owner, so it does not count as alerted. Delivery
   uses the ordinary `Tightbeam.HarklightSend` operation with the owner's Main
   as the origin of record. The row carries its own next attempt time; this
   process keeps one timer for the earliest pending row, so a restart resumes
@@ -19,7 +21,8 @@ defmodule Tightbeam.OwnerAlerts do
   Each row records its owner at creation. Before any new operation, the owner
   setting is read again in the transaction that records the attempt: if it is
   cleared, names no user, or names a different user, the alert is withdrawn
-  instead of sent. An uncertain send is still settled on its own operation.
+  as `off` instead of sent. An uncertain send is still settled on its own
+  operation.
 
   Nothing here creates, queues or changes a turn or a wake of any session. The
   only session records touched are the origin transcript markers for a failed
@@ -48,11 +51,17 @@ defmodule Tightbeam.OwnerAlerts do
   # again so a persistent fault cannot spin the process.
   @repair_delay_ms 60_000
 
-  @owner_alerts_ddl """
+  # A2: a row withdrawn as `off` (§7.1 C2-off) never reached the owner, so it
+  # does not hold its dedupeKey (C3-on). This one predicate is the partial
+  # unique index's, the creation upsert's conflict target's, and every
+  # existence check's, so they cannot disagree.
+  @holds_key "NOT (state = 'withdrawn' AND withdrawnAs = 'off')"
+
+  @owner_alerts_table_ddl """
   CREATE TABLE owner_alerts (
     alertId           TEXT PRIMARY KEY,
     kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback')),
-    dedupeKey         TEXT NOT NULL UNIQUE,
+    dedupeKey         TEXT NOT NULL,
     ownerUserId       TEXT NOT NULL,
     originSessionKey  TEXT NOT NULL,
     sessionKey        TEXT,
@@ -62,6 +71,7 @@ defmodule Tightbeam.OwnerAlerts do
     title             TEXT NOT NULL CHECK (length(title) > 0),
     body              TEXT NOT NULL,
     state             TEXT NOT NULL CHECK (state IN ('pending','sent','withdrawn','undelivered')),
+    withdrawnAs       TEXT CHECK (withdrawnAs IN ('stale','off')),
     createdAt         INTEGER NOT NULL CHECK (createdAt >= 0),
     updatedAt         INTEGER NOT NULL CHECK (updatedAt >= 0),
     opId              TEXT,
@@ -72,12 +82,28 @@ defmodule Tightbeam.OwnerAlerts do
     lastFailureReason TEXT,
     nextAttemptAt     INTEGER,
     CHECK ((state = 'pending') = (nextAttemptAt IS NOT NULL)),
+    CHECK ((state = 'withdrawn') = (withdrawnAs IS NOT NULL)),
     CHECK (state != 'sent' OR (opId IS NOT NULL AND messageId IS NOT NULL)),
     CHECK (kind != 'usage-limit' OR (sessionKey IS NOT NULL AND turnSeq IS NOT NULL)),
     CHECK (kind != 'stall' OR (workItemId IS NOT NULL AND anchorAt IS NOT NULL))
-  );
+  )
+  """
+
+  @owner_alerts_dedupe_ddl """
+  CREATE UNIQUE INDEX owner_alerts_dedupe ON owner_alerts (dedupeKey) WHERE #{@holds_key}
+  """
+
+  @owner_alerts_pending_ddl """
   CREATE INDEX owner_alerts_pending ON owner_alerts (state, nextAttemptAt)
   """
+
+  # Every object the migration creates, in creation order. Validation of an
+  # applied shape compares each one's stored SQL with exactly this text.
+  @owner_alerts_objects [
+    {"table", "owner_alerts", @owner_alerts_table_ddl},
+    {"index", "owner_alerts_dedupe", @owner_alerts_dedupe_ddl},
+    {"index", "owner_alerts_pending", @owner_alerts_pending_ddl}
+  ]
 
   @migration_stamp_ddl """
   CREATE TABLE owner_alert_migration (
@@ -147,9 +173,13 @@ defmodule Tightbeam.OwnerAlerts do
 
     # The stamp is written with the table. An unstamped table is dirt from
     # something else and is refused by name, never adopted.
+    names = Enum.map(@owner_alerts_objects, fn {_type, name, _sql} -> name end)
+    placeholders = Enum.map_join(1..length(names), ",", &"?#{&1}")
+
     case Txn.q(
            txn,
-           "SELECT type, name FROM sqlite_master WHERE name IN ('owner_alerts','owner_alerts_pending')"
+           "SELECT type, name FROM sqlite_master WHERE name IN (#{placeholders})",
+           names
          ) do
       [] ->
         :ok
@@ -160,7 +190,7 @@ defmodule Tightbeam.OwnerAlerts do
     end
 
     :ok = Txn.exec(txn, @migration_stamp_ddl)
-    :ok = Txn.exec(txn, @owner_alerts_ddl)
+    Enum.each(@owner_alerts_objects, fn {_type, _name, sql} -> :ok = Txn.exec(txn, sql) end)
 
     Txn.q(
       txn,
@@ -177,10 +207,8 @@ defmodule Tightbeam.OwnerAlerts do
   end
 
   defp validate_applied_shape!(txn) do
-    [table_sql, index_sql] = String.split(@owner_alerts_ddl, ";", parts: 2)
-
     Enum.each(
-      [{"table", "owner_alerts", table_sql}, {"index", "owner_alerts_pending", index_sql}],
+      @owner_alerts_objects,
       fn {type, name, expected} ->
         case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2", [
                type,
@@ -277,7 +305,9 @@ defmodule Tightbeam.OwnerAlerts do
   Create the usage-limit alert for a failed turn, inside the transaction that
   recorded the failure's harness-health observation. Only `rate-limit-dead`
   failures of sessions owned by the alert owner create one, and only the first
-  failure of a limit episode (B2) does.
+  failure of a limit episode (B2) does. An episode whose only alert was
+  withdrawn as `off` alerts again at its next failure while alerts are on
+  (§7.1 C3-on); the new row keeps the episode's `dedupeKey`.
   """
   @spec usage_limit_failure_in_txn(Txn.t(), map(), String.t(), term(), integer()) :: :ok
   def usage_limit_failure_in_txn(%Txn{} = txn, turn, "rate-limit-dead", result, observed_at) do
@@ -298,7 +328,9 @@ defmodule Tightbeam.OwnerAlerts do
       first_seq = episode_first_seq_in_txn(txn, session_key, turn.seq)
       dedupe_key = "usage-limit:#{session_key}:#{first_seq}"
 
-      if Txn.q(txn, "SELECT 1 FROM owner_alerts WHERE dedupeKey=?1", [dedupe_key]) == [] do
+      if Txn.q(txn, "SELECT 1 FROM owner_alerts WHERE dedupeKey=?1 AND #{@holds_key}", [
+           dedupe_key
+         ]) == [] do
         failed_at = ended_at || observed_at
 
         facts = %{
@@ -512,7 +544,7 @@ defmodule Tightbeam.OwnerAlerts do
         (alertId, kind, dedupeKey, ownerUserId, originSessionKey, sessionKey, turnSeq,
          workItemId, anchorAt, title, body, state, createdAt, updatedAt, nextAttemptAt)
       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?12, ?12)
-      ON CONFLICT(dedupeKey) DO NOTHING
+      ON CONFLICT(dedupeKey) WHERE #{@holds_key} DO NOTHING
       """,
       [
         alert_id,
@@ -753,7 +785,7 @@ defmodule Tightbeam.OwnerAlerts do
     # which records either this attempt or the alert's withdrawal.
     {:ok, decision} =
       DB.transaction(db, fn txn ->
-        case withdrawal_reason_in_txn(txn, alert) do
+        case withdrawal_in_txn(txn, alert) do
           nil ->
             Txn.q(
               txn,
@@ -766,8 +798,8 @@ defmodule Tightbeam.OwnerAlerts do
 
             if Txn.changes(txn) == 1, do: :send, else: raise("owner alert is no longer pending")
 
-          reason ->
-            withdraw_in_txn(txn, alert, reason, now)
+          withdrawal ->
+            withdraw_in_txn(txn, alert, withdrawal, now)
             :withdrawn
         end
       end)
@@ -779,29 +811,31 @@ defmodule Tightbeam.OwnerAlerts do
   # the owner this alert recorded at creation. Unset, or naming no user, is
   # off; naming another user is a changed owner. Either way the alert is
   # withdrawn, never re-addressed: every attempt's origin is the recorded
-  # owner's Main.
-  defp withdrawal_reason_in_txn(txn, alert) do
+  # owner's Main. The withdrawal is recorded as `off` with its fine-grained
+  # reason (A2), so the alert's key is free for the next trigger (C3-on).
+  defp withdrawal_in_txn(txn, alert) do
     case owner_in_txn(txn) do
-      nil -> "alerts-off"
+      nil -> {"off", "alerts-off"}
       owner when owner == alert.owner -> nil
-      _other -> "owner-changed"
+      _other -> {"off", "owner-changed"}
     end
   end
 
-  defp withdraw_in_txn(txn, alert, reason, now) do
+  defp withdraw_in_txn(txn, alert, {withdrawn_as, reason}, now) do
     Txn.q(
       txn,
       """
-      UPDATE owner_alerts SET state='withdrawn', nextAttemptAt=NULL, updatedAt=?2
+      UPDATE owner_alerts SET state='withdrawn', withdrawnAs=?3, nextAttemptAt=NULL, updatedAt=?2
       WHERE alertId=?1 AND state='pending'
       """,
-      [alert.alert_id, now]
+      [alert.alert_id, now, withdrawn_as]
     )
 
     if Txn.changes(txn) != 1, do: raise("owner alert is no longer pending")
 
     lifecycle_in_txn(txn, "owner_alert_withdrawn", alert.alert_id, alert.kind, "withdrawn", %{
-      reason: reason
+      reason: reason,
+      withdrawnAs: withdrawn_as
     })
   end
 

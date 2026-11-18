@@ -559,6 +559,7 @@ defmodule Tightbeam.OwnerAlertsTest do
              alert_for(db, failed_session)
 
     assert withdrawn_reasons(db, failed.alert_id) == ["alerts-off"]
+    assert withdrawn_as(db, failed.alert_id) == "off"
     assert %{state: "sent", op_id: ^uncertain_op} = alert_for(db, uncertain_session)
 
     assert {:ok, [[^uncertain_op, ^main, "bound"]]} =
@@ -680,6 +681,7 @@ defmodule Tightbeam.OwnerAlertsTest do
              alert_for(db, failed_session)
 
     assert withdrawn_reasons(db, failed.alert_id) == ["owner-changed"]
+    assert withdrawn_as(db, failed.alert_id) == "off"
     assert %{state: "sent", op_id: ^uncertain_op} = alert_for(db, uncertain_session)
     assert %{state: "sent", op_id: ^alice_op} = alert_for(db, alice_session)
 
@@ -694,6 +696,62 @@ defmodule Tightbeam.OwnerAlertsTest do
 
     assert ops == [["alice", alice_op, alice_main], [@owner, uncertain_op, main]]
     assert count(db, "SELECT count(*) FROM harklight_send_operations") == 2
+  end
+
+  test "T20: an episode whose alert was withdrawn as off alerts once more after re-enable",
+       %{db: db} do
+    config = config_handler(db)
+    set = fn value -> config.(%{action: "set", setting: "owner-alerts-user", value: value}) end
+    sending = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+
+    assert %{value: @owner, changed: true} = set.(@owner)
+
+    # Session S is in a limit episode; its alert is pending after a definite failure.
+    s = session(db, "agent:george:s")
+    first = fail_turn(db, s, @codex_limit)
+    key = "usage-limit:#{s}:#{first}"
+    assert [%{dedupe_key: ^key} = withdrawn] = alerts(db)
+    assert OwnerAlerts.deliver_due(db, now: withdrawn.created_at, runner: failing(self())) == 0
+    assert_received {:harklight, ["send", "--prepare" | _]}
+    assert %{state: "pending", last_outcome: "failed"} = alert_for(db, s)
+
+    # Clear: its next attempt withdraws it as off, with no new operation.
+    assert %{value: nil, changed: true} = set.("")
+    due = withdrawn.created_at + 5 * @minute
+    assert OwnerAlerts.deliver_due(db, now: due, runner: sending) == 0
+    refute_received {:harklight, _}
+    assert [%{state: "withdrawn", attempts: 1}] = alerts(db)
+    assert withdrawn_as(db, withdrawn.alert_id) == "off"
+    assert withdrawn_reasons(db, withdrawn.alert_id) == ["alerts-off"]
+
+    # First re-enable: S's next failure in the same episode alerts once, on
+    # the same dedupeKey; the failure after it does not.
+    assert %{value: @owner, changed: true} = set.(@owner)
+    second = fail_turn(db, s, @codex_limit)
+    others = fn -> Enum.reject(alerts(db), &(&1.alert_id == withdrawn.alert_id)) end
+
+    assert [%{dedupe_key: ^key, turn_seq: ^second, state: "pending", attempts: 0} = realerted] =
+             others.()
+
+    fail_turn(db, s, @codex_limit)
+    assert others.() == [realerted]
+
+    assert OwnerAlerts.deliver_due(db, now: realerted.created_at, runner: sending) == 0
+    assert_received {:harklight, ["send", "--prepare", "--op-id", op | _]}
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^op]}
+    assert [%{state: "sent", op_id: ^op}] = others.()
+
+    # Second cycle: the sent alert holds the episode, so nothing is alerted again.
+    assert %{value: nil, changed: true} = set.("")
+    assert %{value: @owner, changed: true} = set.(@owner)
+    fail_turn(db, s, @codex_limit)
+    assert OwnerAlerts.deliver_due(db, now: due + @hour, runner: sending) == 0
+    refute_received {:harklight, _}
+
+    assert [%{state: "sent", op_id: ^op}] = others.()
+    assert %{state: "withdrawn"} = Enum.find(alerts(db), &(&1.alert_id == withdrawn.alert_id))
+    assert length(alerts(db)) == 2
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 1
   end
 
   test "T15: an alert created before a restart is sent once after it", %{db: db} do
@@ -753,6 +811,18 @@ defmodule Tightbeam.OwnerAlertsTest do
              DB.query(db, "SELECT id, shape, appliedAt FROM owner_alert_migration")
 
     assert is_integer(applied)
+    assert :ok = OwnerAlerts.ensure_schema(db)
+
+    # The dedupe index is partial: a full unique index is a different shape.
+    dedupe = "CREATE UNIQUE INDEX owner_alerts_dedupe ON owner_alerts (dedupeKey)"
+    partial = dedupe <> " WHERE NOT (state = 'withdrawn' AND withdrawnAs = 'off')"
+    :ok = DB.execute(db, "DROP INDEX owner_alerts_dedupe; " <> dedupe)
+
+    assert_raise Tightbeam.Schema.ShapeError, ~r/incompatible_owner_alerts_schema_object/, fn ->
+      OwnerAlerts.ensure_schema(db)
+    end
+
+    :ok = DB.execute(db, "DROP INDEX owner_alerts_dedupe; " <> partial)
     assert :ok = OwnerAlerts.ensure_schema(db)
 
     :ok = DB.execute(db, "DROP INDEX owner_alerts_pending")
@@ -1011,6 +1081,9 @@ defmodule Tightbeam.OwnerAlertsTest do
 
     Enum.map(rows, fn [detail] -> JSON.decode!(detail)["reason"] end)
   end
+
+  defp withdrawn_as(db, alert_id),
+    do: count(db, "SELECT withdrawnAs FROM owner_alerts WHERE alertId=?1", [alert_id])
 
   defp record_counts(db) do
     %{
