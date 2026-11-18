@@ -29,7 +29,7 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
     before = actor_schema(db)
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["artifact-process-attribution-v1-015"]]} =
+    assert {:ok, [["user-removal-v1-016"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert actor_schema(db) == before

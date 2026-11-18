@@ -12,7 +12,7 @@ defmodule Tightbeam.PiReconciliationSchemaTest do
     assert :ok = Schema.ensure_all(db)
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["artifact-process-attribution-v1-015"]]} =
+    assert {:ok, [["user-removal-v1-016"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert :ok =
@@ -55,7 +55,7 @@ defmodule Tightbeam.PiReconciliationSchemaTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["artifact-process-attribution-v1-015"]]} =
+    assert {:ok, [["user-removal-v1-016"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(sessions)")
