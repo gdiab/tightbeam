@@ -23,6 +23,7 @@ defmodule Tightbeam.Archetypes do
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [Tightbeam.Model.t()],
           model_preference_entries: [%{model: Tightbeam.Model.t(), harness: String.t() | nil}],
+          limit_fallback: limit_fallback() | nil,
           ephemeral: boolean(),
           containment: %{fs: :off, network: :open},
           mcp: [
@@ -36,6 +37,13 @@ defmodule Tightbeam.Archetypes do
           guidance: String.t() | nil,
           source: %{file: String.t(), sha256: String.t()} | nil
         }
+
+  @typedoc """
+  An archetype's configured fallback for a provider usage-limit failure: one
+  entry of its own `model_preferences`, and optionally the harness the
+  manifest expects that model to route to on the session's host.
+  """
+  @type limit_fallback :: %{model: Tightbeam.Model.t(), harness: String.t() | nil}
 
   @doc """
   Load every manifest under `<base_dir>/identity/archetypes/*.toml`, validate,
@@ -135,6 +143,19 @@ defmodule Tightbeam.Archetypes do
   def get(name) do
     {archetypes, _fragments} = :persistent_term.get(@persist_key)
     Map.get(archetypes, name)
+  end
+
+  @doc """
+  The configured `[limit_fallback]` of the archetype as currently loaded, or nil
+  when the archetype declares none or is not loaded. Read at evaluation time:
+  a published manifest takes effect at the next lookup and retunes nothing.
+  """
+  @spec limit_fallback(String.t()) :: limit_fallback() | nil
+  def limit_fallback(name) do
+    case get(name) do
+      %{limit_fallback: fallback} -> fallback
+      _ -> nil
+    end
   end
 
   @doc "Compile an archetype's MCP declarations to the ACP mcpServers shape."
@@ -603,6 +624,7 @@ defmodule Tightbeam.Archetypes do
       references: [],
       model_preferences: [],
       model_preference_entries: [],
+      limit_fallback: nil,
       ephemeral: false,
       containment: %{fs: :off, network: :open},
       mcp: [],
@@ -620,6 +642,7 @@ defmodule Tightbeam.Archetypes do
         "defaults",
         "references",
         "model_preferences",
+        "limit_fallback",
         "ephemeral",
         # Shipped 0.1.9 identity manifests may still contain these retired keys.
         # Accept them for compatibility, but do not read them into archetype state.
@@ -702,6 +725,13 @@ defmodule Tightbeam.Archetypes do
 
     model_preferences = Enum.map(model_preference_entries, & &1.model)
 
+    limit_fallback =
+      validate_limit_fallback!(
+        Map.get(manifest, "limit_fallback"),
+        model_preference_entries,
+        path
+      )
+
     mcp = validate_mcp!(Map.get(manifest, "mcp", %{}))
     containment = validate_containment!(Map.get(manifest, "containment", %{}), path)
 
@@ -711,6 +741,7 @@ defmodule Tightbeam.Archetypes do
       where: where,
       model_preferences: model_preferences,
       model_preference_entries: model_preference_entries,
+      limit_fallback: limit_fallback,
       ephemeral: ephemeral,
       containment: containment,
       defaults: defaults,
@@ -767,6 +798,73 @@ defmodule Tightbeam.Archetypes do
               "archetype model_preferences entry must be a table, got #{inspect(other)}: #{path}"
     end)
   end
+
+  # A fallback for a provider usage-limit failure is CONFIGURED, never chosen:
+  #
+  #     [limit_fallback]
+  #     model = "claude-opus-5-5"
+  #     effort = "high"
+  #
+  # `model` and `effort` are required, `context` and `harness` optional. The
+  # model/effort/context fields must equal one entry of the same archetype's
+  # `[[model_preferences]]`, its `harness` included: the fallback is drawn
+  # from the role's own list, and one that is not on it is refused by name
+  # rather than used. A preference entry on this line carries its own
+  # `harness`, so the harness a fallback routes to is fixed when the manifest
+  # loads (contract c §12).
+  defp validate_limit_fallback!(nil, _preferences, _path), do: nil
+
+  defp validate_limit_fallback!(raw, preferences, path) when is_map(raw) do
+    unknown =
+      raw
+      |> Map.keys()
+      |> MapSet.new()
+      |> MapSet.difference(MapSet.new(["model", "effort", "context", "harness"]))
+      |> MapSet.to_list()
+
+    if unknown != [] do
+      raise ArgumentError,
+            "unknown limit_fallback keys in #{path}: #{unknown |> Enum.sort() |> Enum.join(", ")}"
+    end
+
+    for key <- ["model", "effort"] do
+      unless is_binary(raw[key]) and raw[key] != "" do
+        raise ArgumentError, "archetype limit_fallback.#{key} must be a non-empty string: #{path}"
+      end
+    end
+
+    for key <- ["context", "harness"], Map.has_key?(raw, key) do
+      unless is_binary(raw[key]) and raw[key] != "" do
+        raise ArgumentError, "archetype limit_fallback.#{key} must be a non-empty string: #{path}"
+      end
+    end
+
+    model = Tightbeam.Model.from_params(Map.take(raw, ["model", "effort", "context"]))
+
+    harness =
+      case raw["harness"] do
+        nil -> nil
+        name -> Tightbeam.Harness.parse!(name).wire_name()
+      end
+
+    unless %{model: model, harness: harness} in preferences do
+      raise ArgumentError,
+            "archetype limit_fallback #{Tightbeam.Model.describe(model)}" <>
+              harness_suffix(harness) <>
+              " is not one of its model_preferences; a fallback is drawn from the " <>
+              "archetype's own preferences: " <> path
+    end
+
+    %{model: model, harness: harness}
+  end
+
+  defp validate_limit_fallback!(other, _preferences, path) do
+    raise ArgumentError,
+          "archetype limit_fallback must be a table, got #{inspect(other)}: #{path}"
+  end
+
+  defp harness_suffix(nil), do: ""
+  defp harness_suffix(harness), do: " on harness #{harness}"
 
   defp validate_containment!(raw, path) do
     unknown =
