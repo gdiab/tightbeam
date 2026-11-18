@@ -51,7 +51,7 @@ defmodule Tightbeam.OwnerAlerts do
   use GenServer
   require Logger
 
-  alias Tightbeam.{DB, EventLog, HarklightSend, Id, Org}
+  alias Tightbeam.{DB, EventLog, HarklightSend, HarnessHealth, Id, Org}
   alias Tightbeam.DB.Txn
 
   @shape "owner-alerts-v1-0114"
@@ -373,7 +373,7 @@ defmodule Tightbeam.OwnerAlerts do
              [turn.seq]
            ) do
       session_key = turn.session_key
-      first_seq = episode_first_seq_in_txn(txn, session_key, turn.seq)
+      first_seq = HarnessHealth.limit_episode_first_seq_in_txn(txn, session_key, turn.seq)
       dedupe_key = "usage-limit:#{session_key}:#{first_seq}"
 
       if Txn.q(txn, "SELECT 1 FROM owner_alerts WHERE dedupeKey=?1 AND #{@holds_key}", [
@@ -413,29 +413,32 @@ defmodule Tightbeam.OwnerAlerts do
 
   @doc """
   Create the `model-fallback` alert of one limit-fallback outcome (contract c
-  R15), inside the transaction that commits the outcome. Only a session whose
-  owner is the alert owner gets one. Its `dedupeKey` is
-  `model-fallback:<sessionKey>:<trigger>`; the shared creation path, sender,
-  retry, undelivered and `off` rules apply unchanged, and like `usage-limit`
-  it is never withdrawn as `stale`.
+  v1.4 R15), inside the transaction that commits the outcome. Only a session
+  whose owner is the alert owner gets one. An applied outcome's `dedupeKey` is
+  `model-fallback:<sessionKey>:<trigger>`, so each switch alerts. A withheld
+  outcome's is `model-fallback:<sessionKey>:withheld:<episode>`, where
+  `episode` is the seq of the first failed turn of the session's limit
+  episode, so a withheld episode alerts once however often it is evaluated.
+  The shared creation path, sender, retry, undelivered and `off` rules apply
+  unchanged, and like `usage-limit` it is never withdrawn as `stale`.
   """
   @spec model_fallback_in_txn(Txn.t(), %{
           required(:session_key) => String.t(),
-          required(:trigger_ref) => String.t(),
+          required(:dedupe_ref) => {:applied, String.t()} | {:withheld, pos_integer()},
           required(:title) => String.t(),
           required(:body) => String.t(),
           optional(:turn_seq) => pos_integer() | nil
         }) :: :ok
   def model_fallback_in_txn(
         %Txn{} = txn,
-        %{session_key: session_key, trigger_ref: trigger_ref, title: title, body: body} = input
+        %{session_key: session_key, dedupe_ref: dedupe_ref, title: title, body: body} = input
       ) do
     with owner when is_binary(owner) <- owner_in_txn(txn),
          [[^owner]] <-
            Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
       create_in_txn(txn, %{
         kind: "model-fallback",
-        dedupe_key: "model-fallback:#{session_key}:#{trigger_ref}",
+        dedupe_key: model_fallback_dedupe_key(session_key, dedupe_ref),
         owner: owner,
         session_key: session_key,
         turn_seq: Map.get(input, :turn_seq),
@@ -447,40 +450,13 @@ defmodule Tightbeam.OwnerAlerts do
     :ok
   end
 
-  # A session's limit episode runs from its first usage-limit failure to its
-  # next delivered turn. Its first failure is the earliest rate-limit-dead
-  # failure after the session's latest delivered turn. A session's lane runs
-  # one turn at a time and claims the lowest queued seq, so seq order is the
-  # order its turns ended.
-  defp episode_first_seq_in_txn(txn, session_key, seq) do
-    delivered =
-      case Txn.q(
-             txn,
-             """
-             SELECT seq FROM turns WHERE sessionKey=?1 AND status='delivered'
-             ORDER BY seq DESC LIMIT 1
-             """,
-             [session_key]
-           ) do
-        [[delivered]] -> delivered
-        [] -> 0
-      end
+  defp model_fallback_dedupe_key(session_key, {:applied, trigger_ref})
+       when is_binary(trigger_ref),
+       do: "model-fallback:#{session_key}:#{trigger_ref}"
 
-    case Txn.q(
-           txn,
-           """
-           SELECT t.seq FROM turns t
-           JOIN harness_health_observations o
-             ON o.correlationId = 'harness-turn:' || t.seq || ':rate-limit-dead'
-           WHERE t.sessionKey=?1 AND t.seq>?2 AND t.status IN ('failed','failed_unknown')
-           ORDER BY t.seq LIMIT 1
-           """,
-           [session_key, delivered]
-         ) do
-      [[first]] -> first
-      [] -> seq
-    end
-  end
+  defp model_fallback_dedupe_key(session_key, {:withheld, episode})
+       when is_integer(episode) and episode > 0,
+       do: "model-fallback:#{session_key}:withheld:#{episode}"
 
   # The Claude reset Tightbeam parsed from this failure is the due time of
   # its rate-limit-reset wake. No other provider reset is parsed on this line.

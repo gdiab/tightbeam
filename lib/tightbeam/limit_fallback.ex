@@ -1,6 +1,6 @@
 defmodule Tightbeam.LimitFallback do
   @moduledoc """
-  Durable state for the per-archetype limit-fallback switch (contract c v1.3,
+  Durable state for the per-archetype limit-fallback switch (contract c v1.4,
   phase c1). This module owns the records; the evaluation and the switch
   itself run elsewhere and call in here inside their own transactions.
 
@@ -16,6 +16,10 @@ defmodule Tightbeam.LimitFallback do
     incident for T2) holds the T1 claim hold and its single outcome. A row
     with no outcome is a standing hold: the session's lane claims nothing
     while it stands, and the outcome's commit releases it.
+  - Withheld T1 outcomes are announced once per limit episode (R11, v1.4).
+    The one withheld evaluation that filed an episode's notice and fact
+    carries `withheldEpisode`, the seq of the episode's first failed turn;
+    `UNIQUE (sessionKey, withheldEpisode)` lets no second one carry it.
 
   The schema objects are created by `Tightbeam.Schema` at the
   `limit-fallback-v1-0114` stamp transition, through `migrate_in_txn!/1`, and
@@ -79,6 +83,7 @@ defmodule Tightbeam.LimitFallback do
     heldAt      INTEGER CHECK (heldAt IS NULL OR heldAt >= 0),
     outcome     TEXT CHECK (outcome IN ('applied','withheld')),
     reason      TEXT CHECK (reason IS NULL OR length(reason) > 0),
+    withheldEpisode INTEGER REFERENCES turns(seq),
     createdAt   INTEGER NOT NULL CHECK (createdAt >= 0),
     decidedAt   INTEGER CHECK (decidedAt IS NULL OR decidedAt >= 0),
     CHECK ((turnSeq IS NULL) != (incidentId IS NULL)),
@@ -87,8 +92,10 @@ defmodule Tightbeam.LimitFallback do
     CHECK (outcome IS NOT NULL OR heldAt IS NOT NULL),
     CHECK (outcome IS NOT NULL OR reason IS NULL),
     CHECK (outcome IS NULL OR (outcome = 'withheld') = (reason IS NOT NULL)),
+    CHECK (withheldEpisode IS NULL OR (outcome = 'withheld' AND turnSeq IS NOT NULL)),
     UNIQUE (sessionKey, turnSeq),
-    UNIQUE (sessionKey, incidentId)
+    UNIQUE (sessionKey, incidentId),
+    UNIQUE (sessionKey, withheldEpisode)
   )
   """
 
@@ -382,6 +389,7 @@ defmodule Tightbeam.LimitFallback do
           held_at: non_neg_integer() | nil,
           outcome: String.t() | nil,
           reason: String.t() | nil,
+          withheld_episode: pos_integer() | nil,
           created_at: non_neg_integer(),
           decided_at: non_neg_integer() | nil
         }
@@ -434,7 +442,7 @@ defmodule Tightbeam.LimitFallback do
   Commit the one outcome of an evaluation, releasing its hold if it had one.
   `{:recorded, evaluation}` the first time; `{:duplicate, evaluation}` when the
   trigger already has an outcome, in which case nothing is written and the
-  caller emits nothing (R5 exactly once, R11 once per trigger). Call it in the
+  caller emits nothing (R5 exactly once; R14 one lifecycle event per trigger). Call it in the
   transaction that writes the outcome's other records: the swap transaction
   for `:applied`, the withhold transaction for `{:withheld, reason}`.
   """
@@ -498,6 +506,40 @@ defmodule Tightbeam.LimitFallback do
   end
 
   @doc """
+  Claim the announcement of a limit episode for one withheld T1 evaluation,
+  in the transaction that commits that outcome (R11, v1.4). `episode` is the
+  seq of the episode's first failed turn
+  (`Tightbeam.HarnessHealth.limit_episode_first_seq_in_txn/3`). `true` when
+  no evaluation of the session has announced that episode yet: this one now
+  carries it and its outcome files the episode's notice and fact. `false`
+  otherwise; the caller then records the outcome and its lifecycle event
+  only. The claim is a stored column, so it holds across restarts, and it
+  reads nothing of the owner-alert setting.
+  """
+  @spec claim_withheld_episode_in_txn(Txn.t(), evaluation(), pos_integer()) :: boolean()
+  def claim_withheld_episode_in_txn(
+        %Txn{} = txn,
+        %{id: id, session_key: session_key, outcome: "withheld", trigger: {:turn, _seq}},
+        episode
+      )
+      when is_integer(episode) and episode > 0 do
+    Txn.q(
+      txn,
+      """
+      UPDATE limit_fallback_evaluations SET withheldEpisode=?2
+      WHERE id=?1 AND withheldEpisode IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM limit_fallback_evaluations
+          WHERE sessionKey=?3 AND withheldEpisode=?2
+        )
+      """,
+      [id, episode, session_key]
+    )
+
+    Txn.changes(txn) == 1
+  end
+
+  @doc """
   Every standing hold. At gateway start, before any lane claims, phase 2
   releases each with a withheld `switch-failed:interrupted` outcome.
   """
@@ -516,7 +558,9 @@ defmodule Tightbeam.LimitFallback do
     do: {"incidentId", id}
 
   defp evaluation_columns,
-    do: "id, sessionKey, turnSeq, incidentId, heldAt, outcome, reason, createdAt, decidedAt"
+    do:
+      "id, sessionKey, turnSeq, incidentId, heldAt, outcome, reason, withheldEpisode, " <>
+        "createdAt, decidedAt"
 
   defp to_evaluation([
          id,
@@ -526,6 +570,7 @@ defmodule Tightbeam.LimitFallback do
          held_at,
          outcome,
          reason,
+         withheld_episode,
          created_at,
          decided_at
        ]) do
@@ -536,6 +581,7 @@ defmodule Tightbeam.LimitFallback do
       held_at: held_at,
       outcome: outcome,
       reason: reason,
+      withheld_episode: withheld_episode,
       created_at: created_at,
       decided_at: decided_at
     }
