@@ -1221,6 +1221,7 @@ defmodule Tightbeam.OwnerAlertsTest do
     refute_received {:harklight, _}
     assert [%{state: "withdrawn", attempts: 1, next_attempt_at: nil}] = stall_alerts(db)
     assert withdrawn_reasons(db, alert.alert_id) == ["work-moved"]
+    assert withdrawn_as(db, alert.alert_id) == "stale"
 
     assert OwnerAlerts.deliver_due(db, now: next + 2 * @hour, runner: failing) == 0
     refute_received {:harklight, _}
@@ -1245,6 +1246,7 @@ defmodule Tightbeam.OwnerAlertsTest do
     refute_received {:harklight, _}
     assert [%{state: "withdrawn", attempts: 0, op_id: nil}] = stall_alerts(db)
     assert withdrawn_reasons(db, alert.alert_id) == ["held-or-waiting"]
+    assert withdrawn_as(db, alert.alert_id) == "stale"
     assert count(db, "SELECT count(*) FROM harklight_send_operations") == 0
   end
 
@@ -1274,7 +1276,7 @@ defmodule Tightbeam.OwnerAlertsTest do
     assert stall_alerts(db) == []
   end
 
-  test "T18: alerts off withdraw a failed stall alert and skip new stalls; re-enabling alerts a still-stalled item once",
+  test "T18: alerts off withdraw a failed stall alert and skip new stalls; re-enabling alerts each still-stalled item once",
        %{db: db} do
     enable(db)
     config = config_handler(db)
@@ -1311,6 +1313,7 @@ defmodule Tightbeam.OwnerAlertsTest do
 
     assert [%{state: "withdrawn", attempts: 1, next_attempt_at: nil}] = stall_alerts(db)
     assert withdrawn_reasons(db, queued.alert_id) == ["alerts-off"]
+    assert withdrawn_as(db, queued.alert_id) == "off"
     assert count(db, "SELECT count(*) FROM harklight_send_operations") == 0
 
     assert %{value: nil, changed: false} = set_owner.("")
@@ -1322,9 +1325,93 @@ defmodule Tightbeam.OwnerAlertsTest do
     assert [%{work_item_id: "wi_queued"}] = stall_alerts(db)
     refute_received {:harklight, _}
 
-    # Re-enabling: the setting's commit makes the process look at once. The
-    # still-stalled item alerts once; the queued item's stall identity was
-    # already alerted (S6), so it gets no second alert.
+    # Re-enabling: the setting's commit makes the process look at once. Each
+    # still-stalled item alerts once: the new item, and the queued item on its
+    # unchanged stall identity, because its only alert was withdrawn as off
+    # and never reached the owner (S6, §7.1 C3-on).
+    enabled_at = now_ms()
+    assert %{value: @owner, changed: true} = set_owner.(@owner)
+    :sys.get_state(OwnerAlerts)
+
+    ops =
+      for _ <- 1..2 do
+        assert_received {:harklight, ["send", "--prepare", "--op-id", op | _]}
+        assert_received {:harklight, ["send", "--execute", "--op-id", ^op]}
+        op
+      end
+
+    refute_received {:harklight, _}
+
+    assert [%{work_item_id: "wi_queued", state: "withdrawn"} | resumed] = stall_alerts(db)
+
+    assert [
+             %{work_item_id: "wi_new", anchor_at: ^t1, state: "sent"} = new,
+             %{work_item_id: "wi_queued", anchor_at: ^t0, state: "sent"} = again
+           ] = Enum.sort_by(resumed, & &1.work_item_id)
+
+    assert again.dedupe_key == queued.dedupe_key
+    assert Enum.sort([new.op_id, again.op_id]) == Enum.sort(ops)
+
+    for alert <- [new, again] do
+      assert alert.created_at >= enabled_at
+      assert alert.created_at < enabled_at + 10 * @minute
+    end
+  end
+
+  test "T20: a stall alert withdrawn as off is alerted once more after re-enable; a stale one is not",
+       %{db: db} do
+    config = config_handler(db)
+
+    set_owner = fn value ->
+      config.(%{action: "set", setting: "owner-alerts-user", value: value})
+    end
+
+    assert %{value: @owner, changed: true} = set_owner.(@owner)
+    holder = session(db, "agent:george:idle")
+    t0 = now_ms() - 20 * @stall
+    item(db, "wi_w")
+    assignment(db, "asg_w", "wi_w", holder, t0)
+    item(db, "wi_stale")
+    assignment(db, "asg_stale", "wi_stale", holder, t0)
+    stale_alerts = fn -> Enum.filter(stall_alerts(db), &(&1.work_item_id == "wi_stale")) end
+
+    assert %{created: 2} = OwnerAlerts.detect_stalls(db, now: t0 + @stall)
+    assert [w] = w_alerts(db)
+    assert [stale] = stale_alerts.()
+
+    # Control: the stale item is iceboxed before its first send, so its alert
+    # is withdrawn as stale (A7). W's first send fails definitely.
+    :ok = DB.execute(db, "UPDATE work_items SET state='iceboxed' WHERE id='wi_stale'")
+    assert OwnerAlerts.deliver_due(db, now: w.created_at, runner: failing(self())) == 0
+    assert_received {:harklight, ["send", "--prepare" | _]}
+    refute_received {:harklight, _}
+    assert [%{state: "pending", attempts: 1, next_attempt_at: retry_at}] = w_alerts(db)
+    assert [%{state: "withdrawn", attempts: 0}] = stale_alerts.()
+    assert withdrawn_reasons(db, stale.alert_id) == ["out-of-scope"]
+    assert withdrawn_as(db, stale.alert_id) == "stale"
+
+    # Reopening moves no anchor: the control is stalled again on the same
+    # identity, and its stale-withdrawn row still holds the key.
+    :ok = DB.execute(db, "UPDATE work_items SET state='open' WHERE id='wi_stale'")
+    assert %{created: 0} = OwnerAlerts.detect_stalls(db, now: retry_at)
+    assert [%{alert_id: stale_id}] = stale_alerts.()
+    assert stale_id == stale.alert_id
+
+    # Clear: W's retry withdraws it as off, with no new operation.
+    assert %{value: nil, changed: true} = set_owner.("")
+    assert OwnerAlerts.deliver_due(db, now: retry_at, runner: failing(self())) == 0
+    refute_received {:harklight, _}
+    assert [%{state: "withdrawn", attempts: 1}] = w_alerts(db)
+    assert withdrawn_reasons(db, w.alert_id) == ["alerts-off"]
+    assert withdrawn_as(db, w.alert_id) == "off"
+
+    runner = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_supervised!({OwnerAlerts, db: db, send_runner: runner})
+    :sys.get_state(OwnerAlerts)
+    refute_received {:harklight, _}
+
+    # First re-enable, W's anchor unchanged: exactly one new alert for W, on
+    # the same dedupeKey, sent within ten minutes. The control stays held.
     enabled_at = now_ms()
     assert %{value: @owner, changed: true} = set_owner.(@owner)
     :sys.get_state(OwnerAlerts)
@@ -1333,13 +1420,25 @@ defmodule Tightbeam.OwnerAlertsTest do
     assert_received {:harklight, ["send", "--execute", "--op-id", ^op]}
     refute_received {:harklight, _}
 
-    assert [
-             %{work_item_id: "wi_queued", state: "withdrawn"},
-             %{work_item_id: "wi_new", anchor_at: ^t1, state: "sent", op_id: ^op} = alert
-           ] = stall_alerts(db)
+    assert [%{state: "withdrawn"}, %{anchor_at: ^t0, state: "sent", op_id: ^op} = again] =
+             w_alerts(db)
 
-    assert alert.created_at >= enabled_at
-    assert alert.created_at < enabled_at + 10 * @minute
+    assert again.dedupe_key == w.dedupe_key
+    assert again.created_at >= enabled_at
+    assert again.created_at < enabled_at + 10 * @minute
+    assert [%{alert_id: ^stale_id, state: "withdrawn"}] = stale_alerts.()
+
+    # Second cycle: W's alert was sent, so it holds the identity.
+    assert %{value: nil, changed: true} = set_owner.("")
+    :sys.get_state(OwnerAlerts)
+    assert %{value: @owner, changed: true} = set_owner.(@owner)
+    :sys.get_state(OwnerAlerts)
+    assert %{created: 0} = OwnerAlerts.detect_stalls(db)
+    refute_received {:harklight, _}
+
+    assert [%{state: "withdrawn"}, %{state: "sent", op_id: ^op}] = w_alerts(db)
+    assert [%{alert_id: ^stale_id, state: "withdrawn"}] = stale_alerts.()
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 1
   end
 
   test "T15: a stall alert created before a restart is sent once after it", %{db: db} do
