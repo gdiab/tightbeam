@@ -3867,6 +3867,256 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
+  describe "quota resume (companion v1.1 A1/A2, quota v3 R9(c))" do
+    test "A1/A2: resume releases the park, reruns the incident's turn once, reports both, and replays the same body",
+         ctx do
+      repair = failed_repair_route!(ctx, "asg_resume_result", "rate-limit-dead", 70)
+      adapter_key = {:claude, "shared", "testhost"}
+      handler = resume_handler(ctx, :ok)
+
+      call = resume_call({:user, "flynn"}, repair.assignment_id, "resume-result", ctx.lane)
+
+      assert %{
+               ok: true,
+               action: "resume",
+               park: "released",
+               rerun: %{state: "queued", sourceTurnSeq: source, attemptTurnSeq: attempt}
+             } = first = handler.(call)
+
+      assert source == repair.source_seq
+      assert is_integer(attempt) and attempt > source
+      assert handler.(call) == first
+      refute Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+
+      assert [%{"cause" => "explicit_resume", "actor" => "user:flynn", "releasedAt" => at}] =
+               hold_releases(ctx.db, repair.incident.id)
+
+      assert is_integer(at)
+
+      # A second resume finds nothing parked and nothing left to rerun.
+      again = resume_call({:user, "flynn"}, repair.assignment_id, "resume-again", ctx.lane)
+
+      assert %{ok: true, park: "not_parked", rerun: %{state: "none", reason: "superseded"}} =
+               handler.(again)
+
+      assert turn_count(ctx.db, repair.assignment_id) == 2
+    end
+
+    test "A1: a covered assignment with no eligible turn still reports the release, with ok:true",
+         ctx do
+      %{assignment_id: id, incident: incident} = covered_assignment!(ctx, "asg_no_turn", "k1")
+      handler = resume_handler(ctx, :ok)
+
+      result = handler.(resume_call({:user, "flynn"}, id, "no-turn", ctx.lane))
+
+      assert result == %{
+               ok: true,
+               action: "resume",
+               incidentId: incident.id,
+               assignmentId: id,
+               park: "released",
+               rerun: %{state: "none", reason: "no_eligible_turn"}
+             }
+
+      refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
+    end
+
+    test "A1: a failed close_adapter leaves the fence and says so", ctx do
+      repair = failed_repair_route!(ctx, "asg_resume_wedged", "rate-limit-dead", 75)
+      handler = resume_handler(ctx, {:error, :wedged})
+
+      assert %{ok: false, code: "repair_failed", park: "unchanged"} =
+               handler.(resume_call({:user, "flynn"}, repair.assignment_id, "wedged", ctx.lane))
+
+      assert Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
+      assert turn_count(ctx.db, repair.assignment_id) == 1
+    end
+
+    test "A2: a stale turn from before the incident is never rerun", ctx do
+      # asg_6ad92d53's shape: its only failed turn predates the incident.
+      %{assignment_id: stale} =
+        covered_assignment!(ctx, "asg_stale_turn", "k1", stale_turn: "failed")
+
+      handler = resume_handler(ctx, :ok)
+
+      assert %{ok: true, park: "released", rerun: %{state: "none", reason: "not_from_incident"}} =
+               handler.(resume_call({:user, "flynn"}, stale, "stale", ctx.lane))
+
+      assert turn_count(ctx.db, stale) == 1
+    end
+
+    test "A2: a turn whose outcome is unknown is never rerun", ctx do
+      %{assignment_id: id} =
+        covered_assignment!(ctx, "asg_unknown_turn", "k1", stale_turn: "failed_unknown")
+
+      handler = resume_handler(ctx, :ok)
+
+      assert %{ok: true, park: "released", rerun: %{state: "none", reason: "unknown_effect"}} =
+               handler.(resume_call({:user, "flynn"}, id, "unknown", ctx.lane))
+
+      assert turn_count(ctx.db, id) == 1
+    end
+
+    test "R9(c): only the opener, an admin, the holder's delivery owner or Main may resume",
+         ctx do
+      Devices.add_user(ctx.db, "zoe", false)
+      ensure_main_session(ctx.db, "zoe")
+      main = Org.personal_session_key("zoe")
+
+      for key <- ["z-holder", "z-opener", "z-pdo", "z-sibling"] do
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          owner_user_id: "zoe",
+          origin: "user:zoe",
+          archetype: "default",
+          host: "testhost",
+          harness: "claude",
+          provider: "anthropic",
+          model: Model.new("fable")
+        })
+      end
+
+      {:ok, []} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt,deliveryOwnerSessionKey)
+          VALUES ('wi_zoe','Zoe work','zoe','zoe',1,'z-pdo')
+          """
+        )
+
+      %{assignment_id: id, incident: incident} =
+        covered_assignment!(ctx, "asg_zoe", "z-holder",
+          opened_by_session: "z-opener",
+          work_item_id: "wi_zoe"
+        )
+
+      handler = resume_handler(ctx, :ok)
+      key = {:claude, "shared", "testhost"}
+
+      assert %{
+               ok: false,
+               code: "not_authorized",
+               message:
+                 "assignment resume requires its opener, an admin, the holder's delivery owner or Main"
+             } = handler.(resume_call({:session, "z-sibling"}, id, "sibling", ctx.lane))
+
+      assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
+      assert hold_releases(ctx.db, incident.id) == []
+
+      assert %{ok: true, park: "released"} =
+               handler.(resume_call({:session, "z-pdo"}, id, "delivery-owner", ctx.lane))
+
+      assert [%{"actor" => "session:z-pdo", "cause" => "explicit_resume"}] =
+               hold_releases(ctx.db, incident.id)
+
+      assert %{ok: true, park: "not_parked"} =
+               handler.(resume_call({:session, main}, id, "main", ctx.lane))
+    end
+  end
+
+  defp resume_handler(ctx, close_result) do
+    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), close_result})
+
+    ctx.catalog_base
+    |> gateway_config(ctx.db, 0)
+    |> Map.put(:adapter_coordinator, coordinator)
+    |> Gateway.handlers()
+    |> Map.fetch!("repair-assignment")
+  end
+
+  defp resume_call(principal, assignment_id, key, lane) do
+    origin =
+      case principal do
+        {:user, user} -> "user:" <> user
+        {:session, session} -> "agent:" <> session
+      end
+
+    %{
+      origin: origin,
+      principal: principal,
+      lane_manager: lane,
+      params: %{assignment_id: assignment_id, action: "resume", idempotency_key: key}
+    }
+  end
+
+  defp hold_releases(db, incident_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT detail FROM lifecycle_events WHERE kind='rate_limit_hold_released' AND subject=?1",
+        [incident_id]
+      )
+
+    Enum.map(rows, fn [detail] -> JSON.decode!(detail) end)
+  end
+
+  defp turn_count(db, assignment_id) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT count(*) FROM turns WHERE assignmentId=?1", [assignment_id])
+
+    count
+  end
+
+  # An open assignment covered by a rate-limit-dead incident whose observation
+  # names no turn of it. With `stale_turn: terminal` the assignment has one
+  # turn that ended `terminal` before the incident (companion A2's
+  # asg_6ad92d53 shape).
+  defp covered_assignment!(ctx, assignment_id, holder, opts \\ []) do
+    session = Org.get(ctx.db, holder)
+
+    {:ok, []} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignments
+          (id,subject,holderKey,openedByUser,openedBySession,workItemId,openedAt,state,
+           holderHarness,holderProvider)
+        VALUES (?1,'held work',?2,?3,?4,?5,1,'open',?6,?7)
+        """,
+        [
+          assignment_id,
+          holder,
+          if(opts[:opened_by_session], do: nil, else: "flynn"),
+          opts[:opened_by_session],
+          opts[:work_item_id],
+          session.harness,
+          session.provider
+        ]
+      )
+
+    if terminal = opts[:stale_turn] do
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: holder,
+          message_id: "m-#{assignment_id}",
+          origin: "agent:#{holder}",
+          prompt: "old work",
+          assignment_id: assignment_id
+        })
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, holder, "stale-fixture")
+      :ok = Ledger.finish(ctx.db, seq, terminal, "old failure", owner_lease: turn.owner_lease)
+    end
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "route-#{assignment_id}",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: holder,
+               assignment_id: assignment_id,
+               observed_at: 90,
+               cause: "rate-limit-dead",
+               principal: "process:tightbeam"
+             })
+
+    %{assignment_id: assignment_id, incident: incident}
+  end
+
   defp failed_repair_route!(ctx, assignment_id, failure_class, observed_at) do
     session = Org.get(ctx.db, "k1")
 
@@ -3897,9 +4147,11 @@ defmodule Tightbeam.GatewayTest do
         owner_lease: claimed_turn.owner_lease
       )
 
+    # The incident's observation is this turn's own failure, so a resume or
+    # restart may rerun it (companion v1.1 A2(ii)).
     assert {:opened, incident} =
              HarnessHealth.observe(ctx.db, %{
-               correlation_id: "route-#{assignment_id}",
+               correlation_id: "harness-turn:#{source_seq}:#{failure_class}",
                harness: session.harness,
                host: session.host,
                failure_class: failure_class,
