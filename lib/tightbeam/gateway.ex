@@ -3570,7 +3570,11 @@ defmodule Tightbeam.Gateway do
                      db,
                      adapter,
                      generation,
-                     %{session | model: current.model},
+                     Map.put(
+                       %{session | model: current.model},
+                       :fallback_active,
+                       current.fallback_active
+                     ),
                      turn.seq
                    )
                  end)
@@ -4453,6 +4457,11 @@ defmodule Tightbeam.Gateway do
   end
 
   defp close_superseded_turn_runtime(_db, _session, _adapter, _pointer, _candidate), do: :ok
+
+  # A session on its configured limit fallback (contract c R8a) keeps its
+  # selection: a refusal there is an ordinary failed turn, never a step back
+  # along the preferences onto the provider whose limit moved it.
+  defp configured_turn_model_ring(%{fallback_active: %{}, model: current}), do: [current]
 
   defp configured_turn_model_ring(%{archetype: archetype, model: current}) do
     preferences =
@@ -8964,6 +8973,10 @@ defmodule Tightbeam.Gateway do
               :stale -> raise "harness mutation race inside serialized tune"
             end
 
+            # Contract c R8a: any later tune ends fallback-active. The limit
+            # fallback switch sets it again in its own interlock, below.
+            LimitFallback.clear_fallback_active_in_txn(txn, session.session_key)
+
             case Map.get(call, :on_swap_interlock) do
               fun when is_function(fun, 1) -> fun.(txn)
               _ -> :ok
@@ -9450,6 +9463,10 @@ defmodule Tightbeam.Gateway do
   defp project_verified_mismatch(db, session, actual, provider) do
     try do
       _ = Org.set_model(db, session.session_key, actual, provider)
+
+      {:ok, _} =
+        DB.transaction(db, &LimitFallback.clear_fallback_active_in_txn(&1, session.session_key))
+
       :ok
     rescue
       error -> {:error, error}
@@ -9641,6 +9658,8 @@ defmodule Tightbeam.Gateway do
     case DB.transaction(db, fn txn ->
            {record_model, record_harness} = read_recorded_model(txn, session.session_key)
 
+           LimitFallback.clear_fallback_active_in_txn(txn, session.session_key)
+
            case Org.swap_model_in_txn(
                   txn,
                   session.session_key,
@@ -9709,6 +9728,7 @@ defmodule Tightbeam.Gateway do
     result =
       DB.transaction(db, fn txn ->
         {record_model, record_harness} = read_recorded_model(txn, session.session_key)
+        LimitFallback.clear_fallback_active_in_txn(txn, session.session_key)
 
         case Org.swap_model_in_txn(
                txn,
