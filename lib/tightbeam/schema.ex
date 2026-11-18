@@ -2021,6 +2021,7 @@ defmodule Tightbeam.Schema do
 
     :ok = Tightbeam.ToolCalls.ensure_schema(db)
     :ok = upgrade_session_identity(db)
+    :ok = Tightbeam.OwnerAlerts.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
