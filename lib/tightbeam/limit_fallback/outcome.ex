@@ -1,7 +1,7 @@
 defmodule Tightbeam.LimitFallback.Outcome do
   @moduledoc """
   The records of one limit-fallback evaluation's single outcome (contract c
-  v1.3, phase c1). Every function here runs inside the transaction that commits
+  v1.4, phase c1). Every function here runs inside the transaction that commits
   the outcome: the swap transaction's `on_swap_interlock` for an applied
   switch, or the withhold transaction. The evaluation and the switch itself
   run in `Tightbeam.Gateway`.
@@ -13,12 +13,29 @@ defmodule Tightbeam.LimitFallback.Outcome do
   - R11-R15: the outcome's records: one process progress attest per open
     assignment (applied only), one notice per distinct delivery owner, one
     process-only fact, one lifecycle event and one owner alert.
+  - R11 (v1.4): a withheld outcome's notices, fact and alert are emitted once
+    per limit episode of the session, the episode of
+    `Tightbeam.HarnessHealth.limit_episode_first_seq_in_txn/3`. Every
+    evaluation still writes its outcome and its lifecycle event. The notices
+    and fact are gated by the episode claim on the evaluation record
+    (`LimitFallback.claim_withheld_episode_in_txn/3`), never by the alert
+    setting; the alert is deduped by its own episode `dedupeKey`.
 
   `LimitFallback.record_outcome_in_txn/4` decides whether this is the first
   outcome of its trigger; a duplicate writes nothing.
   """
 
-  alias Tightbeam.{Assignments, ConditionFacts, EventLog, LimitFallback, Model, Org, Wakes}
+  alias Tightbeam.{
+    Assignments,
+    ConditionFacts,
+    EventLog,
+    HarnessHealth,
+    LimitFallback,
+    Model,
+    Org,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   defmodule Duplicate do
@@ -168,9 +185,12 @@ defmodule Tightbeam.LimitFallback.Outcome do
 
   @doc """
   Commit a withheld outcome: the trigger's one outcome with its named reason,
-  the failed turn's replay vehicles as today, and the notice, fact, lifecycle
-  event and owner alert. No progress attest (R11). `:duplicate` when the
-  trigger already has an outcome; nothing is written then.
+  the failed turn's replay vehicles as today, and its lifecycle event. The
+  first withheld outcome of the session's limit episode also files the
+  episode's notices and fact; a later one in the same episode files neither
+  (R11, v1.4). Each offers the episode's owner alert, which its `dedupeKey`
+  keeps to one. No progress attest (R11). `:duplicate` when the trigger
+  already has an outcome; nothing is written then.
   """
   @spec withheld_in_txn(Txn.t(), String.t(), pos_integer(), String.t()) ::
           :recorded | :duplicate
@@ -184,9 +204,10 @@ defmodule Tightbeam.LimitFallback.Outcome do
       {:duplicate, _evaluation} ->
         :duplicate
 
-      {:recorded, _evaluation} ->
+      {:recorded, evaluation} ->
         :ok = preserve_failed_intent_in_txn(txn, turn_seq)
         session = Org.get_in_txn(txn, session_key)
+        episode = HarnessHealth.limit_episode_first_seq_in_txn(txn, session_key, turn_seq)
 
         facts =
           txn
@@ -199,7 +220,9 @@ defmodule Tightbeam.LimitFallback.Outcome do
             configured: LimitFallback.configured(session),
             reason: reason,
             replay: replay_in_txn(txn, turn_seq, :replayed),
-            assignments: open_assignments_in_txn(txn, session_key)
+            assignments: open_assignments_in_txn(txn, session_key),
+            episode: episode,
+            announce: LimitFallback.claim_withheld_episode_in_txn(txn, evaluation, episode)
           })
 
         :ok = record_in_txn(txn, facts)
@@ -210,7 +233,8 @@ defmodule Tightbeam.LimitFallback.Outcome do
   @doc """
   The last resort when a withhold's records cannot be written: commit the
   outcome alone, with the failed turn's replay vehicles and a lifecycle event
-  naming the failure, so no hold outlives its evaluation.
+  naming the failure, so no hold outlives its evaluation. It claims no limit
+  episode, so the episode's next withheld outcome still announces it.
   """
   @spec withheld_bare_in_txn(Txn.t(), String.t(), pos_integer(), String.t(), String.t()) ::
           :recorded | :duplicate
@@ -246,19 +270,30 @@ defmodule Tightbeam.LimitFallback.Outcome do
 
   ## Shared records
 
+  # An applied outcome always announces. A withheld one announces (notices
+  # and fact) only when it claimed its limit episode.
   defp record_in_txn(txn, facts) do
-    notices = schedule_notices_in_txn(txn, facts)
     kind = fact_kind(facts.outcome)
+    announce? = Map.get(facts, :announce, true)
 
-    case ConditionFacts.file_in_txn(txn, %{
-           kind: kind,
-           scope: facts.session_key,
-           origin: @process,
-           owner_user_id: facts.owner_user_id
-         }) do
-      %{fact_id: _} -> :ok
-      {:error, error} -> raise ArgumentError, "#{kind} fact refused: #{inspect(error)}"
-    end
+    notices =
+      if announce? do
+        notices = schedule_notices_in_txn(txn, facts)
+
+        case ConditionFacts.file_in_txn(txn, %{
+               kind: kind,
+               scope: facts.session_key,
+               origin: @process,
+               owner_user_id: facts.owner_user_id
+             }) do
+          %{fact_id: _} -> :ok
+          {:error, error} -> raise ArgumentError, "#{kind} fact refused: #{inspect(error)}"
+        end
+
+        notices
+      else
+        []
+      end
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -271,13 +306,18 @@ defmodule Tightbeam.LimitFallback.Outcome do
       Tightbeam.OwnerAlerts.model_fallback_in_txn(txn, %{
         session_key: facts.session_key,
         turn_seq: facts.turn_seq,
-        trigger_ref: facts.trigger_ref,
+        dedupe_ref: alert_dedupe_ref(facts),
         title: alert_title(facts),
         body: notice_text(facts, facts.assignments)
       })
 
     :ok
   end
+
+  defp alert_dedupe_ref(%{outcome: :applied, trigger_ref: trigger_ref}),
+    do: {:applied, trigger_ref}
+
+  defp alert_dedupe_ref(%{outcome: :withheld, episode: episode}), do: {:withheld, episode}
 
   defp fact_kind(:applied), do: "session-model-fallback-applied"
   defp fact_kind(:withheld), do: "session-model-fallback-withheld"
@@ -591,6 +631,8 @@ defmodule Tightbeam.LimitFallback.Outcome do
       "since" => iso(facts.since),
       "trigger" => facts.trigger_ref,
       "class" => @class,
+      "episode" => facts.episode,
+      "announced" => facts.announce,
       "assignments" => Enum.map(facts.assignments, & &1.id),
       "notices" => notices
     }

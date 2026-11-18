@@ -1,5 +1,5 @@
 defmodule Tightbeam.LimitFallbackSwitchTest do
-  # Contract c v1.3, phase c1: the automatic per-archetype limit-fallback
+  # Contract c v1.4, phase c1: the automatic per-archetype limit-fallback
   # switch, end to end through a real session lane and the gateway's own turn
   # runner. A Codex session's typed usage limit holds its lane, the evaluation
   # runs the ordinary tune harness-change path as `process:tightbeam`, and the
@@ -719,6 +719,138 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     end)
   end
 
+  # Test 18 (v1.4 R11, R14, R15, V5). The session fails again with no
+  # delivered turn in between, as the retry lineage re-fails it; here each
+  # failure is a fresh message, which ends the same way.
+  test "a withheld outcome is announced once per limit episode, and an applied one still emits" do
+    with_gateway(fn ctx ->
+      key = "switch-episode"
+      session!(ctx, key)
+      lane!(ctx, key)
+
+      {:ok, _session} =
+        DB.transaction(
+          ctx.db,
+          &LimitFallback.set_restriction_in_txn(&1, key, :off, "user:" <> @owner, "test 18")
+        )
+
+      # Episode 1: three typed limits, no delivered turn between them.
+      [first, second, third] =
+        for token <- ~w(episode-one-a episode-one-b episode-one-c) do
+          deliver!(ctx, key, token)
+          {evaluation, seq} = await_hold!(ctx, key)
+          assert evaluation.() == :withheld
+          assert evaluation_outcome(ctx.db, key, seq) == {"withheld", "restricted"}
+          refute LimitFallback.held?(ctx.db, key)
+          seq
+        end
+
+      assert first < second and second < third
+      assert Org.get(ctx.db, key).harness == "codex"
+
+      assert [[@main, "blocker", nil, notice]] = notices(ctx.db, key)
+      assert notice =~ "(reason restricted)"
+      assert notice =~ "turn #{first}"
+      assert count(ctx.db, "condition_facts", key, "session-model-fallback-withheld") == 1
+      assert lifecycle_count(ctx.db, key, "session-model-fallback-withheld") == 3
+      assert alert_keys(ctx.db, key) == ["model-fallback:#{key}:withheld:#{first}"]
+
+      assert withheld_lifecycle(ctx.db, key) == [
+               {"turn:#{first}", first, true},
+               {"turn:#{second}", first, false},
+               {"turn:#{third}", first, false}
+             ]
+
+      # Every failed turn keeps today's replay vehicle, announced or not.
+      for seq <- [first, second, third] do
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                   [seq]
+                 )
+      end
+
+      # A delivered turn ends the episode.
+      :ok = GenServer.call(ctx.codex, {:set, :prompt, fn n, _text, _opts -> ok_reply(n) end})
+      delivered = deliver!(ctx, key, "episode-break")
+      await_turns_settled!(ctx.db, key)
+      assert turn_status(ctx.db, delivered) == "delivered"
+
+      # Episode 2: the next typed limit is announced once more.
+      :ok =
+        GenServer.call(
+          ctx.codex,
+          {:set, :prompt, fn _n, _text, _opts -> {:error, @codex_limit} end}
+        )
+
+      fourth = deliver!(ctx, key, "episode-two-a")
+      {evaluation, ^fourth} = await_hold!(ctx, key)
+      assert evaluation.() == :withheld
+
+      assert [[@main, "blocker", nil, _], [@main, "blocker", nil, notice]] =
+               notices(ctx.db, key)
+
+      assert notice =~ "turn #{fourth}"
+      assert count(ctx.db, "condition_facts", key, "session-model-fallback-withheld") == 2
+      assert lifecycle_count(ctx.db, key, "session-model-fallback-withheld") == 4
+
+      assert alert_keys(ctx.db, key) ==
+               Enum.sort([
+                 "model-fallback:#{key}:withheld:#{first}",
+                 "model-fallback:#{key}:withheld:#{fourth}"
+               ])
+
+      assert List.last(withheld_lifecycle(ctx.db, key)) == {"turn:#{fourth}", fourth, true}
+
+      # Later in episode 2 the session qualifies: the applied outcome emits
+      # as normal.
+      {:ok, _session} =
+        DB.transaction(
+          ctx.db,
+          &LimitFallback.set_restriction_in_txn(&1, key, :on, "user:" <> @owner, nil)
+        )
+
+      fifth = deliver!(ctx, key, "episode-two-b")
+      {evaluation, ^fifth} = await_hold!(ctx, key)
+      assert evaluation.() == :applied
+      assert evaluation_outcome(ctx.db, key, fifth) == {"applied", nil}
+      assert Org.get(ctx.db, key).harness == "claude"
+
+      assert [[@main, "fyi", nil, applied_notice]] =
+               Enum.filter(notices(ctx.db, key), &match?([_, "fyi", _, _], &1))
+
+      assert applied_notice =~ "turn #{fifth}"
+      assert count(ctx.db, "condition_facts", key, "session-model-fallback-applied") == 1
+      assert lifecycle_count(ctx.db, key, "session-model-fallback-applied") == 1
+      assert "model-fallback:#{key}:turn:#{fifth}" in alert_keys(ctx.db, key)
+      assert length(alert_keys(ctx.db, key)) == 3
+
+      # Nothing withheld moved.
+      assert length(notices(ctx.db, key)) == 3
+      assert count(ctx.db, "condition_facts", key, "session-model-fallback-withheld") == 2
+      assert lifecycle_count(ctx.db, key, "session-model-fallback-withheld") == 4
+
+      # The episode claim is on the evaluation record that announced it.
+      assert {:ok,
+              [
+                [^first, ^first],
+                [^second, nil],
+                [^third, nil],
+                [^fourth, ^fourth],
+                [^fifth, nil]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT turnSeq, withheldEpisode FROM limit_fallback_evaluations
+                 WHERE sessionKey=?1 ORDER BY turnSeq
+                 """,
+                 [key]
+               )
+    end)
+  end
+
   ## Shared assertions
 
   defp assert_withheld!(ctx, key, seq, reason) do
@@ -739,8 +871,10 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     assert count(ctx.db, "condition_facts", key, "session-model-fallback-applied") == 0
     assert lifecycle_count(ctx.db, key, "session-model-fallback-withheld") == 1
 
+    # v1.4 R15: a withheld alert is keyed by its limit episode; this is the
+    # session's only limit failure, so the episode begins at `seq`.
     assert [["model-fallback", dedupe, title, _body]] = alerts(ctx.db, key)
-    assert dedupe == "model-fallback:#{key}:turn:#{seq}"
+    assert dedupe == "model-fallback:#{key}:withheld:#{seq}"
     assert title =~ "could not switch to a fallback model"
 
     # The failed turn keeps today's vehicles once the session is not switched.
@@ -1122,6 +1256,32 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       )
 
     rows
+  end
+
+  defp alert_keys(db, key) do
+    db
+    |> alerts(key)
+    |> Enum.map(fn [_kind, dedupe, _title, _body] -> dedupe end)
+    |> Enum.sort()
+  end
+
+  # Each withheld lifecycle event of the session, in order: its trigger, the
+  # first failed turn of its limit episode, and whether it announced.
+  defp withheld_lifecycle(db, key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT detail FROM lifecycle_events
+        WHERE kind='session-model-fallback-withheld' AND subject=?1 ORDER BY id
+        """,
+        [key]
+      )
+
+    Enum.map(rows, fn [detail] ->
+      detail = JSON.decode!(detail)
+      {detail["trigger"], detail["episode"], detail["announced"]}
+    end)
   end
 
   defp retry_rows(db, seq) do
