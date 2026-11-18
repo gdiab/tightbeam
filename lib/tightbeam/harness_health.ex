@@ -2443,6 +2443,8 @@ defmodule Tightbeam.HarnessHealth do
 
         if input.failure_class == "rate-limit-dead" do
           HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
+          # Quota v3 R9(b): a later success is a release like any other (B5, R12).
+          Tightbeam.QuotaRelease.released_in_txn(txn, incident.id, input.harness, input.host)
         end
 
         EventLog.lifecycle_in_txn(
@@ -3871,7 +3873,7 @@ defmodule Tightbeam.HarnessHealth do
       action: "resume",
       requires: [],
       message:
-        "The harness remains parked until an opener or admin explicitly resumes it after the limit clears."
+        "The park releases at the provider's declared reset when its error names one, or on a later successful turn on this harness and host. Otherwise the opener, an admin, the holder's delivery owner or Main explicitly resumes it after the limit clears."
     }
 
   defp repair_guidance("auth-dead"),

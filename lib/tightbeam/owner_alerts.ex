@@ -458,8 +458,9 @@ defmodule Tightbeam.OwnerAlerts do
        when is_integer(episode) and episode > 0,
        do: "model-fallback:#{session_key}:withheld:#{episode}"
 
-  # The Claude reset Tightbeam parsed from this failure is the due time of
-  # its rate-limit-reset wake. No other provider reset is parsed on this line.
+  # The provider reset Tightbeam parsed from this failure (Claude's
+  # "resets …", or Codex's "try again at …" on the gateway's own host) is the
+  # due time of its rate-limit-reset wake.
   defp reset_at_in_txn(txn, {_, %{observationId: observation_id}})
        when is_binary(observation_id) do
     case Txn.q(txn, "SELECT dueAt FROM wakes WHERE wakeId=?1", [
