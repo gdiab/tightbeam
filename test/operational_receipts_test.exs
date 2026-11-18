@@ -470,7 +470,10 @@ defmodule Tightbeam.OperationalReceiptsTest do
           with_contract(contract, fn ->
             assert %{code: "invalid_commit_refs"} = refused(verify(ctx, card, []))
 
-            assert %{code: "invalid_commit_refs"} =
+            # 0.1.16's kept item 7 artifact route judges an artifact pair on any
+            # non-file, non-code card (same adaptation as #618 test 6): still
+            # refused, and still no receipts on these kinds.
+            assert %{code: "operational_evidence_invalid"} =
                      refused(attest(ctx, ctx.holder, artifact_pair(card, receipt)))
           end)
         end
@@ -550,11 +553,15 @@ defmodule Tightbeam.OperationalReceiptsTest do
     refute bare =~ "--receipt #{receipt.id}"
     refute bare =~ "policy"
 
-    assert %{code: "operational_receipts_required", message: hinted} =
+    # 0.1.16 keeps the WIa16 item 7 artifact route beside receipts (parity port
+    # of #618, PDO ruling A; b0 accepted this adaptation for #618 test 6). An
+    # artifact pair on a non-file policy card is judged by that route, whose
+    # attribution check refuses this work-item receipt, rather than refused with
+    # a receipt hint.
+    assert %{code: "operational_evidence_invalid", message: judged} =
              refused(attest(ctx, ctx.holder, artifact_pair(card, receipt)))
 
-    assert hinted =~ "--receipt #{receipt.id}:#{receipt.hash}"
-    refute inspect({bare, hinted}) =~ "non_file_operational_evidence_policy_inactive"
+    refute inspect({bare, judged}) =~ "non_file_operational_evidence_policy_inactive"
     assert attests(ctx, card) == []
   end
 
