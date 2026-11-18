@@ -218,7 +218,8 @@ defmodule Tightbeam.TerminalCredentialFailure do
                  "launch-preparation-evidence-v1-0112",
                  "session-identity-v1-0114",
                  "closed-assignment-cannot-proceed-reconciliation-v1-015",
-                 "artifact-process-attribution-v1-015"
+                 "artifact-process-attribution-v1-015",
+                 "user-removal-v1-016"
                ] ->
             readonly_views_from_conn(conn)
 

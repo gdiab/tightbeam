@@ -451,7 +451,7 @@ defmodule Tightbeam.UserAdminTest do
     test "initialization upgrades the predecessor users table and keeps every row", ctx do
       SchemaShapeRuntimeFixture.downgrade_user_removal!(ctx.db)
 
-      assert {:ok, [["session-identity-v1-0114"]]} =
+      assert {:ok, [["artifact-process-attribution-v1-015"]]} =
                DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
       assert {:ok, [["userId"], ["isAdmin"], ["createdAt"]]} =
@@ -464,7 +464,7 @@ defmodule Tightbeam.UserAdminTest do
       for _boot <- 1..2 do
         assert :ok = Schema.ensure_all(ctx.db)
 
-        assert {:ok, [["user-removal-v1-0114"]]} =
+        assert {:ok, [["user-removal-v1-016"]]} =
                  DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
         assert {:ok, ^users} =

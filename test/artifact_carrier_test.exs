@@ -689,7 +689,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
             "UPDATE schema_stamp SET shape=?1 WHERE shape=?2",
             [
               "closed-assignment-cannot-proceed-reconciliation-v1-015",
-              "artifact-process-attribution-v1-015"
+              "user-removal-v1-016"
             ]
           )
 

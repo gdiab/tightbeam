@@ -2,7 +2,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
   alias Tightbeam.{DB, NoticeBatcher, Schema}
-  @shape "artifact-process-attribution-v1-015"
+  @shape "user-removal-v1-016"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -1183,6 +1183,24 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
       """)
+  end
+
+  # 0.1.16's user-removal step only adds two users columns, so dropping exactly
+  # those columns and restoring the stamp recreates its predecessor,
+  # artifact-process-attribution-v1-015 (cross-line contract v2, art_a823f882).
+  def downgrade_user_removal!(db) do
+    if "removedAt" in table_columns(db, "users") do
+      assert :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN removedBy")
+      assert :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN removedAt")
+    end
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE schema_stamp SET shape='artifact-process-attribution-v1-015' WHERE shape='user-removal-v1-016'"
+             )
+
+    :ok
   end
 
   # Brings a synthetic users table created by Devices.ensure_schema/1 alone to
