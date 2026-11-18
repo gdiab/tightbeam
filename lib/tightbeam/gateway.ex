@@ -6710,6 +6710,10 @@ defmodule Tightbeam.Gateway do
                    result.projection,
                    %{"key" => setting}
                  )
+
+                 # A new owner, or a threshold set or cleared lower, can stall
+                 # items at once; a clear of the owner stops the next pass.
+                 Tightbeam.OwnerAlerts.stall_inputs_changed_in_txn(txn)
                end
 
                {:ok, stored, result}
