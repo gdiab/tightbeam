@@ -991,6 +991,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     Org.create(db, %{
       session_key: @main,
       display_name: "Main",
+      kind: "main",
+      is_built_in: true,
       owner_user_id: @owner,
       origin: "user:" <> @owner,
       archetype: @archetype,
