@@ -348,6 +348,7 @@ defmodule Tightbeam.Gateway do
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
          {Tightbeam.HarklightWakes, db: db, send_runner: Map.get(config, :harklight_send_runner)},
+         {Tightbeam.OwnerAlerts, db: db, send_runner: Map.get(config, :harklight_send_runner)},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -6817,10 +6818,61 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp config_result(db, %{params: %{action: "get", setting: setting}})
+       when setting in ["owner-alerts-user", "owner-alert-stall-ms"] do
+    item = StateResources.query_config(db, setting)
+
+    %{
+      setting: setting,
+      value: Tightbeam.OwnerAlerts.setting_value(db, setting),
+      config: item && StateResources.config(item)
+    }
+  end
+
+  defp config_result(db, %{params: %{action: "set", setting: setting, value: value}} = call)
+       when setting in ["owner-alerts-user", "owner-alert-stall-ms"] do
+    case DB.transaction(db, fn txn ->
+           case Tightbeam.OwnerAlerts.validate_setting_in_txn(txn, setting, value) do
+             {:ok, stored} ->
+               result = Org.put_setting_projected_in_txn(txn, setting, stored)
+               Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+               if result.changed do
+                 Tightbeam.Firehose.Publisher.committed_in_txn(
+                   txn,
+                   "config.updated",
+                   result.projection,
+                   %{"key" => setting}
+                 )
+               end
+
+               {:ok, stored, result}
+
+             {:error, code, message} ->
+               {:error, code, message}
+           end
+         end) do
+      {:ok, {:ok, stored, result}} ->
+        %{
+          setting: setting,
+          value: Tightbeam.OwnerAlerts.present(setting, stored),
+          changed: result.changed,
+          config: StateResources.config(result.projection)
+        }
+
+      {:ok, {:error, code, message}} ->
+        %{code: code, message: message}
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
   defp config_result(_db, _call) do
     %{
       code: "invalid",
-      message: "config supports get/set default-archetype or default-priority"
+      message:
+        "config supports get/set default-archetype, default-priority, owner-alerts-user or owner-alert-stall-ms"
     }
   end
 
