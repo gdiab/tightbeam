@@ -18,8 +18,10 @@ defmodule Tightbeam.OwnerAlerts do
   alert becomes `undelivered`. The alert follows its operation row, so a
   settlement made by boot recovery is adopted rather than repeated.
 
-  Two kinds exist. A `usage-limit` alert is created in the transaction that
-  records a usage-limit turn failure. A `stall` alert is created when an
+  Three kinds exist. A `usage-limit` alert is created in the transaction that
+  records a usage-limit turn failure. A `model-fallback` alert is created in
+  the transaction that commits a limit-fallback switch's outcome, applied or
+  withheld, and like `usage-limit` is never withdrawn as `stale`. A `stall` alert is created when an
   owner's open work item has had no progress for the stall threshold and no
   open assignment of it is held or waiting; its identity is the item and its
   anchor, the latest recorded time anything moved. Stall detection reads
@@ -408,6 +410,44 @@ defmodule Tightbeam.OwnerAlerts do
   end
 
   def usage_limit_failure_in_txn(%Txn{}, _turn, _failure_class, _result, _observed_at), do: :ok
+
+  ## (c) model-fallback outcome
+
+  @doc """
+  Create the `model-fallback` alert of one limit-fallback outcome (contract c
+  R15), inside the transaction that commits the outcome. Only a session whose
+  owner is the alert owner gets one. Its `dedupeKey` is
+  `model-fallback:<sessionKey>:<trigger>`; the shared creation path, sender,
+  retry, undelivered and `off` rules apply unchanged, and like `usage-limit`
+  it is never withdrawn as `stale`.
+  """
+  @spec model_fallback_in_txn(Txn.t(), %{
+          required(:session_key) => String.t(),
+          required(:trigger_ref) => String.t(),
+          required(:title) => String.t(),
+          required(:body) => String.t(),
+          optional(:turn_seq) => pos_integer() | nil
+        }) :: :ok
+  def model_fallback_in_txn(
+        %Txn{} = txn,
+        %{session_key: session_key, trigger_ref: trigger_ref, title: title, body: body} = input
+      ) do
+    with owner when is_binary(owner) <- owner_in_txn(txn),
+         [[^owner]] <-
+           Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      create_in_txn(txn, %{
+        kind: "model-fallback",
+        dedupe_key: "model-fallback:#{session_key}:#{trigger_ref}",
+        owner: owner,
+        session_key: session_key,
+        turn_seq: Map.get(input, :turn_seq),
+        title: title,
+        body: body
+      })
+    end
+
+    :ok
+  end
 
   # A session's limit episode runs from its first usage-limit failure to its
   # next delivered turn. Its first failure is the earliest rate-limit-dead
