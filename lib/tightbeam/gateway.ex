@@ -3773,9 +3773,13 @@ defmodule Tightbeam.Gateway do
 
               case hold do
                 {:held, evidence} ->
+                  # R5 / N1: the evaluation starts first, in its own supervised
+                  # task. This closure runs in the lane after the terminal
+                  # commit; if anything after the start raises, the lane
+                  # crashes but the evaluation still ends the hold.
                   fn ->
-                    if is_function(health_publication, 0), do: health_publication.()
                     start_limit_fallback_evaluation(config, turn.session_key, turn.seq, evidence)
+                    publish_held_failure_health(config, health_publication)
                   end
 
                 :none ->
@@ -8586,6 +8590,8 @@ defmodule Tightbeam.Gateway do
   end
 
   # Runs after the failed turn's terminal commit, in the lane's finish step.
+  # The task is a child of `TurnTaskSupervisor`, not linked to the lane, so a
+  # lane that crashes after this call does not stop the evaluation.
   # `:limit_fallback_runner` is a test seam that receives the evaluation
   # instead of a task starting it.
   defp start_limit_fallback_evaluation(config, session_key, turn_seq, evidence) do
@@ -8603,6 +8609,18 @@ defmodule Tightbeam.Gateway do
     end
   catch
     :exit, reason -> limit_fallback_not_started(config, session_key, turn_seq, {:exit, reason})
+  end
+
+  # The held failed turn's health publication, after its evaluation started.
+  # `:on_held_failure_publication` is a test probe run at this point, so a
+  # test can make the publication raise.
+  defp publish_held_failure_health(config, publication) do
+    case config[:on_held_failure_publication] do
+      probe when is_function(probe, 0) -> probe.()
+      _ -> :ok
+    end
+
+    if is_function(publication, 0), do: publication.()
   end
 
   defp limit_fallback_not_started(config, session_key, turn_seq, why) do
@@ -8796,16 +8814,14 @@ defmodule Tightbeam.Gateway do
         end
       end)
 
+    # `from` is this evaluation's read, taken before the tune lock. The
+    # interlock re-judges it, and the marker, against the row the swap replaces.
     interlock_ctx = %{
       session_key: session.session_key,
       turn_seq: turn_seq,
       evidence: evidence,
       disposition: disposition,
-      from: %{
-        harness: session.harness,
-        model: session.model,
-        provider: to_string(session.provider)
-      },
+      from: LimitFallback.Outcome.engine_tuple(session),
       to: %{harness: plan.harness, model: fallback.model}
     }
 
@@ -8815,7 +8831,7 @@ defmodule Tightbeam.Gateway do
       session_key: session.session_key,
       params: limit_fallback_tune_params(plan.harness, fallback),
       handoff_statement: statement,
-      on_swap_interlock: &LimitFallback.Outcome.applied_in_txn(&1, interlock_ctx)
+      on_swap_interlock: &LimitFallback.Outcome.applied_in_txn(&1, &2, interlock_ctx)
     }
 
     case tune_result(config, db, call) do
@@ -8824,6 +8840,10 @@ defmodule Tightbeam.Gateway do
           :duplicate -> :applied
           _ -> {:withheld, "switch-failed:no_outcome"}
         end
+
+      # The interlock rolled the swap back: the premise changed under the lock.
+      %{limit_fallback_withheld: reason} when is_binary(reason) ->
+        {:withheld, reason}
 
       %{code: code} when is_binary(code) ->
         {:withheld, "switch-failed:" <> code}
@@ -9336,9 +9356,16 @@ defmodule Tightbeam.Gateway do
       {:ok, destination_adapter, destination_sid, handoff_through_seq} ->
         source_pointer = Org.current_pointer(db, session.session_key)
 
+        interlock = Map.get(call, :on_swap_interlock)
+
         committed =
           DB.transaction(db, fn txn ->
             {record_model, record_harness} = read_recorded_model(txn, session.session_key)
+
+            # An arity-2 interlock also receives the sessions row this swap
+            # replaces, read in this transaction, to re-judge its own premise.
+            predecessor =
+              if is_function(interlock, 2), do: Org.get_in_txn(txn, session.session_key)
 
             case Org.swap_model_in_txn(
                    txn,
@@ -9356,9 +9383,10 @@ defmodule Tightbeam.Gateway do
             # fallback switch sets it again in its own interlock, below.
             LimitFallback.clear_fallback_active_in_txn(txn, session.session_key)
 
-            case Map.get(call, :on_swap_interlock) do
-              fun when is_function(fun, 1) -> fun.(txn)
-              _ -> :ok
+            cond do
+              is_function(interlock, 2) -> interlock.(txn, predecessor)
+              is_function(interlock, 1) -> interlock.(txn)
+              true -> :ok
             end
 
             {:appended, marker} =
@@ -9416,6 +9444,7 @@ defmodule Tightbeam.Gateway do
             )
             |> Map.merge(%{cleanup_status: cleanup.status, source_active: true})
             |> Map.merge(Map.drop(cleanup, [:status, :diagnostic]))
+            |> Map.merge(limit_fallback_withheld(error))
         end
 
       {:candidate_prepare_failed, reason, sid, cleanup} ->
@@ -9448,6 +9477,13 @@ defmodule Tightbeam.Gateway do
         )
     end
   end
+
+  # A limit-fallback interlock that rolled the swap back names the reason its
+  # evaluation is withheld with; the evaluation reads it from the tune result.
+  defp limit_fallback_withheld(%LimitFallback.Outcome.Withheld{reason: reason}),
+    do: %{limit_fallback_withheld: reason}
+
+  defp limit_fallback_withheld(_error), do: %{}
 
   defp durable_session_handoff(db, session_key) do
     {:ok, {through_seq, rows}} =
