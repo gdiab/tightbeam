@@ -1960,6 +1960,34 @@ defmodule Tightbeam.Gateway do
   defp repair_assignment(_db, _assignment_id),
     do: {:error, "invalid_request", "repair-assignment requires assignmentId"}
 
+  # A resume releases a quota park for every session on the shared key, so it
+  # is narrower than the other repairs: only the opener, an admin, the holder's
+  # delivery owner or Main (quota v3 R9(c)). A session owned by the opening
+  # user is not, on that ground alone, any of these.
+  defp repair_authorized(db, %{params: %{action: "resume"}} = call, assignment) do
+    allowed =
+      case call.principal do
+        {:user, user} ->
+          assignment.opened_by_user == user or admin_caller?(db, call)
+
+        {:session, session} ->
+          assignment.opened_by_session == session or admin_caller?(db, call) or
+            session in resume_offices(db, assignment)
+
+        {:process, _} ->
+          true
+
+        _ ->
+          false
+      end
+
+    if allowed,
+      do: :ok,
+      else:
+        {:error, "not_authorized",
+         "assignment resume requires its opener, an admin, the holder's delivery owner or Main"}
+  end
+
   defp repair_authorized(db, call, assignment) do
     allowed =
       case call.principal do
@@ -1981,6 +2009,34 @@ defmodule Tightbeam.Gateway do
     if allowed,
       do: :ok,
       else: {:error, "not_authorized", "assignment repair requires its opener or an admin"}
+  end
+
+  # The assignment's current delivery owner (the recipient its terminal notice
+  # would reach) and the holder's owner's Main.
+  defp resume_offices(db, assignment) do
+    {:ok, offices} =
+      DB.transaction(db, fn txn ->
+        owner =
+          case Tightbeam.Wakes.delivery_owner_in_txn(txn, assignment.id) do
+            {:ok, recipient} -> [recipient]
+            {:error, _} -> []
+          end
+
+        main =
+          case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
+                 assignment.holder
+               ]) do
+            [[owner_user_id]] when is_binary(owner_user_id) ->
+              [Org.personal_session_key(owner_user_id)]
+
+            _ ->
+              []
+          end
+
+        owner ++ main
+      end)
+
+    offices
   end
 
   defp repair_holder(db, assignment) do
@@ -2068,16 +2124,34 @@ defmodule Tightbeam.Gateway do
     coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
     key = adapter_key(session)
 
+    # Companion v1.1 A1: the result names every durable effect it committed,
+    # whatever a later step does; `ok:false` only for a step that failed.
     case AdapterCoordinator.close_adapter(coordinator, key) do
       :ok ->
-        if incident.failure_class == "rate-limit-dead" do
-          :ok = HarnessProcess.complete_park(db, key)
+        park =
+          if incident.failure_class == "rate-limit-dead",
+            do: release_quota_park(db, call, session, key, incident),
+            else: "not_parked"
+
+        case guarded_rerun(db, call, assignment, incident) do
+          {:ok, rerun} ->
+            %{
+              ok: true,
+              action: action,
+              incidentId: incident.id,
+              assignmentId: assignment.id,
+              park: park,
+              rerun: rerun
+            }
+
+          {:error, failure} ->
+            Map.put(failure, :park, park)
         end
 
-        rerun_latest(db, call, assignment, incident)
-
       {:error, reason} ->
-        repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
+        reason
+        |> repair_failed(operation: "close_adapter", phase: "repair_#{action}")
+        |> Map.put(:park, "unchanged")
     end
   end
 
@@ -2184,6 +2258,149 @@ defmodule Tightbeam.Gateway do
             repair_failed(reason, operation: "repair_terminal", phase: "repair_rerun")
         end
     end
+  end
+
+  # Quota v3 R9(c): an explicit resume removes the park fence and records the
+  # release with its actor and time; the release then does what every release
+  # does (companion B5, v3 R12).
+  defp release_quota_park(db, call, session, key, incident) do
+    {:ok, park} =
+      DB.transaction(db, fn txn ->
+        if HarnessProcess.parked_in_txn?(txn, key) do
+          HarnessProcess.complete_park_in_txn(txn, key)
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "rate_limit_hold_released",
+            incident.id,
+            JSON.encode!(%{
+              cause: "explicit_resume",
+              actor: repair_principal(call.principal),
+              releasedAt: System.system_time(:millisecond),
+              assignmentId: call.params[:assignment_id]
+            })
+          )
+
+          Tightbeam.QuotaRelease.released_in_txn(
+            txn,
+            incident.id,
+            to_string(session.harness),
+            session.host
+          )
+
+          "released"
+        else
+          "not_parked"
+        end
+      end)
+
+    park
+  end
+
+  # Companion v1.1 A2: a resume or restart reruns a turn only when it is the
+  # assignment's, its failure observation belongs to the incident this repair
+  # covers, its outcome is not unknown, and nothing later superseded it.
+  # Otherwise nothing is enqueued and the reason is reported.
+  defp guarded_rerun(db, call, assignment, incident) do
+    {:ok, eligibility} =
+      DB.transaction(db, fn txn -> rerun_eligibility_in_txn(txn, call, assignment, incident) end)
+
+    case eligibility do
+      {:none, reason} ->
+        {:ok, %{state: "none", reason: reason}}
+
+      {:eligible, source_seq} ->
+        principal = repair_principal(call.principal)
+        repair_key = call.params[:idempotency_key]
+
+        case Ledger.repair_terminal(db, source_seq, assignment.id, repair_key, principal) do
+          {:ok, {status, attempt_seq, _attempt_id}} ->
+            LaneManager.ensure_lane(
+              Map.get(call, :lane_manager, Tightbeam.LaneManager),
+              assignment.holder
+            )
+
+            state = if status == :duplicate, do: "duplicate", else: "queued"
+            {:ok, %{state: state, sourceTurnSeq: source_seq, attemptTurnSeq: attempt_seq}}
+
+          {:error, reason} ->
+            {:error, repair_failed(reason, operation: "repair_terminal", phase: "repair_rerun")}
+        end
+    end
+  end
+
+  defp rerun_eligibility_in_txn(txn, call, assignment, incident) do
+    source =
+      case call.params[:turn_seq] do
+        seq when is_integer(seq) ->
+          Txn.q(txn, "SELECT seq,status,assignmentId FROM turns WHERE seq=?1", [seq])
+
+        _ ->
+          Txn.q(
+            txn,
+            """
+            SELECT seq,status,assignmentId FROM turns
+            WHERE assignmentId=?1 AND status IN ('failed','failed_unknown')
+            ORDER BY seq DESC LIMIT 1
+            """,
+            [assignment.id]
+          )
+      end
+
+    assignment_id = assignment.id
+
+    case source do
+      [[seq, status, ^assignment_id]] when status in ["failed", "failed_unknown"] ->
+        cond do
+          status == "failed_unknown" ->
+            {:none, "unknown_effect"}
+
+          not from_incident?(txn, seq, incident) ->
+            {:none, "not_from_incident"}
+
+          Tightbeam.QuotaRelease.post_activity_quota_failure_in_txn?(txn, seq) ->
+            {:none, "unknown_effect"}
+
+          superseded?(txn, seq, assignment.id) ->
+            {:none, "superseded"}
+
+          true ->
+            {:eligible, seq}
+        end
+
+      _ ->
+        {:none, "no_eligible_turn"}
+    end
+  end
+
+  # (ii) the turn's own failure observation is attached to this incident.
+  defp from_incident?(txn, seq, %{id: incident_id, failure_class: failure_class})
+       when is_binary(incident_id) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM harness_health_observations WHERE correlationId=?1 AND incidentId=?2 LIMIT 1",
+      ["harness-turn:#{seq}:#{failure_class}", incident_id]
+    ) != []
+  end
+
+  defp from_incident?(_txn, _seq, _incident), do: false
+
+  # (iv) a later delivered turn of the assignment, or an earlier rerun,
+  # redelivery or retry of this one, supersedes it.
+  defp superseded?(txn, seq, assignment_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 WHERE
+        EXISTS (SELECT 1 FROM turns WHERE assignmentId=?2 AND seq>?1 AND status='delivered')
+        OR EXISTS (SELECT 1 FROM turn_repair_attempts WHERE sourceSeq=?1)
+        OR EXISTS (SELECT 1 FROM health_redelivery_attempts
+                   WHERE sourceTurnSeq=?1 AND redeliveryTurnSeq IS NOT NULL)
+        OR EXISTS (SELECT 1 FROM wake_retry_attempts
+                   WHERE sourceTurnSeq=?1 AND retryWakeId IS NOT NULL)
+      """,
+      [seq, assignment_id]
+    ) != []
   end
 
   # The public message stays the inspected classification; the reason's own
