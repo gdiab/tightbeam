@@ -4759,7 +4759,7 @@ defmodule Tightbeam.Wire.Router do
     "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
     "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
     "spawn" =>
-      ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id owner_user_id)a,
+      ~w(archetype context display_name effort handle harness host idempotency_key limit_fallback limit_fallback_reason model overrides work_item_id owner_user_id)a,
     "subtree-guidance-set" => ~w(name archetypes text)a,
     "subtree-guidance-show" => ~w(session_key)a,
     "subtree-guidance-withdraw" => ~w(name)a,
@@ -4767,7 +4767,7 @@ defmodule Tightbeam.Wire.Router do
     "toplines" => ~w(origin owner quiet_over session spec spec_sha state)a,
     "transcript" => ~w(after before limit name session_key)a,
     "tune" =>
-      ~w(adopted context display_name effort fast_mode harness host idempotency_key mode model reasoning_level session_key setting skill guidance thinking_level verbosity)a,
+      ~w(adopted context display_name effort fast_mode harness host idempotency_key limit_fallback limit_fallback_reason mode model reasoning_level session_key setting skill guidance thinking_level verbosity)a,
     "unlearn" => ~w(idempotency_key name)a,
     "wake" =>
       ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,

@@ -686,6 +686,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             handle,
             host,
             work_item_id,
+            limit_fallback,
+            limit_fallback_reason,
         } => {
             let mut params = vec![
                 string_field("displayName", display_name),
@@ -705,6 +707,11 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 ("handle", handle.clone().map(Some)),
                 ("host", host.clone().map(Some)),
                 ("workItemId", work_item_id.clone().map(Some)),
+                ("limitFallback", limit_fallback.clone().map(Some)),
+                (
+                    "limitFallbackReason",
+                    limit_fallback_reason.clone().map(Some),
+                ),
             ] {
                 match value {
                     Some(Some(value)) => params.push(string_field(name, &value)),
@@ -838,6 +845,16 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     string_field("setting", "set_host"),
                     string_field("host", host),
                 ],
+                TuneControl::LimitFallback { state, reason } => {
+                    let mut params = vec![
+                        string_field("setting", "set_limit_fallback"),
+                        string_field("limitFallback", state),
+                    ];
+                    if let Some(reason) = reason {
+                        params.push(string_field("limitFallbackReason", reason));
+                    }
+                    params
+                }
             };
             Ok(request(
                 identity,
