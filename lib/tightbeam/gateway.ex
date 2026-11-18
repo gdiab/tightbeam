@@ -255,6 +255,10 @@ defmodule Tightbeam.Gateway do
         Logger.error("assignment inactivity recovery deferred: #{Exception.message(error)}")
     end
 
+    # Contract c R5: no limit-fallback hold outlives its evaluation. Holds left
+    # by a stopped gateway are released before the lane manager starts.
+    :ok = release_interrupted_limit_fallback_holds(db)
+
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 
@@ -3747,15 +3751,36 @@ defmodule Tightbeam.Gateway do
                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, prewrite_evidence)
               end
 
-              Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
+              # Contract c R4 T1 / R5: a typed usage limit on a session whose
+              # archetype declares `[limit_fallback]` holds the session's lane in
+              # this same transaction. The failed turn's replay vehicles are then
+              # written by the evaluation's outcome (R9b), not here.
+              hold = limit_fallback_hold_in_txn(txn, active_session, turn, raw_reason)
+              held? = match?({:held, _evidence}, hold)
 
-              HarnessHealth.observe_turn_failure_in_txn(
-                txn,
-                active_session,
-                turn,
-                failed_stage,
-                raw_reason
-              )
+              unless held?,
+                do: Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
+
+              health_publication =
+                HarnessHealth.observe_turn_failure_in_txn(
+                  txn,
+                  active_session,
+                  turn,
+                  failed_stage,
+                  raw_reason,
+                  defer_redelivery: held?
+                )
+
+              case hold do
+                {:held, evidence} ->
+                  fn ->
+                    if is_function(health_publication, 0), do: health_publication.()
+                    start_limit_fallback_evaluation(config, turn.session_key, turn.seq, evidence)
+                  end
+
+                :none ->
+                  health_publication
+              end
             end
 
             {:error,
@@ -8333,79 +8358,34 @@ defmodule Tightbeam.Gateway do
 
           {:ok, session} ->
             harness = p.harness
-            module = Enum.find(Harness.all(), &(&1.wire_name() == harness))
 
-            cond do
-              is_nil(module) ->
-                tune_error("unknown_harness", "unknown harness: #{harness}")
+            case harness_change_prechecks(config, db, session, harness, p) do
+              {:error, denial} ->
+                denial
 
-              harness == session.harness ->
-                tune_error(
-                  "same_harness",
-                  "#{harness} is already the resident harness; omit --harness for a model change"
-                )
-
-              true ->
-                harness_atom = module.id()
-
-                # A harness boundary never inherits the source model or effort.
-                # The target catalog composes its own supported default effort.
-
-                named = Model.named_fields(p)
-
-                selection_base =
-                  if Map.has_key?(named, :family),
-                    do: nil,
-                    else: %{module.default_model() | effort: nil}
-
-                model =
-                  compose_model_selection(
-                    session.host,
-                    harness,
-                    nil,
-                    resolve_selection(session.host, harness, p, selection_base)
-                  )
-
-                with :ok <- validate_credential(config, harness, session.host, model),
-                     {:ok, routed} <-
-                       validate_catalog_model(
-                         session.host,
-                         harness,
-                         model,
-                         from_default?(p)
-                       ),
-                     :ok <-
-                       Spinup.ensure_ready(
-                         config,
-                         harness_atom,
-                         session.host,
-                         spinup_opts(config, db, harness, session.host, model)
-                       ) do
-                  case at_tune_boundary(
-                         config,
-                         db,
-                         session.session_key,
-                         fn ->
-                           run_session_mutation(session.session_key, fn ->
-                             apply_harness_change(
-                               config,
-                               db,
-                               call,
-                               session,
-                               harness,
-                               harness_atom,
-                               model,
-                               routed.provider
-                             )
-                           end)
-                         end,
-                         allow_queued: true
-                       ) do
-                    {:ok, result} -> result
-                    {:error, :turn_in_progress} -> turn_in_progress_error()
-                  end
-                else
-                  {:error, denial} -> normalize_tune_denial(denial)
+              {:ok, %{harness_atom: harness_atom, model: model, routed: routed}} ->
+                case at_tune_boundary(
+                       config,
+                       db,
+                       session.session_key,
+                       fn ->
+                         run_session_mutation(session.session_key, fn ->
+                           apply_harness_change(
+                             config,
+                             db,
+                             call,
+                             session,
+                             harness,
+                             harness_atom,
+                             model,
+                             routed.provider
+                           )
+                         end)
+                       end,
+                       allow_queued: true
+                     ) do
+                  {:ok, result} -> result
+                  {:error, :turn_in_progress} -> turn_in_progress_error()
                 end
             end
         end
@@ -8516,6 +8496,402 @@ defmodule Tightbeam.Gateway do
       true ->
         %{ok: false, code: "unsupported", message: "tune does not support #{p[:setting]} yet"}
     end
+  end
+
+  # The harness-change prechecks of `tune --harness`, on the session's CURRENT
+  # host: the target selection the tune composes, then `validate_credential`,
+  # `validate_catalog_model` and `Spinup.ensure_ready`. The limit-fallback
+  # switch runs exactly these as its R4.7 qualification before it tunes.
+  defp harness_change_prechecks(config, db, session, harness, p) do
+    module = Enum.find(Harness.all(), &(&1.wire_name() == harness))
+
+    cond do
+      is_nil(module) ->
+        {:error, tune_error("unknown_harness", "unknown harness: #{harness}")}
+
+      harness == session.harness ->
+        {:error,
+         tune_error(
+           "same_harness",
+           "#{harness} is already the resident harness; omit --harness for a model change"
+         )}
+
+      true ->
+        harness_atom = module.id()
+
+        # A harness boundary never inherits the source model or effort.
+        # The target catalog composes its own supported default effort.
+
+        named = Model.named_fields(p)
+
+        selection_base =
+          if Map.has_key?(named, :family),
+            do: nil,
+            else: %{module.default_model() | effort: nil}
+
+        model =
+          compose_model_selection(
+            session.host,
+            harness,
+            nil,
+            resolve_selection(session.host, harness, p, selection_base)
+          )
+
+        with :ok <- validate_credential(config, harness, session.host, model),
+             {:ok, routed} <-
+               validate_catalog_model(
+                 session.host,
+                 harness,
+                 model,
+                 from_default?(p)
+               ),
+             :ok <-
+               Spinup.ensure_ready(
+                 config,
+                 harness_atom,
+                 session.host,
+                 spinup_opts(config, db, harness, session.host, model)
+               ) do
+          {:ok, %{harness_atom: harness_atom, model: model, routed: routed}}
+        else
+          {:error, denial} -> {:error, normalize_tune_denial(denial)}
+        end
+    end
+  end
+
+  ## Limit-fallback switch (contract c v1.3, phase c1)
+  #
+  # T1: a session's own turn ends as a TYPED usage-limit failure and its
+  # archetype declares `[limit_fallback]`. The failed turn's terminal
+  # transaction sets a claim hold on the session's lane (R5) and defers the
+  # turn's replay vehicles; after that commit one evaluation runs OFF the
+  # lane, in a supervised task, because the switch is the ordinary tune
+  # harness-change path and that path waits on the lane's turn boundary and
+  # calls the destination adapter. No DB transaction is open across any
+  # adapter call: qualification reads, the tune (whose own swap transaction
+  # commits the applied outcome through `on_swap_interlock`), and the
+  # withhold transaction are separate steps. Every evaluation ends in exactly
+  # one outcome whose commit releases the hold; a hold left by a stopped
+  # gateway is released at the next start, before any lane claims
+  # (`release_interrupted_limit_fallback_holds/1`).
+
+  defp limit_fallback_hold_in_txn(txn, session, turn, raw_reason) do
+    with evidence when is_binary(evidence) <- HarnessHealth.typed_limit_evidence(raw_reason),
+         %{} <- LimitFallback.configured(session),
+         {:held, _evaluation} <- LimitFallback.hold_in_txn(txn, turn.session_key, turn.seq) do
+      {:held, evidence}
+    else
+      _ -> :none
+    end
+  end
+
+  # Runs after the failed turn's terminal commit, in the lane's finish step.
+  # `:limit_fallback_runner` is a test seam that receives the evaluation
+  # instead of a task starting it.
+  defp start_limit_fallback_evaluation(config, session_key, turn_seq, evidence) do
+    evaluation = fn -> evaluate_limit_fallback(config, session_key, turn_seq, evidence) end
+
+    case config[:limit_fallback_runner] do
+      runner when is_function(runner, 1) ->
+        runner.(evaluation)
+
+      _ ->
+        case Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, evaluation) do
+          {:ok, _pid} -> :ok
+          other -> limit_fallback_not_started(config, session_key, turn_seq, other)
+        end
+    end
+  catch
+    :exit, reason -> limit_fallback_not_started(config, session_key, turn_seq, {:exit, reason})
+  end
+
+  defp limit_fallback_not_started(config, session_key, turn_seq, why) do
+    Logger.error(
+      "limit fallback evaluation for #{session_key} turn #{turn_seq} did not start: " <>
+        inspect(why, limit: 20)
+    )
+
+    db = Map.get(config, :db, Tightbeam.DB)
+    withhold_limit_fallback(db, session_key, turn_seq, "switch-failed:not-started")
+    Tightbeam.SessionLane.nudge(session_key)
+    :ok
+  end
+
+  @doc false
+  # One limit-fallback evaluation of a held failed turn (contract c R4-R15).
+  # Re-entry for the same turn yields no second outcome: a trigger that is
+  # already decided returns `:duplicate` and writes nothing.
+  @spec evaluate_limit_fallback(map(), String.t(), pos_integer(), String.t()) ::
+          :applied | :withheld | :duplicate | :not_held | :hold_standing
+  def evaluate_limit_fallback(config, session_key, turn_seq, evidence) do
+    db = Map.get(config, :db, Tightbeam.DB)
+
+    result =
+      :global.trans({{__MODULE__, :limit_fallback, session_key}, self()}, fn ->
+        case limit_fallback_state(db, session_key, turn_seq) do
+          :held ->
+            decision =
+              try do
+                limit_fallback_decision(config, db, session_key, turn_seq, evidence)
+              rescue
+                error ->
+                  Logger.error(
+                    "limit fallback evaluation for #{session_key} turn #{turn_seq} raised: " <>
+                      Exception.message(error)
+                  )
+
+                  {:withheld, "switch-failed:" <> limit_fallback_failure_name(error)}
+              catch
+                kind, reason ->
+                  Logger.error(
+                    "limit fallback evaluation for #{session_key} turn #{turn_seq} " <>
+                      "#{kind}: #{inspect(reason, limit: 20)}"
+                  )
+
+                  {:withheld, "switch-failed:#{kind}"}
+              end
+
+            case decision do
+              :applied -> :applied
+              {:withheld, reason} -> withhold_limit_fallback(db, session_key, turn_seq, reason)
+            end
+
+          other ->
+            other
+        end
+      end)
+
+    # The outcome's commit released the hold; let the lane claim again.
+    Tightbeam.SessionLane.nudge(session_key)
+    result
+  end
+
+  defp limit_fallback_state(db, session_key, turn_seq) do
+    {:ok, evaluation} =
+      DB.transaction(db, &LimitFallback.evaluation_in_txn(&1, session_key, {:turn, turn_seq}))
+
+    case evaluation do
+      nil -> :not_held
+      %{outcome: nil} -> :held
+      %{} -> :duplicate
+    end
+  end
+
+  defp limit_fallback_failure_name(%{__struct__: module}),
+    do: module |> Module.split() |> List.last()
+
+  # R4: the conditions are checked in the contract's order, each failure
+  # withheld with its named reason (R11). Nothing here calls a provider (V3).
+  defp limit_fallback_decision(config, db, session_key, turn_seq, evidence) do
+    session = Org.get(db, session_key)
+    fallback = LimitFallback.configured(session)
+
+    cond do
+      is_nil(fallback) ->
+        {:withheld, "unqualified:R4.1"}
+
+      LimitFallback.restricted?(session) ->
+        {:withheld, "restricted"}
+
+      session_key == Org.personal_session_key(session.owner_user_id) ->
+        {:withheld, "main"}
+
+      LimitFallback.fallback_active?(session) ->
+        {:withheld, "already-on-fallback"}
+
+      is_nil(session.model) ->
+        # The pre-switch tuple is the switch-back target; without it there is
+        # nothing to record or to name.
+        {:withheld, "switch-failed:model_unknown"}
+
+      true ->
+        with {:ok, plan} <- qualify_limit_fallback(config, db, session, fallback) do
+          switch_limit_fallback(config, db, session, fallback, plan, turn_seq, evidence)
+        end
+    end
+  end
+
+  defp qualify_limit_fallback(config, db, session, fallback) do
+    case ModelCatalog.route(session.host, fallback.model, ModelCatalog) do
+      {:error, _unroutable} ->
+        {:withheld, "unqualified:R4.7"}
+
+      {:ok, %{harness: harness, provider: provider}} ->
+        cond do
+          # R1: a manifest harness must be the routed one.
+          is_binary(fallback.harness) and fallback.harness != harness ->
+            {:withheld, "unqualified:R1-harness"}
+
+          # R4.5: a different harness AND a different provider credential.
+          harness == session.harness or provider == to_string(session.provider) ->
+            {:withheld, "unqualified:R4.5"}
+
+          # R4.6: no open limit, auth or terminal-credential incident on the
+          # fallback's (harness, host).
+          limit_fallback_incident_open?(db, harness, session.host) ->
+            {:withheld, "unqualified:R4.6"}
+
+          true ->
+            # R4.7: the existing harness-change prechecks on the current host.
+            case harness_change_prechecks(
+                   config,
+                   db,
+                   session,
+                   harness,
+                   limit_fallback_tune_params(harness, fallback)
+                 ) do
+              {:ok, _plan} -> {:ok, %{harness: harness, provider: provider}}
+              {:error, _denial} -> {:withheld, "unqualified:R4.7"}
+            end
+        end
+    end
+  end
+
+  defp limit_fallback_incident_open?(db, harness, host) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT 1 FROM harness_health_incidents
+        WHERE harness=?1 AND host=?2 AND state='open'
+          AND failureClass IN ('rate-limit-dead','auth-dead')
+        LIMIT 1
+        """,
+        [harness, host]
+      )
+
+    rows != [] or TerminalCredentialFailure.open?(db, host, harness)
+  end
+
+  # R6: the configured model and effort are named tune fields, so the harness
+  # boundary composes exactly the configured tuple.
+  defp limit_fallback_tune_params(harness, %{model: %Model{} = model}) do
+    %{
+      setting: "set_harness",
+      harness: harness,
+      model: model.family,
+      effort: model.effort,
+      context: model.context
+    }
+  end
+
+  # R6: the switch IS `tune --harness --model --effort`, run as the process
+  # principal. The applied outcome's records commit in its swap transaction
+  # (R5 interlock); any failure after the prechecks is withheld
+  # `switch-failed:<code>` and the session stays on its tuple.
+  defp switch_limit_fallback(config, db, session, fallback, plan, turn_seq, evidence) do
+    # R9a/R9b: classify before anything can replay. A `replayed` turn gets its
+    # existing vehicles now, at their existing timing; an `unknown_effect`
+    # turn gets none, and the new engine is told why in the handoff.
+    {:ok, {disposition, statement}} =
+      DB.transaction(db, fn txn ->
+        case LimitFallback.Outcome.classify_in_txn(txn, turn_seq) do
+          :replayed ->
+            :ok = LimitFallback.Outcome.preserve_failed_intent_in_txn(txn, turn_seq)
+            {:replayed, nil}
+
+          :unknown_effect ->
+            {:unknown_effect,
+             LimitFallback.Outcome.unknown_effect_statement_in_txn(txn, turn_seq)}
+        end
+      end)
+
+    interlock_ctx = %{
+      session_key: session.session_key,
+      turn_seq: turn_seq,
+      evidence: evidence,
+      disposition: disposition,
+      from: %{
+        harness: session.harness,
+        model: session.model,
+        provider: to_string(session.provider)
+      },
+      to: %{harness: plan.harness, model: fallback.model}
+    }
+
+    call = %{
+      origin: LimitFallback.process_principal(),
+      principal: {:process, "tightbeam"},
+      session_key: session.session_key,
+      params: limit_fallback_tune_params(plan.harness, fallback),
+      handoff_statement: statement,
+      on_swap_interlock: &LimitFallback.Outcome.applied_in_txn(&1, interlock_ctx)
+    }
+
+    case tune_result(config, db, call) do
+      %{ok: true} ->
+        case limit_fallback_state(db, session.session_key, turn_seq) do
+          :duplicate -> :applied
+          _ -> {:withheld, "switch-failed:no_outcome"}
+        end
+
+      %{code: code} when is_binary(code) ->
+        {:withheld, "switch-failed:" <> code}
+
+      other ->
+        {:withheld, "switch-failed:" <> inspect(other, limit: 5)}
+    end
+  end
+
+  # The withhold transaction: one outcome with its reason, the failed turn's
+  # vehicles as today, and the R11/R13-R15 records. If the records cannot be
+  # written, the outcome still commits alone, so the hold never outlives the
+  # evaluation.
+  defp withhold_limit_fallback(db, session_key, turn_seq, reason) do
+    case DB.transaction(db, fn txn ->
+           LimitFallback.Outcome.withheld_in_txn(txn, session_key, turn_seq, reason)
+         end) do
+      {:ok, :recorded} ->
+        :withheld
+
+      {:ok, :duplicate} ->
+        :duplicate
+
+      {:error, error} ->
+        Logger.error(
+          "limit fallback withhold records for #{session_key} turn #{turn_seq} failed: " <>
+            inspect(error, limit: 20)
+        )
+
+        case DB.transaction(db, fn txn ->
+               LimitFallback.Outcome.withheld_bare_in_txn(
+                 txn,
+                 session_key,
+                 turn_seq,
+                 reason,
+                 inspect(error, limit: 10)
+               )
+             end) do
+          {:ok, :recorded} ->
+            :withheld
+
+          {:ok, :duplicate} ->
+            :duplicate
+
+          {:error, bare_error} ->
+            # The hold stands; the next gateway start releases it.
+            Logger.error(
+              "limit fallback outcome for #{session_key} turn #{turn_seq} could not commit: " <>
+                inspect(bare_error, limit: 20)
+            )
+
+            :hold_standing
+        end
+    end
+  end
+
+  @doc false
+  # R5 restart: before any lane claims, every hold with no committed outcome
+  # is released with a withheld `switch-failed:interrupted` outcome for the
+  # same trigger. The swap and its interlock records commit together, so a
+  # hold without an outcome means nothing was swapped.
+  @spec release_interrupted_limit_fallback_holds(DB.server()) :: :ok
+  def release_interrupted_limit_fallback_holds(db) do
+    {:ok, holds} = DB.transaction(db, &LimitFallback.outstanding_holds_in_txn/1)
+
+    Enum.each(holds, fn %{session_key: session_key, trigger: {:turn, turn_seq}} ->
+      withhold_limit_fallback(db, session_key, turn_seq, "switch-failed:interrupted")
+    end)
   end
 
   # Contract c R10: `tune --limit-fallback off|on` sets or clears the session's
@@ -8932,7 +9308,10 @@ defmodule Tightbeam.Gateway do
         with {:ok, adapter, _generation} <- resident_adapter(destination),
              revision = session.identity_revision || Identity.live_revision!(config.base_dir),
              snapshot = served_snapshot(config, destination, harness_atom, revision),
-             guidance = append_durable_session_handoff(snapshot.guidance, handoff.records),
+             guidance =
+               snapshot.guidance
+               |> append_durable_session_handoff(handoff.records)
+               |> append_handoff_statement(call[:handoff_statement]),
              cwd = Placement.holder_workdir(config, session) do
           case Adapter.new_candidate_session(
                  adapter,
@@ -9209,6 +9588,15 @@ defmodule Tightbeam.Gateway do
       "These entries are past conversation for context; they may omit older records.\n\n" <>
       "```json\n" <> JSON.encode!(records) <> "\n```"
   end
+
+  # Contract c R9b: the limit-fallback switch's statement about a failed turn
+  # that was not replayed travels with the handoff to the new engine. Only the
+  # in-process switch sets it; no wire call carries this key.
+  defp append_handoff_statement(guidance, statement)
+       when is_binary(statement) and statement != "",
+       do: guidance <> "\n\n" <> statement
+
+  defp append_handoff_statement(guidance, _statement), do: guidance
 
   defp report_candidate_cleanup(_db, _sid, _cause, _principal, %{status: "verified"}),
     do: %{status: "verified"}
