@@ -82,6 +82,100 @@ defmodule Tightbeam.RateLimitResetTest do
     end
   end
 
+  describe "Codex declared reset (companion v1.1 §1, B1)" do
+    @la "America/Los_Angeles"
+
+    test "the Nov 14 shape: a dated reset read in the host's zone" do
+      # Captured shape: harness_health_test's @captured_codex_rate_limit.
+      assert codex(
+               "You've hit your usage limit. Visit the account usage page or try again at Nov 18th, 2026 9:59 AM.",
+               ~U[2026-11-14 16:04:00Z],
+               @la
+             ) == millis(~U[2026-11-18 17:59:00Z])
+    end
+
+    test "a time alone is that time on the observation's local date" do
+      # 08:10 local (PST) on Nov 18.
+      assert codex(
+               "You've hit your usage limit. Try again at 9:59 AM.",
+               ~U[2026-11-18 16:10:00Z],
+               @la
+             ) == millis(~U[2026-11-18 17:59:00Z])
+
+      # The local date, not the UTC one: 17:30 local on Nov 17 is 01:30Z Nov 18.
+      assert codex("try again at 11:45 PM.", ~U[2026-11-18 01:30:00Z], @la) ==
+               millis(~U[2026-11-18 07:45:00Z])
+    end
+
+    test "the other ordinals and the text in the error's own message" do
+      for {text, expected} <- [
+            {"Dec 1st, 2026 12:05 AM", ~U[2026-12-01 08:05:00Z]},
+            {"Dec 2nd, 2026 12:05 PM", ~U[2026-12-02 20:05:00Z]},
+            {"Dec 3rd, 2026 1:00 PM", ~U[2026-12-03 21:00:00Z]}
+          ] do
+        assert codex("or try again at #{text}.", ~U[2026-11-18 16:10:00Z], @la) ==
+                 millis(expected)
+      end
+
+      reason = %{
+        "code" => -32_603,
+        "data" => %{"codexErrorInfo" => "usageLimitExceeded"},
+        "message" => "You've hit your usage limit. Try again at 9:59 AM."
+      }
+
+      assert RateLimitReset.from_error(reason, millis(~U[2026-11-18 16:10:00Z]), @la) ==
+               millis(~U[2026-11-18 17:59:00Z])
+    end
+
+    test "an unknown reset is never guessed" do
+      at = ~U[2026-11-18 16:10:00Z]
+
+      for text <- [
+            "You've hit your usage limit.",
+            "You've hit your usage limit. Try again later.",
+            "Try again at 13:59 PM.",
+            "Try again at 9:75 AM.",
+            "Try again at 9:59.",
+            "Try again at Feb 30th, 2027 9:59 AM.",
+            # Not after the observation.
+            "Try again at 8:10 AM.",
+            "Try again at 7:00 AM.",
+            "Try again at Nov 17th, 2026 9:59 AM."
+          ] do
+        assert codex(text, at, @la) == nil, text
+      end
+
+      # The host's zone is unknown (a remote host).
+      assert codex("Try again at 9:59 AM.", at, nil) == nil
+      # A Claude-shaped reset text in a Codex error is not Codex's reset.
+      assert codex("resets 9:59am (America/Los_Angeles)", at, @la) == nil
+      # Untyped text is not a typed quota error.
+      assert RateLimitReset.from_error(%{"message" => "Try again at 9:59 AM."}, millis(at), @la) ==
+               nil
+    end
+
+    test "a repeated local hour takes the later instant; a nonexistent one is unknown" do
+      # Nov 1, 2026: 1:30 AM PDT and 1:30 AM PST.
+      assert codex("Try again at 1:30 AM.", ~U[2026-11-01 07:00:00Z], @la) ==
+               millis(~U[2026-11-01 09:30:00Z])
+
+      # Mar 8, 2026: 2:30 AM does not exist in Los Angeles.
+      assert codex("Try again at 2:30 AM.", ~U[2026-03-08 08:00:00Z], @la) == nil
+    end
+  end
+
+  defp codex(message, observed, zone) do
+    RateLimitReset.from_error(
+      %{
+        "code" => -32_603,
+        "data" => %{"codexErrorInfo" => "usageLimitExceeded", "message" => message},
+        "message" => "Internal error"
+      },
+      millis(observed),
+      zone
+    )
+  end
+
   defp reset(text, observed) do
     RateLimitReset.from_error(
       %{
