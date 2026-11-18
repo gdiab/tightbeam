@@ -694,8 +694,10 @@ defmodule Tightbeam.OwnerAlerts do
         Enum.reduce(q.(@candidates_sql, [owner]), initial, fn [work_item_id], acc ->
           try do
             case stall_status(q, work_item_id, owner, stall_ms, now) do
+              # S6: one alert per stall identity, not counting one withdrawn
+              # as off, which never reached the owner (§7.1 C3-on).
               {:stalled, anchor} ->
-                if q.("SELECT 1 FROM owner_alerts WHERE dedupeKey=?1", [
+                if q.("SELECT 1 FROM owner_alerts WHERE dedupeKey=?1 AND #{@holds_key}", [
                      stall_dedupe_key(work_item_id, anchor)
                    ]) == [] and create_stall(db, work_item_id, now, missed_before) == :created,
                    do: %{acc | created: acc.created + 1},
