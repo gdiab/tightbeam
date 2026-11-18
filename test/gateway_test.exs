@@ -5214,6 +5214,137 @@ defmodule Tightbeam.GatewayTest do
     refute Enum.any?(visible, &(&1.content =~ "[engine swap]"))
   end
 
+  # Contract c R10: the fallback-off marker is set and cleared by tune with the
+  # tune's own principal, and shows in `list` (inspect) and the session status.
+  test "tune --limit-fallback off|on records the marker shown in list and status", ctx do
+    base_dir = role_test_base("limit-fallback-tune")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :limit_fallback_tune_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    Org.create(ctx.db, %{
+      session_key: "restrict-me",
+      display_name: "Restrict me",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5")
+    })
+
+    tune = fn origin, params ->
+      [kind, id] = String.split(origin, ":", parts: 2)
+
+      handlers["tune"].(%{
+        origin: origin,
+        principal: {String.to_existing_atom(kind), id},
+        session_key: "restrict-me",
+        params: Map.put(params, :setting, "set_limit_fallback")
+      })
+    end
+
+    off =
+      tune.("user:flynn", %{limit_fallback: "off", limit_fallback_reason: "claude-only review"})
+
+    assert %{ok: true, limit_fallback: "off"} = off
+
+    assert %{"by" => "user:flynn", "reason" => "claude-only review", "at" => at} =
+             off["limitFallbackOff"]
+
+    assert is_integer(at)
+
+    session = Org.get(ctx.db, "restrict-me")
+    assert Tightbeam.LimitFallback.restricted?(session)
+    assert session.limit_fallback_off == %{by: "user:flynn", at: at, reason: "claude-only review"}
+    assert Payloads.stream_session(session)["limitFallbackOff"] == off["limitFallbackOff"]
+
+    listed = handlers["inspect"].(%{origin: "user:flynn", params: %{}})
+    item = Enum.find(listed.sessions, &(&1.session_key == "restrict-me"))
+    assert item["limitFallbackOff"] == off["limitFallbackOff"]
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "limit-fallback-off" and &1.subject == "restrict-me")
+           )
+
+    assert %{ok: false, code: "invalid_limit_fallback_reason"} =
+             tune.("user:flynn", %{limit_fallback: "on", limit_fallback_reason: "why"})
+
+    assert %{ok: false, code: "not_found"} = tune.("user:other", %{limit_fallback: "on"})
+    assert Tightbeam.LimitFallback.restricted?(Org.get(ctx.db, "restrict-me"))
+
+    assert %{ok: true, limit_fallback: "on"} = on = tune.("user:flynn", %{limit_fallback: "on"})
+    refute Map.has_key?(on, "limitFallbackOff")
+    session = Org.get(ctx.db, "restrict-me")
+    refute Tightbeam.LimitFallback.restricted?(session)
+    refute Map.has_key?(Payloads.stream_session(session), "limitFallbackOff")
+
+    listed = handlers["inspect"].(%{origin: "user:flynn", params: %{}})
+
+    refute Map.has_key?(
+             Enum.find(listed.sessions, &(&1.session_key == "restrict-me")),
+             "limitFallbackOff"
+           )
+  end
+
+  # Contract c R10: `spawn --limit-fallback off` creates the session restricted,
+  # with the spawn's principal as the marker's actor.
+  test "spawn --limit-fallback off creates the session restricted", ctx do
+    base_dir = role_test_base("limit-fallback-spawn")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :limit_fallback_spawn_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    call = fn key, params ->
+      spawn.(%{
+        verb: "spawn",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: Map.merge(%{display_name: key, idempotency_key: key}, params)
+      })
+    end
+
+    created =
+      call.("limit-fallback-spawn-off", %{
+        limit_fallback: "off",
+        limit_fallback_reason: "family pinned"
+      })
+
+    assert is_binary(created.session_key)
+    session = Org.get(ctx.db, created.session_key)
+    assert %{by: "user:flynn", reason: "family pinned"} = session.limit_fallback_off
+    assert Tightbeam.LimitFallback.restricted?(session)
+    assert created.stream["limitFallbackOff"]["by"] == "user:flynn"
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "limit-fallback-off" and &1.subject == created.session_key)
+           )
+
+    assert %{code: "invalid_limit_fallback"} =
+             call.("limit-fallback-spawn-on", %{limit_fallback: "on"})
+
+    assert %{code: "invalid_limit_fallback_reason"} =
+             call.("limit-fallback-spawn-reason", %{limit_fallback_reason: "no marker"})
+
+    plain = call.("limit-fallback-spawn-plain", %{})
+    refute Tightbeam.LimitFallback.restricted?(Org.get(ctx.db, plain.session_key))
+    refute Map.has_key?(plain.stream, "limitFallbackOff")
+  end
+
   test "spawn admits only its matching reserved remedy principal", ctx do
     base_dir = role_test_base("remedy-spawn")
     Archetypes.load!(base_dir)
