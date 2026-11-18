@@ -16,6 +16,11 @@ defmodule Tightbeam.OwnerAlerts do
   alert becomes `undelivered`. The alert follows its operation row, so a
   settlement made by boot recovery is adopted rather than repeated.
 
+  Each row records its owner at creation. Before any new operation, the owner
+  setting is read again in the transaction that records the attempt: if it is
+  cleared, names no user, or names a different user, the alert is withdrawn
+  instead of sent. An uncertain send is still settled on its own operation.
+
   Nothing here creates, queues or changes a turn or a wake of any session. The
   only session records touched are the origin transcript markers for a failed
   delivery and the lifecycle events of each state change.
@@ -233,10 +238,14 @@ defmodule Tightbeam.OwnerAlerts do
 
   @doc """
   Validate a setting value inside the transaction that stores it. Returns the
-  stored text, or a named refusal.
+  stored text, nil for `""` (§7.1 C1-off: clear the setting to unset), or a
+  named refusal.
   """
   @spec validate_setting_in_txn(Txn.t(), String.t(), term()) ::
-          {:ok, String.t()} | {:error, String.t(), String.t()}
+          {:ok, String.t() | nil} | {:error, String.t(), String.t()}
+  def validate_setting_in_txn(_txn, setting, "") when setting in [@owner_setting, @stall_setting],
+    do: {:ok, nil}
+
   def validate_setting_in_txn(txn, @owner_setting, user_id) do
     if is_binary(user_id) and user_id != "" and user_exists_in_txn?(txn, user_id) do
       {:ok, user_id}
@@ -255,6 +264,7 @@ defmodule Tightbeam.OwnerAlerts do
        "owner-alert-stall-ms must be a positive integer number of milliseconds; got #{inspect(ms)}"}
 
   @doc "Present a stored setting value as the config command returns it."
+  def present(_setting, nil), do: nil
   def present(@owner_setting, stored), do: stored
   def present(@stall_setting, stored), do: String.to_integer(stored)
 
@@ -641,7 +651,8 @@ defmodule Tightbeam.OwnerAlerts do
         db,
         """
         SELECT alertId, kind, originSessionKey, title, body, state, createdAt, opId,
-               attempts, firstFailureAt, lastOutcome, lastFailureReason, nextAttemptAt
+               attempts, firstFailureAt, lastOutcome, lastFailureReason, nextAttemptAt,
+               ownerUserId
         FROM owner_alerts WHERE alertId=?1
         """,
         [alert_id]
@@ -662,7 +673,8 @@ defmodule Tightbeam.OwnerAlerts do
           first_failure_at,
           last_outcome,
           last_reason,
-          next_attempt_at
+          next_attempt_at,
+          owner
         ]
       ] ->
         %{
@@ -678,7 +690,8 @@ defmodule Tightbeam.OwnerAlerts do
           first_failure_at: first_failure_at,
           last_outcome: last_outcome,
           last_reason: last_reason,
-          next_attempt_at: next_attempt_at
+          next_attempt_at: next_attempt_at,
+          owner: owner
         }
 
       [] ->
@@ -736,22 +749,63 @@ defmodule Tightbeam.OwnerAlerts do
 
     # The op id is recorded before anything runs, so a crash at any later
     # point leaves the alert bound to the one operation that may have run.
-    # This is also the transaction in which a stall alert's A7 re-evaluation
-    # records either this attempt or its withdrawal.
-    {:ok, :ok} =
+    # §7.1 C2-off: the owner setting is re-read in this same transaction,
+    # which records either this attempt or the alert's withdrawal.
+    {:ok, decision} =
       DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          """
-          UPDATE owner_alerts SET opId=?2, attempts=attempts+1, updatedAt=?3
-          WHERE alertId=?1 AND state='pending'
-          """,
-          [alert.alert_id, op_id, now]
-        )
+        case withdrawal_reason_in_txn(txn, alert) do
+          nil ->
+            Txn.q(
+              txn,
+              """
+              UPDATE owner_alerts SET opId=?2, attempts=attempts+1, updatedAt=?3
+              WHERE alertId=?1 AND state='pending'
+              """,
+              [alert.alert_id, op_id, now]
+            )
 
-        if Txn.changes(txn) == 1, do: :ok, else: raise("owner alert is no longer pending")
+            if Txn.changes(txn) == 1, do: :send, else: raise("owner alert is no longer pending")
+
+          reason ->
+            withdraw_in_txn(txn, alert, reason, now)
+            :withdrawn
+        end
       end)
 
+    if decision == :send, do: send_op(db, alert, op_id, now, opts), else: :ok
+  end
+
+  # §7.1 C2-off: a new operation is minted only while the setting still names
+  # the owner this alert recorded at creation. Unset, or naming no user, is
+  # off; naming another user is a changed owner. Either way the alert is
+  # withdrawn, never re-addressed: every attempt's origin is the recorded
+  # owner's Main.
+  defp withdrawal_reason_in_txn(txn, alert) do
+    case owner_in_txn(txn) do
+      nil -> "alerts-off"
+      owner when owner == alert.owner -> nil
+      _other -> "owner-changed"
+    end
+  end
+
+  defp withdraw_in_txn(txn, alert, reason, now) do
+    Txn.q(
+      txn,
+      """
+      UPDATE owner_alerts SET state='withdrawn', nextAttemptAt=NULL, updatedAt=?2
+      WHERE alertId=?1 AND state='pending'
+      """,
+      [alert.alert_id, now]
+    )
+
+    if Txn.changes(txn) != 1, do: raise("owner alert is no longer pending")
+
+    lifecycle_in_txn(txn, "owner_alert_withdrawn", alert.alert_id, alert.kind, "withdrawn", %{
+      reason: reason
+    })
+  end
+
+  defp send_op(db, alert, op_id, now, opts) do
     result =
       HarklightSend.send_request(
         db,

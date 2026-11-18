@@ -6690,12 +6690,17 @@ defmodule Tightbeam.Gateway do
     }
   end
 
+  # §7.1 C1-off: the value "" clears either owner-alert setting to unset.
   defp config_result(db, %{params: %{action: "set", setting: setting, value: value}} = call)
        when setting in ["owner-alerts-user", "owner-alert-stall-ms"] do
     case DB.transaction(db, fn txn ->
            case Tightbeam.OwnerAlerts.validate_setting_in_txn(txn, setting, value) do
              {:ok, stored} ->
-               result = Org.put_setting_projected_in_txn(txn, setting, stored)
+               result =
+                 if is_nil(stored),
+                   do: Org.delete_setting_projected_in_txn(txn, setting),
+                   else: Org.put_setting_projected_in_txn(txn, setting, stored)
+
                Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
                if result.changed do
@@ -6718,7 +6723,7 @@ defmodule Tightbeam.Gateway do
           setting: setting,
           value: Tightbeam.OwnerAlerts.present(setting, stored),
           changed: result.changed,
-          config: StateResources.config(result.projection)
+          config: result.projection && StateResources.config(result.projection)
         }
 
       {:ok, {:error, code, message}} ->

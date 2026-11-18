@@ -437,7 +437,8 @@ defmodule Tightbeam.OwnerAlertsTest do
     fail_turn(db, session(db, "agent:george:unset"), @codex_limit)
     assert alerts(db) == []
 
-    for value <- ["nobody", ""] do
+    # "" is not a refusal: it clears the setting (§7.1, T18).
+    for value <- ["nobody", nil] do
       assert %{code: "unknown_owner_alerts_user"} =
                config.(%{action: "set", setting: "owner-alerts-user", value: value})
     end
