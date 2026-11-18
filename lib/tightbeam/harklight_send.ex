@@ -30,7 +30,10 @@ defmodule Tightbeam.HarklightSend do
   end
 
   defp send_with_association(db, call, %{decision_request_id: nil} = input, runner, opts) do
-    send_with_operation(db, call, input, Id.uuid4(), runner, opts)
+    # A gateway-originated sender records its op id before the send runs,
+    # so a crash cannot separate it from the operation that may have run.
+    op_id = Keyword.get_lazy(opts, :op_id, &Id.uuid4/0)
+    send_with_operation(db, call, input, op_id, runner, opts)
   end
 
   defp send_with_association(db, call, input, runner, opts) do

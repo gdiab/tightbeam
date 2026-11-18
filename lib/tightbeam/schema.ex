@@ -2134,6 +2134,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_closed_assignment_reconciliation(db)
     :ok = upgrade_artifact_process_attribution(db)
     :ok = upgrade_user_removal(db)
+    :ok = Tightbeam.OwnerAlerts.ensure_schema(db)
     :ok = upgrade_retirement_parent_moves(db)
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
