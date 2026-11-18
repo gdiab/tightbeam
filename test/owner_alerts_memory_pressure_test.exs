@@ -889,7 +889,19 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
     for t <- 0..120//15, do: sample(ctx, t * 1_000)
 
     assert [_alert] = memory_alerts(ctx.db)
-    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
+
+    # Fired by the episode's fact. A fired condition wake stays pending only
+    # while notice batching carries it; its firing is recorded now.
+    assert {:ok, [[fact_id]]} =
+             DB.query(ctx.db, "SELECT id FROM condition_facts WHERE kind='host-memory-pressure'")
+
+    assert %{
+             fired_by: "condition",
+             fired_at: fired_at,
+             recognition_evidence: %{"condition_fact" => %{"id" => ^fact_id}}
+           } = Wakes.get(ctx.db, wake.wake_id)
+
+    assert is_integer(fired_at)
 
     # The episode closes; the cleared fact fires nothing more.
     calm(ctx)
