@@ -39,6 +39,11 @@ defmodule Tightbeam.ToolCallsTest do
         "tool_calls_predecessor_51de4df3",
         "cbd036156edb64eec721bc1cbde4800f0cfc5c9c672d34a9284ad487f8199d91"
       )
+
+      # Device pairing below reads the user-removal columns; the pinned
+      # predecessor predates them, so add exactly those two, as PR622 does for
+      # partial synthetic schemas. The later upgrade validates them.
+      :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
     else
       :ok = ensure_all_schemas(db)
     end
