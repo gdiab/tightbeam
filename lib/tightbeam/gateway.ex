@@ -9414,6 +9414,10 @@ defmodule Tightbeam.Gateway do
               :stale -> raise "harness mutation race inside serialized tune"
             end
 
+            # Contract c R8a: any later tune ends fallback-active. The limit
+            # fallback switch sets it again in its own interlock, below.
+            LimitFallback.clear_fallback_active_in_txn(txn, session.session_key)
+
             case Map.get(call, :on_swap_interlock) do
               fun when is_function(fun, 1) -> fun.(txn)
               _ -> :ok
@@ -10014,6 +10018,10 @@ defmodule Tightbeam.Gateway do
   defp project_verified_mismatch(db, session, actual, provider) do
     try do
       _ = Org.set_model(db, session.session_key, actual, provider)
+
+      {:ok, _} =
+        DB.transaction(db, &LimitFallback.clear_fallback_active_in_txn(&1, session.session_key))
+
       :ok
     rescue
       error -> {:error, error}
@@ -10193,6 +10201,8 @@ defmodule Tightbeam.Gateway do
     case DB.transaction(db, fn txn ->
            {record_model, record_harness} = read_recorded_model(txn, session.session_key)
 
+           LimitFallback.clear_fallback_active_in_txn(txn, session.session_key)
+
            case Org.swap_model_in_txn(
                   txn,
                   session.session_key,
@@ -10262,6 +10272,7 @@ defmodule Tightbeam.Gateway do
     result =
       DB.transaction(db, fn txn ->
         {record_model, record_harness} = read_recorded_model(txn, session.session_key)
+        LimitFallback.clear_fallback_active_in_txn(txn, session.session_key)
 
         case Org.swap_model_in_txn(
                txn,
