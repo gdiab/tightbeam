@@ -1934,11 +1934,12 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             setting,
             value,
         } => {
-            let encoded_value = if setting == "default-priority" {
-                format!("\"value\":{value}")
-            } else {
-                string_field("value", value)
-            };
+            let encoded_value =
+                if setting == "default-priority" || setting == "owner-alert-stall-ms" {
+                    format!("\"value\":{value}")
+                } else {
+                    string_field("value", value)
+                };
             Ok(request(
                 identity,
                 "config",
@@ -6280,6 +6281,38 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-priority","value":6}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "owner-alerts-user",
+                "george",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"owner-alerts-user","value":"george"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "owner-alert-stall-ms",
+                "7200000",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"owner-alert-stall-ms","value":7200000}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "get",
+                "owner-alert-stall-ms",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"owner-alert-stall-ms"}}"#
         );
     }
 
