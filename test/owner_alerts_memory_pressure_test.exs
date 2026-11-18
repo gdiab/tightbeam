@@ -879,9 +879,12 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
         creator_session_key: "agent:owner:app"
       })
 
+    # The waiter's own wake may go on to run a turn on the waiter (V5); any
+    # other wake or turn would be G1's own.
     others = "SELECT count(*) FROM wakes WHERE sessionKey <> ?1"
+    other_turns = "SELECT count(*) FROM turns WHERE sessionKey <> ?1"
     wakes_before = count(ctx.db, others, [waiter])
-    turns_before = count(ctx.db, "SELECT count(*) FROM turns")
+    turns_before = count(ctx.db, other_turns, [waiter])
     {:ok, settings} = DB.query(ctx.db, "SELECT key, value FROM org_settings ORDER BY key")
 
     start_stack(ctx, scheduler: scheduler)
@@ -915,7 +918,7 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
 
     # G1 itself created no wake or turn and changed no setting.
     assert count(ctx.db, others, [waiter]) == wakes_before
-    assert count(ctx.db, "SELECT count(*) FROM turns") == turns_before
+    assert count(ctx.db, other_turns, [waiter]) == turns_before
     assert {:ok, ^settings} = DB.query(ctx.db, "SELECT key, value FROM org_settings ORDER BY key")
 
     # V5: the sampler's code can signal, spawn or reconfigure nothing.
