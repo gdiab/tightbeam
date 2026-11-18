@@ -888,6 +888,160 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     end)
   end
 
+  # Review residual R-a (R5, N1). The evaluation starts before the held
+  # turn's health publication, in a task the lane does not own. A publication
+  # that raises crashes the lane after the terminal commit; the evaluation
+  # still ends the hold with exactly one outcome, and the restarted lane
+  # claims again, with no gateway restart.
+  test "a lane that crashes after the hold commits still gets one outcome and claims again" do
+    parent = self()
+
+    with_gateway(
+      fn ctx ->
+        key = "switch-lane-crash"
+        session!(ctx, key)
+        lane = lane!(ctx, key)
+        lane_ref = Process.monitor(lane)
+
+        # The evaluation waits inside its prechecks until the lane restarted,
+        # so its tune meets the restarted lane, not a dying one.
+        in_window!(:anthropic, fn ->
+          send(parent, {:evaluation_running, self()})
+
+          receive do
+            :continue_evaluation -> :ok
+          end
+        end)
+
+        deliver!(ctx, key, "limited")
+
+        assert_receive {:DOWN, ^lane_ref, :process, ^lane,
+                        {%RuntimeError{message: "deliberate publication failure"}, _stack}},
+                       15_000
+
+        # The evaluation started before the publication raised, and the
+        # lane's crash did not stop it.
+        assert_receive {:evaluation_running, evaluation}, 15_000
+        refute evaluation == lane
+        assert Process.alive?(evaluation)
+
+        assert {:ok, [[seq, nil]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT turnSeq, outcome FROM limit_fallback_evaluations WHERE sessionKey=?1",
+                   [key]
+                 )
+
+        assert turn_status(ctx.db, seq) == "failed"
+
+        # The restarted lane claims nothing while the hold stands.
+        restarted = await_restarted_lane!(key, lane)
+        waiting = deliver!(ctx, key, "queued-after-crash")
+        SessionLane.nudge(key)
+        assert %{task_ref: nil} = :sys.get_state(restarted)
+        assert turn_status(ctx.db, waiting) == "queued"
+        assert LimitFallback.held?(ctx.db, key)
+
+        send(evaluation, :continue_evaluation)
+
+        # Exactly one outcome: the switch, which the gated evaluation reaches
+        # through the restarted lane. Its commit released the hold.
+        assert await_outcome!(ctx.db, key, seq) == {"applied", nil}
+        refute LimitFallback.held?(ctx.db, key)
+
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM limit_fallback_evaluations WHERE sessionKey=?1",
+                   [key]
+                 )
+
+        assert lifecycle_count(ctx.db, key, "session-model-fallback-applied") == 1
+        assert lifecycle_count(ctx.db, key, "session-model-fallback-withheld") == 0
+        assert Org.get(ctx.db, key).harness == "claude"
+
+        # The restarted lane claims again, on the fallback.
+        assert ordered_tokens(:claude, ["queued-after-crash"]) == ["queued-after-crash"]
+        await_turns_settled!(ctx.db, key)
+        assert_ran_once!(ctx.db, key, ["queued-after-crash"])
+      end,
+      evaluation: :task,
+      on_held_failure_publication: fn -> raise "deliberate publication failure" end
+    )
+  end
+
+  # Review finding (5). The evaluation reads the session's engine before the
+  # tune lock. An owner tune that lands after that read and before the swap
+  # changes the engine the switch would record as `from` and name in the
+  # switch-back command; the interlock re-judges the read against the row the
+  # swap replaces and rolls the swap back.
+  test "an owner selection tune before the swap withholds the switch as switch-failed:stale" do
+    with_gateway(
+      fn ctx ->
+        key = "switch-stale"
+        session!(ctx, key)
+        lane!(ctx, key)
+        deliver!(ctx, key, "limited")
+        {evaluation, seq} = await_hold!(ctx, key)
+
+        %{harness_session_id: sid} = Org.current_pointer(ctx.db, key)
+        owner_choice = %{source_model() | effort: "medium"}
+
+        in_window!(:anthropic, fn ->
+          # The live harness takes the new effort in place, as Codex does.
+          :ok = GenServer.call(ctx.codex, {:apply_model, sid, owner_choice})
+
+          result =
+            owner_tune(ctx, key, %{setting: "set_reasoning", reasoningLevel: "medium"})
+
+          send(ctx.parent, {:owner_tune, result})
+        end)
+
+        assert evaluation.() == :withheld
+        assert_received {:owner_tune, %{ok: true}}
+
+        # The switch reached its swap: the candidate was prepared, and the
+        # interlock rolled the swap back.
+        assert_received {:candidate, :claude, _model, _guidance}
+        assert_withheld!(ctx, key, seq, "switch-failed:stale")
+
+        # The owner's selection stands.
+        assert Org.get(ctx.db, key).model == owner_choice
+      end,
+      codex_efforts: ~w(low medium)
+    )
+  end
+
+  # Review finding (5), the marker half: `tune --limit-fallback off` takes no
+  # tune lock, so the interlock re-checks the marker inside the swap
+  # transaction and withholds as `restricted`, the reason R4.2 names.
+  test "a --limit-fallback off before the swap withholds the switch as restricted" do
+    with_gateway(fn ctx ->
+      key = "switch-restricted-late"
+      session!(ctx, key)
+      lane!(ctx, key)
+      deliver!(ctx, key, "limited")
+      {evaluation, seq} = await_hold!(ctx, key)
+
+      in_window!(:anthropic, fn ->
+        result =
+          owner_tune(ctx, key, %{
+            setting: "set_limit_fallback",
+            limit_fallback: "off",
+            limit_fallback_reason: "landed mid-evaluation"
+          })
+
+        send(ctx.parent, {:owner_tune, result})
+      end)
+
+      assert evaluation.() == :withheld
+      assert_received {:owner_tune, %{ok: true, limit_fallback: "off"}}
+      assert_received {:candidate, :claude, _model, _guidance}
+      assert_withheld!(ctx, key, seq, "restricted")
+      assert LimitFallback.restricted?(Org.get(ctx.db, key))
+    end)
+  end
+
   ## Shared assertions
 
   defp assert_withheld!(ctx, key, seq, reason) do
@@ -958,7 +1112,9 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     start_supervised!(
       {CatalogStub,
        %{
-         {"testhost", "codex"} => [catalog_entry("synthetic-codex", "low", :openai)],
+         {"testhost", "codex"} => [
+           catalog_entry("synthetic-codex", Keyword.get(opts, :codex_efforts, "low"), :openai)
+         ],
          {"testhost", "claude"} => [
            catalog_entry(
              "synthetic-claude",
@@ -1013,15 +1169,33 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       onboarding_lease_ms: 1_800_000,
       model_catalog: Tightbeam.ModelCatalog,
       credential_status: fn provider, _machine ->
+        run_window_hook(provider)
+
         if :persistent_term.get({__MODULE__, :denied_provider}, nil) == provider,
           do: {:needs_onboarding, :missing},
           else: :onboarded
       end,
-      patch_adapter: fn _harness, _path -> :ok end,
-      limit_fallback_runner: fn evaluation ->
-        send(parent, {:limit_fallback_evaluation, evaluation})
-      end
+      patch_adapter: fn _harness, _path -> :ok end
     }
+
+    # By default the evaluation is handed to the test; `evaluation: :task`
+    # keeps the production start, a supervised task.
+    config =
+      case Keyword.get(opts, :evaluation, :seam) do
+        :seam ->
+          Map.put(config, :limit_fallback_runner, fn evaluation ->
+            send(parent, {:limit_fallback_evaluation, evaluation})
+          end)
+
+        :task ->
+          config
+      end
+
+    config =
+      case Keyword.fetch(opts, :on_held_failure_publication) do
+        {:ok, probe} -> Map.put(config, :on_held_failure_publication, probe)
+        :error -> config
+      end
 
     # The start composition also loads the law (rules) the assign verb reads.
     runner = extract_runner!(config)
@@ -1177,6 +1351,65 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
              {:error, @codex_limit}
          end}
       )
+  end
+
+  # Runs `hook` once, in the evaluation's process, at its first credential
+  # check for `provider`: the R4.7 prechecks, after the evaluation read the
+  # session and before the tune takes its lock.
+  defp in_window!(provider, hook) do
+    :persistent_term.put({__MODULE__, :window}, {provider, hook})
+    on_exit(fn -> :persistent_term.erase({__MODULE__, :window}) end)
+  end
+
+  defp run_window_hook(provider) do
+    case :persistent_term.get({__MODULE__, :window}, nil) do
+      {^provider, hook} ->
+        :persistent_term.erase({__MODULE__, :window})
+        hook.()
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp owner_tune(ctx, key, params) do
+    Gateway.handlers(ctx.config)["tune"].(%{
+      origin: "user:" <> @owner,
+      principal: {:user, @owner},
+      session_key: key,
+      params: params
+    })
+  end
+
+  # The session's lane registered under a pid other than `old`.
+  defp await_restarted_lane!(key, old, attempts \\ 300) do
+    case Registry.lookup(Tightbeam.LaneRegistry, key) do
+      [{pid, _}] when pid != old ->
+        pid
+
+      _ when attempts == 0 ->
+        flunk("#{key}'s lane did not restart")
+
+      _ ->
+        # Polled: the supervisor restarts the lane on its own schedule.
+        Process.sleep(50)
+        await_restarted_lane!(key, old, attempts - 1)
+    end
+  end
+
+  defp await_outcome!(db, key, seq, attempts \\ 300) do
+    case evaluation_outcome(db, key, seq) do
+      {nil, _reason} when attempts == 0 ->
+        flunk("#{key} turn #{seq} has no limit-fallback outcome")
+
+      {nil, _reason} ->
+        # Polled: the evaluation runs in its own task.
+        Process.sleep(50)
+        await_outcome!(db, key, seq, attempts - 1)
+
+      outcome ->
+        outcome
+    end
   end
 
   defp await_hold!(ctx, key) do
@@ -1451,7 +1684,7 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       context: nil,
       display_name: family,
       name: family,
-      efforts: [effort],
+      efforts: List.wrap(effort),
       provider: provider
     }
   end
