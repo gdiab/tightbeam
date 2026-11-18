@@ -18,7 +18,7 @@ defmodule Tightbeam.OwnerAlerts do
   alert becomes `undelivered`. The alert follows its operation row, so a
   settlement made by boot recovery is adopted rather than repeated.
 
-  Two kinds exist. A `usage-limit` alert is created in the transaction that
+  A `usage-limit` alert is created in the transaction that
   records a usage-limit turn failure. A `stall` alert is created when an
   owner's open work item has had no progress for the stall threshold and no
   open assignment of it is held or waiting; its identity is the item and its
@@ -35,7 +35,16 @@ defmodule Tightbeam.OwnerAlerts do
   re-evaluated in the transaction that records the attempt, and an alert whose
   stall is no longer current is withdrawn as `stale` instead.
 
-  Each row of either kind records its owner at creation. Before any new
+  A `memory-pressure` alert (G1) is created when the gateway's host has been
+  under memory pressure long enough to open an episode, and once more, as a
+  restart alert, when the gateway starts and finds the run marker a pressure
+  run left behind. The sampling, the episode rules and the marker file live in
+  `Tightbeam.OwnerAlerts.MemoryPressure`; this module holds the transactions
+  that record them. A memory-pressure row names no session, turn or work item:
+  its `dedupeKey` (`memory-pressure:<host>:<episodeOpenedAt>` or
+  `memory-pressure-restart:<host>:<runStartedAt>`) identifies it.
+
+  Each row of every kind records its owner at creation. Before any new
   operation, the owner setting is read again in the transaction that records
   the attempt: if it is cleared, names no user, or names a different user, the
   alert is withdrawn as `off` instead of sent. An uncertain send is still
@@ -49,7 +58,7 @@ defmodule Tightbeam.OwnerAlerts do
   use GenServer
   require Logger
 
-  alias Tightbeam.{DB, EventLog, HarklightSend, Id, Org}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, HarklightSend, Id, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @shape "owner-alerts-v1-0114"
@@ -268,6 +277,10 @@ defmodule Tightbeam.OwnerAlerts do
   """
   @spec owner_in_txn(Txn.t()) :: String.t() | nil
   def owner_in_txn(%Txn{} = txn), do: owner_via(in_txn(txn))
+
+  @doc "The alert owner read outside a transaction, or nil when alerts are off."
+  @spec owner(DB.server()) :: String.t() | nil
+  def owner(db \\ DB), do: owner_via(reader(db))
 
   defp owner_via(q) do
     case q.("SELECT value FROM org_settings WHERE key=?1", [@owner_setting]) do
@@ -990,6 +1003,400 @@ defmodule Tightbeam.OwnerAlerts do
       _current -> nil
     end
   end
+
+  ## G1 host memory pressure
+
+  @memory_kind "memory-pressure"
+  @pressure_fact "host-memory-pressure"
+  @cleared_fact "host-memory-pressure-cleared"
+  @gib_kib 1_048_576
+  @gib_bytes 1_073_741_824
+  @memory_closing "Tightbeam is only watching. It has not stopped or changed anything. " <>
+                    "If free memory keeps falling, the machine may stop responding."
+
+  @doc """
+  M4: record one memory-pressure episode's open in one transaction: its
+  `memory-pressure` alert and the standing fact `host-memory-pressure` (scope
+  the host, filed by the process). The alert's commit hands it to delivery at
+  once. Returns `:opened` (also when this episode's alert already exists, for a
+  repeated request) or `:off` when alerts are off, in which case nothing is
+  written.
+
+  `open` carries `:host`, `:episode_opened_at` and `:run_started_at` (wall
+  milliseconds), the `:sample` at the open and the cgroup `:populations`.
+  """
+  @spec open_memory_episode(DB.server(), GenServer.server(), map()) :: :opened | :off
+  def open_memory_episode(db, scheduler, open) do
+    %{host: host, episode_opened_at: opened_at} = open
+
+    with_pressure_fact(db, scheduler, fn txn ->
+      case owner_in_txn(txn) do
+        nil ->
+          {:off, nil}
+
+        owner ->
+          created =
+            create_in_txn(txn, %{
+              kind: @memory_kind,
+              dedupe_key: memory_dedupe_key(host, opened_at),
+              owner: owner,
+              title: memory_title(host),
+              body: memory_body(open),
+              lifecycle: %{
+                host: host,
+                episodeOpenedAt: opened_at,
+                runStartedAt: open.run_started_at
+              }
+            })
+
+          # The fact is filed with the alert, so an existing alert means this
+          # open was already recorded and the fact already stands.
+          case created do
+            {:created, _alert_id} ->
+              {:opened, file_pressure_fact_in_txn(txn, @pressure_fact, host)}
+
+            :exists ->
+              {:opened, nil}
+          end
+      end
+    end)
+  end
+
+  @doc """
+  M5 and §7.1 C2-off: record one episode's close: a lifecycle event with its
+  start, end and reason, and `host-memory-pressure-cleared` while the pressure
+  fact stands, so no waiter is left standing. No alert is sent on close.
+  """
+  @spec close_memory_episode(DB.server(), GenServer.server(), map()) :: :closed
+  def close_memory_episode(db, scheduler, close) do
+    with_pressure_fact(db, scheduler, fn txn ->
+      memory_episode_closed_in_txn(
+        txn,
+        close.host,
+        close.episode_opened_at,
+        close.ended_at,
+        close.reason,
+        Map.get(close, :detail, %{})
+      )
+
+      {:closed, cleared_fact_in_txn(txn, close.host)}
+    end)
+  end
+
+  @doc """
+  M6: the gateway started and found a run marker. In one transaction: create
+  the restart alert (while alerts are on), withdraw the episode's unsent first
+  alert as `stale`, close an open episode as `interrupted` and file
+  `host-memory-pressure-cleared` while the pressure fact stands.
+
+  `found` is `{:marker, marker}` for a parsed marker or `{:unreadable,
+  marked_at}` for one that could not be parsed (a standing run with unknown
+  details). The run's episode is the `memory-pressure` alert of this host
+  whose episode open time, from its `dedupeKey`, is at or after the run's
+  start: the same clock wrote both, and a committed open is found even when
+  the marker missed its `episodeOpenedAt`.
+  """
+  @spec memory_restart(DB.server(), GenServer.server(), String.t(), term(), integer()) ::
+          :restarted
+  def memory_restart(db, scheduler, host, found, now) do
+    run = restart_run(host, found, now)
+
+    with_pressure_fact(db, scheduler, fn txn ->
+      owner = owner_in_txn(txn)
+      standing? = ConditionFacts.standing_in_txn?(txn, @pressure_fact, run.host)
+
+      episode =
+        if is_integer(run.run_started_at),
+          do: memory_episode_in_txn(txn, run.host, run.run_started_at)
+
+      opened_at = (episode && episode.opened_at) || run.episode_opened_at
+
+      created =
+        if owner do
+          create_in_txn(txn, %{
+            kind: @memory_kind,
+            dedupe_key: run.dedupe_key,
+            owner: owner,
+            title: memory_restart_title(run.host),
+            body:
+              memory_restart_body(%{
+                run
+                | episode_opened_at: opened_at,
+                  first_alert: first_alert_status(episode, opened_at)
+              }),
+            lifecycle: %{
+              host: run.host,
+              runStartedAt: run.run_started_at,
+              episodeOpenedAt: opened_at,
+              restart: true
+            }
+          })
+        end
+
+      # A replay (the marker survived an earlier restart's commit) changes
+      # nothing more: that commit already did the rest.
+      if created == :exists do
+        {:restarted, nil}
+      else
+        if owner && episode, do: supersede_first_alert_in_txn(txn, episode, now)
+
+        if opened_at != nil or (run.unknown? and standing?) do
+          memory_episode_closed_in_txn(txn, run.host, opened_at, now, "interrupted", %{})
+        end
+
+        {:restarted, cleared_fact_in_txn(txn, run.host)}
+      end
+    end)
+  end
+
+  @doc "Record one memory-pressure sampler lifecycle event (best effort, handed off)."
+  @spec memory_lifecycle(DB.server(), String.t(), String.t(), map()) :: :ok
+  def memory_lifecycle(db, kind, host, detail),
+    do: EventLog.lifecycle(db, kind, memory_subject(host), JSON.encode!(detail))
+
+  defp restart_run(_host, {:marker, marker}, _now) do
+    %{
+      host: marker["host"],
+      run_started_at: marker["runStartedAt"],
+      episode_opened_at: marker["episodeOpenedAt"],
+      last_sample_at: marker["lastSampleAt"],
+      last_sample: marker["lastSample"],
+      unknown?: false,
+      first_alert: nil,
+      dedupe_key: "memory-pressure-restart:#{marker["host"]}:#{marker["runStartedAt"]}"
+    }
+  end
+
+  # A2b: an unparsable marker is a standing run with unknown details. Its
+  # key uses the time the marker was last written, so a replay dedupes.
+  defp restart_run(host, {:unreadable, marked_at}, now) do
+    %{
+      host: host,
+      run_started_at: nil,
+      episode_opened_at: nil,
+      last_sample_at: nil,
+      last_sample: nil,
+      unknown?: true,
+      first_alert: nil,
+      dedupe_key: "memory-pressure-restart:#{host}:unknown-#{marked_at || now}"
+    }
+  end
+
+  defp memory_episode_in_txn(txn, host, run_started_at) do
+    prefix = "memory-pressure:#{host}:"
+
+    case Txn.q(
+           txn,
+           """
+           SELECT alertId, state, lastOutcome, CAST(substr(dedupeKey, ?2 + 1) AS INTEGER) AS openedAt
+           FROM owner_alerts
+           WHERE kind='memory-pressure' AND substr(dedupeKey, 1, ?2) = ?1
+             AND CAST(substr(dedupeKey, ?2 + 1) AS INTEGER) >= ?3
+           ORDER BY openedAt, (state = 'withdrawn' AND withdrawnAs = 'off'), createdAt, alertId
+           LIMIT 1
+           """,
+           [prefix, String.length(prefix), run_started_at]
+         ) do
+      [[alert_id, state, last_outcome, opened_at]] ->
+        %{alert_id: alert_id, state: state, last_outcome: last_outcome, opened_at: opened_at}
+
+      [] ->
+        nil
+    end
+  end
+
+  defp first_alert_status(nil, nil), do: nil
+  defp first_alert_status(nil, _opened_at), do: :not_sent
+  defp first_alert_status(%{state: "sent"}, _opened_at), do: :sent
+
+  defp first_alert_status(%{state: "pending", last_outcome: "outcome_unknown"}, _opened_at),
+    do: :unconfirmed
+
+  defp first_alert_status(_episode, _opened_at), do: :not_sent
+
+  # M6: the restart alert supersedes the episode's first alert while that is
+  # not yet sent.
+  defp supersede_first_alert_in_txn(txn, %{state: "pending"} = episode, now) do
+    withdraw_in_txn(
+      txn,
+      %{alert_id: episode.alert_id, kind: @memory_kind},
+      {"stale", "superseded-by-restart"},
+      now
+    )
+  end
+
+  defp supersede_first_alert_in_txn(_txn, _episode, _now), do: :ok
+
+  defp memory_episode_closed_in_txn(txn, host, opened_at, ended_at, reason, extra) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "memory_pressure_episode_closed",
+      memory_subject(host),
+      JSON.encode!(
+        Map.merge(
+          %{host: host, episodeOpenedAt: opened_at, endedAt: ended_at, reason: reason},
+          extra
+        )
+      )
+    )
+  end
+
+  defp cleared_fact_in_txn(txn, host) do
+    if ConditionFacts.standing_in_txn?(txn, @pressure_fact, host),
+      do: file_pressure_fact_in_txn(txn, @cleared_fact, host)
+  end
+
+  # M8: the reserved standing pair, scope the host name, filed by the process.
+  defp file_pressure_fact_in_txn(txn, kind, host) do
+    %{fact_id: _} =
+      ConditionFacts.file_in_txn(txn, %{kind: kind, scope: host, origin: "process:tightbeam"})
+  end
+
+  # A fact filed here is recognized after commit exactly as a filed condition
+  # is (`ConditionFacts.file/3`), so a session's own fact wait fires at once.
+  defp with_pressure_fact(db, scheduler, prepare) do
+    case DB.transaction_then(
+           db,
+           prepare,
+           fn txn, {result, fact} ->
+             Wakes.row_commit_in_txn(txn, [])
+
+             deliveries =
+               if fact, do: ConditionFacts.recognize_in_txn(txn, fact.fact_id), else: []
+
+             {result, fact, deliveries}
+           end,
+           fallback: fn {result, fact} -> {result, fact, []} end,
+           retry_deliveries: true
+         ) do
+      {:ok, {result, fact, deliveries}} ->
+        ConditionFacts.complete_deliveries(db, scheduler, deliveries)
+        if fact, do: Wakes.nudge_matching(scheduler, fact.fact_id)
+        result
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  defp memory_dedupe_key(host, opened_at), do: "memory-pressure:#{host}:#{opened_at}"
+  defp memory_subject(host), do: "memory-pressure:#{host}"
+
+  @doc false
+  def memory_title(host), do: "#{host} is running low on memory"
+
+  @doc false
+  def memory_restart_title(host), do: "#{host}: Tightbeam restarted during memory pressure"
+
+  @doc false
+  def memory_body(open) do
+    Enum.join(
+      [
+        "Since #{format_local(open.episode_opened_at)}, #{open.host} has had " <>
+          "#{memory_text(open.sample)}.",
+        stalled_text(open.sample)
+      ] ++ population_text(open.populations) ++ [@memory_closing],
+      " "
+    )
+  end
+
+  @doc false
+  def memory_restart_body(%{unknown?: true} = run) do
+    Enum.join(
+      [
+        "Tightbeam restarted on #{run.host} while memory pressure was ongoing.",
+        "Its record of this pressure could not be read, so when it began and how severe " <>
+          "it was are unknown.",
+        @memory_closing
+      ],
+      " "
+    )
+  end
+
+  def memory_restart_body(run) do
+    opened =
+      case run.episode_opened_at do
+        nil -> "The episode had not yet opened."
+        at -> "The episode opened at #{format_local(at)}."
+      end
+
+    last =
+      case {run.last_sample_at, run.last_sample} do
+        {at, %{} = sample} when is_integer(at) ->
+          [
+            "The last kept sample, at #{format_local(at)}, showed #{memory_text(sample)}.",
+            stalled_text(sample)
+          ]
+
+        _ ->
+          []
+      end
+
+    first =
+      case run.first_alert do
+        :sent ->
+          ["The first alert for this episode was sent."]
+
+        :not_sent ->
+          ["The first alert for this episode was not sent."]
+
+        :unconfirmed ->
+          [
+            "Harklight never confirmed the first alert for this episode, so it may not have reached you."
+          ]
+
+        nil ->
+          []
+      end
+
+    Enum.join(
+      [
+        "Tightbeam restarted on #{run.host} while memory pressure was ongoing.",
+        "The pressure began at #{format_local(run.run_started_at)}.",
+        opened
+      ] ++ last ++ first ++ [@memory_closing],
+      " "
+    )
+  end
+
+  defp memory_text(sample) do
+    total = sample["memTotalKiB"]
+    available = sample["memAvailableKiB"]
+    swap_total = sample["swapTotalKiB"]
+    swap_used = swap_total - sample["swapFreeKiB"]
+
+    "#{gib(available, @gib_kib)} GiB of #{gib(total, @gib_kib)} GiB free " <>
+      "(#{round(available * 100 / total)}%), with swap #{gib(swap_used, @gib_kib)} of " <>
+      "#{gib(swap_total, @gib_kib)} GiB used"
+  end
+
+  defp stalled_text(%{"someAvg10" => avg10, "someAvg60" => avg60})
+       when is_number(avg10) and is_number(avg60) do
+    "Programs were stalled waiting for memory #{round(avg10)}% of the last 10 seconds " <>
+      "and #{round(avg60)}% of the last minute."
+  end
+
+  defp stalled_text(_sample),
+    do: "This host does not report how long programs were stalled waiting for memory."
+
+  # M9: memory by population, from cgroup v2 only; omitted without it.
+  defp population_text(%{"populations" => [_ | _] = populations, "swapAccounted" => swap?}) do
+    listed =
+      Enum.map_join(populations, ", ", fn [label, bytes] ->
+        "#{label} #{gib(bytes, @gib_bytes)} GiB"
+      end)
+
+    swap =
+      if swap?,
+        do: "",
+        else: " These figures are memory only, because this host does not account swap per group."
+
+    ["Using memory: #{listed}." <> swap]
+  end
+
+  defp population_text(_populations), do: []
+
+  defp gib(amount, unit), do: :erlang.float_to_binary(amount / unit, decimals: 1)
 
   ## Shared record
 

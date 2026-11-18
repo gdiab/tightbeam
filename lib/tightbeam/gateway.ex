@@ -348,6 +348,10 @@ defmodule Tightbeam.Gateway do
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
          {Tightbeam.HarklightWakes, db: db, send_runner: Map.get(config, :harklight_send_runner)},
+         # Before OwnerAlerts: a memory-pressure restart (M6) is recorded before
+         # the delivery boot pass can send the episode alert it supersedes.
+         {Tightbeam.OwnerAlerts.MemoryPressure,
+          db: db, scheduler: Tightbeam.WakeScheduler, state_dir: config.base_dir},
          {Tightbeam.OwnerAlerts, db: db, send_runner: Map.get(config, :harklight_send_runner)},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
@@ -6714,6 +6718,10 @@ defmodule Tightbeam.Gateway do
                  # A new owner, or a threshold set or cleared lower, can stall
                  # items at once; a clear of the owner stops the next pass.
                  Tightbeam.OwnerAlerts.stall_inputs_changed_in_txn(txn)
+
+                 # The memory sampler runs only while there is an owner.
+                 if setting == "owner-alerts-user",
+                   do: Tightbeam.OwnerAlerts.MemoryPressure.owner_changed_in_txn(txn)
                end
 
                {:ok, stored, result}
