@@ -477,6 +477,225 @@ defmodule Tightbeam.OwnerAlertsTest do
     assert %{value: 7_200_000} = config.(%{action: "get", setting: "owner-alert-stall-ms"})
   end
 
+  test "T18: clearing the owner setting turns usage-limit alerts off, and setting it turns them on",
+       %{db: db, main: main} do
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+    :ok = Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{mode: :all})
+    config = config_handler(db)
+    set = fn setting, value -> config.(%{action: "set", setting: setting, value: value}) end
+    get = fn setting -> config.(%{action: "get", setting: setting}) end
+
+    assert %{value: @owner, changed: true} = set.("owner-alerts-user", @owner)
+    assert [%{"refs" => %{"key" => "owner-alerts-user"}}] = config_updates()
+
+    # A caller without config authority is refused clearing exactly as setting.
+    as_owner = config_handler(db, {:session, main})
+    forbidden = as_owner.(%{action: "set", setting: "owner-alerts-user", value: "other"})
+    assert %{code: "forbidden"} = forbidden
+    assert as_owner.(%{action: "set", setting: "owner-alerts-user", value: ""}) == forbidden
+    assert Org.get_setting(db, "owner-alerts-user") == @owner
+    assert config_updates() == []
+
+    # One usage-limit alert after a definite failure.
+    failed_session = session(db, "agent:george:failed")
+    fail_turn(db, failed_session, @codex_limit)
+    failed = alert_for(db, failed_session)
+    assert OwnerAlerts.deliver_due(db, now: failed.created_at, runner: failing(self())) == 0
+    assert_received {:harklight, ["send", "--prepare" | _]}
+
+    assert %{state: "pending", last_outcome: "failed", attempts: 1} =
+             alert_for(db, failed_session)
+
+    # One usage-limit alert whose send is uncertain.
+    uncertain_session = session(db, "agent:george:uncertain")
+    fail_turn(db, uncertain_session, @codex_limit)
+    uncertain = alert_for(db, uncertain_session)
+    unknown_runner = runner(self(), fn {:execute, op} -> unknown(op) end)
+    assert OwnerAlerts.deliver_due(db, now: uncertain.created_at, runner: unknown_runner) == 0
+    assert_received {:harklight, ["send", "--prepare", "--op-id", uncertain_op | _]}
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^uncertain_op]}
+    refute_received {:harklight, _}
+
+    assert %{state: "pending", last_outcome: "outcome_unknown", op_id: ^uncertain_op} =
+             alert_for(db, uncertain_session)
+
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 1
+
+    # Clear: the row is deleted and config.updated is published once.
+    assert %{
+             setting: "owner-alerts-user",
+             value: nil,
+             changed: true,
+             config: %{"key" => "owner-alerts-user", "value" => nil} = cleared
+           } = set.("owner-alerts-user", "")
+
+    assert [%{"refs" => %{"key" => "owner-alerts-user"}, "payload" => ^cleared}] =
+             config_updates()
+
+    assert count(db, "SELECT count(*) FROM org_settings WHERE key='owner-alerts-user'") == 0
+    assert %{setting: "owner-alerts-user", value: nil} = get.("owner-alerts-user")
+
+    # A failure while alerts are off creates no row, then or later.
+    off_session = session(db, "agent:george:off")
+    fail_turn(db, off_session, @codex_limit)
+    assert alert_for(db, off_session) == nil
+    assert length(alerts(db)) == 2
+
+    # Clearing again changes nothing and publishes nothing.
+    assert %{setting: "owner-alerts-user", value: nil, changed: false} =
+             set.("owner-alerts-user", "")
+
+    assert config_updates() == []
+
+    # At the next attempts: the definite failure is withdrawn without a new
+    # operation; the uncertain send is settled on its own op id only.
+    due = max(failed.created_at, uncertain.created_at) + 5 * @minute
+    settle_runner = runner(self(), fn {:retry, op} -> committed(op, "retry") end)
+    assert OwnerAlerts.deliver_due(db, now: due, runner: settle_runner) == 0
+    assert_received {:harklight, ["retry", "--op-id", ^uncertain_op]}
+    refute_received {:harklight, _}
+
+    assert %{state: "withdrawn", next_attempt_at: nil, attempts: 1} =
+             alert_for(db, failed_session)
+
+    assert withdrawn_reasons(db, failed.alert_id) == ["alerts-off"]
+    assert %{state: "sent", op_id: ^uncertain_op} = alert_for(db, uncertain_session)
+
+    assert {:ok, [[^uncertain_op, ^main, "bound"]]} =
+             DB.query(db, "SELECT opId, sessionKey, state FROM harklight_send_operations")
+
+    # Withdrawn stays withdrawn; nothing is attempted again.
+    assert OwnerAlerts.deliver_due(db, now: due + 24 * @hour, runner: settle_runner) == 0
+    refute_received {:harklight, _}
+
+    # The stall threshold clears back to its default.
+    assert %{value: 7_200_000, changed: true} = set.("owner-alert-stall-ms", 7_200_000)
+    assert [%{"refs" => %{"key" => "owner-alert-stall-ms"}}] = config_updates()
+
+    assert %{setting: "owner-alert-stall-ms", value: nil, changed: true} =
+             set.("owner-alert-stall-ms", "")
+
+    assert [%{"refs" => %{"key" => "owner-alert-stall-ms"}, "payload" => %{"value" => nil}}] =
+             config_updates()
+
+    assert count(db, "SELECT count(*) FROM org_settings WHERE key='owner-alert-stall-ms'") == 0
+    assert %{setting: "owner-alert-stall-ms", value: 14_400_000} = get.("owner-alert-stall-ms")
+    assert OwnerAlerts.stall_ms(db) == 14_400_000
+    assert %{changed: false} = set.("owner-alert-stall-ms", "")
+    assert config_updates() == []
+
+    # Any other setting refuses "" as it refuses any non-integer today.
+    assert %{code: "invalid_priority"} = refused = set.("default-priority", "")
+    assert set.("default-priority", "high") == refused
+    assert Org.get_setting(db, "default-priority") == nil
+    assert config_updates() == []
+
+    # Setting the owner again: alerts resume for failures from then on.
+    assert %{value: @owner, changed: true} = set.("owner-alerts-user", @owner)
+    assert [%{"refs" => %{"key" => "owner-alerts-user"}}] = config_updates()
+
+    resumed_session = session(db, "agent:george:resumed")
+    fail_turn(db, resumed_session, @codex_limit)
+    assert %{state: "pending", attempts: 0} = alert_for(db, resumed_session)
+    assert owner_of(db, alert_for(db, resumed_session).alert_id) == @owner
+    assert alert_for(db, off_session) == nil
+  end
+
+  test "T19: a changed owner withdraws or settles the old owner's alerts, never re-addressing them",
+       %{db: db, main: main, host: host} do
+    enable(db)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('alice',0,1)")
+
+    alice_main =
+      Org.create(db, %{
+        session_key: Org.personal_session_key("alice"),
+        display_name: "Alice Main",
+        kind: "main",
+        is_built_in: true,
+        owner_user_id: "alice",
+        origin: "user:alice",
+        archetype: "default",
+        host: host,
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol")
+      }).session_key
+
+    # A george alert pending after a definite failure.
+    failed_session = session(db, "agent:george:failed")
+    fail_turn(db, failed_session, @codex_limit)
+    failed = alert_for(db, failed_session)
+    assert OwnerAlerts.deliver_due(db, now: failed.created_at, runner: failing(self())) == 0
+    assert_received {:harklight, ["send", "--prepare" | _]}
+
+    # A george alert whose send is uncertain.
+    uncertain_session = session(db, "agent:george:uncertain")
+    fail_turn(db, uncertain_session, @codex_limit)
+    uncertain = alert_for(db, uncertain_session)
+    unknown_runner = runner(self(), fn {:execute, op} -> unknown(op) end)
+    assert OwnerAlerts.deliver_due(db, now: uncertain.created_at, runner: unknown_runner) == 0
+    assert_received {:harklight, ["send", "--prepare", "--op-id", uncertain_op | _]}
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^uncertain_op]}
+    refute_received {:harklight, _}
+
+    config = config_handler(db)
+
+    assert %{setting: "owner-alerts-user", value: "alice", changed: true} =
+             config.(%{action: "set", setting: "owner-alerts-user", value: "alice"})
+
+    # A failure on an alice session alerts alice; one on a george session does not.
+    alice_session = session(db, "agent:alice:worker", owner: "alice")
+    fail_turn(db, alice_session, @codex_limit)
+    george_session = session(db, "agent:george:late")
+    fail_turn(db, george_session, @codex_limit)
+
+    assert alert_for(db, george_session) == nil
+    alice_alert = alert_for(db, alice_session)
+    assert owner_of(db, alice_alert.alert_id) == "alice"
+    assert alice_alert.origin == alice_main
+    assert owner_of(db, failed.alert_id) == @owner
+    assert owner_of(db, uncertain.alert_id) == @owner
+
+    due = max(failed.created_at, uncertain.created_at) + 5 * @minute
+
+    both =
+      runner(self(), fn
+        {:execute, op} -> committed(op, "send")
+        {:retry, op} -> committed(op, "retry")
+      end)
+
+    assert OwnerAlerts.deliver_due(db, now: due, runner: both) == 0
+
+    # The uncertain george send is settled on its own op id, from george's Main.
+    assert_received {:harklight, ["retry", "--op-id", ^uncertain_op]}
+    # Alice's alert is sent as a new operation from alice's Main.
+    assert_received {:harklight, ["send", "--prepare", "--op-id", alice_op | _]}
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^alice_op]}
+    # The definite-failure george alert gets no new operation.
+    refute_received {:harklight, _}
+
+    assert %{state: "withdrawn", attempts: 1, next_attempt_at: nil} =
+             alert_for(db, failed_session)
+
+    assert withdrawn_reasons(db, failed.alert_id) == ["owner-changed"]
+    assert %{state: "sent", op_id: ^uncertain_op} = alert_for(db, uncertain_session)
+    assert %{state: "sent", op_id: ^alice_op} = alert_for(db, alice_session)
+
+    {:ok, ops} =
+      DB.query(
+        db,
+        """
+        SELECT a.ownerUserId, o.opId, o.sessionKey FROM harklight_send_operations o
+        JOIN owner_alerts a ON a.opId=o.opId ORDER BY a.ownerUserId
+        """
+      )
+
+    assert ops == [["alice", alice_op, alice_main], [@owner, uncertain_op, main]]
+    assert count(db, "SELECT count(*) FROM harklight_send_operations") == 2
+  end
+
   test "T15: an alert created before a restart is sent once after it", %{db: db} do
     enable(db)
     fail_turn(db, session(db, "agent:george:worker"), @codex_limit)
@@ -637,7 +856,7 @@ defmodule Tightbeam.OwnerAlertsTest do
 
   defp ended_at(db, seq), do: count(db, "SELECT endedAt FROM turns WHERE seq=?1", [seq])
 
-  defp config_handler(db) do
+  defp config_handler(db, principal \\ {:process, "test"}) do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-owner-alerts-#{System.unique_integer([:positive])}")
 
@@ -645,8 +864,27 @@ defmodule Tightbeam.OwnerAlertsTest do
     Archetypes.load!(base_dir)
     config = Gateway.handlers(%{db: db, base_dir: base_dir, wake_tick_ms: 1_000})["config"]
 
-    fn params ->
-      config.(%{principal: {:process, "test"}, origin: "process:test", params: params})
+    origin =
+      case principal do
+        {:process, name} -> "process:" <> name
+        {:session, key} -> "session:" <> key
+      end
+
+    fn params -> config.(%{principal: principal, origin: origin, params: params}) end
+  end
+
+  # The config.updated notices the firehose published since the last call.
+  defp config_updates do
+    :sys.get_state(Tightbeam.Firehose.Hub)
+    drain_config_updates([])
+  end
+
+  defp drain_config_updates(notices) do
+    receive do
+      {:firehose_notice, %{"class" => "config.updated"} = notice} ->
+        drain_config_updates([notice | notices])
+    after
+      0 -> Enum.reverse(notices)
     end
   end
 
@@ -692,6 +930,14 @@ defmodule Tightbeam.OwnerAlertsTest do
       op_id: op,
       response: %{session_handle: op, sender_id: "tightbeam-alerts", message_id: "msg-" <> op}
     })
+  end
+
+  # Every Harklight call fails definitely: nothing is prepared or delivered.
+  defp failing(parent) do
+    fn args ->
+      send(parent, {:harklight, args})
+      {"harklight-agent: network unreachable", 1}
+    end
   end
 
   defp unknown(op), do: {JSON.encode!(%{kind: "outcome_unknown", op_id: op}) <> "\n", 7}
@@ -748,6 +994,22 @@ defmodule Tightbeam.OwnerAlertsTest do
         origin: origin
       }
     end)
+  end
+
+  defp alert_for(db, session_key), do: Enum.find(alerts(db), &(&1.session_key == session_key))
+
+  defp owner_of(db, alert_id),
+    do: count(db, "SELECT ownerUserId FROM owner_alerts WHERE alertId=?1", [alert_id])
+
+  defp withdrawn_reasons(db, alert_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT detail FROM lifecycle_events WHERE kind='owner_alert_withdrawn' AND subject=?1",
+        [alert_id]
+      )
+
+    Enum.map(rows, fn [detail] -> JSON.decode!(detail)["reason"] end)
   end
 
   defp record_counts(db) do
