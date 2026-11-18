@@ -70,7 +70,7 @@ defmodule Tightbeam.LimitFallbackTest do
                )
 
       assert {:ok,
-              [["index", "limit_fallback_open_holds"], ["table", "limit_fallback_evaluations"]]} =
+              [["table", "limit_fallback_evaluations"], ["index", "limit_fallback_open_holds"]]} =
                DB.query(
                  ctx.db,
                  "SELECT type, name FROM sqlite_master WHERE name LIKE 'limit_fallback_%' ORDER BY name"
