@@ -4193,6 +4193,415 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  describe "companion v1.6 §7 on 0.1.16: probes and the one release step" do
+    test "PR3 and PR5: an unknown reset is probed at open + 2 min, then 4, 8, 16, 32 min, then hourly, without output",
+         ctx do
+      %{hold: hold_id, opened_at: opened_at} = codex_hold!(ctx)
+
+      starts =
+        for _probe <- 1..7 do
+          {started, result} = probe_cycle!(ctx.db, hold_id, "failed")
+          assert result == :ok
+          started
+        end
+
+      assert hd(starts) == opened_at + 120_000
+
+      assert starts |> Enum.chunk_every(2, 1, :discard) |> Enum.map(fn [a, b] -> b - a end) ==
+               [240_000, 480_000, 960_000, 1_920_000, 3_600_000, 3_600_000]
+
+      # Each probe is recorded by time, key and outcome class, with no output.
+      assert {:ok, rows} =
+               DB.query(
+                 ctx.db,
+                 "SELECT harness,host,outcome,errorExcerpt FROM harness_health_recovery_checks WHERE holdId=?1",
+                 [hold_id]
+               )
+
+      assert length(rows) == 7
+      assert Enum.all?(rows, &(&1 == ["codex", "testhost", "failed", nil]))
+    end
+
+    test "PR3: at most 24 automatic probes start on one key in any rolling 24 hours", ctx do
+      %{hold: hold_id} = codex_hold!(ctx)
+
+      starts =
+        for _probe <- 1..24 do
+          {started, :ok} = probe_cycle!(ctx.db, hold_id, "failed")
+          started
+        end
+
+      # The uncapped 25th would be due an hour after the 24th, inside the
+      # first probe's 24 hours; it waits until that window allows one.
+      assert List.last(starts) + 3_600_000 < hd(starts) + 86_400_000
+
+      assert {:ok, [[due_at]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT dueAt FROM harness_health_recovery_schedules WHERE holdId=?1 AND status='pending'",
+                 [hold_id]
+               )
+
+      assert due_at == hd(starts) + 86_400_000
+    end
+
+    test "PR2: one probe per key per cycle, on the model of the incident's first failure",
+         ctx do
+      %{hold: hold_id} = codex_hold!(ctx)
+
+      for {key, model} <- [{"pr2-a", "gpt-5"}, {"pr2-b", "gpt-5-mini"}, {"pr2-c", "gpt-5-mini"}] do
+        session_key = "agent:harness-health:#{key}"
+        codex_session!(ctx.db, session_key, model)
+
+        fail_health_turn!(
+          ctx.db,
+          session_key,
+          "#{key}-msg",
+          "#{key} prompt",
+          @captured_codex_rate_limit
+        )
+      end
+
+      assert {:ok, %{"routes" => routes}} =
+               DB.transaction(
+                 ctx.db,
+                 &Tightbeam.RowReactions.Snapshot.harness_health_hold(&1, hold_id)
+               )
+
+      assert length(Enum.uniq_by(routes, & &1["model"])) >= 2
+
+      {:ok, [[first_model]]} =
+        DB.query(
+          ctx.db,
+          """
+          SELECT t.model FROM harness_health_observations o
+          JOIN turns t ON o.correlationId='harness-turn:' || t.seq || ':' || o.failureClass
+          WHERE o.incidentId=?1 ORDER BY o.observedAt,o.id LIMIT 1
+          """,
+          [hold_id]
+        )
+
+      {:ok, [[cycle_id, due_at]]} =
+        DB.query(
+          ctx.db,
+          "SELECT cycleId,dueAt FROM harness_health_recovery_schedules WHERE holdId=?1 AND status='pending'",
+          [hold_id]
+        )
+
+      assert [_] = Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, due_at)
+
+      # A supervisor that starts nothing: the check is recorded, and no
+      # provider request is made by the test.
+      task_sup = start_supervised!({Task.Supervisor, max_children: 0}, id: :pr2_task_sup)
+
+      assert :ok =
+               RecoveryCheck.start_cycle(ctx.db, System.tmp_dir!(), task_sup, hold_id, cycle_id)
+
+      assert {:ok, [[route_json, "inconclusive", nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT routeJson,outcome,errorExcerpt FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2",
+                 [hold_id, cycle_id]
+               )
+
+      route = JSON.decode!(route_json)
+      assert Map.keys(route) |> Enum.sort() == ~w(harness host model sharedAccount)
+      assert route["model"] == first_model
+      refute route_json =~ "prompt"
+      refute route_json =~ "agent:"
+    end
+
+    test "PR1: a declared reset suppresses probing, and no probe follows its release", ctx do
+      previous = Application.get_env(:tightbeam, :local_time_zone)
+      Application.put_env(:tightbeam, :local_time_zone, "America/Los_Angeles")
+
+      on_exit(fn ->
+        if previous,
+          do: Application.put_env(:tightbeam, :local_time_zone, previous),
+          else: Application.delete_env(:tightbeam, :local_time_zone)
+      end)
+
+      reset_error = future_codex_rate_limit(System.system_time(:millisecond))
+      fail_health_turn!(ctx.db, ctx.main_session, "pr1-msg", "pr1 prompt", reset_error)
+
+      assert {:ok, [[hold_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT id FROM harness_health_incidents WHERE harness='codex' AND state='open'"
+               )
+
+      assert {:ok, [[wake_id]]} =
+               DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE consumer='rate_limit_reset'")
+
+      Tightbeam.HarnessHealth.RecoverySchedule.reconcile_open_holds(ctx.db)
+      assert pending_probes(ctx.db, hold_id) == 0
+
+      {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
+      assert {:ok, _} = Tightbeam.RateLimitReset.release(ctx.db, %{wake_id: wake_id})
+      refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+      assert HarnessHealth.get(ctx.db, hold_id).state == "open"
+
+      Tightbeam.HarnessHealth.RecoverySchedule.reconcile_open_holds(ctx.db)
+      assert pending_probes(ctx.db, hold_id) == 0
+    end
+
+    test "C1: a probe release keeps the fence while another quota incident stands; admission resumes when it clears",
+         ctx do
+      %{hold: hold_id} = codex_hold!(ctx)
+      other = second_open_codex_incident!(ctx.db)
+
+      {_started, release} = probe_cycle!(ctx.db, hold_id, "succeeded")
+
+      assert release == :ok
+      assert HarnessHealth.get(ctx.db, hold_id).state == "resolved"
+      assert Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+      assert [%{"cause" => "recovery_probe"}] =
+               lifecycle_details(ctx.db, "rate_limit_hold_released", hold_id)
+
+      assert [%{"reasons" => ["open_incident:" <> ^other]}] =
+               lifecycle_details(ctx.db, "rate_limit_hold_remains", hold_id)
+
+      assert lifecycle_details(ctx.db, "rate_limit_admission_resumed", hold_id) == []
+
+      # The remaining incident clears: admission resumes, recorded on its own.
+      assert {:resolved, _} =
+               HarnessHealth.resolve(ctx.db, %{
+                 harness: "codex",
+                 host: "testhost",
+                 failure_class: "rate-limit-dead",
+                 observed_at: System.system_time(:millisecond),
+                 correlation_id: "c1-second-clears",
+                 cause: "normal turn delivered",
+                 principal: "process:tightbeam"
+               })
+
+      refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+      assert [%{"cause" => "later_success"}] =
+               lifecycle_details(ctx.db, "rate_limit_admission_resumed", other)
+    end
+
+    test "C2: after a probe release a pre-activity turn is redelivered once; a started turn never is",
+         ctx do
+      %{hold: hold_id, turn: pre_activity} = codex_hold!(ctx)
+
+      second = "agent:harness-health:c2-started"
+      codex_session!(ctx.db, second, "gpt-5")
+
+      started =
+        fail_health_turn!(
+          ctx.db,
+          second,
+          "c2-started-msg",
+          "c2 started prompt",
+          @captured_codex_rate_limit, before_finish: &started_work!/3)
+
+      {_started_at, :ok} = probe_cycle!(ctx.db, hold_id, "succeeded")
+      refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
+
+      {:ok, [[correlation]]} =
+        DB.query(
+          ctx.db,
+          "SELECT o.correlationId FROM harness_health_incidents i JOIN harness_health_observations o ON o.id=i.resolutionObservationId WHERE i.id=?1",
+          [hold_id]
+        )
+
+      for _ <- 1..2,
+          do:
+            assert(:ok = Wakes.redeliver_cycle_release(ctx.db, correlation, "codex", "testhost"))
+
+      assert redelivered_count(ctx.db, pre_activity.seq) == 1
+      assert redelivered_count(ctx.db, started.seq) == 0
+
+      # The started turn is recorded unknown_effect and surfaced once each to
+      # its holder and delivery owner.
+      assert [%{"turnSeq" => seq, "disposition" => "unknown_effect"}] =
+               lifecycle_details(ctx.db, "quota_failed_turn_not_replayed", second)
+
+      assert seq == started.seq
+    end
+  end
+
+  defp codex_hold!(ctx) do
+    turn =
+      fail_health_turn!(
+        ctx.db,
+        ctx.main_session,
+        "codex-hold-#{System.unique_integer([:positive])}",
+        "codex rate limit hold",
+        @captured_codex_rate_limit
+      )
+
+    {:ok, [[hold_id, opened_at]]} =
+      DB.query(
+        ctx.db,
+        "SELECT i.id,i.openedAt FROM harness_health_observations o JOIN harness_health_incidents i ON i.id=o.incidentId WHERE o.correlationId=?1",
+        ["harness-turn:#{turn.seq}:rate-limit-dead"]
+      )
+
+    %{hold: hold_id, opened_at: opened_at, turn: turn}
+  end
+
+  # One automatic probe of the hold's due cycle: fired at its due time, its
+  # one route recorded with the given outcome.
+  defp probe_cycle!(db, hold_id, outcome) do
+    {:ok, [[cycle_id, due_at]]} =
+      DB.query(
+        db,
+        "SELECT cycleId,dueAt FROM harness_health_recovery_schedules WHERE holdId=?1 AND status='pending'",
+        [hold_id]
+      )
+
+    assert [%{"cycle_id" => ^cycle_id}] =
+             Tightbeam.HarnessHealth.RecoverySchedule.fire_due(db, due_at)
+
+    {:ok, %{"routes" => [route | _], "ownerUserId" => owner}} =
+      DB.transaction(db, &Tightbeam.RowReactions.Snapshot.harness_health_hold(&1, hold_id))
+
+    seed_running_recovery_checks!(db, hold_id, cycle_id, [route], due_at, owner || "system")
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        RecoveryCheck.record_result_in_txn(
+          txn,
+          hold_id,
+          cycle_id,
+          RecoveryCheck.route_key(route),
+          outcome,
+          "provider output that must not be kept",
+          due_at + 1
+        )
+      end)
+
+    {due_at, if(match?({:released, _}, result), do: :ok, else: result)}
+  end
+
+  defp codex_session!(db, session_key, model) do
+    Org.create(db, %{
+      session_key: session_key,
+      display_name: session_key,
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "coder",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new(model)
+    })
+  end
+
+  # A second open rate-limit-dead incident on the same Codex key, as one
+  # stated fixture (two incidents can stand on a key; upstream's standing-
+  # reasons guard counts them).
+  defp second_open_codex_incident!(db) do
+    at = System.system_time(:millisecond)
+    incident = "hhi_c1_second_#{System.unique_integer([:positive])}"
+    observation = "hho_c1_second_#{System.unique_integer([:positive])}"
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DB.Txn.q(
+          txn,
+          "INSERT INTO harness_health_observations(id,correlationId,harness,host,failureClass,evidenceKind,observedAt,cause,principal,incidentId) VALUES(?1,?2,'codex','testhost','rate-limit-dead','terminal-failure',?3,'fixture','process:test',?4)",
+          [observation, "c1-second-#{observation}", at, incident]
+        )
+
+        Tightbeam.DB.Txn.q(
+          txn,
+          "INSERT INTO harness_health_incidents(id,harness,host,failureClass,state,openedAt,openObservationId) VALUES(?1,'codex','testhost','rate-limit-dead','open',?2,?3)",
+          [incident, at, observation]
+        )
+      end)
+
+    incident
+  end
+
+  defp started_work!(db, key, seq) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO turn_lifecycle_events
+          (turnSeq, ordinal, at, eventKey, kind, stage, cause, principal, producerEventId)
+        SELECT ?1, COALESCE(MAX(ordinal), 0) + 1, 1, 'dispatched-' || ?1, 'prompt_dispatched',
+               'prompt', 'test', 'process:test', 'dispatched-' || ?1
+        FROM turn_lifecycle_events WHERE turnSeq=?1
+        """,
+        [seq]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO tool_calls
+          (id, sessionKey, turnSeq, afterMessageSeq, harnessToolCallId, title, kind, toolName,
+           status, truncated, startedAt, endedAt, rowVersion)
+        VALUES (?1, ?2, ?3, 0, 'tool-1', 'git push', 'execute', 'Bash', 'completed', '[]', 1, 2, 1)
+        """,
+        ["tc_#{System.unique_integer([:positive])}", key, seq]
+      )
+  end
+
+  defp future_codex_rate_limit(at) do
+    {:ok, local} =
+      (at + 2 * 3_600_000)
+      |> DateTime.from_unix!(:millisecond)
+      |> DateTime.shift_zone("America/Los_Angeles", Tz.TimeZoneDatabase)
+
+    day = local.day
+
+    suffix =
+      cond do
+        day in [1, 21, 31] -> "st"
+        day in [2, 22] -> "nd"
+        day in [3, 23] -> "rd"
+        true -> "th"
+      end
+
+    put_in(
+      @captured_codex_rate_limit,
+      ["data", "message"],
+      "You've hit your usage limit. Visit the account usage page or try again at " <>
+        Calendar.strftime(local, "%b %-d") <>
+        suffix <> Calendar.strftime(local, ", %Y %-I:%M %p") <> "."
+    )
+  end
+
+  defp pending_probes(db, hold_id) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM harness_health_recovery_schedules WHERE holdId=?1 AND status IN ('pending','due')",
+        [hold_id]
+      )
+
+    count
+  end
+
+  defp lifecycle_details(db, kind, subject) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT detail FROM lifecycle_events WHERE kind=?1 AND subject=?2 ORDER BY id",
+        [kind, subject]
+      )
+
+    Enum.map(rows, fn [detail] -> JSON.decode!(detail) end)
+  end
+
+  defp redelivered_count(db, source_seq) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1 AND (cycleReleaseTurnSeq IS NOT NULL OR redeliveryTurnSeq IS NOT NULL)",
+        [source_seq]
+      )
+
+    count
+  end
+
   defp seed_running_recovery_checks!(db, hold_id, cycle_id, routes, started_at, org) do
     routes
     |> Enum.sort_by(&Tightbeam.HarnessHealth.RecoveryCheck.route_key/1)
@@ -4329,6 +4738,11 @@ defmodule Tightbeam.HarnessHealthTest do
     {:ok, turn} = Ledger.claim_next(db, session_key, "health-redelivery-test")
     turn = Map.put(turn, :session_key, session_key)
     session = Org.get(db, session_key)
+
+    case Keyword.get(opts, :before_finish) do
+      fun when is_function(fun, 3) -> fun.(db, session_key, source_seq)
+      nil -> :ok
+    end
 
     assert {:ok, post_commit} =
              DB.transaction(db, fn txn ->
