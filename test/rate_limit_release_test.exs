@@ -1,5 +1,6 @@
 defmodule Tightbeam.RateLimitReleaseTest do
   use Tightbeam.TestCase, async: false
+  import Bitwise
 
   alias Tightbeam.{
     DB,
@@ -720,6 +721,116 @@ defmodule Tightbeam.RateLimitReleaseTest do
              end)
 
     assert length(queued_messages(db)) == 2
+  end
+
+  ## Memory limits v1.4 R6a / T14: a quota park and a memory hold are separate
+  ## standing reasons. A release ends only its own; B5's re-admission runs once,
+  ## when the last one clears, whichever clears last.
+
+  describe "memory limits T14" do
+    setup %{db: db} do
+      root = Path.join(System.tmp_dir!(), "tb-t14-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(root, "proc"))
+      on_exit(fn -> File.rm_rf(root) end)
+      meminfo!(root, 10)
+
+      start_supervised!(
+        {Tightbeam.MemoryGuard,
+         db: db,
+         base_dir: Path.join(root, "base"),
+         local_host: "testhost",
+         root: root,
+         probe: fn -> %{mode: :watched, reason: "test", mem_total: 16 <<< 30, cgroup: nil} end,
+         sample_ms: :manual,
+         nudge: fn _ -> :ok end}
+      )
+
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert Tightbeam.MemoryGuard.host_reasons("testhost") == ["memory_floor"]
+      %{root: root}
+    end
+
+    defp meminfo!(root, percent) do
+      total = 16 <<< 20
+
+      File.write!(
+        Path.join(root, "proc/meminfo"),
+        "MemTotal: #{total} kB\nMemAvailable: #{div(total * percent, 100)} kB\n"
+      )
+    end
+
+    defp parked_with_two_quota_failed_turns!(db) do
+      error = future_codex_error(System.system_time(:millisecond))
+      first = fail_turn(db, "c1", error)
+      second = fail_turn(db, "c1", error)
+
+      assert {:ok, _} =
+               DB.transaction(db, fn txn ->
+                 observe_in_txn(txn, "open", "c1", "testhost", System.system_time(:millisecond))
+               end)
+
+      assert HarnessProcess.parked?(db, @codex_key)
+      {first, second}
+    end
+
+    defp release_at_reset!(db) do
+      {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE consumer='rate_limit_reset'")
+      {:ok, wakes} = DB.query(db, "SELECT wakeId FROM wakes WHERE consumer='rate_limit_reset'")
+
+      for [wake_id] <- wakes,
+          do: assert({:ok, _} = RateLimitReset.release(db, %{wake_id: wake_id}))
+
+      refute HarnessProcess.parked?(db, @codex_key)
+    end
+
+    defp lifecycle(db, kind) do
+      {:ok, rows} =
+        DB.query(db, "SELECT subject,detail FROM lifecycle_events WHERE kind=?1 ORDER BY id", [
+          kind
+        ])
+
+      Enum.map(rows, fn [subject, detail] -> {subject, JSON.decode!(detail)} end)
+    end
+
+    test "(b) the quota park releases first: nothing re-admitted while the floor stands; at the floor's release, once, in order",
+         %{db: db, root: root} do
+      {first, second} = parked_with_two_quota_failed_turns!(db)
+      release_at_reset!(db)
+
+      # The release is recorded and the remaining hold is a separate record;
+      # no re-admission hook has run.
+      assert [{_incident, %{"released" => "quota_park", "remaining" => ["memory_floor"]}}] =
+               lifecycle(db, "admission_hold_remaining")
+
+      assert queued_messages(db) == []
+      assert lifecycle(db, "admission_resumed") == []
+
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+
+      assert [{_incident, %{"after" => ["memory"]}}] = lifecycle(db, "admission_resumed")
+      assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+
+      # Exactly once: another release finds nothing pending.
+      :ok = Tightbeam.MemoryGuard.Admission.run_deferred(db, "testhost")
+      assert length(queued_messages(db)) == 2
+    end
+
+    test "(a) the floor releases first: the park still holds and nothing is re-admitted; at the park's release, once, in order",
+         %{db: db, root: root} do
+      {first, second} = parked_with_two_quota_failed_turns!(db)
+
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert [{"testhost", %{"detail" => "memory_floor"}}] = lifecycle(db, "memory_guard_release")
+      assert HarnessProcess.parked?(db, @codex_key)
+      assert queued_messages(db) == []
+      assert lifecycle(db, "admission_resumed") == []
+
+      release_at_reset!(db)
+      assert [{_incident, %{"after" => ["quota_park"]}}] = lifecycle(db, "admission_resumed")
+      assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+    end
   end
 
   test "B5: a quota-failed wake turn that had started work gets no retry; one that had not keeps it",
