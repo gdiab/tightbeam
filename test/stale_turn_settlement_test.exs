@@ -116,6 +116,26 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     %{db: db, base: base, handlers: handlers, adapter: adapter}
   end
 
+  test "stale-turn v1.3 R7: an unresponsive adapter takes no new turn until its replacement wakes the lanes",
+       ctx do
+    key = {:claude, "shared", "testhost"}
+    refute AdapterCoordinator.unresponsive?(key)
+
+    # What the adapter's on_unresponsive callback sends its coordinator.
+    send(Tightbeam.AdapterCoordinator, {:adapter_unresponsive, key, ctx.adapter, :test})
+    assert eventually(fn -> AdapterCoordinator.unresponsive?(key) end)
+
+    held = enqueue!(ctx.db, "k1", "held while unresponsive")
+    :ok = LaneManager.ensure_lane(Tightbeam.LaneManager, "k1")
+    refute_receive {:runner_started, ^held}, 300
+    assert turn_status(ctx.db, held) == "queued"
+
+    # Drained, it stops; its death clears the hold and wakes the held lane.
+    Process.exit(ctx.adapter, :kill)
+    assert_receive {:runner_started, ^held}, 5_000
+    refute AdapterCoordinator.unresponsive?(key)
+  end
+
   test "authorized cancel is atomic, replay-safe, private, and releases queued work", ctx do
     target = stale_turn!(ctx.db, "k1", "phantom", 42)
     successor = enqueue!(ctx.db, "k1", "successor")
