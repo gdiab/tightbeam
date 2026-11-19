@@ -9,6 +9,7 @@ mod command_execution;
 mod contain;
 mod cursor_execution_identity;
 mod cursor_rails;
+mod device_recovery;
 mod dispatch;
 mod github_auth;
 mod harness_process;

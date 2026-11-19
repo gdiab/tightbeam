@@ -648,6 +648,13 @@ pub enum Command {
         user_id: String,
         admin: bool,
     },
+    RecoverAdmin {
+        user_id: String,
+    },
+    RootAdmin {
+        action: crate::device_recovery::RootAction,
+        user_id: String,
+    },
     ConfigGet {
         identity: Identity,
         setting: String,
@@ -1225,10 +1232,19 @@ COMMANDS:
       Remove one exact user. Removal is deactivation: history is kept, and the
       user can no longer authenticate, be selected or act. Refuses self, the
       last admin and any user who owns rows; nothing is reassigned.
-  approve-device <deviceId> [--user <userId>]
-      Operator only: only an admin's paired device app may approve a device;
-      George sends `/tightbeam approve-device` from Clawline. Pairing is frozen
-      while the device-credential fix is installed.
+  approve-device [--user <userId>]
+      Operator only: only an admin's paired device app may approve a device.
+      George sends `/tightbeam approve-device` from his paired device; it shows a
+      one-time pairing code there, which he types into the new device's name.
+      Agents never run it, never ask another agent to, and never enter a code.
+  recover-admin --user <userId>
+      Operator only: George's full-lockout recovery, on the gateway host with the
+      gateway stopped. It reads his recovery secret from the terminal and prints a
+      60-minute pairing code. Agents never run it or enter a secret.
+  root-admin recovery-enroll|pairing-code --user <userId>
+      Operator only, last resort: run with sudo and George's own password, on the
+      gateway host with the gateway stopped. Enrols a recovery secret or issues a
+      60-minute pairing code, shown only on the terminal. Agents never run it.
   deny-device <deviceId>
       Operator only: George sends `/tightbeam deny-device` from Clawline.
   revoke-device <deviceId>
@@ -3825,14 +3841,12 @@ fn parse_with_optional_catalog(
         // Core fix (A) C8: operator-only verbs. They reach the gateway like any
         // other, which refuses every caller but an admin's paired device (C5).
         "approve-device" => {
-            if parsed.positional.len() != 2 {
-                return Err(
-                    "usage: tightbeam approve-device <deviceId> [--user <userId>]".to_owned(),
-                );
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam approve-device [--user <userId>]".to_owned());
             }
             Ok(Command::ApproveDevice {
                 identity: identity(flags)?,
-                device_id: parsed.positional[1].clone(),
+                device_id: String::new(),
                 user_id: nonempty(flags, "user"),
             })
         }
@@ -3853,6 +3867,32 @@ fn parse_with_optional_catalog(
                     identity,
                     device_id,
                 }
+            })
+        }
+        // Stage 1 S1.2 and S1.5: George's offline recovery and root-shell commands on the
+        // gateway host. Agents never run them (S3).
+        "recover-admin" => {
+            let usage = "usage: tightbeam recover-admin --user <userId>";
+            if parsed.positional.len() != 1 {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::RecoverAdmin {
+                user_id: nonempty(flags, "user").ok_or_else(|| usage.to_owned())?,
+            })
+        }
+        "root-admin" => {
+            let usage = "usage: tightbeam root-admin recovery-enroll|pairing-code --user <userId>";
+            let action = match parsed.positional.get(1).map(String::as_str) {
+                Some("recovery-enroll") => crate::device_recovery::RootAction::RecoveryEnroll,
+                Some("pairing-code") => crate::device_recovery::RootAction::PairingCode,
+                _ => return Err(usage.to_owned()),
+            };
+            if parsed.positional.len() != 2 {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::RootAdmin {
+                action,
+                user_id: nonempty(flags, "user").ok_or_else(|| usage.to_owned())?,
             })
         }
         "promote-user" => {
@@ -6311,6 +6351,8 @@ mod tests {
                 "deny-device",
                 "revoke-device",
                 "promote-user",
+                "recover-admin",
+                "root-admin",
                 "breathing",
                 "cancel-wake",
                 "condition",
@@ -7560,22 +7602,47 @@ mod tests {
     /// paired device; their help says operator only.
     #[test]
     fn operator_only_device_and_user_verbs_parse_to_their_requests() {
+        // Stage 1 S2.1: approval issues a code; no device id is named.
         assert_eq!(
-            parse(strings(&["approve-device", "dev_X"])),
+            parse(strings(&["approve-device"])),
             Ok(Command::ApproveDevice {
                 identity: Identity::Session,
-                device_id: "dev_X".to_owned(),
+                device_id: String::new(),
                 user_id: None,
             })
         );
         assert_eq!(
-            parse(strings(&["approve-device", "dev_X", "--user", "george"])),
+            parse(strings(&["approve-device", "--user", "george"])),
             Ok(Command::ApproveDevice {
                 identity: Identity::Session,
-                device_id: "dev_X".to_owned(),
+                device_id: String::new(),
                 user_id: Some("george".to_owned()),
             })
         );
+        assert_eq!(
+            parse(strings(&["recover-admin", "--user", "george"])),
+            Ok(Command::RecoverAdmin {
+                user_id: "george".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(strings(&["root-admin", "pairing-code", "--user", "george"])),
+            Ok(Command::RootAdmin {
+                action: crate::device_recovery::RootAction::PairingCode,
+                user_id: "george".to_owned()
+            })
+        );
+        for args in [
+            &["recover-admin"][..],
+            &["root-admin", "pairing-code"],
+            &["root-admin", "other", "--user", "george"],
+        ] {
+            assert!(
+                parse(strings(args))
+                    .unwrap_err()
+                    .starts_with("usage: tightbeam ")
+            );
+        }
         assert_eq!(
             parse(strings(&["deny-device", "dev_X"])),
             Ok(Command::DenyDevice {
@@ -7607,8 +7674,7 @@ mod tests {
             })
         );
         for args in [
-            &["approve-device"][..],
-            &["approve-device", "a", "b"],
+            &["approve-device", "a"][..],
             &["deny-device"],
             &["revoke-device", "a", "b"],
             &["promote-user"],
@@ -7626,6 +7692,8 @@ mod tests {
             "promote-user",
             "add-user",
             "remove-user",
+            "recover-admin",
+            "root-admin",
         ] {
             let entry = render_command_help(None, verb).unwrap();
             assert!(entry.contains("Operator only"), "{verb}: {entry}");
