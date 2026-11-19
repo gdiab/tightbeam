@@ -778,6 +778,30 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  describe "stale-turn v1.1 R7 no collateral" do
+    test "an unanswered settle of one session leaves a peer's prompt on the same adapter to complete" do
+      {adapter, _capture} =
+        start_adapter(gate_mode: "ignore-cancel-turn", probe: false, settle_grace_ms: 200)
+
+      conn = Adapter.conn(adapter)
+      stuck = Task.async(fn -> Adapter.prompt(adapter, "stuck", "stall") end)
+      peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "work") end)
+      stuck_id = s1_request_id(adapter, "stuck")
+      _peer_id = s1_request_id(adapter, "peer")
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, "stuck", stuck_id, "response_missing")
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(stuck, 5_000)
+
+      # The stuck prompt stays in Conn only as an orphan; the peer is untouched.
+      assert Process.alive?(conn)
+      assert Map.keys(:sys.get_state(adapter).prompts) == ["peer"]
+      Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "peer"})
+      assert {:ok, %{stop_reason: "end_turn"}} = Task.await(peer, 5_000)
+    end
+  end
+
   describe "stale-turn v1.1 R7 assignment stop" do
     test "an unanswered stop cancel ends the prompt call within G; the adapter keeps serving" do
       {adapter, capture} =
