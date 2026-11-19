@@ -27,6 +27,13 @@ defmodule Tightbeam.HarnessHealthTest do
     },
     "message" => "Internal error"
   }
+  # The same typed Claude limit with no declared reset: its hold is probed
+  # (companion v1.6 PR1 forbids probing while a declared reset is pending).
+  @captured_claude_rate_limit_no_reset %{
+    "code" => -32_603,
+    "data" => %{"errorKind" => "rate_limit"},
+    "message" => "Internal error: You've hit your weekly limit"
+  }
   @captured_claude_rate_limit %{
     "code" => -32_603,
     "data" => %{"errorKind" => "rate_limit"},
@@ -2063,9 +2070,12 @@ defmodule Tightbeam.HarnessHealthTest do
     prompt = "continue after provider recovery"
 
     _source =
-      fail_health_turn!(ctx.db, failed.session, message_id, prompt, @captured_claude_rate_limit,
-        assignment_id: failed.assignment
-      )
+      fail_health_turn!(
+        ctx.db,
+        failed.session,
+        message_id,
+        prompt,
+        @captured_claude_rate_limit_no_reset, assignment_id: failed.assignment)
 
     assert {:opened, initial_incident} =
              HarnessHealth.observe(
@@ -2107,7 +2117,7 @@ defmodule Tightbeam.HarnessHealthTest do
                  failed_session,
                  redelivery,
                  :prompt,
-                 @captured_claude_rate_limit
+                 @captured_claude_rate_limit_no_reset
                )
              end)
 
@@ -3634,7 +3644,7 @@ defmodule Tightbeam.HarnessHealthTest do
         first.session,
         "recovery-cycle-route-one",
         "bounded health failure",
-        @captured_claude_rate_limit
+        @captured_claude_rate_limit_no_reset
       )
 
     _second_failure =
@@ -3643,7 +3653,7 @@ defmodule Tightbeam.HarnessHealthTest do
         second_session,
         "recovery-cycle-route-two",
         "bounded health failure",
-        @captured_claude_rate_limit,
+        @captured_claude_rate_limit_no_reset,
         assignment_id: second_assignment
       )
 
@@ -3868,7 +3878,8 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     assert hold_id == opened.id
-    assert due_at == 3_600_100
+    # Companion v1.6 PR3: the first probe is due two minutes after opening.
+    assert due_at == 120_100
     assert {:ok, [[wake_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
     assert [cycle] =
@@ -3922,8 +3933,10 @@ defmodule Tightbeam.HarnessHealthTest do
                [opened.id]
              )
 
-    assert initial_due_at == 3_600_100
-    assert revised_due_at == 1_800_100
+    # Companion v1.6 PR3: the first probe is due first_interval_ms after
+    # opening; interval_ms caps the backoff and does not move it.
+    assert initial_due_at == 120_100
+    assert revised_due_at == 120_100
 
     assert [%{"cycle_id" => ^cycle_id}] =
              Tightbeam.HarnessHealth.RecoverySchedule.fire_due(ctx.db, revised_due_at)
@@ -3966,7 +3979,8 @@ defmodule Tightbeam.HarnessHealthTest do
              )
 
     refute next_cycle_id == cycle_id
-    assert next_due_at == revised_due_at + 600_000
+    # After one started cycle the interval doubles, under the 10-minute cap.
+    assert next_due_at == revised_due_at + 240_000
     assert next_due_at > revised_due_at + 1_000
   end
 
@@ -4006,7 +4020,7 @@ defmodule Tightbeam.HarnessHealthTest do
       first.session,
       "recovery-scheduler-timer-route-one",
       "bounded health failure",
-      @captured_claude_rate_limit
+      @captured_claude_rate_limit_no_reset
     )
 
     fail_health_turn!(
@@ -4014,7 +4028,7 @@ defmodule Tightbeam.HarnessHealthTest do
       second.session,
       "recovery-scheduler-timer-route-two",
       "bounded health failure",
-      @captured_claude_rate_limit
+      @captured_claude_rate_limit_no_reset
     )
 
     [opened] = HarnessHealth.active(ctx.db)
@@ -4348,7 +4362,7 @@ defmodule Tightbeam.HarnessHealthTest do
     test "C1: a probe release keeps the fence while another quota incident stands; admission resumes when it clears",
          ctx do
       %{hold: hold_id} = codex_hold!(ctx)
-      other = second_open_codex_incident!(ctx.db)
+      other = second_open_codex_incident!(ctx.db, ctx.main_session)
 
       {_started, release} = probe_cycle!(ctx.db, hold_id, "succeeded")
 
@@ -4395,7 +4409,9 @@ defmodule Tightbeam.HarnessHealthTest do
           second,
           "c2-started-msg",
           "c2 started prompt",
-          @captured_codex_rate_limit, before_finish: &started_work!/3)
+          @captured_codex_rate_limit,
+          before_finish: &started_work!/3
+        )
 
       {_started_at, :ok} = probe_cycle!(ctx.db, hold_id, "succeeded")
       refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
@@ -4494,7 +4510,7 @@ defmodule Tightbeam.HarnessHealthTest do
   # A second open rate-limit-dead incident on the same Codex key, as one
   # stated fixture (two incidents can stand on a key; upstream's standing-
   # reasons guard counts them).
-  defp second_open_codex_incident!(db) do
+  defp second_open_codex_incident!(db, session_key) do
     at = System.system_time(:millisecond)
     incident = "hhi_c1_second_#{System.unique_integer([:positive])}"
     observation = "hho_c1_second_#{System.unique_integer([:positive])}"
@@ -4503,8 +4519,8 @@ defmodule Tightbeam.HarnessHealthTest do
       DB.transaction(db, fn txn ->
         Tightbeam.DB.Txn.q(
           txn,
-          "INSERT INTO harness_health_observations(id,correlationId,harness,host,failureClass,evidenceKind,observedAt,cause,principal,incidentId) VALUES(?1,?2,'codex','testhost','rate-limit-dead','terminal-failure',?3,'fixture','process:test',?4)",
-          [observation, "c1-second-#{observation}", at, incident]
+          "INSERT INTO harness_health_observations(id,correlationId,harness,host,failureClass,evidenceKind,sessionKey,observedAt,cause,principal,incidentId) VALUES(?1,?2,'codex','testhost','rate-limit-dead','terminal-failure',?5,?3,'fixture','process:test',?4)",
+          [observation, "c1-second-#{observation}", at, incident, session_key]
         )
 
         Tightbeam.DB.Txn.q(
