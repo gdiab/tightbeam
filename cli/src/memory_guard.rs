@@ -246,7 +246,8 @@ fn join_session_unit(config: &LaunchConfig, sid: &str) -> Result<String, String>
             format!("session unit {unit} is still in use and could not be renewed: {error}")
         })?;
     }
-    fs::create_dir(&dir).map_err(|error| format!("session unit {unit} could not be created: {error}"))?;
+    fs::create_dir(&dir)
+        .map_err(|error| format!("session unit {unit} could not be created: {error}"))?;
     for (file, value) in [
         ("memory.swap.max", "0".to_string()),
         ("memory.oom.group", "1".to_string()),
@@ -325,11 +326,20 @@ mod tests {
             Some("abc-1".into())
         );
         assert_eq!(
-            session_id(&args(&["--resume", "r-2", "--output-format", "stream-json"])),
+            session_id(&args(&[
+                "--resume",
+                "r-2",
+                "--output-format",
+                "stream-json"
+            ])),
             Some("r-2".into())
         );
         assert_eq!(
-            session_id(&args(&["--resume=old", "--fork-session", "--session-id=new"])),
+            session_id(&args(&[
+                "--resume=old",
+                "--fork-session",
+                "--session-id=new"
+            ])),
             Some("new".into())
         );
         assert_eq!(session_id(&args(&["auth", "status"])), None);
@@ -338,7 +348,9 @@ mod tests {
 
     #[test]
     fn invoked_as_step_matches_the_link_name_only() {
-        assert!(invoked_as_step(Some("/x/run/memory-guard/bin/tightbeam-session-exec")));
+        assert!(invoked_as_step(Some(
+            "/x/run/memory-guard/bin/tightbeam-session-exec"
+        )));
         assert!(!invoked_as_step(Some("/usr/local/bin/tightbeam")));
         assert!(!invoked_as_step(None));
     }
