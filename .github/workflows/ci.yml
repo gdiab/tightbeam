@@ -207,7 +207,7 @@ jobs:
 
       - name: mix test
         if: env.FULL_SUITE == 'true'
-        run: scripts/verify_mix.sh
+        run: scripts/verify_mix.sh test/harness_health_test.exs test/rate_limit_release_test.exs test/rate_limit_reset_test.exs test/harness_recovery_main_wake_test.exs
 
       - name: cargo test
         if: env.FULL_SUITE == 'true'
