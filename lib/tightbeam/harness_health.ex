@@ -2537,20 +2537,26 @@ defmodule Tightbeam.HarnessHealth do
 
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
-        if input.failure_class == "rate-limit-dead" do
-          key = adapter_key(input.harness, input.host)
-
-          if input[:cycle_release] do
-            complete_recovery_park_if_unneeded_in_txn(txn, incident.id, input, key)
+        # Companion v1.6 C1: a later success (v3 R9(b)) and a successful
+        # recovery probe (PR3) are causes of the one recorded release step,
+        # which keeps the fence while another standing reason needs it. Their
+        # turns are redelivered by the success or the cycle release itself,
+        # under C2's gate.
+        release =
+          if input.failure_class == "rate-limit-dead" do
+            Tightbeam.QuotaRelease.release_in_txn(txn, incident.id, input.harness, input.host,
+              cause: if(input[:cycle_release], do: "recovery_probe", else: "later_success"),
+              actor: input.principal,
+              detail: %{observationId: observation_id}
+            )
           else
-            HarnessProcess.complete_park_in_txn(txn, key)
+            :admission_resumed
           end
 
-          # Quota v3 R9(b): a later success is a release like any other (B5, R12).
-          Tightbeam.QuotaRelease.released_in_txn(txn, incident.id, input.harness, input.host)
-        end
-
-        if input[:cycle_release] == true do
+        # A cycle release marks its turns for redelivery only when admission
+        # actually resumes (C1); a held release's turns are re-admitted when
+        # the last standing reason clears.
+        if input[:cycle_release] == true and release == :admission_resumed do
           Wakes.mark_cycle_release_health_intents_in_txn(
             txn,
             incident.id,
@@ -2583,32 +2589,6 @@ defmodule Tightbeam.HarnessHealth do
            resolutionObservationId: observation_id
          })}
     end
-  end
-
-  defp complete_recovery_park_if_unneeded_in_txn(txn, incident_id, input, key) do
-    adapter_key = Atom.to_string(elem(key, 0)) <> ":shared@" <> elem(key, 2)
-
-    [[standing_reasons]] =
-      Txn.q(
-        txn,
-        """
-        SELECT
-          (SELECT COUNT(*) FROM harness_health_incidents
-            WHERE id != ?1 AND harness=?2 AND host=?3
-              AND failureClass='rate-limit-dead' AND state='open') +
-          (SELECT COUNT(*) FROM harness_processes
-            WHERE adapterKey=?4
-              AND state IN ('launching','running','park_requested','kill_failed')
-              AND resolvedAt IS NULL)
-        """,
-        [incident_id, input.harness, input.host, adapter_key]
-      )
-
-    if standing_reasons == 0 do
-      HarnessProcess.complete_park_in_txn(txn, key)
-    end
-
-    :ok
   end
 
   defp distinct_sessions(txn, input) do
