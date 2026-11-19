@@ -958,13 +958,21 @@ defmodule Tightbeam.Acp.AdapterTest do
       caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
       _request_id = s1_request_id(adapter, sid)
 
+      cancels = fn ->
+        Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel"))
+      end
+
+      # A repeated stop while settling sends no second cancel.
       assert {:ok, :settling} = Adapter.cancel_prompt(adapter, sid)
       assert {:ok, :settling} = Adapter.cancel_prompt(adapter, sid)
+      assert s1_until(fn -> cancels.() == 1 end)
 
       assert {:error, {:prompt_interrupted, {:cancel_unacknowledged, ^sid}}} =
                Task.await(caller, 5_000)
 
-      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+      # At G the prompt's worker stops; Conn's requester-death handling may send
+      # its own cancel for the orphaned request.
+      assert cancels.() >= 1
       assert Process.alive?(adapter)
       assert {:ok, :sent} = Adapter.cancel_prompt(adapter, sid)
     end
