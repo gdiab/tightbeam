@@ -35,7 +35,7 @@ defmodule Tightbeam.MemoryGuard do
   require Logger
 
   alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Org, Placement}
-  alias Tightbeam.MemoryGuard.{Cgroup, Probe, ProcTree, Records, Settings}
+  alias Tightbeam.MemoryGuard.{Admission, Cgroup, Priority, Probe, ProcTree, Records, Settings}
 
   @table :tightbeam_memory_guard
   @details ~w(resident_cap memory_floor memory_budget)
@@ -322,6 +322,7 @@ defmodule Tightbeam.MemoryGuard do
       idle_check: Keyword.get(opts, :idle_check, &default_idle_check/2),
       killer: Keyword.get(opts, :killer, &default_kill/2),
       nudge: Keyword.get(opts, :nudge, &default_nudge/1),
+      conn_registry: Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry),
       hosts: %{},
       adapters: %{},
       launches: %{},
@@ -627,6 +628,7 @@ defmodule Tightbeam.MemoryGuard do
 
   defp decide(state, session, host_state, seq) do
     launch = launch_needed(state, session)
+    reserved? = reserved_main?(state, session)
 
     if launch == :none do
       state =
@@ -637,7 +639,13 @@ defmodule Tightbeam.MemoryGuard do
       {:ok, state}
     else
       host_reasons = host_level_reasons(host_state)
-      {cap_reason, state} = cap_decision(state, session, host_state, launch, seq, host_reasons)
+
+      # R3b: the reserved Main takes its reserved slot; R3 never holds it. The
+      # floor and the budget still do.
+      {cap_reason, state} =
+        if reserved? and match?({:session, _}, launch),
+          do: {nil, state},
+          else: cap_decision(state, session, host_state, launch, seq, host_reasons)
 
       cond do
         match?({:closing, _}, cap_reason) ->
@@ -650,7 +658,7 @@ defmodule Tightbeam.MemoryGuard do
         true ->
           state =
             state
-            |> reserve(session, launch)
+            |> reserve(session, launch, reserved?)
             |> resume_if_held(session.session_key)
             |> mark_busy(session.session_key, session.host)
 
@@ -705,20 +713,21 @@ defmodule Tightbeam.MemoryGuard do
 
       cap ->
         count = resident_count(state, session.host, session.session_key)
-
-        older_waiting? =
-          older_held?(state, session.host, "resident_cap", seq, session.session_key)
+        ahead = waiting_ahead(state, session, seq)
 
         cond do
-          count < cap and not older_waiting? ->
+          # R3a: free slots go to sessions ahead in line first (a Main, then a
+          # user-facing session, then the oldest worker).
+          count + ahead < cap ->
             {nil, state}
 
-          older_waiting? ->
-            {"resident_cap", state}
-
           host_reasons != [] ->
-            # The floor or budget holds anyway; closing for the cap now would
-            # shed a process for a launch that cannot run.
+            # The floor or budget holds anyway. The cap is a reason only when it
+            # is really full, and closing for it now would shed a process for a
+            # launch that cannot run.
+            {if(count >= cap, do: "resident_cap"), state}
+
+          ahead > 0 ->
             {"resident_cap", state}
 
           true ->
@@ -730,26 +739,73 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
-  defp older_held?(state, host, detail, seq, session_key) do
-    Enum.any?(state.held, fn {key, held} ->
-      key != session_key and held.host == host and Map.has_key?(held.details, detail) and
-        held.seq < seq
-    end)
+  # R3a: how many sessions waiting for a launch on this host go before
+  # `session` (class first, then the oldest waiting turn).
+  defp waiting_ahead(state, session, seq) do
+    mine = {Priority.rank(Priority.class(state.db, session)), seq}
+
+    state
+    |> waiters(session.host, session.session_key)
+    |> Enum.count(fn {_key, place} -> place < mine end)
   end
 
-  # Resident session processes on the host plus slots reserved for launches in
-  # flight, without counting `session_key` itself.
+  # Sessions on `host` still waiting for a launch, each with its place
+  # `{class rank, oldest queued seq}`: held here, a turn still queued, no other
+  # standing reason (R6a: priority never admits past a park), and not the
+  # reserved Main, which never competes for a slot under the cap (R3b).
+  defp waiters(state, host, exclude) do
+    reserved = reserved_main_key(state)
+
+    for {key, %{host: ^host}} <- state.held,
+        key != exclude,
+        key != reserved,
+        seq <- [oldest_queued(state.db, key)],
+        is_integer(seq),
+        Admission.other_reasons(state.db, key) == [],
+        %{} = session <- [Org.get(state.db, key)] do
+      {key, {Priority.rank(Priority.class(state.db, session)), seq}}
+    end
+    |> Enum.sort_by(&elem(&1, 1))
+  end
+
+  defp reserved_main_key(state) do
+    case Priority.reserved_main(state.db) do
+      %{session_key: key} -> key
+      nil -> nil
+    end
+  end
+
+  defp reserved_main?(state, session),
+    do: is_binary(session.session_key) and session.session_key == reserved_main_key(state)
+
+  defp resident_sids(state, host) do
+    state.adapters
+    |> Map.values()
+    |> Enum.filter(&(&1.host == host and Harness.session_processes?(harness_module(&1.key))))
+    |> Enum.flat_map(&MapSet.to_list(&1.sids))
+    |> MapSet.new()
+  end
+
+  # The reserved Main's process, when it is resident on `host` (R3b).
+  defp reserved_sid(state, host) do
+    with key when is_binary(key) <- reserved_main_key(state),
+         sid when is_binary(sid) <- current_sid(state.db, key),
+         true <- MapSet.member?(resident_sids(state, host), sid) do
+      sid
+    else
+      _ -> nil
+    end
+  end
+
+  # Resident session processes under the cap on the host plus slots reserved
+  # for launches in flight, without `session_key` itself. The reserved Main's
+  # process holds the reserved slot and is not counted (R3).
   defp resident_count(state, host, exclude_session) do
-    resident =
-      state.adapters
-      |> Map.values()
-      |> Enum.filter(&(&1.host == host and Harness.session_processes?(harness_module(&1.key))))
-      |> Enum.flat_map(&MapSet.to_list(&1.sids))
-      |> MapSet.new()
+    resident = MapSet.delete(resident_sids(state, host), reserved_sid(state, host))
 
     reserved =
       Enum.count(state.reservations, fn {key, reservation} ->
-        key != exclude_session and reservation.host == host and
+        key != exclude_session and reservation.host == host and not reservation.reserved and
           not (is_binary(reservation.sid) and MapSet.member?(resident, reservation.sid)) and
           not (is_binary(sid = current_sid(state.db, key)) and MapSet.member?(resident, sid))
       end)
@@ -759,19 +815,20 @@ defmodule Tightbeam.MemoryGuard do
 
   defp harness_module({harness, _, _}), do: Harness.module!(harness)
 
-  defp reserve(state, session, {:session, sid}) do
+  defp reserve(state, session, {:session, sid}, reserved?) do
     %{
       state
       | reservations:
           Map.put(state.reservations, session.session_key, %{
             host: session.host,
             sid: sid,
+            reserved: reserved?,
             at: state.clock.()
           })
     }
   end
 
-  defp reserve(state, _session, _launch), do: state
+  defp reserve(state, _session, _launch, _reserved?), do: state
 
   defp mark_busy(state, session_key, host) do
     %{state | busy: Map.put(state.busy, session_key, host)}
@@ -831,7 +888,77 @@ defmodule Tightbeam.MemoryGuard do
     end
 
     held = %{host: session.host, seq: seq, details: new_details}
-    %{state | held: Map.put(state.held, session.session_key, held)}
+    state = %{state | held: Map.put(state.held, session.session_key, held)}
+
+    # R7: a user-originated turn that becomes held gets one plain-words
+    # marker in its own conversation, once per hold.
+    if previous.details == %{} and
+         Priority.user_originated_pending?(state.db, session.session_key),
+       do: waiting_marker(state, session, hd(details))
+
+    state
+  end
+
+  defp waiting_marker(state, session, detail) do
+    host = session.host
+    host_state = Map.fetch!(state.hosts, host)
+    place = place_in_line(state, session)
+
+    line =
+      "You are #{ordinal(place)} in line" <>
+        if(detail == "resident_cap", do: ", and nothing was stopped to make room.", else: ".")
+
+    message =
+      case detail do
+        "resident_cap" ->
+          "Waiting for a free agent slot on #{host}: all #{host_state.settings.resident_cap} are busy with other work. " <>
+            line
+
+        "memory_floor" ->
+          "Waiting for #{host} to have more free memory (now #{fmt(host_state.available)}%, starts at #{fmt(host_state.settings.floor_release)}%). " <>
+            line
+
+        "memory_budget" ->
+          "Waiting for Tightbeam's agents on #{host} to use less memory (now #{gib(host_state.total)} of a #{gib(host_state.settings.budget)} budget). " <>
+            line
+      end
+
+    EventLog.notice(
+      state.db,
+      "memory_guard_waiting",
+      session.session_key,
+      JSON.encode!(%{host: host, detail: detail, placeInLine: place}),
+      audience: {:session, session.session_key},
+      message: message,
+      attention: :normal,
+      conn_registry: state.conn_registry
+    )
+  rescue
+    error ->
+      Logger.warning("memory guard: waiting marker not posted: #{Exception.message(error)}")
+  catch
+    :exit, reason -> Logger.warning("memory guard: waiting marker not posted: #{inspect(reason)}")
+  end
+
+  defp ordinal(1), do: "first"
+  defp ordinal(2), do: "second"
+  defp ordinal(3), do: "third"
+  defp ordinal(n), do: "number #{n}"
+
+  # 1-based place among the sessions waiting for a launch on its host (R3a).
+  defp place_in_line(state, session) do
+    case oldest_queued(state.db, session.session_key) do
+      nil ->
+        1
+
+      seq ->
+        mine = {Priority.rank(Priority.class(state.db, session)), seq}
+
+        ahead =
+          state |> waiters(session.host, session.session_key) |> Enum.count(&(elem(&1, 1) < mine))
+
+        ahead + 1
+    end
   end
 
   defp resume_if_held(state, session_key) do
@@ -855,10 +982,14 @@ defmodule Tightbeam.MemoryGuard do
   # Each lane re-asks `admit/1`, which keeps the oldest-first order (a younger
   # turn waits while an older one holds the same detail).
   defp release_check(state, host) do
-    state.held
-    |> Enum.filter(fn {_key, held} -> held.host == host end)
-    |> Enum.sort_by(fn {_key, held} -> held.seq end)
-    |> Enum.each(fn {key, _held} -> state.nudge.(key) end)
+    reserved = reserved_main_key(state)
+
+    if Map.has_key?(state.held, reserved) and Map.get(state.held, reserved).host == host,
+      do: state.nudge.(reserved)
+
+    state
+    |> waiters(host, reserved)
+    |> Enum.each(fn {key, _place} -> state.nudge.(key) end)
 
     state
   end
@@ -871,12 +1002,20 @@ defmodule Tightbeam.MemoryGuard do
       held = Map.get(state.held, session_key, %{details: %{}})
       now = state.clock.()
 
+      # R3b/R7: the reserved Main is never held by the cap.
       details =
         host_level_reasons(host_state) ++
-          if(match?({:session, _}, launch) and cap_full?(state, session, host_state),
+          if(
+            match?({:session, _}, launch) and not reserved_main?(state, session) and
+              cap_full?(state, session, host_state),
             do: ["resident_cap"],
             else: []
           )
+
+      class =
+        if reserved_main?(state, session), do: "main", else: Priority.class(state.db, session)
+
+      place = place_in_line(state, session)
 
       for detail <- details do
         %{
@@ -884,7 +1023,9 @@ defmodule Tightbeam.MemoryGuard do
           detail: detail,
           host: session.host,
           since: Map.get(held.details, detail, since(host_state, detail, now)),
-          condition: condition(state, session.host, detail)
+          condition: condition(state, session.host, detail),
+          priorityClass: class,
+          placeInLine: place
         }
       end
     else
@@ -899,7 +1040,7 @@ defmodule Tightbeam.MemoryGuard do
 
       cap ->
         resident_count(state, session.host, session.session_key) >= cap and
-          idle_candidates(state, session.host) == []
+          idle_candidates(state, session.host, "resident_cap") == []
     end
   end
 
@@ -932,8 +1073,12 @@ defmodule Tightbeam.MemoryGuard do
 
   ## Idle close (R4)
 
-  defp idle_candidates(state, host) do
+  # R3a: idle workers first (least recently used first), then idle
+  # user-facing processes, an idle Main last. R3 never closes the reserved
+  # Main in its slot: that frees no slot under the cap (R3b).
+  defp idle_candidates(state, host, reason) do
     closing = MapSet.new(Map.values(state.closing), &{&1.host, &1.sid})
+    reserved = if reason == "resident_cap", do: reserved_sid(state, host)
 
     for {adapter, entry} <- state.adapters,
         entry.host == host,
@@ -941,13 +1086,24 @@ defmodule Tightbeam.MemoryGuard do
         sid <- entry.sids,
         not MapSet.member?(closing, {host, sid}),
         not MapSet.member?(state.unclosable, {host, sid}),
+        sid != reserved,
         session_key <- [session_for_sid(state.db, sid)],
         not Map.has_key?(state.busy, session_key),
         not Map.has_key?(state.reservations, session_key),
         is_nil(session_key) or not turn_pending?(state.db, session_key) do
-      {Map.get(state.last_used, {host, sid}, 0), adapter, sid, session_key}
+      {close_rank(state, session_key), Map.get(state.last_used, {host, sid}, 0), adapter, sid,
+       session_key}
     end
     |> Enum.sort()
+  end
+
+  defp close_rank(_state, nil), do: 0
+
+  defp close_rank(state, session_key) do
+    case Org.get(state.db, session_key) do
+      nil -> 0
+      session -> 2 - Priority.rank(Priority.class(state.db, session))
+    end
   end
 
   defp session_for_sid(db, sid) do
@@ -981,11 +1137,11 @@ defmodule Tightbeam.MemoryGuard do
   # Start closing the least recently used idle session process. Returns :none
   # when no session process is idle.
   defp start_close(state, host, reason) do
-    case idle_candidates(state, host) do
+    case idle_candidates(state, host, reason) do
       [] ->
         :none
 
-      [{_used, adapter, sid, session_key} | _] ->
+      [{_rank, _used, adapter, sid, session_key} | _] ->
         guard = self()
         ref = make_ref()
         closer = state.closer
@@ -1822,11 +1978,76 @@ defmodule Tightbeam.MemoryGuard do
           hostAvailablePercent:
             host_state.available && Float.round(host_state.available * 1.0, 1),
           residentCount: resident_count(state, host, nil),
+          reservedSlot: reserved_slot_read(state, host, host_state),
+          oomScoreAdj: oom_read(state, host_state),
           heldTurns: held,
           floorHolds: host_state.floor_held,
           budgetHolds: host_state.budget_held
         }
     end
+  end
+
+  # R3b/R7/R12b: the reserve, shown apart from the cap and as its Main's.
+  defp reserved_slot_read(state, host, host_state) do
+    cap = host_state.settings.resident_cap
+    count = resident_count(state, host, nil)
+    under = if cap, do: "resident: #{count} of #{cap}", else: "resident: #{count}"
+
+    case Priority.reserved_main(state.db) do
+      %{user: user, session_key: key} when is_binary(key) ->
+        in_use = reserved_sid(state, host) != nil
+
+        %{
+          reservedMain: key,
+          owner: user,
+          inUse: in_use,
+          summary:
+            if(in_use,
+              do: "#{under}, plus #{user}'s Main in its reserved slot",
+              else: "#{under}; reserved slot for #{user}'s Main: empty"
+            )
+        }
+
+      %{user: user} ->
+        %{
+          reservedMain: nil,
+          owner: user,
+          inUse: false,
+          summary:
+            "#{under}; there is no reserved Main (#{user}'s Main does not exist), so the reserved slot stays empty"
+        }
+
+      nil ->
+        %{
+          reservedMain: nil,
+          owner: nil,
+          inUse: false,
+          summary: "#{under}; there is no reserved Main, so the reserved slot stays empty"
+        }
+    end
+  end
+
+  # R14: the value the gateway (and so every adapter) runs at, and the value
+  # session processes are raised to.
+  defp oom_read(state, host_state) do
+    gateway =
+      if host_state.local do
+        case File.read(Path.join(state.root, "proc/self/oom_score_adj")) do
+          {:ok, text} ->
+            case Integer.parse(String.trim(text)) do
+              {value, ""} -> value
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+      end
+
+    %{
+      gatewayAndAdapters: gateway,
+      sessionProcesses: gateway && min(gateway + host_state.settings.session_oom_score_adj, 1000)
+    }
   end
 
   ## Publication to ETS
