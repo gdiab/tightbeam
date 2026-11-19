@@ -634,6 +634,124 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  describe "stale-turn v1.1 liveness and settle (R3, R6 answer, R7, R8)" do
+    test "R3/R8: a quiet prompt is not live; its settle sends one cancel and ends unknown_effect" do
+      {adapter, capture} =
+        start_adapter(
+          gate_mode: "stall-turn",
+          probe: false,
+          quiet_bound_ms: 200,
+          settle_grace_ms: 5_000
+        )
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      # Within W of dispatch the prompt is live.
+      assert {:ok, %{live: true, settling: false}} =
+               Adapter.prompt_liveness(adapter, sid, request_id)
+
+      assert s1_until(fn ->
+               match?({:ok, %{live: false}}, Adapter.prompt_liveness(adapter, sid, request_id))
+             end)
+
+      # A genuine chunk is turn activity: live again. A non-advancing status is not.
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "agent_message_chunk", %{
+           "content" => %{"type" => "text", "text" => "progress"}
+         })}
+      )
+
+      assert {:ok, %{live: true}} = Adapter.prompt_liveness(adapter, sid, request_id)
+
+      assert s1_until(fn ->
+               send(
+                 adapter,
+                 {:acp_notification, "session/update",
+                  s1_update(sid, "session_info_update", %{"title" => "same"})}
+               )
+
+               match?({:ok, %{live: false}}, Adapter.prompt_liveness(adapter, sid, request_id))
+             end)
+
+      detail = %{principal: "user:op", reason: "stale"}
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, sid, request_id, "operator_settle", detail)
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, sid, request_id, "operator_settle", detail)
+
+      assert {:error, {:unknown_effect, "operator_settle", ^detail}} = Task.await(caller, 5_000)
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+      assert {:error, :not_pending} = Adapter.prompt_liveness(adapter, sid, request_id)
+    end
+
+    test "R6: a normal stop answering the cancel settles the turn by that answer" do
+      {adapter, _capture} = start_adapter(gate_mode: "late-success-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, sid, request_id, "response_missing")
+
+      assert {:ok, %{stop_reason: "end_turn"}} = Task.await(caller, 5_000)
+    end
+
+    test "R7: a cancel unanswered within G ends the prompt as unknown_effect and is reported" do
+      parent = self()
+
+      {adapter, capture} =
+        start_adapter(
+          gate_mode: "ignore-cancel-turn",
+          probe: false,
+          settle_grace_ms: 200,
+          on_cancel_unanswered: fn sid, cause -> send(parent, {:unanswered, sid, cause}) end
+        )
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, sid, request_id, "response_missing")
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(caller, 5_000)
+      assert_receive {:unanswered, ^sid, "response_missing"}, 2_000
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) >= 1
+      assert {:error, :not_pending} = Adapter.prompt_liveness(adapter, sid, request_id)
+    end
+  end
+
+  defp s1_update(sid, kind, fields),
+    do: %{"sessionId" => sid, "update" => Map.put(fields, "sessionUpdate", kind)}
+
+  defp s1_request_id(adapter, sid) do
+    assert s1_until(fn ->
+             is_integer(get_in(:sys.get_state(adapter), [Access.key(:prompts), sid, :request_id]))
+           end)
+
+    get_in(:sys.get_state(adapter), [Access.key(:prompts), sid, :request_id])
+  end
+
+  defp s1_until(fun, attempts \\ 100) do
+    cond do
+      fun.() ->
+        true
+
+      attempts == 0 ->
+        false
+
+      true ->
+        Process.sleep(50)
+        s1_until(fun, attempts - 1)
+    end
+  end
+
   defp start_adapter(opts \\ []) do
     # Per-run private dir: unique_integer resets across VM restarts, so
     # bare /tmp names collide with stale files from prior/concurrent runs.
@@ -689,6 +807,9 @@ defmodule Tightbeam.Acp.AdapterTest do
           adapter_opts
         end
       end)
+      |> Keyword.merge(
+        Keyword.take(opts, [:quiet_bound_ms, :settle_grace_ms, :on_cancel_unanswered])
+      )
       |> then(fn adapter_opts ->
         case Keyword.get(opts, :on_ready) do
           nil -> adapter_opts
