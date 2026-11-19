@@ -712,6 +712,126 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
     end
   end
 
+  # D1: the gate is bounded. A G1 boot that never succeeds holds the other
+  # owner alerts back for at most the bound, then delivery resumes and the
+  # missing M6 check is recorded.
+  @tag capture_log: true
+  test "D1: a G1 boot that never succeeds holds delivery only until the bound", ctx do
+    enable(ctx.db)
+
+    never = fn
+      :boot -> raise "injected: the G1 boot keeps failing"
+      _operation -> :ok
+    end
+
+    start_stack(ctx, db_hook: never, settle: false)
+    sampler = MemoryPressure.names().sampler
+
+    # A due usage-limit alert, and an item stalled for five hours.
+    due_usage_limit(ctx.db)
+    holder = session(ctx.db, "agent:george:idle")
+    stalled_item(ctx.db, holder, System.system_time(:millisecond) - 5 * @hour)
+
+    gate = :atomics.new(1, signed: true)
+    sending = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_gated_alerts(ctx, gate, sending)
+
+    # Nothing goes out before the bound, whatever asks for a pass.
+    GenServer.cast(OwnerAlerts, :due)
+    GenServer.cast(OwnerAlerts, :stall_inputs)
+    gate_at(gate, 119_999)
+    refute_received {:harklight, _}
+    assert lifecycle(ctx.db, "memory_pressure_restart_unrecorded") == []
+    refute :sys.get_state(sampler).booted?
+
+    # At the bound the gate lifts: both alerts are sent and the missing M6
+    # check is on record. The sampler is still retrying its own boot.
+    gate_at(gate, 120_000)
+
+    titles =
+      for _ <- 1..2 do
+        assert_received {:harklight, ["send", "--prepare", "--op-id", _op | rest]}
+        flag(rest, "--title")
+      end
+
+    assert Enum.sort(titles) == ["No progress for 5h: Item wi_d1", "Worker hit a usage limit"]
+    refute_received {:harklight, ["send", "--prepare" | _]}
+
+    assert [%{"boundMs" => 120_000, "waitedMs" => 120_000}] =
+             lifecycle(ctx.db, "memory_pressure_restart_unrecorded")
+
+    refute :sys.get_state(sampler).booted?
+
+    assert count(ctx.db, "SELECT count(*) FROM owner_alerts WHERE state='sent'") == 2
+  end
+
+  @tag capture_log: true
+  test "D1: a ready signal after the bound lifted the gate changes nothing", ctx do
+    enable(ctx.db)
+    parent = self()
+
+    # A previous run left an open episode whose first alert is unsent.
+    stack = start_stack(ctx)
+    pressure(ctx)
+    for t <- 0..120//15, do: sample(ctx, t * 1_000)
+    assert [%{state: "pending"} = first] = memory_alerts(ctx.db)
+    kill_stack(stack)
+
+    hook = fn
+      :boot ->
+        send(parent, {:boot_stalled, self()})
+
+        receive do
+          :release_db -> :ok
+        end
+
+      _operation ->
+        :ok
+    end
+
+    start_stack(ctx, db_hook: hook, settle: false)
+    assert_receive {:boot_stalled, recorder}, 5_000
+
+    gate = :atomics.new(1, signed: true)
+    sending = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+    start_gated_alerts(ctx, gate, sending)
+
+    # The bound lifts the gate first. The accepted consequence: the first
+    # alert, which M6 would have superseded, goes out.
+    gate_at(gate, 120_000)
+    assert_received {:harklight, ["send", "--prepare", "--op-id", first_op | _]}
+    assert [%{state: "sent", op_id: ^first_op}] = memory_alerts(ctx.db)
+
+    # The boot then succeeds: M6 is recorded normally, and the late signal
+    # adds no second boot pass.
+    send(recorder, :release_db)
+    settle()
+    :sys.get_state(OwnerAlerts)
+
+    assert_received {:harklight, ["send", "--prepare", "--op-id", restart_op | rest]}
+    assert flag(rest, "--title") == "sirius: Tightbeam restarted during memory pressure"
+    refute_received {:harklight, ["send", "--prepare" | _]}
+
+    assert [
+             %{alert_id: first_id, state: "sent", op_id: ^first_op, attempts: 1},
+             %{state: "sent", op_id: ^restart_op, attempts: 1} = restart
+           ] = memory_alerts(ctx.db)
+
+    assert first_id == first.alert_id
+    assert restart.body =~ "The first alert for this episode was sent."
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^first_op]}
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^restart_op]}
+
+    # Further signals and checks are harmless.
+    pid = Process.whereis(OwnerAlerts)
+    GenServer.cast(OwnerAlerts, :memory_pressure_ready)
+    gate_at(gate, 240_000)
+    refute_received {:harklight, _}
+    assert Process.whereis(OwnerAlerts) == pid
+    assert count(ctx.db, "SELECT count(*) FROM harklight_send_operations") == 2
+    assert length(lifecycle(ctx.db, "memory_pressure_restart_unrecorded")) == 1
+  end
+
   test "T15: a memory-pressure alert created before a restart is sent once after it", ctx do
     enable(ctx.db)
     start_stack(ctx)
@@ -1176,6 +1296,62 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
       provider: "openai",
       model: Model.new("gpt-5.6-sol")
     }).session_key
+  end
+
+  defp start_gated_alerts(ctx, gate, runner) do
+    start_supervised!(
+      {OwnerAlerts,
+       db: ctx.db,
+       send_runner: runner,
+       await_memory_pressure: true,
+       gate_clock: fn -> :atomics.get(gate, 1) end}
+    )
+  end
+
+  # Moves the gate's monotonic clock and lets the delivery process check it.
+  defp gate_at(gate, ms) do
+    :atomics.put(gate, 1, ms)
+    send(OwnerAlerts, :memory_pressure_gate_check)
+    :sys.get_state(OwnerAlerts)
+  end
+
+  defp due_usage_limit(db) do
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO owner_alerts
+          (alertId, kind, dedupeKey, ownerUserId, originSessionKey, sessionKey, turnSeq,
+           title, body, state, createdAt, updatedAt, nextAttemptAt)
+        VALUES ('oal_d1', 'usage-limit', 'usage-limit:agent:george:w:7', ?1, ?2,
+                'agent:george:w', 7, 'Worker hit a usage limit', 'body', 'pending', ?3, ?3, ?3)
+        """,
+        [@owner, Org.personal_session_key(@owner), now]
+      )
+  end
+
+  defp stalled_item(db, holder, opened_at) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_d1', 'Item wi_d1', ?1, 'open', ?1, 1)
+        """,
+        [@owner]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt, state, workItemId)
+        VALUES ('asg_d1', 'Work asg_d1', ?1, ?2, ?3, 'open', 'wi_d1')
+        """,
+        [holder, @owner, opened_at]
+      )
   end
 
   defp start_stack(ctx, opts \\ []) do

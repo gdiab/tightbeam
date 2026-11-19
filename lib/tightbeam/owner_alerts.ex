@@ -83,6 +83,9 @@ defmodule Tightbeam.OwnerAlerts do
   @horizon_ms 600_000
   @min_horizon_ms 60_000
   @max_listed_uncovered 5
+  # The delivery gate for a G1 restart (M6) lifts after this long at most, so
+  # a G1 boot that keeps failing never holds the other alerts back for longer.
+  @memory_pressure_gate_ms 120_000
 
   # A2: a row withdrawn as `off` (§7.1 C2-off) never reached the owner, so it
   # does not hold its dedupeKey (C3-on). This one predicate is the partial
@@ -1966,20 +1969,29 @@ defmodule Tightbeam.OwnerAlerts do
     # runs until the sampler has recorded its boot. A restart (M6) withdraws
     # an episode's unsent first alert, and every pass delivers whatever is
     # due, so until then no pass may run, whatever asks for one.
+    # The gate is bounded: whichever comes first, the sampler's signal or
+    # the bound, lifts it. `:gate_clock` (monotonic milliseconds) and
+    # `:memory_pressure_gate_ms` are the test seams.
     gated? = Keyword.get(opts, :await_memory_pressure, false)
 
-    if gated? do
-      sampler =
-        Keyword.get_lazy(opts, :memory_pressure, fn ->
-          __MODULE__.MemoryPressure.names().sampler
-        end)
+    gate =
+      if gated? do
+        sampler =
+          Keyword.get_lazy(opts, :memory_pressure, fn ->
+            __MODULE__.MemoryPressure.names().sampler
+          end)
 
-      GenServer.cast(sampler, {:notify_ready, self()})
-    else
-      # The boot pass finds every stall that came due while the gateway was
-      # down (S7) and every pending delivery, from the tables alone.
-      send(self(), {:pass, :boot})
-    end
+        GenServer.cast(sampler, {:notify_ready, self()})
+        clock = Keyword.get(opts, :gate_clock, fn -> System.monotonic_time(:millisecond) end)
+        bound_ms = Keyword.get(opts, :memory_pressure_gate_ms, @memory_pressure_gate_ms)
+        Process.send_after(self(), :memory_pressure_gate_check, bound_ms)
+        %{clock: clock, started_at: clock.(), bound_ms: bound_ms}
+      else
+        # The boot pass finds every stall that came due while the gateway was
+        # down (S7) and every pending delivery, from the tables alone.
+        send(self(), {:pass, :boot})
+        nil
+      end
 
     {:ok,
      %{
@@ -1987,7 +1999,8 @@ defmodule Tightbeam.OwnerAlerts do
        runner: Keyword.get(opts, :send_runner),
        timer: nil,
        last_pass_at: nil,
-       ready?: not gated?
+       ready?: not gated?,
+       gate: gate
      }}
   end
 
@@ -2008,6 +2021,52 @@ defmodule Tightbeam.OwnerAlerts do
   @impl true
   def handle_info({:pass, _reason}, %{ready?: false} = state), do: {:noreply, state}
   def handle_info({:pass, reason}, state), do: {:noreply, run(state, reason)}
+
+  def handle_info(:memory_pressure_gate_check, %{ready?: false, gate: gate} = state) do
+    elapsed = gate.clock.() - gate.started_at
+
+    if elapsed >= gate.bound_ms do
+      {:noreply, run(lift_unrecorded(state, elapsed), :boot)}
+    else
+      Process.send_after(self(), :memory_pressure_gate_check, max(gate.bound_ms - elapsed, 1_000))
+      {:noreply, state}
+    end
+  end
+
+  # The signal came first, or the gate is already lifted.
+  def handle_info(:memory_pressure_gate_check, state), do: {:noreply, state}
+
+  # The bound lifted the gate before the sampler recorded its boot. Delivery
+  # resumes without M6, so an episode's first alert that a restart alert
+  # would supersede may be sent; the sampler records M6 when its boot
+  # succeeds. Its late signal then changes nothing.
+  defp lift_unrecorded(state, elapsed) do
+    Logger.warning(
+      "owner alerts resumed delivery after #{elapsed} ms without the memory-pressure " <>
+        "restart check (M6) recorded; a superseded memory alert may be sent"
+    )
+
+    try do
+      EventLog.lifecycle(
+        state.db,
+        "memory_pressure_restart_unrecorded",
+        "owner-alerts",
+        JSON.encode!(%{boundMs: state.gate.bound_ms, waitedMs: elapsed})
+      )
+    rescue
+      error ->
+        Logger.warning(
+          "memory_pressure_restart_unrecorded was not recorded: #{Exception.message(error)}"
+        )
+    catch
+      kind, reason ->
+        Logger.warning(
+          "memory_pressure_restart_unrecorded was not recorded: #{inspect({kind, reason})}"
+        )
+    end
+
+    %{state | ready?: true}
+  end
 
   defp run(state, reason) do
     if state.timer, do: Process.cancel_timer(state.timer)
