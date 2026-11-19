@@ -1482,12 +1482,13 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
         # R10/R11: the read shows the terminal and its cause.
         assert %{turnSeq: ^seq, cause: "memory_limit"} =
                  Tightbeam.TurnSettlementView.settlement(
-                   Tightbeam.TurnSettlementView.latest_turn(ctx.db, key)
+                   Tightbeam.TurnSettlementView.turn(ctx.db, seq)
                  )
 
         # R11: a later delivered turn (today's redelivery trigger) re-sends nothing.
         assert redelivery_rows(ctx.db, seq) == 0
-        next = deliver!(ctx, key, "mg-next")
+        assert post(ctx, key, "mg-next") in [:appended, :queued]
+        next = await_turn_seq!(ctx.db, key, "mg-next")
         await_turns_settled!(ctx.db, key)
         assert turn_status(ctx.db, next) == "delivered"
         assert same_message_turns(ctx.db, seq) == [seq]
@@ -1545,10 +1546,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
     test "T9/R15: an outside kill of the adapter while the host is low on memory is harness_exited with the signal, never memory_limit, and the relaunch is held" do
       with_gateway(fn ctx ->
-        # 5% available: below the floor.
-        host_root = memory_host!(ctx, 16 * @gib, div(16 * @gib, 20))
+        host_root = memory_host!(ctx, 16 * @gib, div(16 * @gib, 2))
         memory_guard!(ctx, host_root)
-        :ok = Tightbeam.MemoryGuard.tick()
         launch_id = adapter_row!(ctx.db, "claude")
         key = "mg-outside-kill"
         s1_session!(ctx, key, :claude)
@@ -1561,7 +1560,11 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
              fn
                1, _text, opts ->
                  Keyword.fetch!(opts, :trace_dispatch).(101)
-                 # The helper reports 128 + SIGTERM before the transport fails.
+                 # The host falls to 5% (earlyoom's territory) and something
+                 # outside SIGTERMs the adapter; the helper reports 128 + 15
+                 # before the transport fails.
+                 memory_host!(ctx, 16 * @gib, div(16 * @gib, 20))
+                 :ok = Tightbeam.MemoryGuard.tick()
                  Tightbeam.MemoryGuard.note_adapter_exit(launch_id, 143)
                  {:error, {:adapter_unavailable, "acp exited with status 143"}}
 
@@ -1570,25 +1573,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
              end}
           )
 
-        # The floor holds launches; this session is not resident, so its first
-        # turn is held until memory frees.
-        seq = deliver!(ctx, key, "mg-floor-held")
-
-        assert %{reasonClass: "host_capacity", reasons: [%{detail: "memory_floor"} = reason]} =
-                 await_held!(ctx.db, key)
-
-        assert reason.condition =~ "starts when testhost has 15% of memory free; now 5.0%"
-        assert turn_status(ctx.db, seq) == "queued"
-
-        # R7: the session status read carries the held state and never reads idle.
-        status = Gateway.session_status(key, ctx.db)
-        assert status.run.state == "running"
-        assert %{reasonClass: "host_capacity"} = status.run.held
-
-        # Memory frees; the turn runs and the adapter is killed from outside.
-        memory_host!(ctx, 16 * @gib, div(16 * @gib, 2))
-        :ok = Tightbeam.MemoryGuard.tick()
-        await_turns_settled!(ctx.db, key)
+        seq = deliver!(ctx, key, "mg-killed-outside")
+        await_turn_ended!(ctx.db, seq)
 
         assert turn_status(ctx.db, seq) == "failed_unknown"
         assert terminal_cause(ctx.db, seq) == "harness_exited"
@@ -1600,6 +1586,40 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
         assert %{"cause" => "harness_exited", "exitSignal" => 15, "hostLowOnMemory" => true} =
                  unknown_effect_detail(ctx.db, seq)
+
+        # The relaunch the next turn needs is held while the floor holds; the
+        # killed tree is never restarted to replace it.
+        # (The R11 notice to this holder is its next queued turn; a post made
+        # now is staged behind it.)
+        assert post(ctx, key, "mg-after-kill") in [:appended, :queued]
+
+        assert %{reasonClass: "host_capacity", reasons: reasons} = await_held!(ctx.db, key)
+
+        assert %{detail: "memory_floor"} =
+                 reason = Enum.find(reasons, &(&1.detail == "memory_floor"))
+
+        assert reason.condition =~ "starts when testhost has 15% of memory free; now 5.0%"
+
+        assert count(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM turns WHERE sessionKey='#{key}' AND status='running'"
+               ) == 0
+
+        # R7: the session read carries the held state; the sender sees the hold.
+        status = Gateway.session_status(key, ctx.db)
+        assert status.run.state == "running"
+        assert %{reasonClass: "host_capacity"} = status.run.held
+
+        assert Tightbeam.MemoryGuard.HeldState.sender_result(status.run.held) ==
+                 "recipient held (host_capacity)"
+
+        # Memory frees: the held turn runs on a fresh session process.
+        memory_host!(ctx, 16 * @gib, div(16 * @gib, 2))
+        :ok = Tightbeam.MemoryGuard.tick()
+        next = await_turn_seq!(ctx.db, key, "mg-after-kill")
+        await_turns_settled!(ctx.db, key)
+        assert turn_status(ctx.db, next) == "delivered"
+        assert same_message_turns(ctx.db, seq) == [seq]
       end)
     end
   end
@@ -1690,6 +1710,16 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
       nil ->
         flunk("#{key} never read held")
+    end
+  end
+
+  defp await_turn_ended!(db, seq, attempts \\ 300) do
+    if turn_status(db, seq) in ["queued", "running"] do
+      if attempts == 0, do: flunk("turn #{seq} never ended")
+      Process.sleep(20)
+      await_turn_ended!(db, seq, attempts - 1)
+    else
+      :ok
     end
   end
 
