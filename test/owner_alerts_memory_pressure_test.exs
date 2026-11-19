@@ -909,6 +909,54 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
     assert_reads_confined(ctx)
   end
 
+  ## Memory limits v1.4 R16 / T12: the amended closing line
+
+  test "T12: an episode after the memory guard closed 2 idle processes says so in its closing line",
+       ctx do
+    enable(ctx.db)
+    cgroup_v2(ctx, swap: true)
+    start_stack(ctx)
+
+    # The memory guard's own records on this host during the run (and one on
+    # another host, and one from before the run, which do not count).
+    for {kind, subject, host, at} <- [
+          {"memory_guard_idle_closed", "agent:a", @host, ctx.wall0 + 1_000},
+          {"memory_guard_idle_closed", "agent:b", @host, ctx.wall0 + 2_000},
+          {"memory_guard_idle_closed", "agent:c", "elsewhere", ctx.wall0 + 3_000},
+          {"memory_tree_ended", "agent:d", @host, ctx.wall0 - 60_000}
+        ] do
+      {:ok, _} =
+        Tightbeam.DB.query(
+          ctx.db,
+          "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)",
+          [at, kind, subject, JSON.encode!(%{host: host, reason: "memory_floor"})]
+        )
+    end
+
+    memory(ctx, 19, swap_free: 0, psi: {14.0, 11.0})
+    for t <- 0..120//15, do: sample(ctx, t * 1_000)
+
+    assert [alert] = memory_alerts(ctx.db)
+    refute alert.body =~ "Tightbeam is only watching"
+
+    assert String.ends_with?(
+             alert.body,
+             "other services 1.6 GiB. Tightbeam has closed 2 idle ones. " <>
+               "If free memory keeps falling, the machine may stop responding."
+           )
+  end
+
+  test "T12: holds, closes and ended trees together read in plain words" do
+    assert OwnerAlerts.memory_restart_body(%{
+             unknown?: true,
+             host: "sirius",
+             guard_actions: %{held: true, closed: 4, ended: 1}
+           }) =~
+             "Tightbeam has paused starting new agent processes and closed 4 idle ones. " <>
+               "It has stopped 1 agent that went over its own memory limit. " <>
+               "If free memory keeps falling, the machine may stop responding."
+  end
+
   ## M1: the sampler never waits
 
   test "T27: a stalled database and a stalled Harklight send never delay a sample", ctx do
