@@ -13,6 +13,8 @@ defmodule Tightbeam.EscalationGuardFixture do
       :ok = Schema.ensure_all(db)
       :ok = DB.assert_base_admitted!(db, base)
       Devices.add_user(db, "flynn", true)
+      # Core fix (A) C12: the owner rules from a paired device.
+      Tightbeam.TestDevices.paired!(db, "flynn", device_id: "flynn-guard-device")
       marker = File.read!(Path.join(base, "build-owner.json"))
 
       case mode do
@@ -210,6 +212,8 @@ defmodule Tightbeam.EscalationGuardFixture do
       verb: "operator-rule",
       origin: "user:flynn",
       principal: {:user, "flynn"},
+      auth_class: "device",
+      auth_device_id: "flynn-guard-device",
       transport_session_key: submitting_session_key,
       params: Map.put(params, :request, id)
     }
