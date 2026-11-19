@@ -533,6 +533,11 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (text === "fail after dispatch") {
           return send({ id: m.id, error: { code: -32000, message: "post-dispatch failure" } });
         }
+        if (text === "session process exits") {
+          // claude-agent-acp 0.81.0's answer when a session's claude process
+          // dies under a pending prompt (dist/acp-agent.js:4510-4543).
+          return send({ id: m.id, error: { code: -32603, message: "Internal error: The Claude Agent process exited unexpectedly. Please start a new session." } });
+        }
         if (["stall-turn", "ignore-cancel-turn", "late-success-turn"].includes(gateMode)) {
           stalledPrompts.set(sid, m.id);
           return;
@@ -764,6 +769,55 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert reason == :closed or match?({:adapter_unavailable, _}, reason), inspect(reason)
       assert System.monotonic_time(:millisecond) - killed_at < 30_000
       assert {:acp_exit, _status} = assert_down(adapter, monitor)
+    end
+  end
+
+  describe "memory limits v1.4 R11a and the idle test" do
+    test "a session process that died under a prompt leaves no residency; another failure keeps it" do
+      {adapter, _capture} = start_adapter(probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      assert Adapter.knows_session?(adapter, sid)
+
+      assert {:error, %{"code" => -32_000}} = Adapter.prompt(adapter, sid, "fail after dispatch")
+      assert Adapter.knows_session?(adapter, sid)
+
+      assert {:error, %{"code" => -32_603}} =
+               Adapter.prompt(adapter, sid, "session process exits")
+
+      refute Adapter.knows_session?(adapter, sid)
+    end
+
+    test "a session with a pending prompt is not idle; with none it is" do
+      {adapter, _capture} = start_adapter(gate_mode: "stall-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      assert Adapter.idle_session?(adapter, sid) == :idle
+      _caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+      assert Adapter.idle_session?(adapter, sid) == :busy
+    end
+
+    test "a subagent the harness reported starting and not stopping keeps its root busy (R4, AS4)" do
+      {adapter, _capture} = start_adapter(probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "subagent_spawned", %{"subagentSessionId" => "child-1"})}
+      )
+
+      assert Adapter.idle_session?(adapter, sid) == :busy
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "subagent_state_update", %{
+           "subagentSessionId" => "child-1",
+           "state" => "completed"
+         })}
+      )
+
+      assert Adapter.idle_session?(adapter, sid) == :idle
     end
   end
 
