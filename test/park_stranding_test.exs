@@ -309,6 +309,12 @@ defmodule Tightbeam.ParkStrandingTest do
 
     assert MapSet.disjoint?(MapSet.new(first_notices), MapSet.new(second_notices))
     assert length(notices(db)) == 4
+
+    # The second episode's notices name when that park began, not the incident.
+    for notice <- notices(db), notice.wake_id in second_notices do
+      assert notice.prompt =~ "since #{iso(second.due_at - ParkStranding.after_ms())}"
+    end
+
     assert length(lifecycle(db, "rate_limit_park_stranding_notified")) == 2
   end
 
