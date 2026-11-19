@@ -727,6 +727,38 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  describe "stale-turn v1.1 R7 assignment stop" do
+    test "an unanswered stop cancel ends the prompt call within G; the adapter keeps serving" do
+      {adapter, capture} =
+        start_adapter(gate_mode: "ignore-cancel-turn", probe: false, settle_grace_ms: 200)
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+
+      assert {:ok, :settling} = Adapter.cancel_prompt(adapter, sid)
+      assert {:ok, :settling} = Adapter.cancel_prompt(adapter, sid)
+
+      assert {:error, {:prompt_interrupted, {:cancel_unacknowledged, ^sid}}} =
+               Task.await(caller, 5_000)
+
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+      assert Process.alive?(adapter)
+      assert {:ok, :sent} = Adapter.cancel_prompt(adapter, sid)
+    end
+
+    test "an answered stop cancel passes the answer through as it is" do
+      {adapter, _capture} = start_adapter(gate_mode: "stall-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+
+      # The fake answers the cancel with a JSON-RPC error; it is not judged.
+      assert {:ok, :settling} = Adapter.cancel_prompt(adapter, sid)
+      assert {:error, %{"code" => -32_800}} = Task.await(caller, 5_000)
+    end
+  end
+
   describe "stale-turn v1.1 R6 missing response" do
     @s1_turn_end %{
       "used" => 120,
