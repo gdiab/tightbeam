@@ -154,7 +154,12 @@ defmodule Tightbeam.Wire.RouterTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      Tightbeam.TestDevices.pair(db, %{
+        device_id: "d1",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
 
     parent = self()
 
@@ -393,7 +398,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "canonical session collection uses visible rows and the shared item serializer", ctx do
     {:pending, _device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "collection-reader-device",
         claimed_name: "Collection reader",
         platform: nil,
@@ -2999,7 +3004,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "typed target grammar distinguishes keys, users, and roles without unions", ctx do
     {:pending, _device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "mike-device",
         claimed_name: "Mike",
         platform: nil,
@@ -3556,7 +3561,7 @@ defmodule Tightbeam.Wire.RouterTest do
     device_id = "read-marker-device-#{unique}"
 
     {:pending, _device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: device_id,
         claimed_name: "Mike",
         platform: nil,
@@ -4613,7 +4618,12 @@ defmodule Tightbeam.Wire.RouterTest do
 
   defp approved_device(db, device_id, name) do
     {:pending, pending} =
-      Devices.pair(db, %{device_id: device_id, claimed_name: name, platform: nil, model: nil})
+      Tightbeam.TestDevices.pair(db, %{
+        device_id: device_id,
+        claimed_name: name,
+        platform: nil,
+        model: nil
+      })
 
     Devices.approve(db, pending.device_id)
   end

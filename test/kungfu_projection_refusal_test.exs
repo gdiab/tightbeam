@@ -367,7 +367,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
 
     {:paired, device} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "wire-synthetic",
         claimed_name: "Wire",
         platform: nil,
@@ -439,7 +439,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
 
     {:paired, device} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "device-only",
         claimed_name: "Device only",
         platform: nil,
@@ -478,7 +478,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
 
     pair = fn id ->
-      Devices.pair(db, %{device_id: id, claimed_name: id, platform: nil, model: nil})
+      Tightbeam.TestDevices.pair(db, %{device_id: id, claimed_name: id, platform: nil, model: nil})
     end
 
     assert {:paired, admin} = pair.("synthetic-admin")

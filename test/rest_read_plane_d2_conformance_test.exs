@@ -932,7 +932,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
 
   defp approved_device(db, device_id, name, user_id) do
     {:pending, _device} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: device_id,
         claimed_name: name,
         platform: nil,

@@ -13,7 +13,12 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      Tightbeam.TestDevices.pair(db, %{
+        device_id: "d1",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
 
     {:ok, state} =
       ChangeSocket.init(%{

@@ -49,7 +49,7 @@ defmodule Tightbeam.ToolCallsTest do
     end
 
     {:paired, device} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "tool-calls-device",
         claimed_name: "Test Device",
         platform: nil,

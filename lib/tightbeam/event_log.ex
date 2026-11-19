@@ -201,14 +201,15 @@ defmodule Tightbeam.EventLog do
     [[event_id]] =
       case auth do
         # Core fix (A) C4: a transport-authenticated call records its
-        # authentication class and authenticating device beside its principal.
+        # authentication class and authenticating device beside its principal,
+        # and a protected act the pairing freeze state at the call.
         %{class: class, device_id: device_id} when is_binary(class) ->
           Txn.q(
             txn,
             """
             INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload,
-              authClass, authDeviceId)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+              authClass, authDeviceId, pairingFreeze)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             RETURNING id
             """,
             [
@@ -220,7 +221,8 @@ defmodule Tightbeam.EventLog do
               session_key,
               encode(payload),
               class,
-              device_id
+              device_id,
+              Map.get(auth, :pairing_freeze)
             ]
           )
 

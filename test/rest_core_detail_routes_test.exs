@@ -132,7 +132,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     :ok = Schema.ensure_all(db)
 
     {:paired, admin_device} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "core-admin-device",
         claimed_name: "Flynn",
         platform: nil,
@@ -2520,7 +2520,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     Devices.add_user(ctx.db, "alice", false)
 
     {:pending, _device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "alice-device",
         claimed_name: "Alice",
         platform: nil,
@@ -4504,7 +4504,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     Devices.add_user(ctx.db, "outsider", false)
 
     {:pending, _device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "outsider-device",
         claimed_name: "Outsider",
         platform: nil,
@@ -4710,7 +4710,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       })
 
     {:pending, _device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "raw-a6-device",
         claimed_name: "Raw A6 device",
         platform: "test",

@@ -32,7 +32,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
   refute reader.is_admin
 
   {:pending, pending} =
-    Devices.pair(db, %{
+    Tightbeam.TestDevices.pair(db, %{
       device_id: "detail-reader-device",
       claimed_name: "detail-reader",
       platform: nil,

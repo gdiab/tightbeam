@@ -62,7 +62,7 @@ defmodule Tightbeam.FailureContainmentTest do
     {:ok, {_, port}} = ThousandIsland.listener_info(listener)
 
     {:paired, device} =
-      Tightbeam.Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "containment",
         claimed_name: "Client",
         platform: nil,
