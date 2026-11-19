@@ -3,23 +3,29 @@ defmodule Tightbeam.ParkStranding do
   The six-hour stranding notice for a rate-limit park (quota-stranding
   contract v3, R11; I-notices (ii)).
 
-  When a `rate-limit-dead` incident opens and parks its shared adapter key,
-  `schedule_in_txn/3` persists ONE internal wake, `park-stranding:<incidentId>`,
-  due six hours after the incident opened. Its id makes it once per park
-  episode (a re-park of the same incident finds it) and its row makes it
-  survive a gateway restart.
+  A park episode is one fence on the shared adapter key, from its begin to its
+  named release (quota companion B2), identified by the fence's `generation`.
+  When a `rate-limit-dead` incident opens and parks its key,
+  `schedule_in_txn/3` persists ONE internal wake for that episode,
+  `park-stranding:<incidentId>:<generation>`, due six hours after the incident
+  opened. When a limit met again after a release parks the key anew under the
+  same open incident (companion B4), `repark_in_txn/4` persists the new
+  episode's wake, due six hours after that re-park. A further observation while
+  the park still stands finds its episode's wake and adds nothing. The id makes
+  it once per park episode and the row makes it survive a gateway restart.
 
   When it comes due, `notify/3` consumes it and, in the same transaction,
-  checks that the incident is still open, that the park still stands on the
-  key, and that no reset time is known for the incident (no pending
-  `rate_limit_reset` wake for one of its observations). If any check fails it records why
-  and sends nothing. Otherwise it schedules one blocker-class notice to each
+  checks that the incident is still open, that ITS park episode still stands
+  (the key's fence carries the wake's generation; a released or newer episode
+  does not count), and that no reset time is known for the incident (no
+  pending `rate_limit_reset` wake for one of its observations). If any check
+  fails it records why and sends nothing. Otherwise it schedules one blocker-class notice to each
   delivery owner of the held work and to the Main of each affected owner, and
   records that it did. It takes no other action: nothing is killed, retried,
   resumed, released, reassigned or staffed.
   """
 
-  alias Tightbeam.{DB, EventLog, Harness, HarnessHealth, HarnessProcess, Org, Wakes}
+  alias Tightbeam.{DB, EventLog, Harness, HarnessHealth, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @consumer "park_stranding"
@@ -33,9 +39,10 @@ defmodule Tightbeam.ParkStranding do
   @spec after_ms() :: pos_integer()
   def after_ms, do: @after_ms
 
-  @doc "The deterministic id of an incident's stranding wake."
-  @spec wake_id(String.t()) :: String.t()
-  def wake_id(incident_id) when is_binary(incident_id), do: @wake_prefix <> incident_id
+  @doc "The deterministic id of a park episode's stranding wake."
+  @spec wake_id(String.t(), String.t()) :: String.t()
+  def wake_id(incident_id, generation) when is_binary(incident_id) and is_binary(generation),
+    do: @wake_prefix <> incident_id <> ":" <> generation
 
   @doc """
   Persist the incident's stranding wake inside the transaction that opened the
@@ -44,35 +51,86 @@ defmodule Tightbeam.ParkStranding do
   @spec schedule_in_txn(Txn.t(), String.t(), map()) :: :ok
   def schedule_in_txn(%Txn{} = txn, incident_id, %{observed_at: opened_at} = input)
       when is_binary(incident_id) and is_integer(opened_at) do
-    wake_id = wake_id(incident_id)
+    episode_in_txn(
+      txn,
+      incident_id,
+      input.harness,
+      input.host,
+      anchor_session(txn, incident_id, Map.get(input, :session_key)),
+      opened_at
+    )
+  end
 
-    if Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == [] do
-      case anchor_session(txn, incident_id, Map.get(input, :session_key)) do
-        nil ->
-          # No session of this harness exists on this host and the evidence
-          # names none: nothing is held and no owner is affected.
-          skipped_in_txn(txn, incident_id, "no_affected_session", %{
-            harness: input.harness,
-            host: input.host,
-            openedAt: opened_at
-          })
+  @doc """
+  Companion B4: a limit met again parked the key under the still-open
+  incident. Persist the stranding wake of the park episode now standing, due
+  six hours after `parked_at`, unless that episode already has one.
+  """
+  @spec repark_in_txn(Txn.t(), String.t(), String.t(), integer()) :: :ok
+  def repark_in_txn(%Txn{} = txn, incident_id, session_key, parked_at)
+      when is_binary(incident_id) and is_binary(session_key) and is_integer(parked_at) do
+    case Txn.q(
+           txn,
+           "SELECT harness,host FROM harness_health_incidents WHERE id=?1 AND failureClass=?2 AND state='open'",
+           [incident_id, @class]
+         ) do
+      [[harness, host]] -> episode_in_txn(txn, incident_id, harness, host, session_key, parked_at)
+      [] -> :ok
+    end
+  end
 
-        session_key ->
-          Wakes.schedule_in_txn(txn, %{
-            wake_id: wake_id,
-            session_key: session_key,
-            origin: @process,
-            consumer: @consumer,
-            prompt: incident_id,
-            due_at: opened_at + @after_ms,
-            # The anchor session is only where the row is filed. Ungated, its
-            # retirement neither cancels nor re-mints this one-shot wake.
-            target_gate: 0
-          })
-      end
+  defp episode_in_txn(txn, incident_id, harness, host, anchor, parked_at) do
+    case fence_generation(txn, harness, host) do
+      nil ->
+        # The key holds no fence: nothing stands for this incident to strand.
+        :ok
+
+      generation ->
+        wake_id = wake_id(incident_id, generation)
+
+        cond do
+          Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) != [] ->
+            :ok
+
+          is_nil(anchor) ->
+            # No session of this harness exists on this host and the evidence
+            # names none: nothing is held and no owner is affected.
+            skipped_in_txn(txn, incident_id, "no_affected_session", %{
+              harness: harness,
+              host: host,
+              openedAt: parked_at
+            })
+
+          true ->
+            Wakes.schedule_in_txn(txn, %{
+              wake_id: wake_id,
+              session_key: anchor,
+              origin: @process,
+              consumer: @consumer,
+              prompt: incident_id,
+              due_at: parked_at + @after_ms,
+              # The anchor session is only where the row is filed. Ungated, its
+              # retirement neither cancels nor re-mints this one-shot wake.
+              target_gate: 0
+            })
+        end
     end
 
     :ok
+  end
+
+  # The generation of the fence that parks `{harness, "shared", host}`, or nil.
+  # The key name is HarnessProcess's (`<harness id>:shared@<host>`), as the
+  # quota-hold guard also builds it in SQL.
+  defp fence_generation(txn, harness, host) do
+    case Txn.q(
+           txn,
+           "SELECT generation FROM harness_park_fences WHERE adapterKey=?1",
+           ["#{Harness.parse!(harness).id()}:shared@#{host}"]
+         ) do
+      [[generation]] -> generation
+      [] -> nil
+    end
   end
 
   @doc """
@@ -90,7 +148,7 @@ defmodule Tightbeam.ParkStranding do
            ) do
         [[incident_id, due_at]] when due_at <= at ->
           Wakes.consume_internal_in_txn(txn, wake_id)
-          decide_in_txn(txn, incident_id, wake_id, at)
+          decide_in_txn(txn, incident_id, wake_id, episode(wake_id, incident_id), at)
 
         [[_, _]] ->
           {:deferred, :before_deadline}
@@ -101,7 +159,16 @@ defmodule Tightbeam.ParkStranding do
     end)
   end
 
-  defp decide_in_txn(txn, incident_id, wake_id, at) do
+  # The park episode a stranding wake was written for: the fence generation
+  # after `park-stranding:<incidentId>:`.
+  defp episode(wake_id, incident_id) do
+    prefix = @wake_prefix <> incident_id <> ":"
+
+    if String.starts_with?(wake_id, prefix),
+      do: binary_part(wake_id, byte_size(prefix), byte_size(wake_id) - byte_size(prefix))
+  end
+
+  defp decide_in_txn(txn, incident_id, wake_id, generation, at) do
     case Txn.q(
            txn,
            "SELECT harness,host,state,openedAt FROM harness_health_incidents WHERE id=?1 AND failureClass=?2",
@@ -121,7 +188,10 @@ defmodule Tightbeam.ParkStranding do
           state != "open" ->
             skipped_in_txn(txn, incident_id, "incident_" <> state, detail(facts))
 
-          not HarnessProcess.parked_in_txn?(txn, adapter_key(harness, host)) ->
+          # Only a named release (or a later success) lifts a quota park's
+          # fence (companion B2). A re-park after one is a new episode with its
+          # own wake, so this episode counts as released.
+          is_nil(generation) or fence_generation(txn, harness, host) != generation ->
             skipped_in_txn(txn, incident_id, "park_released", detail(facts))
 
           reset_known?(txn, incident_id) ->
@@ -362,6 +432,4 @@ defmodule Tightbeam.ParkStranding do
   end
 
   defp iso(ms), do: ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601()
-
-  defp adapter_key(harness, host), do: {Harness.parse!(harness).id(), "shared", host}
 end
