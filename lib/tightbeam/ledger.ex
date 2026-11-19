@@ -435,22 +435,7 @@ defmodule Tightbeam.Ledger do
   def repair_terminal(db \\ Tightbeam.DB, source_seq, assignment_id, repair_key, principal) do
     case DB.transaction_then(
            db,
-           fn txn ->
-             case Txn.q(
-                    txn,
-                    """
-                    SELECT attemptSeq,id FROM turn_repair_attempts
-                    WHERE assignmentId=?1 AND repairKey=?2
-                    """,
-                    [assignment_id, repair_key]
-                  ) do
-               [[attempt_seq, attempt_id]] ->
-                 {:duplicate, attempt_seq, attempt_id}
-
-               [] ->
-                 append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal)
-             end
-           end,
+           &repair_terminal_in_txn(&1, source_seq, assignment_id, repair_key, principal),
            fn txn, result ->
              Tightbeam.Wakes.row_commit_in_txn(txn, [])
              result
@@ -480,6 +465,31 @@ defmodule Tightbeam.Ledger do
     |> Enum.map(fn [attempt_id, attempt_seq, status, principal] ->
       %{attempt_id: attempt_id, attempt_seq: attempt_seq, status: status, principal: principal}
     end)
+  end
+
+  @doc """
+  The repair attempt of `repair_terminal/5` inside a caller-owned transaction,
+  for a caller that must judge the source turn and append its attempt
+  atomically. The caller's transaction must publish row commits as
+  `repair_terminal/5` does.
+  """
+  @spec repair_terminal_in_txn(Txn.t(), integer(), String.t(), String.t(), String.t()) ::
+          {:appended | :duplicate, integer(), String.t()} | {:error, atom()}
+  def repair_terminal_in_txn(%Txn{} = txn, source_seq, assignment_id, repair_key, principal) do
+    case Txn.q(
+           txn,
+           """
+           SELECT attemptSeq,id FROM turn_repair_attempts
+           WHERE assignmentId=?1 AND repairKey=?2
+           """,
+           [assignment_id, repair_key]
+         ) do
+      [[attempt_seq, attempt_id]] ->
+        {:duplicate, attempt_seq, attempt_id}
+
+      [] ->
+        append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal)
+    end
   end
 
   defp append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal) do

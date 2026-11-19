@@ -3281,8 +3281,10 @@ defmodule Tightbeam.Wakes do
       when is_integer(source_turn_seq) do
     # Companion v1.1 B5: no redelivery row for a quota-failed turn that had
     # started work (contract c R9a `:unknown_effect`).
+    # It is recorded unknown_effect and surfaced here, where its vehicles are
+    # withheld, whether or not its incident ever opens or releases (v3 R16).
     if post_activity_quota_failure?(txn, source_turn_seq),
-      do: :ok,
+      do: Tightbeam.QuotaRelease.surface_not_replayed_in_txn(txn, source_turn_seq),
       else: record_health_redelivery_row_in_txn(txn, source_turn_seq, "rate-limit-dead")
   end
 
@@ -3588,6 +3590,28 @@ defmodule Tightbeam.Wakes do
       _ ->
         0
     end
+  end
+
+  @doc """
+  Mark a source turn's pending health-redelivery row as consumed by a repair
+  rerun of that turn, in the rerun's transaction: the repair attempt is the
+  turn's re-admission, so no later restoration redelivers it again (companion
+  v1.1 B5, A2 at most once).
+  """
+  @spec consume_health_redelivery_by_repair_in_txn(Txn.t(), pos_integer(), pos_integer()) :: :ok
+  def consume_health_redelivery_by_repair_in_txn(%Txn{} = txn, source_turn_seq, attempt_seq)
+      when is_integer(source_turn_seq) and is_integer(attempt_seq) do
+    Txn.q(
+      txn,
+      """
+      UPDATE health_redelivery_attempts
+      SET restorationTurnSeq=?2,redeliveryTurnSeq=?2
+      WHERE sourceTurnSeq=?1 AND redeliveryTurnSeq IS NULL
+      """,
+      [source_turn_seq, attempt_seq]
+    )
+
+    :ok
   end
 
   @doc """
