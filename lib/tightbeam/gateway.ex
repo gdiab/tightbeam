@@ -3274,7 +3274,8 @@ defmodule Tightbeam.Gateway do
             runId: nil,
             messageId: nil,
             startedAt: nil,
-            queueDepth: depth
+            queueDepth: depth,
+            settlement: status_turn_settlement(db, session)
           },
           context: nil,
           approval: nil,
@@ -3332,6 +3333,26 @@ defmodule Tightbeam.Gateway do
             payload
         end
     end
+  end
+
+  # Stale-turn v1.1 R10: the latest turn's settlement, asking the turn's own
+  # adapter generation whether a running turn is live (R3).
+  defp status_turn_settlement(db, session) do
+    alias Tightbeam.TurnSettlementView
+
+    TurnSettlementView.settlement(
+      TurnSettlementView.latest_turn(db, session.session_key),
+      fn turn ->
+        with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
+             {:ok, adapter, generation} <- resident_adapter(session) do
+          TurnSettlementView.liveness(db, turn, adapter, generation, sid)
+        else
+          _ -> :unknown
+        end
+      end
+    )
+  catch
+    :exit, _ -> nil
   end
 
   defp live_runtime_projection(db, session) do
@@ -3574,7 +3595,14 @@ defmodule Tightbeam.Gateway do
       |> Map.put(:capabilities, StateResources.session(session)["capabilities"])
       |> Map.merge(Payloads.limit_fallback_fields(session))
 
-    Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
+    item
+    |> Map.put(:po_association, SessionPoAssociations.get(db, session.session_key))
+    |> Map.put(
+      :turn_settlement,
+      Tightbeam.TurnSettlementView.settlement(
+        Tightbeam.TurnSettlementView.latest_turn(db, session.session_key)
+      )
+    )
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
