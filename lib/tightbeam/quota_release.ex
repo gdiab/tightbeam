@@ -14,6 +14,9 @@ defmodule Tightbeam.QuotaRelease do
     it (`Wakes`), a retry attempt still pending is settled, the disposition is
     recorded with cause `provider_quota`, and one item goes to the holder and
     the delivery owner (v3 R16).
+  - Companion B5 (spec writer's ruling, asg_a4d1e7d6): a release by the
+    declared reset or an explicit resume re-admits the key's pending
+    pre-activity message turns itself, once each in seq order (`readmit: true`).
   - v3 R12: every active session on the key with a queued turn gets its lane
     ensured, so the queue drains in its original order.
   """
@@ -23,8 +26,8 @@ defmodule Tightbeam.QuotaRelease do
 
   @process "process:tightbeam"
 
-  @spec released_in_txn(Txn.t(), String.t(), String.t(), String.t()) :: :ok
-  def released_in_txn(%Txn{} = txn, incident_id, harness, host)
+  @spec released_in_txn(Txn.t(), String.t(), String.t(), String.t(), keyword()) :: :ok
+  def released_in_txn(%Txn{} = txn, incident_id, harness, host, opts \\ [])
       when is_binary(incident_id) and is_binary(harness) and is_binary(host) do
     txn
     |> quota_failed_turns_in_txn(incident_id)
@@ -32,6 +35,13 @@ defmodule Tightbeam.QuotaRelease do
       if LimitFallback.Outcome.classify_in_txn(txn, turn.seq) == :unknown_effect,
         do: not_replayed_in_txn(txn, incident_id, turn)
     end)
+
+    # A release by the declared reset or an explicit resume is itself the
+    # restoration of the key's pending pre-activity message turns: re-admitting
+    # them must not wait for an unrelated turn to succeed (v3 V1). A release by
+    # a later success already redelivers them from that success.
+    if Keyword.get(opts, :readmit, false),
+      do: Wakes.readmit_released_quota_intents_in_txn(txn, incident_id)
 
     Txn.q(
       txn,
