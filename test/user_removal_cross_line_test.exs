@@ -1,19 +1,25 @@
 defmodule Tightbeam.UserRemovalCrossLineTest do
-  # Cross-line user-removal migration contract v2 (art_a823f882), 0.1.16 tests.
+  # Cross-line migration contract v3.1 (art_669dd19a), 0.1.16 tests: the
+  # user-removal adoption (v2) and item 6's limit-fallback step (R7, R8, R10).
   # F0 is a base written by the 0.1.14 + PR622 build (stamp user-removal-v1-0114,
   # with a removed user). Every case boots it through the guarded persistent
   # path: the marked base, the build transition, the guard, ensure_all, then the
-  # marker publication.
+  # marker publication. The cases on F1 (a base written by the reviewed Part-A
+  # 0.1.14 build, stamp limit-fallback-v1-0114: T7, T9-T11, N8-N12) wait for
+  # that build and are not here.
   use Tightbeam.TestCase, async: false
 
   alias Exqlite.Sqlite3
-  alias Tightbeam.{DB, LiveBaseAdmission, LiveBaseGuard, Schema, UserAdmin}
+  alias Tightbeam.{DB, LimitFallback, LiveBaseAdmission, LiveBaseGuard, Schema, UserAdmin}
+  alias Tightbeam.DB.Txn
 
   @u_l "user-removal-v1-016"
   @lf_l "limit-fallback-v1-016"
   @p_l "artifact-process-attribution-v1-015"
   @f0_dir Path.expand("fixtures/user_removal/f0", __DIR__)
   @removal_check "removedBy TEXT CHECK ((removedAt IS NULL) = (removedBy IS NULL))"
+  @process_branch "(kind = 'progress' AND bySession IS NULL AND byUser IS NULL " <>
+                    "AND verdictKind IS NULL AND byProcess IS NOT NULL)"
 
   setup do
     suffix = System.unique_integer([:positive])
@@ -293,7 +299,165 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
     end
   end
 
+  describe "v3.1 item 6: this line's limit-fallback step (R7, R8, R10)" do
+    test "T8: this line's pre-port database reaches limit-fallback-v1-016 through user-removal-v1-016",
+         ctx do
+      stage_f0!(ctx.base)
+      db = guarded_boot!(ctx)
+      :ok = downgrade_to_pre_port!(db)
+      assert {:ok, [[@p_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+      assert lf_objects(db) == []
+      {:ok, users} = DB.query(db, "SELECT userId, isAdmin, createdAt FROM users ORDER BY userId")
+      :ok = GenServer.stop(db)
+
+      before = snapshot(db_path(ctx.base))
+
+      for _boot <- 1..2 do
+        db = guarded_boot!(ctx)
+
+        try do
+          assert {:ok, [[@lf_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+          assert marker(ctx.base) == owner_marker(ctx.identity)
+          assert {:ok, :ok} = DB.transaction(db, &LimitFallback.validate_in_txn!/1)
+
+          # R10: the owner-alerts objects were created over user-removal-v1-016.
+          assert {:ok, [[0, "owner-alerts-v1-0114", _]]} =
+                   DB.query(db, "SELECT id, shape, appliedAt FROM owner_alert_migration")
+
+          assert {:ok, ^users} =
+                   DB.query(db, "SELECT userId, isAdmin, createdAt FROM users ORDER BY userId")
+
+          assert users_sql(db) =~ @removal_check
+          assert_preserved!(db, before)
+        after
+          :ok = GenServer.stop(db)
+        end
+      end
+    end
+
+    test "a crash after this line's user-removal step resumes at the limit-fallback step", ctx do
+      stage_f0!(ctx.base)
+      db = guarded_boot!(ctx)
+      :ok = downgrade_to_pre_port!(db)
+      :ok = GenServer.stop(db)
+
+      {db, boundary} = guarded_boot_without!(ctx, :limit_fallback)
+
+      try do
+        assert {:ok, [[@u_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+        assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM owner_alert_migration")
+        assert lf_objects(db) == []
+      after
+        GenServer.stop(boundary)
+        :ok = GenServer.stop(db)
+      end
+
+      db = guarded_boot!(ctx)
+
+      try do
+        assert {:ok, [[@lf_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+        assert {:ok, :ok} = DB.transaction(db, &LimitFallback.validate_in_txn!/1)
+      after
+        :ok = GenServer.stop(db)
+      end
+    end
+
+    test "R8: limit-fallback-v1-0114 without c1's objects refuses at adoption, changing nothing",
+         ctx do
+      # One stated mutation of F0: its stamp claims the 0.1.14 limit-fallback
+      # shape while the base carries only PR622's columns.
+      stage_f0!(ctx.base)
+      mutate!(ctx.base, "UPDATE schema_stamp SET shape='limit-fallback-v1-0114'")
+
+      assert_refused_unchanged!(
+        ctx,
+        ~r/incompatible_limit_fallback_schema/,
+        "limit-fallback-v1-0114"
+      )
+    end
+
+    test "R10: owner alerts are created only over user-removal-v1-016", ctx do
+      stage_f0!(ctx.base)
+      db = guarded_boot!(ctx)
+
+      for name <- ["owner_alerts", "owner_alert_migration"] do
+        assert :ok = DB.execute(db, "DROP TABLE #{name}")
+      end
+
+      try do
+        assert_raise Schema.ShapeError, ~r/incompatible_owner_alert_predecessor/, fn ->
+          Schema.ensure_all(db)
+        end
+
+        assert {:ok, [[@lf_l]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+        assert {:ok, []} =
+                 DB.query(db, "SELECT name FROM sqlite_master WHERE name='owner_alerts'")
+      after
+        :ok = GenServer.stop(db)
+      end
+    end
+  end
+
   # -- helpers ---------------------------------------------------------------
+
+  # This line's pre-port shape (P_L), as a stated rewind of a booted F0: c1's
+  # objects and the owner-alerts objects are removed, then PR622's columns
+  # (SchemaShapeRuntimeFixture.downgrade_user_removal!/1). Every other row stays.
+  defp downgrade_to_pre_port!(db) do
+    {:ok, :ok} =
+      DB.migration_transaction(
+        db,
+        :test_rewind_limit_fallback,
+        [],
+        ["PRAGMA writable_schema = OFF"],
+        fn txn ->
+          [[sql]] =
+            Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='attests'")
+
+          restored = String.replace(sql, "\n      OR\n      " <> @process_branch, "")
+          true = restored != sql
+          :ok = Txn.exec(txn, "DROP INDEX limit_fallback_open_holds")
+          :ok = Txn.exec(txn, "DROP TABLE limit_fallback_evaluations")
+          :ok = Txn.exec(txn, "DROP TABLE owner_alerts")
+          :ok = Txn.exec(txn, "DROP TABLE owner_alert_migration")
+          [[version]] = Txn.q(txn, "PRAGMA schema_version")
+          :ok = Txn.exec(txn, "PRAGMA writable_schema = ON")
+
+          Txn.q(txn, "UPDATE sqlite_master SET sql=?1 WHERE type='table' AND name='attests'", [
+            restored
+          ])
+
+          :ok = Txn.exec(txn, "PRAGMA schema_version = #{version + 1}")
+          :ok = Txn.exec(txn, "PRAGMA writable_schema = RESET")
+          :ok
+        end
+      )
+
+    {:ok, :ok} =
+      DB.migration_transaction(db, :test_rewind_limit_fallback_columns, [], [], fn txn ->
+        :ok = Txn.exec(txn, "ALTER TABLE attests DROP COLUMN byProcess")
+        :ok = Txn.exec(txn, "ALTER TABLE sessions DROP COLUMN limitFallbackOff")
+        :ok = Txn.exec(txn, "ALTER TABLE sessions DROP COLUMN fallbackActive")
+        :ok
+      end)
+
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_user_removal!(db)
+  end
+
+  defp lf_objects(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT name FROM sqlite_master
+        WHERE name IN ('limit_fallback_evaluations', 'limit_fallback_open_holds')
+        ORDER BY name
+        """
+      )
+
+    rows
+  end
 
   # F0 is stored as gzip + base64 text, like the other SQLite fixtures; the
   # decoded bytes are the generator's file exactly (state.db.sha256).
@@ -368,7 +532,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
     assert {:stopped, _} = outcome
   end
 
-  defp assert_refused_unchanged!(ctx, message) do
+  defp assert_refused_unchanged!(ctx, message, stamp \\ "user-removal-v1-0114") do
     before_db = File.read!(db_path(ctx.base))
     before_marker = File.read!(Path.join(ctx.base, "build-owner.json"))
 
@@ -380,7 +544,7 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
       :ok = GenServer.stop(db)
     end
 
-    assert raw(db_path(ctx.base), "SELECT shape FROM schema_stamp") == [["user-removal-v1-0114"]]
+    assert raw(db_path(ctx.base), "SELECT shape FROM schema_stamp") == [[stamp]]
     assert File.read!(Path.join(ctx.base, "build-owner.json")) == before_marker
     assert snapshot_bytes(before_db) == snapshot(db_path(ctx.base))
   end
