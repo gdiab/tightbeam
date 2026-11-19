@@ -156,64 +156,38 @@ defmodule Tightbeam.TestDevices do
   def proof(device_id), do: Tightbeam.GrantAuth.proof(fixture_token(device_id))
 
   @doc """
-  A path that passes every core fix (A) C6a check, for tests that lift the freeze:
-  a regular file owned by uid 0 and gid 0, not writable by group or others, whose
-  directory and that directory's parent are root-owned and not group- or
-  other-writable.
-
-  An existing system file is used when one passes. Otherwise, on a CI runner with
-  passwordless sudo, one is built once with sudo in a temporary tree. Elsewhere the
-  test fails, naming each candidate's failing check. Nothing here ever writes a
-  host's real `/etc`.
+  Stage 1 S2.1: issue a pairing code from `admin`'s paired device for `user` (the
+  device's own by default). Returns `{code, record}`; the code is taken from the
+  calling process's mailbox, as the requesting connection receives it.
   """
-  @spec valid_unfreeze_file!() :: String.t()
-  def valid_unfreeze_file! do
-    candidates = ["/usr/bin/env", "/bin/sh", "/usr/bin/true", "/etc/hostname", "/etc/passwd"]
+  @spec issue_code!(GenServer.server(), map(), String.t() | nil) :: {String.t(), map()}
+  def issue_code!(db, admin, user \\ nil) do
+    call = device_call(admin, %{verb: "approve-device", params: %{}})
 
-    case Enum.find(candidates, &Tightbeam.PairingFreeze.read(&1).lifted) do
-      nil -> sudo_built_unfreeze_file!(candidates)
-      path -> path
-    end
-  end
-
-  defp sudo_built_unfreeze_file!(candidates) do
-    case :persistent_term.get({__MODULE__, :unfreeze_file}, nil) do
-      nil ->
-        if System.get_env("CI") == "true" and
-             match?({_, 0}, System.cmd("sudo", ["-n", "true"], stderr_to_stdout: true)) do
-          base = Path.join(System.tmp_dir!(), "tb-unfreeze-#{System.unique_integer([:positive])}")
-          File.mkdir_p!(base)
-          etc = Path.join(base, "etc")
-          dir = Path.join(etc, "tightbeam")
-          file = Path.join(dir, "pairing-unfreeze")
-          sudo!(["install", "-d", "-o", "root", "-g", "0", "-m", "0755", etc, dir])
-          sudo!(["install", "-o", "root", "-g", "0", "-m", "0644", "/dev/null", file])
-
-          unless Tightbeam.PairingFreeze.read(file).lifted,
-            do:
-              raise(
-                "sudo-built unfreeze file is not valid: #{inspect(Tightbeam.PairingFreeze.read(file))}"
-              )
-
-          :persistent_term.put({__MODULE__, :unfreeze_file}, file)
-          file
-        else
-          checks = Enum.map(candidates, &{&1, Tightbeam.PairingFreeze.read(&1)})
-
-          raise "this host offers no root-owned fixture file for a valid unfreeze file " <>
-                  "and no passwordless sudo on CI: #{inspect(checks)}"
+    case Tightbeam.DeviceLifecycle.issue_code(db, call, user) do
+      %{code_id: _} = record ->
+        receive do
+          {:tightbeam_ephemeral, text} ->
+            [code] = Regex.run(~r/TB-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}/, text)
+            {code, record}
+        after
+          0 -> raise "issue_code sent no ephemeral code"
         end
 
-      file ->
-        file
+      refusal ->
+        raise "issue_code refused: #{inspect(refusal)}"
     end
   end
 
-  defp sudo!(args) do
-    case System.cmd("sudo", ["-n" | args], stderr_to_stdout: true) do
-      {_, 0} -> :ok
-      {output, status} -> raise "sudo #{inspect(args)} exited #{status}: #{output}"
-    end
+  @doc "Stage 1 S2.2: a coded `pair_request` through `admission` (a PairingAdmission)."
+  @spec coded_pair(GenServer.server(), String.t(), String.t(), String.t(), GenServer.server()) ::
+          term()
+  def coded_pair(db, device_id, name, code, admission) do
+    Tightbeam.Devices.pair(
+      db,
+      %{device_id: device_id, claimed_name: "#{name} #{code}", platform: "ios", model: "iPhone"},
+      admission: admission
+    )
   end
 
   # Users go through the ordinary in-process writer so their projections exist;
