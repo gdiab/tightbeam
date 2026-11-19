@@ -74,7 +74,7 @@ defmodule Tightbeam.Wire.Router do
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @read_marker_verbs ~w(read-marker-set read-marker-clear)
-  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts memento-set mementos harklight-send harklight-revise harklight-retract harklight-settle spawn session-reparent session-po-set retire critical inspect cancel settle-turn tune approve-device deny-device revoke-device promote-user add-user recovery-enroll config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list kungfu-setup sentinel-enable sentinel-disable sentinel-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment repair-assignment assignments work-item-create work-item-handoff work-item-get breathing work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes harness-process-settle)
   @agent_verbs @agent_verbs ++
                  [
                    "fact-demand",
@@ -3599,13 +3599,13 @@ defmodule Tightbeam.Wire.Router do
         _ -> nil
       end
 
-    case token && Devices.by_token(db(conn), token) do
-      nil ->
-        {:error, 401, "auth_failed", nil}
-
-      device ->
-        Tightbeam.RequestContext.resolve_principal("user", device.user_id)
-        {:ok, device}
+    with device when not is_nil(device) <- token && Devices.by_token(db(conn), token),
+         # Stage 1 S2.3: a device's first authenticated use confirms delivery.
+         :ok <- Tightbeam.DeviceLifecycle.sign_in(db(conn), token) do
+      Tightbeam.RequestContext.resolve_principal("user", device.user_id)
+      {:ok, device}
+    else
+      _ -> {:error, 401, "auth_failed", nil}
     end
   end
 
@@ -4395,6 +4395,7 @@ defmodule Tightbeam.Wire.Router do
     "revoke-device" => ~w(device_id)a,
     "deny-device" => ~w(device_id)a,
     "approve-device" => ~w(device_id user_id)a,
+    "recovery-enroll" => [],
     "assignment-get" => ~w(assignment_id fact_id)a,
     "add-user" => ~w(is_admin user_id)a,
     "remove-user" => ~w(user_id)a,

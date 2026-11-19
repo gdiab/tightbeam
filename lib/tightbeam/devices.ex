@@ -16,7 +16,6 @@ defmodule Tightbeam.Devices do
     AdminProjection,
     DB,
     GrantAuth,
-    PairingFreeze,
     StateResources,
     TerminalCredentialFailure,
     UserAdmin
@@ -96,128 +95,16 @@ defmodule Tightbeam.Devices do
   end
 
   @doc """
-  Pair a device (core-v8 C6, C6a). The unfreeze file is read in this handling step
-  and the observation is recorded in the pairing transaction.
-
-  While FROZEN every request is refused `pairing_frozen` and nothing is created or
-  changed: no user, no device row, no token, no status change.
-
-  While LIFTED only new devices pair:
-  - an unknown device goes pending (its claimed user is created non-admin), and a
-    pending device stays pending;
-  - an approved device collects its uncollected token once; the token is marked
-    collected in the same transaction;
-  - a device whose token is collected gets `already_paired`, and nothing changes;
-  - a revoked device (allowlisted, no token) is set pending again;
-  - a denied device stays denied, and a removed user's device gets `user_removed`;
-  - the cold start (no user at all) is refused `pairing_frozen`, lifted or not.
+  Decide one `pair_request` by one-time code (stage1-v8 S2.2). The freeze and its
+  escape hatch of core fix (A) no longer apply (S0.1). Returns `{:paired, device}`
+  with the new token, or `{:refused, reason, message}`; an uncoded request creates
+  no row.
   """
-  @spec pair(db(), %{
-          device_id: String.t(),
-          claimed_name: String.t(),
-          platform: String.t() | nil,
-          model: String.t() | nil
-        }) :: pair_outcome()
-  def pair(db \\ Tightbeam.DB, input) do
-    freeze = PairingFreeze.read()
-
-    transaction!(db, fn txn ->
-      device_id = Map.fetch!(input, :device_id)
-      :ok = PairingFreeze.observe_in_txn(txn, freeze)
-
-      if freeze.lifted do
-        outcome = pair_lifted_in_txn(txn, input, device_id)
-        PairingFreeze.record_use_in_txn(txn, freeze, "pair_request", device_id, label(outcome))
-        outcome
-      else
-        {:refused, "pairing_frozen"}
-      end
-    end)
-  end
-
-  defp pair_lifted_in_txn(txn, input, device_id) do
-    case select_device(txn, "d.deviceId = ?1", [device_id]) do
-      [row] ->
-        case to_device(row) do
-          # A removed user's device obtains no token, whatever its status.
-          %{user_removed: true} ->
-            {:refused, "user_removed"}
-
-          %{status: "denied"} ->
-            :denied
-
-          %{status: "pending"} = device ->
-            {:pending, device}
-
-          # Revoked: no token is re-minted; it returns only through a fresh approval.
-          %{status: "allowlisted", token: nil} ->
-            Txn.q(txn, "UPDATE devices SET status = 'pending' WHERE deviceId = ?1", [device_id])
-            stamp_device_in_txn(txn, device_id, now())
-            {:pending, must_get(txn, device_id)}
-
-          %{status: "allowlisted"} ->
-            case Txn.q(txn, "SELECT tokenCollected FROM devices WHERE deviceId = ?1", [device_id]) do
-              [[0]] ->
-                Txn.q(txn, "UPDATE devices SET tokenCollected = 1 WHERE deviceId = ?1", [
-                  device_id
-                ])
-
-                stamp_device_in_txn(txn, device_id, now())
-                {:paired, must_get(txn, device_id)}
-
-              [[1]] ->
-                {:refused, "already_paired"}
-            end
-        end
-
-      [] ->
-        claimed_name = Map.fetch!(input, :claimed_name)
-        user_id = slug_user_id(claimed_name)
-
-        cond do
-          # The cold start is never lifted: whoever can create the file could
-          # otherwise mint the first admin device with no approval.
-          Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]] ->
-            {:refused, "pairing_frozen"}
-
-          UserAdmin.removed_in_txn?(txn, user_id) ->
-            {:refused, "user_removed"}
-
-          true ->
-            pair_new_device(txn, input, device_id, claimed_name, user_id)
-        end
-    end
-  end
-
-  defp label({:paired, _}), do: "paired"
-  defp label({:pending, _}), do: "pending"
-  defp label(:denied), do: "denied"
-  defp label({:refused, reason}), do: reason
-
-  defp pair_new_device(txn, input, device_id, claimed_name, user_id) do
-    ensure_user(txn, user_id)
-
-    Txn.q(
-      txn,
-      """
-        INSERT INTO devices
-          (deviceId, userId, claimedName, status, token, platform, model, createdAt)
-        VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?5, ?6)
-      """,
-      [
-        device_id,
-        user_id,
-        claimed_name,
-        Map.fetch!(input, :platform),
-        Map.fetch!(input, :model),
-        now()
-      ]
-    )
-
-    device = must_get(txn, device_id)
-    stamp_device_in_txn(txn, device_id, device.created_at)
-    {:pending, device}
-  end
+  @spec pair(db(), map(), keyword()) ::
+          {:paired, %{device_id: String.t(), user_id: String.t(), token: String.t()}}
+          | {:refused, String.t(), String.t()}
+  def pair(db \\ Tightbeam.DB, input, opts \\ []),
+    do: Tightbeam.DeviceLifecycle.pair(db, input, opts)
 
   @doc """
   Device by bearer token — ONLY if allowlisted and its user is not removed
@@ -272,56 +159,6 @@ defmodule Tightbeam.Devices do
       stamp_device_in_txn(txn, device_id, now())
 
       must_get(txn, device_id)
-    end)
-  end
-
-  @doc false
-  # C2 then C6/C6a, in the approval's own transaction: only an admin-paired device
-  # approves, only while the freeze is lifted, and only a pending device. The token
-  # is minted uncollected; the device collects it on its next pair_request. A
-  # refusal changes no device or user.
-  def approve_with_firehose(db, device_id, user_id, call) do
-    freeze = PairingFreeze.read()
-
-    transaction!(db, fn txn ->
-      with :ok <- GrantAuth.authorize_in_txn(txn, call),
-           :ok <- PairingFreeze.observe_in_txn(txn, freeze),
-           :ok <- if(freeze.lifted, do: :ok, else: PairingFreeze.frozen_refusal()) do
-        device = must_get(txn, device_id)
-        target = user_id || device.user_id
-
-        outcome =
-          cond do
-            UserAdmin.removed_in_txn?(txn, target) ->
-              UserAdmin.removed_refusal(target)
-
-            device.status != "pending" ->
-              %{
-                code: "device_not_pending",
-                message:
-                  "#{device_id} is #{device.status}; only a pending device can be approved. " <>
-                    "A revoked device returns to pending when it next asks to pair."
-              }
-
-            true ->
-              if user_id, do: ensure_user(txn, user_id)
-
-              Txn.q(
-                txn,
-                "UPDATE devices SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3, tokenCollected = 0 WHERE deviceId = ?1",
-                [device_id, user_id, mint_token()]
-              )
-
-              stamp_device_in_txn(txn, device_id, now())
-              device = firehose_device_in_txn(txn, device_id)
-              Publisher.maybe_accepted_in_txn(txn, call, %{device: device})
-              device
-          end
-
-        result = if match?(%{code: _}, outcome), do: outcome.code, else: "approved"
-        PairingFreeze.record_use_in_txn(txn, freeze, "approve-device", device_id, result)
-        outcome
-      end
     end)
   end
 
@@ -658,16 +495,6 @@ defmodule Tightbeam.Devices do
       removed_at: removed_at,
       removed_by: removed_by
     }
-  end
-
-  defp slug_user_id(claimed_name) do
-    case claimed_name
-         |> String.downcase()
-         |> String.replace(~r/[^a-z0-9]+/, "-")
-         |> String.trim("-") do
-      "" -> "user"
-      slug -> slug
-    end
   end
 
   defp mint_token do

@@ -62,7 +62,7 @@ defmodule Tightbeam.OwnerAlerts do
   @owner_alerts_table_ddl """
   CREATE TABLE owner_alerts (
     alertId           TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback','pairing-freeze-lifted')),
+    kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback','pairing-freeze-lifted','pairing-unfreeze-ignored','recovery-enrolled','admin-recovered','root-recovery-enroll','root-pairing-code')),
     dedupeKey         TEXT NOT NULL,
     ownerUserId       TEXT NOT NULL,
     originSessionKey  TEXT NOT NULL,
@@ -550,6 +550,33 @@ defmodule Tightbeam.OwnerAlerts do
           dedupe_key: "pairing-freeze-lifted:#{observed_at}",
           owner: owner,
           title: "The pairing freeze is lifted",
+          body: body
+        })
+
+      _ ->
+        :off
+    end
+  end
+
+  ## Device lifecycle stage 1 (S0.2, S1.1, S1.3, S1.5)
+
+  @device_lifecycle_kinds ~w(pairing-unfreeze-ignored recovery-enrolled admin-recovered root-recovery-enroll root-pairing-code)
+
+  @doc """
+  Create one stage 1 device-lifecycle alert inside the transaction that records its
+  trigger. Its text names users and times only, never a code or secret.
+  """
+  @spec device_lifecycle_in_txn(Txn.t(), String.t(), String.t(), String.t(), String.t()) ::
+          {:created, String.t()} | :exists | :off
+  def device_lifecycle_in_txn(%Txn{} = txn, kind, dedupe_key, title, body)
+      when kind in @device_lifecycle_kinds do
+    case owner_in_txn(txn) do
+      owner when is_binary(owner) ->
+        create_in_txn(txn, %{
+          kind: kind,
+          dedupe_key: dedupe_key,
+          owner: owner,
+          title: title,
           body: body
         })
 

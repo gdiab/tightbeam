@@ -178,8 +178,10 @@ defmodule Tightbeam.Gateway do
     :ok = Schema.ensure_all(db)
     :ok = AdminProjection.bootstrap_served(db, config.base_dir)
     :ok = TerminalCredentialFailure.reconcile_all(db)
-    # Core fix (A) C6a: boot reads the unfreeze file only to record and alert.
-    :ok = Tightbeam.PairingFreeze.observe_at_boot(db)
+    # Stage 1 S0.2, S1.3, S1.5 (6): an old unfreeze file is ignored and reported, and
+    # recoveries or root-shell actions recorded while stopped are alerted once.
+    :ok = Tightbeam.DeviceLifecycle.observe_at_boot(db, Tightbeam.PairingFreeze.path())
+    _ = Tightbeam.DeviceLifecycle.expire_due(db)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
@@ -353,6 +355,8 @@ defmodule Tightbeam.Gateway do
           name: Tightbeam.WakeScheduler},
          {Tightbeam.HarklightWakes, db: db, send_runner: Map.get(config, :harklight_send_runner)},
          {Tightbeam.OwnerAlerts, db: db, send_runner: Map.get(config, :harklight_send_runner)},
+         {Tightbeam.PairingAdmission, name: Tightbeam.PairingAdmission},
+         {Tightbeam.DeliveryDeadlines, db: db},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -1035,21 +1039,15 @@ defmodule Tightbeam.Gateway do
           request -> %{decision_request: request}
         end
       end,
-      {"approve-device", ["device.approved"]} =>
+      # Stage 1 S2.1: approval issues a one-time pairing code for the target user (the
+      # device's own by default). The code reaches only the requesting connection.
+      {"approve-device", []} =>
         protected_handler(db, fn call ->
-          p = call.params
-
-          case Devices.approve_with_firehose(db, p.device_id, p[:user_id], call) do
-            %{code: _code} = refusal ->
-              refusal
-
-            d ->
-              %{
-                approved: %{device_id: d.device_id, user_id: d.user_id, is_admin: d.is_admin},
-                pairing_freeze: "lifted"
-              }
-          end
+          Tightbeam.DeviceLifecycle.issue_code(db, call, call.params[:user_id])
         end),
+      # Stage 1 S1.1: a new recovery secret for the device's own user.
+      {"recovery-enroll", []} =>
+        protected_handler(db, fn call -> Tightbeam.DeviceLifecycle.enroll(db, call) end),
       {"deny-device", ["device.denied"]} =>
         protected_handler(db, fn call ->
           p = call.params

@@ -327,31 +327,27 @@ defmodule Tightbeam.Wire.Socket do
         info = if is_map(msg["deviceInfo"]), do: msg["deviceInfo"], else: %{}
 
         result =
-          Devices.pair(db(state), %{
-            device_id: device_id,
-            claimed_name: string(msg["claimedName"] || "device"),
-            platform: info["platform"],
-            model: info["model"]
-          })
+          Devices.pair(
+            db(state),
+            %{
+              device_id: device_id,
+              claimed_name: string(msg["claimedName"] || "device"),
+              platform: info["platform"],
+              model: info["model"]
+            },
+            admission: Map.get(state.deps, :pairing_admission, Tightbeam.PairingAdmission)
+          )
 
+        # Stage 1 S2.2: a token only for a valid one-time code; S2.3 confirms its
+        # delivery by the device's first sign-in, not by this send.
         payload =
           case result do
             {:paired, device} ->
+              Tightbeam.DeliveryDeadlines.poke_if_running()
               Payloads.pair_result({:ok, device.token, device.user_id})
 
-            {:pending, _device} ->
-              Payloads.pair_result({:error, "pair_pending"})
-
-            :denied ->
-              Payloads.pair_result({:error, "pair_denied"})
-
-            {:refused, "pairing_frozen"} ->
-              Payloads.pair_result(
-                {:error, "pairing_frozen", Tightbeam.PairingFreeze.frozen_message()}
-              )
-
-            {:refused, reason} ->
-              Payloads.pair_result({:error, reason})
+            {:refused, reason, message} ->
+              Payloads.pair_result({:error, reason, message})
           end
 
         stop_with(payload, state)
@@ -427,7 +423,12 @@ defmodule Tightbeam.Wire.Socket do
         stop_with(Payloads.auth_result_failure(reason), state)
 
       device ->
-        auth_success(msg, device, %{state | auth_class: "device", device_token: token})
+        # Stage 1 S2.3: the first sign-in confirms delivery; past its deadline an
+        # undelivered token is cleared instead.
+        case Tightbeam.DeviceLifecycle.sign_in(db(state), token) do
+          :ok -> auth_success(msg, device, %{state | auth_class: "device", device_token: token})
+          :expired -> stop_with(Payloads.auth_result_failure("token_revoked"), state)
+        end
     end
   end
 
@@ -661,7 +662,7 @@ defmodule Tightbeam.Wire.Socket do
 
     case UserCommands.record(db(state), input, content) do
       {:recorded, command} ->
-        outcome =
+        {outcome, ephemeral} =
           content
           |> UserCommands.parse()
           |> UserCommands.execute(%{
@@ -673,12 +674,19 @@ defmodule Tightbeam.Wire.Socket do
 
         result = UserCommands.record_outcome(db(state), session_key, outcome)
 
+        # Stage 1 W7: a pairing code or recovery secret travels only in this batch, on
+        # this socket, after the persisted outcome; it is never recorded.
+        ephemeral_frames =
+          if ephemeral,
+            do: [UserCommands.ephemeral_frame(ephemeral, session_key, id)],
+            else: []
+
         push_many(
           [
             Payloads.ack(id),
             Payloads.server_message(command),
             Payloads.server_message(result)
-          ],
+          ] ++ ephemeral_frames,
           state
         )
 

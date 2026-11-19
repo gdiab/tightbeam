@@ -13,14 +13,14 @@ defmodule Tightbeam.UserCommands do
   and it is neither executed nor delivered.
   """
 
-  alias Tightbeam.{DB, Devices, Dispatch, GrantAuth, PairingFreeze, Projection}
+  alias Tightbeam.{DB, Devices, Dispatch, Projection}
   alias Tightbeam.DB.Txn
 
   @prefix "/tightbeam"
 
   @usage %{
-    "pending-devices" => "/tightbeam pending-devices",
-    "approve-device" => "/tightbeam approve-device <deviceId> [<userId>]",
+    "approve-device" => "/tightbeam approve-device [<userId>]",
+    "recovery-enroll" => "/tightbeam recovery-enroll",
     "deny-device" => "/tightbeam deny-device <deviceId>",
     "revoke-device" => "/tightbeam revoke-device <deviceId>",
     "promote-user" => "/tightbeam promote-user <userId>",
@@ -33,11 +33,10 @@ defmodule Tightbeam.UserCommands do
     "respond" => "/tightbeam respond <ref> <text>"
   }
 
-  @typedoc "A parsed command: a dispatchable act, the pending-devices read, or malformed."
+  @typedoc "A parsed command: a dispatchable act, a ruling, or malformed."
   @type parsed ::
           {:act, String.t(), map()}
           | {:rule, String.t(), String.t(), :label | :text}
-          | :pending_devices
           | {:malformed, String.t()}
 
   @doc "Whether `content` is a user command (C9): one trimmed line, `/tightbeam` then whitespace."
@@ -75,15 +74,16 @@ defmodule Tightbeam.UserCommands do
     end
   end
 
-  defp parse("pending-devices", ""), do: :pending_devices
-
+  # Stage 1 S2.1: approval issues a one-time code, for the device's own user by default.
   defp parse("approve-device", args) do
     case words(args) do
-      [device_id] -> {:act, "approve-device", %{device_id: device_id}}
-      [device_id, user_id] -> {:act, "approve-device", %{device_id: device_id, user_id: user_id}}
+      [] -> {:act, "approve-device", %{}}
+      [user_id] -> {:act, "approve-device", %{user_id: user_id}}
       _ -> malformed("approve-device")
     end
   end
+
+  defp parse("recovery-enroll", ""), do: {:act, "recovery-enroll", %{}}
 
   defp parse(verb, args) when verb in ["deny-device", "revoke-device"] do
     case words(args) do
@@ -169,16 +169,23 @@ defmodule Tightbeam.UserCommands do
   defp malformed(sub), do: {:malformed, "usage: " <> Map.fetch!(@usage, sub)}
 
   @doc """
-  Execute a parsed command for a device-authenticated connection and return the
-  outcome text recorded in the transcript. `ctx` carries `:db`, `:handlers`,
-  `:user_id` and `:device_id`.
+  Execute a parsed command for a device-authenticated connection. Returns the outcome
+  text recorded in the transcript, and the ephemeral text (a pairing code or recovery
+  secret, stage 1 W7) for the requesting connection alone, or nil. The ephemeral text
+  reaches this process by message from the act itself, so it never passes through a
+  dispatch result, an audit row or a change-feed notice.
+  `ctx` carries `:db`, `:handlers`, `:user_id` and `:device_id`.
   """
-  @spec execute(parsed(), map()) :: String.t()
-  def execute({:malformed, why}, _ctx), do: "Refused, nothing was executed: #{why}"
+  @spec execute(parsed(), map()) :: {String.t(), String.t() | nil}
+  def execute(parsed, ctx) do
+    flush_ephemeral()
+    text = outcome(parsed, ctx)
+    {text, take_ephemeral()}
+  end
 
-  def execute(:pending_devices, ctx), do: pending_devices(ctx)
+  defp outcome({:malformed, why}, _ctx), do: "Refused, nothing was executed: #{why}"
 
-  def execute({:act, verb, params}, ctx) do
+  defp outcome({:act, verb, params}, ctx) do
     case Dispatch.dispatch(ctx.db, ctx.handlers, call(ctx, verb, params)) do
       {:ok, result} -> "Done: #{verb}. " <> act_details(ctx, verb, params, result)
       {:error, error} -> refused(error)
@@ -186,7 +193,7 @@ defmodule Tightbeam.UserCommands do
     end
   end
 
-  def execute({:rule, ref, value, mode}, ctx) do
+  defp outcome({:rule, ref, value, mode}, ctx) do
     case resolve_ref(ctx.db, ref) do
       {:ok, request_id} ->
         answer =
@@ -205,6 +212,44 @@ defmodule Tightbeam.UserCommands do
     end
   end
 
+  defp flush_ephemeral do
+    receive do
+      {:tightbeam_ephemeral, _} -> flush_ephemeral()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp take_ephemeral do
+    receive do
+      {:tightbeam_ephemeral, text} -> text
+    after
+      0 -> nil
+    end
+  end
+
+  @doc """
+  The W7 ephemeral frame: an ordinary server message that Clawline `ddf31e2` renders,
+  with an `e_` id (never a transcript id or replay cursor), no `seq`, and the markers
+  `ephemeral: true` and `replyToClientMessageId`. It is never persisted.
+  """
+  @spec ephemeral_frame(String.t(), String.t(), String.t()) :: map()
+  def ephemeral_frame(text, session_key, client_message_id) do
+    %{
+      "type" => "message",
+      "id" => "e_" <> Tightbeam.Id.uuid4(),
+      "role" => "assistant",
+      "sender" => "process:tightbeam",
+      "sessionKey" => session_key,
+      "content" => text,
+      "timestamp" => System.system_time(:millisecond),
+      "streaming" => false,
+      "attachments" => [],
+      "ephemeral" => true,
+      "replyToClientMessageId" => client_message_id
+    }
+  end
+
   defp call(ctx, verb, params) do
     %{
       verb: verb,
@@ -221,8 +266,12 @@ defmodule Tightbeam.UserCommands do
     "Refused (#{error[:code] || "server_error"}): #{error[:message] || "no message"}"
   end
 
+  defp act_details(_ctx, verb, _params, %{message: message})
+       when verb in ["approve-device", "recovery-enroll"],
+       do: message <> "."
+
   defp act_details(ctx, verb, params, _result)
-       when verb in ["approve-device", "deny-device", "revoke-device"] do
+       when verb in ["deny-device", "revoke-device"] do
     case Devices.by_id(ctx.db, params.device_id) do
       nil -> "Device #{params.device_id}."
       device -> device_line(device)
@@ -245,41 +294,6 @@ defmodule Tightbeam.UserCommands do
     "Device #{device.device_id} (#{device.claimed_name}; platform #{device.platform || "unknown"}; " <>
       "model #{device.model || "unknown"}; paired #{format_time(device.created_at)}) " <>
       "is #{device.status} for user #{device.user_id}."
-  end
-
-  # C11: answered from the gateway's own rows, and only for an admin-paired device.
-  defp pending_devices(ctx) do
-    {:ok, admin?} =
-      DB.transaction(ctx.db, fn txn ->
-        match?(
-          %{is_admin: true},
-          GrantAuth.device_user_in_txn(txn, call(ctx, "pending-devices", %{}))
-        )
-      end)
-
-    if admin? do
-      frozen =
-        if PairingFreeze.read().lifted,
-          do: "Pairing is LIFTED (the unfreeze file is present).",
-          else: "Pairing is frozen."
-
-      case Devices.list_pending(ctx.db) do
-        [] ->
-          frozen <> " No pending devices."
-
-        devices ->
-          lines =
-            Enum.map(devices, fn d ->
-              "- #{d.device_id}: #{d.claimed_name}, claimed user #{d.user_id}, platform " <>
-                "#{d.platform || "unknown"}, model #{d.model || "unknown"}, paired " <>
-                format_time(d.created_at)
-            end)
-
-          Enum.join([frozen <> " Pending devices:" | lines], "\n")
-      end
-    else
-      refused(%{code: "forbidden", message: "pending-devices requires an admin's paired device"})
-    end
   end
 
   @doc """

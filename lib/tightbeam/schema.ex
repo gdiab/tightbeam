@@ -2030,6 +2030,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_user_removal(db)
     :ok = Tightbeam.OwnerAlerts.ensure_schema(db)
     :ok = Tightbeam.GrantAuth.ensure_schema(db)
+    :ok = Tightbeam.DeviceLifecycle.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
