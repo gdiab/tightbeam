@@ -5980,16 +5980,19 @@ defmodule Tightbeam.GatewayTest do
     start_runtime_supervisor()
     handlers = Gateway.handlers(config)
 
+    # Core fix (A): register-host is a protected act; flynn calls from his paired admin device.
     assert %{host: %{"host" => ^machine}} =
-             handlers["register-host"].(%{
-               origin: "user:flynn",
-               session_key: nil,
-               params: %{
-                 name: machine,
-                 ssh: machine,
-                 base_dir: "/remote/tb"
-               }
-             })
+             handlers["register-host"].(
+               Tightbeam.TestDevices.device_call(ctx.device, %{
+                 verb: "register-host",
+                 session_key: nil,
+                 params: %{
+                   name: machine,
+                   ssh: machine,
+                   base_dir: "/remote/tb"
+                 }
+               })
+             )
 
     server = Credentials.server(machine)
     first_pid = GenServer.whereis(server)
@@ -6004,15 +6007,17 @@ defmodule Tightbeam.GatewayTest do
     try do
       reregister =
         Task.async(fn ->
-          handlers["register-host"].(%{
-            origin: "user:flynn",
-            session_key: nil,
-            params: %{
-              name: machine,
-              ssh: machine,
-              base_dir: "/remote/tb"
-            }
-          })
+          handlers["register-host"].(
+            Tightbeam.TestDevices.device_call(ctx.device, %{
+              verb: "register-host",
+              session_key: nil,
+              params: %{
+                name: machine,
+                ssh: machine,
+                base_dir: "/remote/tb"
+              }
+            })
+          )
         end)
 
       # Two bounds, and the budget must sit between them. It must exceed a real
@@ -6036,15 +6041,17 @@ defmodule Tightbeam.GatewayTest do
     end
 
     assert %{host: %{"host" => ^machine}} =
-             handlers["register-host"].(%{
-               origin: "user:flynn",
-               session_key: nil,
-               params: %{
-                 name: machine,
-                 ssh: machine,
-                 base_dir: "/remote/new-tb"
-               }
-             })
+             handlers["register-host"].(
+               Tightbeam.TestDevices.device_call(ctx.device, %{
+                 verb: "register-host",
+                 session_key: nil,
+                 params: %{
+                   name: machine,
+                   ssh: machine,
+                   base_dir: "/remote/new-tb"
+                 }
+               })
+             )
 
     second_pid = GenServer.whereis(server)
     assert is_pid(second_pid)
@@ -6419,26 +6426,38 @@ defmodule Tightbeam.GatewayTest do
   test "add-user lets an admin add admins and non-admins but refuses a non-admin", ctx do
     handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["add-user"]
 
+    # Core fix (A): add-user is a protected act, so each user acts from their own
+    # allowlisted device; the admin bit still decides between them.
     assert %{user: %{"userId" => "second-admin", "isAdmin" => true}} =
-             handler.(%{
-               origin: "user:flynn",
-               session_key: nil,
-               params: %{user_id: "second-admin", is_admin: true}
-             })
+             handler.(
+               Tightbeam.TestDevices.device_call(ctx.device, %{
+                 verb: "add-user",
+                 session_key: nil,
+                 params: %{user_id: "second-admin", is_admin: true}
+               })
+             )
+
+    second_admin = Tightbeam.TestDevices.paired!(ctx.db, "second-admin")
 
     assert %{user: %{"userId" => "guest", "isAdmin" => false}} =
-             handler.(%{
-               origin: "user:second-admin",
-               session_key: nil,
-               params: %{user_id: "guest", is_admin: false}
-             })
+             handler.(
+               Tightbeam.TestDevices.device_call(second_admin, %{
+                 verb: "add-user",
+                 session_key: nil,
+                 params: %{user_id: "guest", is_admin: false}
+               })
+             )
+
+    guest = Tightbeam.TestDevices.paired!(ctx.db, "guest")
 
     assert %{code: "forbidden", message: "admin required"} =
-             handler.(%{
-               origin: "user:guest",
-               session_key: nil,
-               params: %{user_id: "blocked", is_admin: false}
-             })
+             handler.(
+               Tightbeam.TestDevices.device_call(guest, %{
+                 verb: "add-user",
+                 session_key: nil,
+                 params: %{user_id: "blocked", is_admin: false}
+               })
+             )
 
     assert Devices.user(ctx.db, "blocked") == nil
   end
@@ -6552,16 +6571,19 @@ defmodule Tightbeam.GatewayTest do
     # server with a foreign base_dir + non-nil ssh wedges every local spawn
     # until restart (fail-closed), and Placement.hosts/1 ignores the registry
     # entry for the local name anyway.
+    # Core fix (A): register-host is a protected act; flynn calls from his paired admin device.
     assert %{host: %{"host" => ^local}} =
-             handlers["register-host"].(%{
-               origin: "user:flynn",
-               session_key: nil,
-               params: %{
-                 name: local,
-                 ssh: "clu@#{local}",
-                 base_dir: "/remote/definitely-elsewhere"
-               }
-             })
+             handlers["register-host"].(
+               Tightbeam.TestDevices.device_call(ctx.device, %{
+                 verb: "register-host",
+                 session_key: nil,
+                 params: %{
+                   name: local,
+                   ssh: "clu@#{local}",
+                   base_dir: "/remote/definitely-elsewhere"
+                 }
+               })
+             )
 
     assert GenServer.whereis(Credentials.server(local)) == local_server,
            "local credential server was replaced by re-registering the local hostname"
@@ -6610,12 +6632,15 @@ defmodule Tightbeam.GatewayTest do
 
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
 
+    # Core fix (A): register-host is a protected act; flynn calls from his paired admin device.
     assert %{host: %{"host" => ^machine}} =
-             handlers["register-host"].(%{
-               origin: "user:flynn",
-               session_key: nil,
-               params: %{name: machine, ssh: machine, base_dir: "/remote/tb"}
-             })
+             handlers["register-host"].(
+               Tightbeam.TestDevices.device_call(ctx.device, %{
+                 verb: "register-host",
+                 session_key: nil,
+                 params: %{name: machine, ssh: machine, base_dir: "/remote/tb"}
+               })
+             )
 
     assert_receive {:staged, content, 0o600}
 
@@ -6655,12 +6680,15 @@ defmodule Tightbeam.GatewayTest do
     # Fail at registration rather than at the operator's first `onboard`: a host
     # with an ssh destination is a satellite, and a satellite whose gateway has no
     # advertised url cannot be reached by its own adapters either.
+    # Core fix (A): register-host is a protected act; flynn calls from his paired admin device.
     assert %{code: "advertised_url_missing", message: message} =
-             handlers["register-host"].(%{
-               origin: "user:flynn",
-               session_key: nil,
-               params: %{name: machine, ssh: machine, base_dir: "/remote/tb"}
-             })
+             handlers["register-host"].(
+               Tightbeam.TestDevices.device_call(ctx.device, %{
+                 verb: "register-host",
+                 session_key: nil,
+                 params: %{name: machine, ssh: machine, base_dir: "/remote/tb"}
+               })
+             )
 
     assert message =~ "TIGHTBEAM_ADVERTISED_URL"
     assert Placement.hosts(base_dir, ctx.db)[machine].base_dir == "/remote/tb"
@@ -6677,14 +6705,17 @@ defmodule Tightbeam.GatewayTest do
         |> Map.put(:credential_supervisor, rejecting_supervisor)
       )["register-host"]
 
+    # Core fix (A): register-host is a protected act; flynn calls from his paired admin device.
     assert_raise RuntimeError,
                  "failed to start credential server for host #{machine}: :deliberate_start_failure",
                  fn ->
-                   handler.(%{
-                     origin: "user:flynn",
-                     session_key: nil,
-                     params: %{name: machine, ssh: machine, base_dir: "/remote/failed"}
-                   })
+                   handler.(
+                     Tightbeam.TestDevices.device_call(ctx.device, %{
+                       verb: "register-host",
+                       session_key: nil,
+                       params: %{name: machine, ssh: machine, base_dir: "/remote/failed"}
+                     })
+                   )
                  end
 
     assert Placement.hosts(base_dir, ctx.db)[machine].base_dir == "/remote/failed"

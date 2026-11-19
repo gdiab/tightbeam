@@ -365,6 +365,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     alias Tightbeam.Wire.Router
     :ok = Devices.ensure_schema(db)
     :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
+    :ok = paired_device_schema!(db)
 
     {:paired, device} =
       Tightbeam.TestDevices.pair(db, %{
@@ -437,6 +438,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
 
     :ok = Devices.ensure_schema(db)
     :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
+    :ok = paired_device_schema!(db)
 
     {:paired, device} =
       Tightbeam.TestDevices.pair(db, %{
@@ -476,6 +478,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     alias Tightbeam.Devices
     :ok = Devices.ensure_schema(db)
     :ok = Tightbeam.SchemaShapeRuntimeFixture.add_user_removal_columns!(db)
+    :ok = paired_device_schema!(db)
 
     pair = fn id ->
       Tightbeam.TestDevices.pair(db, %{device_id: id, claimed_name: id, platform: nil, model: nil})
@@ -646,5 +649,16 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
     assert :ok = Hub.shutdown(hub)
     assert Hub.connection_stats(hub, pid) == nil
+  end
+
+  # Core fix (A): pairing issues no token, so these device-only synthetic databases get
+  # their paired devices from Tightbeam.TestDevices. It writes the C6a tokenCollected
+  # column and creates users through Devices.add_user, which reconciles
+  # terminal-credential deliveries; both are added here, keeping the partial schema.
+  defp paired_device_schema!(db) do
+    :ok =
+      DB.execute(db, "ALTER TABLE devices ADD COLUMN tokenCollected INTEGER NOT NULL DEFAULT 0")
+
+    :ok = Tightbeam.TerminalCredentialFailure.ensure_schema(db)
   end
 end
