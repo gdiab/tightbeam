@@ -4404,6 +4404,46 @@ defmodule Tightbeam.HarnessHealthTest do
                lifecycle_details(ctx.db, "rate_limit_admission_resumed", hold_id)
     end
 
+    # Companion v1.2 B2 with v1.7 C1 on 0.1.16: a named release on an open
+    # incident that a standing reason held has ended the quota cause, so the
+    # reason's own settlement completes the park; before the release no
+    # completion lifts it.
+    test "B2/C1: a resume held by a parking process lifts the park when the process settles",
+         ctx do
+      %{hold: hold_id} = codex_hold!(ctx)
+      key = {:codex, "shared", "testhost"}
+      launch = parking_codex_process!(ctx.db)
+
+      # No unnamed completion lifts the quota park.
+      :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, key)
+      assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
+
+      assert {:ok, {:held, ["harness_process:" <> ^launch]}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Tightbeam.QuotaRelease.release_in_txn(txn, hold_id, "codex", "testhost",
+                   cause: "explicit_resume",
+                   actor: "user:flynn",
+                   readmit: true
+                 )
+               end)
+
+      assert HarnessHealth.get(ctx.db, hold_id).state == "open"
+      assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE harness_processes SET state='closed_gracefully',resolvedAt=?2 WHERE launchId=?1",
+          [launch, System.system_time(:millisecond)]
+        )
+
+      :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, key)
+      refute Tightbeam.HarnessProcess.parked?(ctx.db, key)
+
+      assert [%{"cause" => "standing_reason_cleared", "releaseCause" => "explicit_resume"}] =
+               lifecycle_details(ctx.db, "rate_limit_admission_resumed", hold_id)
+    end
+
     test "C2: after a probe release a pre-activity turn is redelivered once; a started turn never is",
          ctx do
       %{hold: hold_id, turn: pre_activity} = codex_hold!(ctx)
