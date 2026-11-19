@@ -311,16 +311,16 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
              )
   end
 
-  # ── R1/R4 — rpc/remote resolve the node from the descriptor (Phase 1) ───────
+  # ── Core fix (A), review B1 — rpc/remote reach no live node ─────────────────
 
-  test "rpc resolves the node from the descriptor, and the descriptor node wins over ambient" do
+  test "rpc and remote are refused outright and never reach the release, whatever the env" do
     shim = faked_release_shim!()
 
     base = Path.join(System.tmp_dir!(), "tb-rpc-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(base) end)
 
-    # A CUSTOM-node instance (booted with its own TIGHTBEAM_NODE), recorded in the
-    # descriptor at boot.
+    # A descriptor naming a node, plus the exact incident vector: none of it may
+    # route the verb anywhere.
     write_descriptor(base, %{
       port: 11_484,
       cliToken: "tbc_iso",
@@ -329,51 +329,24 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
       ownedCommand: "x"
     })
 
-    {out, status} =
-      System.cmd(shim, ["rpc", "Foo.bar()"],
-        env: [
-          {"TIGHTBEAM_BASE_DIR", base},
-          # the exact incident vector, now aimed at a debug verb:
-          {"RELEASE_NODE", "tightbeam_gateway_11373"},
-          {"TIGHTBEAM_NODE", "tightbeam_gateway_11373"},
-          {"RELEASE_COOKIE", "prod-shared-cookie"}
-        ],
-        stderr_to_stdout: true
-      )
+    for args <- [["rpc", "Foo.bar()"], ["remote"]] do
+      {out, status} =
+        System.cmd(shim, args,
+          env: [
+            {"TIGHTBEAM_BASE_DIR", base},
+            {"RELEASE_NODE", "tightbeam_gateway_11373"},
+            {"TIGHTBEAM_NODE", "tightbeam_gateway_11373"},
+            {"RELEASE_COOKIE", "prod-shared-cookie"}
+          ],
+          stderr_to_stdout: true
+        )
 
-    assert status == 0, out
-    # (a) custom-node support restored: rpc used the descriptor's node.
-    assert out =~ ~r/^REL_NODE=custom_iso_node$/m
-    # (b) incident-safety for the debug verbs: the inherited node did NOT redirect.
-    refute out =~ ~r/^REL_NODE=tightbeam_gateway_11373$/m
-    # (c) R4 (shim half, T2): the shim STRIPS the inherited RELEASE_COOKIE from
-    # the rpc/remote environment, so the release falls back to its baked cookie.
-    # The real launcher's baked resolution is proven against the built artifact
-    # in release_cookie_resolution_test.exs (T1).
-    assert out =~ ~r/^REL_COOKIE=<unset>$/m
-    refute out =~ ~r/prod-shared-cookie/
-    # the debug argv is forwarded intact.
-    assert out =~ ~r/^ARG=rpc$/m
-    assert out =~ ~r/^ARG=Foo\.bar\(\)$/m
-  end
-
-  test "rpc refuses when the descriptor has no node" do
-    shim = faked_release_shim!()
-
-    base = Path.join(System.tmp_dir!(), "tb-rpc-nonode-#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf!(base) end)
-
-    write_descriptor(base, %{port: 11_484, cliToken: "tbc_iso", ownedPid: "1", ownedCommand: "x"})
-
-    {out, status} =
-      System.cmd(shim, ["rpc", "Foo.bar()"],
-        env: [{"TIGHTBEAM_BASE_DIR", base}, {"RELEASE_NODE", "tightbeam_gateway_11373"}],
-        stderr_to_stdout: true
-      )
-
-    assert status != 0, "rpc must refuse a descriptor with no node"
-    assert out =~ "no node"
-    refute out =~ "REL_NODE="
+      assert status == 64, out
+      assert out =~ "without Erlang"
+      # The fake release never ran: nothing was forwarded to a node.
+      refute out =~ "REL_NODE="
+      refute out =~ "ARG="
+    end
   end
 
   # Case 2 (design §5, N5) — the direct mix-script per-instance-cookie backstop —
@@ -400,10 +373,10 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
 
     fake = Path.join(rel_bin, "tightbeam_gateway")
 
-    # A raw probe: echoes the node it was handed and the RAW inherited
-    # RELEASE_COOKIE — so the tests can prove the shim STRIPS the cookie on the
-    # rpc/remote path (T2). The REAL launcher's baked-cookie resolution is proven
-    # separately, against the built artifact, in release_cookie_resolution_test.
+    # A raw probe: echoes the node it was handed, the inherited RELEASE_COOKIE and
+    # its argv, so a test can see whether the shim forwarded anything at all. The
+    # REAL release's distribution and cookie are proven against the built artifact
+    # in release_cookie_resolution_test.
     File.write!(
       fake,
       "#!/bin/sh\n" <>

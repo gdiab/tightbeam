@@ -808,30 +808,33 @@ defmodule Tightbeam.Placement do
     end)
   end
 
-  @doc """
-  Record (or update) a host in the instance registry — the DUMB half of
-  assimilation: the CLI ceremony prepares the machine; this writes the fact.
-  Admin gating happens in the verb handler, not here. Returns the stored
-  config.
-  """
-  @spec register_host(DB.server(), String.t(), host_config()) :: {:ok, host_config()}
-  def register_host(db \\ DB, name, config) do
-    entry = %{
-      ssh: Map.fetch!(config, :ssh),
-      base_dir: Map.fetch!(config, :base_dir),
-      cli_bin: Map.get(config, :cli_bin),
-      adapter_bin_dir: Map.get(config, :adapter_bin_dir)
-    }
+  # Core fix (A), review B1: the ungated writer exists only in test builds.
+  if Application.compile_env(:tightbeam, :test_fixtures, false) do
+    @doc """
+    Record (or update) a host in the instance registry — the DUMB half of
+    assimilation: the CLI ceremony prepares the machine; this writes the fact.
+    Admin gating happens in the verb handler, not here. Returns the stored
+    config.
+    """
+    @spec register_host(DB.server(), String.t(), host_config()) :: {:ok, host_config()}
+    def register_host(db \\ DB, name, config) do
+      entry = %{
+        ssh: Map.fetch!(config, :ssh),
+        base_dir: Map.fetch!(config, :base_dir),
+        cli_bin: Map.get(config, :cli_bin),
+        adapter_bin_dir: Map.get(config, :adapter_bin_dir)
+      }
 
-    # One row upsert, inside the DB owner's transaction. There is nothing to read
-    # first, so there is no window to lose a concurrent registration in.
-    {:ok, :ok} =
-      DB.transaction(db, fn txn ->
-        upsert_host_in_txn(txn, name, entry)
-        :ok
-      end)
+      # One row upsert, inside the DB owner's transaction. There is nothing to read
+      # first, so there is no window to lose a concurrent registration in.
+      {:ok, :ok} =
+        DB.transaction(db, fn txn ->
+          upsert_host_in_txn(txn, name, entry)
+          :ok
+        end)
 
-    {:ok, entry}
+      {:ok, entry}
+    end
   end
 
   @doc false
