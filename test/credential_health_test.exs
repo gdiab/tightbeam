@@ -49,7 +49,7 @@ defmodule Tightbeam.CredentialHealthTest do
     assert %{state: "retired"} = Org.retire(db, retired.session_key, "user:health-owner", 1_000)
 
     {:pending, allowlisted_pending} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "health-allowlisted",
         claimed_name: "Health Owner",
         platform: nil,
@@ -59,7 +59,7 @@ defmodule Tightbeam.CredentialHealthTest do
     allowlisted = Devices.approve(db, allowlisted_pending.device_id, "health-owner")
 
     {:pending, pending} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "health-revoked",
         claimed_name: "Health Owner",
         platform: nil,

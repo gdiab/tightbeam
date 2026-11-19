@@ -60,7 +60,7 @@ defmodule Tightbeam.CredentialHealthCliTest do
              Org.retire(db, retired.session_key, "user:cli-health-owner", 1_000)
 
     {:pending, pending} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "cli-health-device",
         claimed_name: "CLI Health Owner",
         platform: nil,
