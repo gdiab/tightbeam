@@ -685,7 +685,12 @@ defmodule Tightbeam.SessionLane do
            state.session_key
          ]) do
       {:ok, [[harness, host]]} ->
-        HarnessProcess.parked?(state.db, {Harness.parse!(harness).id(), "shared", host})
+        key = {Harness.parse!(harness).id(), "shared", host}
+
+        # Stale-turn v1.3 R7: an unresponsive adapter takes no new turn; its
+        # replacement wakes this lane.
+        HarnessProcess.parked?(state.db, key) or
+          Tightbeam.AdapterCoordinator.unresponsive?(key)
 
       {:ok, []} ->
         false

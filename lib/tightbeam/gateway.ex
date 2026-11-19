@@ -3339,9 +3339,20 @@ defmodule Tightbeam.Gateway do
   # adapter generation whether a running turn is live (R3).
   defp status_turn_settlement(db, session) do
     alias Tightbeam.TurnSettlementView
+    turn = TurnSettlementView.latest_turn(db, session.session_key)
+
+    if session_adapter_unresponsive?(session),
+      do: TurnSettlementView.adapter_hold(turn),
+      else: status_turn_liveness(db, session, turn)
+  catch
+    :exit, _ -> nil
+  end
+
+  defp status_turn_liveness(db, session, turn) do
+    alias Tightbeam.TurnSettlementView
 
     TurnSettlementView.settlement(
-      TurnSettlementView.latest_turn(db, session.session_key),
+      turn,
       fn turn ->
         with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
              {:ok, adapter, generation} <- resident_adapter(session) do
@@ -3597,12 +3608,24 @@ defmodule Tightbeam.Gateway do
 
     item
     |> Map.put(:po_association, SessionPoAssociations.get(db, session.session_key))
-    |> Map.put(
-      :turn_settlement,
-      Tightbeam.TurnSettlementView.settlement(
-        Tightbeam.TurnSettlementView.latest_turn(db, session.session_key)
-      )
+    |> Map.put(:turn_settlement, list_turn_settlement(db, session))
+  end
+
+  defp list_turn_settlement(db, session) do
+    alias Tightbeam.TurnSettlementView
+    turn = TurnSettlementView.latest_turn(db, session.session_key)
+
+    if session_adapter_unresponsive?(session),
+      do: TurnSettlementView.adapter_hold(turn),
+      else: TurnSettlementView.settlement(turn)
+  end
+
+  defp session_adapter_unresponsive?(session) do
+    AdapterCoordinator.unresponsive?(
+      {Harness.parse!(session.harness).id(), "shared", session.host}
     )
+  rescue
+    _ -> false
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -3933,73 +3956,77 @@ defmodule Tightbeam.Gateway do
         emit_identity_staleness_alarm(db)
       end
 
+      select_session = fn adapter, generation ->
+        stage(
+          :session,
+          with_session_mutation_lock(turn.session_key, fn ->
+            # Tune holds this same lock across adapter apply and record
+            # commit. Re-read inside it so the push cannot use the
+            # pre-checkout snapshot or interleave with that sequence.
+            current = Org.get(db, turn.session_key)
+
+            configured_turn_session(
+              config,
+              db,
+              adapter,
+              generation,
+              Map.put(
+                %{session | model: current.model},
+                :fallback_active,
+                current.fallback_active
+              ),
+              turn.seq
+            )
+          end)
+        )
+      end
+
+      prompt_selected = fn selected ->
+        stage_with_session(
+          :prompt,
+          Adapter.prompt(
+            selected.adapter,
+            selected.harness_session_id,
+            turn_prompt_content(
+              db,
+              turn,
+              selected.session.session_key,
+              selected.session.harness,
+              config.base_dir
+            ),
+            trace_dispatch: fn request_id ->
+              Tightbeam.TurnLifecycle.append(db, turn.seq, %{
+                event_key: "prompt:dispatched",
+                producer_event_id:
+                  "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
+                kind: "prompt_dispatched",
+                stage: "prompt",
+                outcome: "dispatched",
+                cause: "acp:port-write",
+                principal: "process:tightbeam",
+                owner_lease: turn.owner_lease,
+                adapter_gen: selected.generation,
+                acp_request_id: request_id,
+                detail: %{v: 1}
+              })
+            end,
+            progress: progress_fun(db, turn.session_key, session.owner_user_id, correlation),
+            session_key: turn.session_key,
+            turn_seq: turn.seq
+          ),
+          selected.session
+        )
+      end
+
       outcome =
         with {:ok, adapter, generation} <-
                stage(:checkout, checkout_adapter(session, config)),
-             {:ok,
-              %{
-                harness_session_id: harness_session_id,
-                adapter: prompt_adapter,
-                generation: prompt_generation,
-                session: active_session
-              }} <-
-               stage(
-                 :session,
-                 with_session_mutation_lock(turn.session_key, fn ->
-                   # Tune holds this same lock across adapter apply and record
-                   # commit. Re-read inside it so the push cannot use the
-                   # pre-checkout snapshot or interleave with that sequence.
-                   current = Org.get(db, turn.session_key)
-
-                   configured_turn_session(
-                     config,
-                     db,
-                     adapter,
-                     generation,
-                     Map.put(
-                       %{session | model: current.model},
-                       :fallback_active,
-                       current.fallback_active
-                     ),
-                     turn.seq
-                   )
-                 end)
-               ),
-             {:ok, result} <-
-               stage_with_session(
-                 :prompt,
-                 Adapter.prompt(
-                   prompt_adapter,
-                   harness_session_id,
-                   turn_prompt_content(
-                     db,
-                     turn,
-                     active_session.session_key,
-                     active_session.harness,
-                     config.base_dir
-                   ),
-                   trace_dispatch: fn request_id ->
-                     Tightbeam.TurnLifecycle.append(db, turn.seq, %{
-                       event_key: "prompt:dispatched",
-                       producer_event_id:
-                         "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
-                       kind: "prompt_dispatched",
-                       stage: "prompt",
-                       outcome: "dispatched",
-                       cause: "acp:port-write",
-                       principal: "process:tightbeam",
-                       owner_lease: turn.owner_lease,
-                       adapter_gen: prompt_generation,
-                       acp_request_id: request_id,
-                       detail: %{v: 1}
-                     })
-                   end,
-                   progress:
-                     progress_fun(db, turn.session_key, session.owner_user_id, correlation),
-                   session_key: turn.session_key,
-                   turn_seq: turn.seq
-                 ),
-                 active_session
+             {:ok, selected} <- select_session.(adapter, generation),
+             {:ok, result, active_session} <-
+               prompt_on_fresh_session_if_fenced(
+                 selected,
+                 fn -> select_session.(adapter, generation) end,
+                 prompt_selected
                ) do
           attention_tier = elected_attention(db, turn.seq)
 
@@ -4235,6 +4262,24 @@ defmodule Tightbeam.Gateway do
   end
 
   defp assistant_message_texts(%{text: text}) when is_binary(text), do: [text]
+
+  # Stale-turn v1.3 R7: a prompt refused, undispatched, because its harness
+  # session was fenced (its previous prompt's cancel went unanswered) runs once
+  # more on the session the turn now selects: a fresh harness session.
+  defp prompt_on_fresh_session_if_fenced(selected, reselect, prompt) do
+    case prompt.(selected) do
+      {:error, {:prompt, {:acp_request_not_dispatched, {:harness_session_fenced, _sid}}, _}} ->
+        with {:ok, reselected} <- reselect.(),
+             {:ok, result} <- prompt.(reselected),
+             do: {:ok, result, reselected.session}
+
+      {:ok, result} ->
+        {:ok, result, selected.session}
+
+      other ->
+        other
+    end
+  end
 
   defp stage(stage, {:error, reason}), do: {:error, {stage, reason}}
   defp stage(_stage, result), do: result
@@ -4579,11 +4624,11 @@ defmodule Tightbeam.Gateway do
     with {:pointer, %{harness_session_id: sid}} <-
            {:pointer, Org.current_pointer(db, session.session_key)},
          key = {Harness.parse!(session.harness).id(), "shared", session.host},
-         {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
-      Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
-        sessionId: sid
-      })
-
+         {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key),
+         # Stale-turn v1.3 R7: the adapter waits G for the canceled prompt's
+         # answer, so the session's next prompt is not queued behind one the
+         # harness never answers.
+         {:ok, _} <- Tightbeam.Acp.Adapter.cancel_prompt(adapter, sid) do
       {:unconfirmed, sid}
     else
       {:pointer, _} -> {:not_sent, :no_pointer}
@@ -5141,6 +5186,20 @@ defmodule Tightbeam.Gateway do
                       {:error, {:codex_identity_projection_failed, _reason}} ->
                         loaded
 
+                      # Stale-turn v1.3 R7: the adapter fenced this harness
+                      # session after a cancel went unanswered. The session's
+                      # next turn gets a fresh one on the same adapter.
+                      {:error, {:harness_session_fenced, _sid}} ->
+                        fresh_session_after_fence(
+                          db,
+                          adapter,
+                          session,
+                          pointer,
+                          cwd,
+                          mcp_servers,
+                          snapshot
+                        )
+
                       {:error, lost} ->
                         # Spec §pointer chain: reason "fallback" — the harness lost
                         # the session; start fresh, on the record, model context
@@ -5256,6 +5315,37 @@ defmodule Tightbeam.Gateway do
     {:error,
      {:adapter_unavailable,
       "adapter is not running; its failure record could not be read: " <> JSON.encode!(node)}}
+  end
+
+  # History is preserved by the durable session handoff (the bounded excerpt a
+  # harness change carries, v3 R17); the pointer is recorded as a fallback with
+  # its why. Creation is bounded by G: an adapter that does not answer it is
+  # unresponsive (R7) and fences itself.
+  defp fresh_session_after_fence(db, adapter, session, pointer, cwd, mcp_servers, snapshot) do
+    Tightbeam.EventLog.lifecycle(
+      db,
+      "pointer_fallback",
+      session.session_key,
+      inspect({:harness_session_fenced, pointer.harness_session_id})
+    )
+
+    handoff = durable_session_handoff(db, session.session_key)
+
+    guidance =
+      append_durable_session_handoff(
+        snapshot.guidance,
+        handoff.records,
+        "The previous harness session stopped answering and was closed; this is a fresh one. "
+      )
+
+    with {:ok, sid} <-
+           Adapter.new_fenced_session(adapter, session.model, cwd, mcp_servers, guidance),
+         :ok <- capture_created_model(db, adapter, session, sid) do
+      Org.append_pointer(db, session.session_key, sid, "fallback")
+      stamp_session_identity(db, session.session_key, snapshot)
+      append_session_restart_marker(db, session.session_key, pointer.harness_session_id, sid)
+      {:ok, sid}
+    end
   end
 
   defp new_harness_session(db, adapter, session, cwd, mcp_servers, guidance) do
@@ -10012,12 +10102,18 @@ defmodule Tightbeam.Gateway do
     |> elem(0)
   end
 
-  defp append_durable_session_handoff(guidance, []), do: guidance
+  defp append_durable_session_handoff(
+         guidance,
+         records,
+         why \\ "ACP did not transfer prior conversation history to this candidate. "
+       )
 
-  defp append_durable_session_handoff(guidance, records) do
+  defp append_durable_session_handoff(guidance, [], _why), do: guidance
+
+  defp append_durable_session_handoff(guidance, records, why) do
     guidance <>
       "\n\n## Cross-harness handoff from durable session records\n\n" <>
-      "ACP did not transfer prior conversation history to this candidate. " <>
+      why <>
       "The following bounded excerpt is ordered by durable message sequence and keeps each sender attribution. " <>
       "These entries are past conversation for context; they may omit older records.\n\n" <>
       "```json\n" <> JSON.encode!(records) <> "\n```"
