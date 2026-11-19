@@ -898,7 +898,11 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
   defp production_call(fixture, verb, params) do
     firehose_call(fixture, verb, params)
     |> Map.put(:firehose_hub, fixture.hub)
-    |> Map.merge(%{auth_class: "device", auth_device_id: fixture.device.device_id})
+    |> Map.merge(%{
+      auth_class: "device",
+      auth_device_id: fixture.device.device_id,
+      auth_proof: Tightbeam.GrantAuth.proof(fixture.device.token)
+    })
   end
 
   defp capture_classes(fixture, notices, classes, mutation) do
