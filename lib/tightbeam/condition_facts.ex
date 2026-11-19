@@ -29,6 +29,7 @@ defmodule Tightbeam.ConditionFacts do
     harness-other-unavailable harness-other-restored
     catalog-terminal-credential-failure catalog-terminal-credential-restored
     cli-incompatible cli-compatible
+    session-model-fallback-applied session-model-fallback-withheld
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 

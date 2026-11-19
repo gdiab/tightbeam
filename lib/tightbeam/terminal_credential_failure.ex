@@ -216,7 +216,8 @@ defmodule Tightbeam.TerminalCredentialFailure do
                  "work-item-delivery-owner-v1-019",
                  "launch-preparation-boot-v1-0110",
                  "launch-preparation-evidence-v1-0112",
-                 "session-identity-v1-0114"
+                 "session-identity-v1-0114",
+                 "limit-fallback-v1-0114"
                ] ->
             readonly_views_from_conn(conn)
 
