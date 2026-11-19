@@ -333,6 +333,26 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
+  @doc """
+  Begin the quota park of a `rate-limit-dead` incident: the key's fence, as
+  `begin_park_in_txn/2` takes it, marked with the incident as its quota park
+  (quota companion B2). An existing fence on the key becomes the quota park;
+  a later close, shutdown or recovery fence re-inserted on top of it keeps the
+  mark, since those only insert where no fence stands.
+  """
+  @spec begin_quota_park_in_txn(DB.Txn.t(), tuple(), String.t()) :: row() | :no_launch
+  def begin_quota_park_in_txn(%DB.Txn{} = txn, key, incident_id) when is_binary(incident_id) do
+    result = begin_park_in_txn(txn, key)
+
+    DB.Txn.q(
+      txn,
+      "UPDATE harness_park_fences SET quotaIncidentId = ?1 WHERE adapterKey = ?2",
+      [incident_id, key_name(key)]
+    )
+
+    result
+  end
+
   @doc "True only while an explicit durable park request stands for the key."
   @spec parked?(DB.server(), tuple()) :: boolean()
   def parked?(db, key) do
@@ -416,23 +436,69 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  defp quota_hold_guard_in_txn(txn) do
-    if DB.Txn.q(
-         txn,
-         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
-       ) == [[1]] do
-      """
-      AND NOT EXISTS (
-        SELECT 1
-          FROM harness_health_incidents
-         WHERE state = 'open'
-           AND failureClass = 'rate-limit-dead'
-           AND harness || ':shared@' || host = harness_park_fences.adapterKey
+  defp quota_hold_guard_in_txn(txn), do: quota_fence_guard_in_txn(txn)
+
+  @doc false
+  # The condition every fence completion adds (quota companion B2): a fence is
+  # kept only while it is the quota park's own instance, marked with an incident
+  # that is still an open `rate-limit-dead` one. A close, shutdown or recovery
+  # fence started after a named release carries no mark and completes as
+  # before. A database without the marker column predates it, so the guard
+  # falls back to keeping any fence of a key with an open quota incident.
+  @spec quota_fence_guard_in_txn(DB.Txn.t()) :: String.t()
+  def quota_fence_guard_in_txn(%DB.Txn{} = txn) do
+    quota_fence_guard_sql(
+      DB.Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
+      ) == [[1]],
+      DB.Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM pragma_table_info('harness_park_fences') WHERE name='quotaIncidentId'"
+      ) == [[1]]
+    )
+  end
+
+  defp quota_fence_guard(db) do
+    {:ok, incidents} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
       )
-      """
-    else
-      ""
-    end
+
+    {:ok, column} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM pragma_table_info('harness_park_fences') WHERE name='quotaIncidentId'"
+      )
+
+    quota_fence_guard_sql(incidents == [[1]], column == [[1]])
+  end
+
+  defp quota_fence_guard_sql(false, _marker?), do: ""
+
+  defp quota_fence_guard_sql(true, true) do
+    """
+    AND NOT EXISTS (
+      SELECT 1
+        FROM harness_health_incidents
+       WHERE id = harness_park_fences.quotaIncidentId
+         AND state = 'open'
+         AND failureClass = 'rate-limit-dead'
+    )
+    """
+  end
+
+  defp quota_fence_guard_sql(true, false) do
+    """
+    AND NOT EXISTS (
+      SELECT 1
+        FROM harness_health_incidents
+       WHERE state = 'open'
+         AND failureClass = 'rate-limit-dead'
+         AND harness || ':shared@' || host = harness_park_fences.adapterKey
+    )
+    """
   end
 
   @doc "Deliver SIGKILL to a parked process group."
@@ -1556,7 +1622,7 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp complete_reconciled_park_name(db, adapter_key) do
-    incident_guard = rate_limit_incident_guard(db)
+    incident_guard = quota_fence_guard(db)
 
     {:ok, _} =
       DB.query(
@@ -1587,7 +1653,7 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp clear_orphan_fence_names(db) do
-    incident_guard = rate_limit_incident_guard(db)
+    incident_guard = quota_fence_guard(db)
 
     {:ok, released} =
       DB.query(
@@ -1607,32 +1673,6 @@ defmodule Tightbeam.HarnessProcess do
       )
 
     Enum.map(released, fn [adapter_key] -> adapter_key end)
-  end
-
-  defp rate_limit_incident_guard(db) do
-    if harness_health_schema?(db) do
-      """
-      AND NOT EXISTS (
-        SELECT 1
-          FROM harness_health_incidents
-         WHERE state = 'open'
-           AND failureClass = 'rate-limit-dead'
-           AND harness || ':shared@' || host = harness_park_fences.adapterKey
-      )
-      """
-    else
-      ""
-    end
-  end
-
-  defp harness_health_schema?(db) do
-    {:ok, [[count]]} =
-      DB.query(
-        db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
-      )
-
-    count == 1
   end
 
   defp resolve(db, row, state) do
