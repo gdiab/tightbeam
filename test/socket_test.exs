@@ -606,16 +606,17 @@ defmodule Tightbeam.Wire.SocketTest do
     {:stop, :normal, 1000, {:text, frame}, _} =
       Socket.handle_in({JSON.encode!(pair), opcode: :text}, state)
 
-    # Core fix (A) C6: pairing is frozen, the cold start included; no token is issued.
+    # Stage 1: pairing is one-time-code only, the cold start included; an uncoded
+    # request is refused pairing_code_required, names the way to a code, and
+    # creates no device row.
     assert %{
              "type" => "pair_result",
              "success" => false,
-             "reason" => "pairing_frozen",
+             "reason" => "pairing_code_required",
              "message" => message
            } = JSON.decode!(frame)
 
-    assert message == Tightbeam.PairingFreeze.frozen_message()
-    refute message =~ "/etc"
+    assert message =~ "/tightbeam approve-device"
     assert Devices.by_id(ctx.db, "d1") == nil
 
     {:paired, %{token: token}} =
