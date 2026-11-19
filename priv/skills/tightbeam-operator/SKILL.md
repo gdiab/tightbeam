@@ -1,6 +1,6 @@
 ---
 name: tightbeam-operator
-description: Operate a Tightbeam organization from outside it on behalf of a named user. Use when an agent that is not a Tightbeam session must inspect work, present or rule on decision requests, file and route work to a delivery owner, or wake sessions through the tightbeam CLI.
+description: Operate a Tightbeam organization from outside it on behalf of a named user. Use when an agent that is not a Tightbeam session must inspect work, present decision requests and relay rulings, file and route work to a delivery owner, or wake sessions through the tightbeam CLI.
 ---
 
 # Operate a Tightbeam organization as an outside operator
@@ -22,11 +22,18 @@ to that person, so make only the changes they asked for. Reading is normally fin
 Local CLI-only commands such as `tightbeam skill list` and `tightbeam skill install` do
 not take `--as-user` and do not act on the organization.
 
-Creating work, waking sessions, ruling or withdrawing decisions, revoking or reopening
+Creating work, waking sessions, withdrawing decisions, revoking or reopening
 assignments, spawning, retiring or tuning sessions, onboarding credentials, learning
-kungfu, editing identity, and host or user administration each need the person's
-instruction for that operation. When the CLI refuses an action, report the exact code
-and message. Do not work around a refusal, and do not switch identity to get past one.
+kungfu and editing identity each need the person's instruction for that operation. When
+the CLI refuses an action, report the exact code and message. Do not work around a
+refusal, and do not switch identity to get past one.
+
+Some acts belong to the person alone: approving, denying or revoking a device; adding,
+promoting, demoting or removing a user; registering a host; and ruling an operator
+request. The gateway accepts them only from the person's own paired device, as
+`/tightbeam …` commands sent in Clawline, never from this CLI. Do not run them, and do
+not ask a session to. Prepare the exact command, give it to the person and say the step
+is theirs. The same holds for `tightbeam assimilate`, which ends in registering a host.
 
 ## Reach the right organization
 
@@ -110,15 +117,19 @@ For each live operator request, tell the person the background in plain words, t
 choice being asked, what each option would change, and the evidence on record. Do not
 add options and do not make the choice yourself.
 
-Record the person's choice with its exact option label, or their own words when the
-request has no options or they answered freely:
+The person records their choice from their paired device, with its exact option label,
+or their own words when the request has no options or they answered freely. Prepare the
+line for them to send in Clawline:
 
-```sh
-tightbeam operator-rule <decisionRequestId> --decision "<exact label>" --as-user <userId>
-tightbeam operator-rule <decisionRequestId> --response "<their answer>" --as-user <userId>
+```text
+/tightbeam rule <decisionRequestId> <exact label>
+/tightbeam respond <decisionRequestId> <their answer>
 ```
 
-Add `--rationale "<text>"` to carry the person's reasoning or their exact delegation.
+The only delegated route is the person's Main session. If they ask for it to be recorded
+for them, relay their exact words, naming the request id, to their Main with
+`tightbeam wake --session <their Main's key> --prompt "<their words>" --as-user <userId>`;
+Main records it, quoting them. Never run `operator-rule` on an operator request yourself.
 Withdraw a request that is no longer needed only with the person's instruction:
 `tightbeam operator-withdraw <decisionRequestId> --reason "<text>"`. A ruling wakes the
 session that raised the request; do not send a second wake to repeat it.
