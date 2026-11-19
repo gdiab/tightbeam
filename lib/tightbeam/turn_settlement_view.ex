@@ -6,7 +6,10 @@ defmodule Tightbeam.TurnSettlementView do
 
   - `in_flight_stalled`: the turn is running and P's harness turn is not live
     (R3: no turn activity within W and no tool call open);
-  - `harness_exited`: the turn was settled under R4.
+  - `harness_exited`: the turn was settled under R4;
+  - `adapter_unresponsive`: the session's adapter left a fenced session's
+    close or a fresh session's creation unanswered within G (R7), so it takes
+    no new turn until it drains and is replaced.
 
   Only turn rows, lifecycle causes and the adapter's liveness answer are
   read; no credential, private field, raw payload or process inventory.
@@ -30,13 +33,19 @@ defmodule Tightbeam.TurnSettlementView do
 
   @doc "The session's latest turn, with its shown cause."
   @spec latest_turn(DB.server(), String.t()) :: map() | nil
-  def latest_turn(db, session_key) do
+  def latest_turn(db, session_key),
+    do: one_turn(db, "sessionKey=?1 ORDER BY seq DESC LIMIT 1", [session_key])
+
+  @doc "One turn by seq, with its shown cause."
+  @spec turn(DB.server(), pos_integer()) :: map() | nil
+  def turn(db, seq), do: one_turn(db, "seq=?1", [seq])
+
+  defp one_turn(db, where, params) do
     case DB.query(
            db,
            "SELECT seq,status,error,adapterGen," <>
-             cause_column_sql() <>
-             " FROM turns WHERE sessionKey=?1 ORDER BY seq DESC LIMIT 1",
-           [session_key]
+             cause_column_sql() <> " FROM turns WHERE " <> where,
+           params
          ) do
       {:ok, [[seq, status, error, adapter_gen, cause]]} ->
         %{
@@ -96,12 +105,16 @@ defmodule Tightbeam.TurnSettlementView do
 
   def liveness(_db, _turn, _adapter, _generation, _sid), do: :unknown
 
+  @doc "The settlement for a session whose adapter is unresponsive (R7): its hold."
+  @spec adapter_hold(map() | nil) :: map()
+  def adapter_hold(turn), do: fields(turn || %{}, "adapter_unresponsive")
+
   defp fields(turn, held_state) do
     %{
-      turnSeq: turn.seq,
-      status: turn.status,
-      error: turn.error,
-      cause: turn.cause,
+      turnSeq: Map.get(turn, :seq),
+      status: Map.get(turn, :status),
+      error: Map.get(turn, :error),
+      cause: Map.get(turn, :cause),
       heldState: held_state
     }
   end

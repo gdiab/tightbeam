@@ -522,6 +522,17 @@ defmodule Tightbeam.GatewayTest do
 
       {:noreply, parent}
     end
+
+    # The cancel now goes through Adapter.cancel_prompt/2 (stale-turn R7).
+    def handle_call({:cancel_prompt, _sid}, from, parent) do
+      send(parent, {:cancel_conn_waiting, self()})
+
+      receive do
+        :release_cancel_conn -> GenServer.reply(from, {:ok, :settling})
+      end
+
+      {:noreply, parent}
+    end
   end
 
   defmodule IdentityApplyAdapterStub do

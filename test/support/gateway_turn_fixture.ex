@@ -105,6 +105,13 @@ defmodule Tightbeam.GatewayTurnFixture do
 
     def handle_call(:conn, _from, parent), do: {:reply, parent, parent}
 
+    # Adapter.cancel_prompt/2 (stale-turn R7): the real adapter sends the
+    # cancel and waits G; the stub only sends it.
+    def handle_call({:cancel_prompt, sid}, _from, parent) do
+      Tightbeam.Acp.Conn.notify(parent, "session/cancel", %{sessionId: sid})
+      {:reply, {:ok, :settling}, parent}
+    end
+
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
 
     def handle_call({:current_model, "harness-1"}, _from, parent),
