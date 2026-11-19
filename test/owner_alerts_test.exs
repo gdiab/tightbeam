@@ -840,6 +840,27 @@ defmodule Tightbeam.OwnerAlertsTest do
     end
   end
 
+  # Owner-alerts v1.11 §6A.5 and §13; contract v3.1 R10: G1's memory-pressure
+  # kind is part of the same owner-alerts-v1-0114 object set, so a database
+  # written by a 0.1.14 build carrying G1 validates here by its exact text.
+  test "the owner-alerts object set carries G1's memory-pressure kind and fact pair",
+       %{db: db} do
+    assert {:ok, [[sql]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='owner_alerts'"
+             )
+
+    assert sql =~
+             "kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback','memory-pressure')),"
+
+    assert :ok = OwnerAlerts.ensure_schema(db)
+
+    for kind <- ["host-memory-pressure", "host-memory-pressure-cleared"] do
+      assert Tightbeam.ConditionFacts.substrate_defined_kind?(kind)
+    end
+  end
+
   ## (a) four-hour stall
 
   test "T5: an item whose only assignment has a running turn alerts at the threshold",
