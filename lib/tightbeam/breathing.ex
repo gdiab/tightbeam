@@ -268,7 +268,8 @@ defmodule Tightbeam.Breathing do
   defp wake_target("work-item", id), do: {"work_item_id=?1", [id]}
 
   defp turn_select do
-    "SELECT seq,sessionKey,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt FROM turns"
+    "SELECT seq,sessionKey,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt," <>
+      Tightbeam.TurnSettlementView.cause_column_sql() <> " FROM turns"
   end
 
   defp assignment_row(txn, id) do
@@ -353,9 +354,10 @@ defmodule Tightbeam.Breathing do
          error,
          created_at,
          started_at,
-         ended_at
+         ended_at,
+         cause
        ]) do
-    %{
+    turn = %{
       seq: seq,
       sessionKey: session_key,
       assignmentId: assignment_id,
@@ -367,6 +369,12 @@ defmodule Tightbeam.Breathing do
       startedAt: started_at,
       endedAt: ended_at
     }
+
+    # Stale-turn v1.1 R10: an unknown-effect terminal shows its cause.
+    case Tightbeam.TurnSettlementView.shown_cause(status, error, cause) do
+      nil -> turn
+      shown -> Map.put(turn, :cause, shown)
+    end
   end
 
   defp breathing_wake([
