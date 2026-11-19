@@ -113,7 +113,7 @@ defmodule Tightbeam.RateLimitReset do
             })
           )
 
-          QuotaRelease.released_in_txn(txn, incident_id, harness, host)
+          QuotaRelease.released_in_txn(txn, incident_id, harness, host, readmit: true)
         end
 
         :ok

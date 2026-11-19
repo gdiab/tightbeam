@@ -446,12 +446,20 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert notice.prompt =~ "NOT replayed"
     end
 
-    # A later success is a release too (v3 R9(b)). It surfaces nothing again;
-    # the pre-activity turn is redelivered once, the post-activity one never.
+    # The reset release itself re-admitted the pre-activity turn, and never the
+    # post-activity one.
+    assert {:ok, [[^pre]]} =
+             DB.query(
+               db,
+               "SELECT sourceTurnSeq FROM health_redelivery_attempts WHERE redeliveryTurnSeq IS NOT NULL"
+             )
+
+    # A later success is a release too (v3 R9(b)). It surfaces nothing again
+    # and redelivers nothing again.
     assert {:resolved, incident} = resolve_codex(db, "c1", "testhost")
     assert length(notices(db)) == 2
 
-    assert {:ok, 1} =
+    assert {:ok, 0} =
              DB.transaction(db, fn txn ->
                for key <- ["c1", "c2"], reduce: 0 do
                  count ->
@@ -471,6 +479,54 @@ defmodule Tightbeam.RateLimitReleaseTest do
              )
 
     assert HarnessHealth.get(db, incident.id).state == "resolved"
+  end
+
+  test "B5: the reset release itself re-admits a sole pre-activity message turn, once, in seq order",
+       %{db: db} do
+    error = future_codex_error(System.system_time(:millisecond))
+    first = fail_turn(db, "c1", error)
+    second = fail_turn(db, "c1", error)
+
+    # The incident opens without any other session's turn.
+    assert {:ok, _} =
+             DB.transaction(db, fn txn ->
+               observe_in_txn(txn, "open", "c1", "testhost", System.system_time(:millisecond))
+             end)
+
+    assert HarnessProcess.parked?(db, @codex_key)
+    assert queued_messages(db) == []
+
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE consumer='rate_limit_reset'")
+    {:ok, wakes} = DB.query(db, "SELECT wakeId FROM wakes WHERE consumer='rate_limit_reset'")
+    for [wake_id] <- wakes, do: assert({:ok, _} = RateLimitReset.release(db, %{wake_id: wake_id}))
+    refute HarnessProcess.parked?(db, @codex_key)
+
+    # Each failed turn is queued again exactly once, in its seq order, with no
+    # success on the key; the release is its restoration.
+    assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               "SELECT sourceTurnSeq,restorationTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts ORDER BY sourceTurnSeq"
+             )
+
+    assert [[^first, r1, r1], [^second, r2, r2]] = rows
+    assert r1 < r2
+
+    # A later success redelivers neither again.
+    assert {:resolved, _} = resolve_codex(db, "c2", "testhost")
+
+    assert {:ok, 0} =
+             DB.transaction(db, fn txn ->
+               Wakes.redeliver_pending_health_intents_in_txn(
+                 txn,
+                 %{harness: :codex, host: "testhost", session_key: "c1"},
+                 %{seq: second}
+               )
+             end)
+
+    assert length(queued_messages(db)) == 2
   end
 
   test "B5: a quota-failed wake turn that had started work gets no retry; one that had not keeps it",
@@ -658,6 +714,18 @@ defmodule Tightbeam.RateLimitReleaseTest do
       )
 
     Enum.map(rows, fn [session_key, prompt] -> %{session_key: session_key, prompt: prompt} end)
+  end
+
+  defp queued_messages(db) do
+    {:ok, rows} =
+      DB.query(db, "SELECT messageId FROM turns WHERE status='queued' ORDER BY seq")
+
+    Enum.map(rows, &hd/1)
+  end
+
+  defp source_message(db, seq) do
+    {:ok, [[message_id]]} = DB.query(db, "SELECT messageId FROM turns WHERE seq=?1", [seq])
+    message_id
   end
 
   defp redelivery_sources(db) do

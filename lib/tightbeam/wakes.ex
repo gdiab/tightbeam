@@ -3590,6 +3590,26 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc """
+  Re-admit the pending redelivery rows of an open quota incident's
+  pre-activity failed turns, once each, in source-seq order, when its park is
+  released by the declared reset or an explicit resume (companion v1.1 B5).
+  Such a release has no restoration turn, so the release itself is the
+  restoration: the row's `restorationTurnSeq` is its own redelivery turn.
+  Each re-admitted turn joins the session's queue behind the turns already
+  queued; their order is unchanged (v3 R12). A post-activity turn is skipped
+  by the consumption guard.
+  """
+  @spec readmit_released_quota_intents_in_txn(Txn.t(), String.t()) :: non_neg_integer()
+  def readmit_released_quota_intents_in_txn(%Txn{} = txn, incident_id)
+      when is_binary(incident_id) do
+    txn
+    |> health_redelivery_sources_in_txn(incident_id, "rate-limit-dead")
+    |> Enum.reduce(0, fn source, count ->
+      count + redeliver_health_source_in_txn(txn, source, :release)
+    end)
+  end
+
   defp health_redelivery_sources_in_txn(
          txn,
          incident_id,
@@ -3655,7 +3675,7 @@ defmodule Tightbeam.Wakes do
          ],
          marker
        )
-       when (is_integer(marker) and is_nil(cycle_release_correlation)) or
+       when ((is_integer(marker) or marker == :release) and is_nil(cycle_release_correlation)) or
               (is_tuple(marker) and tuple_size(marker) == 2 and elem(marker, 0) == :cycle_release and
                  is_binary(elem(marker, 1)) and elem(marker, 1) == cycle_release_correlation) do
     cond do
@@ -3757,6 +3777,24 @@ defmodule Tightbeam.Wakes do
       [idempotency_key, restoration_turn_seq, redelivery_turn_seq]
     )
   end
+
+  # A release by the declared reset or an explicit resume has no restoration
+  # turn: the re-admitted turn is its own restoration (companion B5).
+  defp mark_health_redelivery_enqueued_in_txn(
+         txn,
+         idempotency_key,
+         :release,
+         nil,
+         redelivery_turn_seq
+       ),
+       do:
+         mark_health_redelivery_enqueued_in_txn(
+           txn,
+           idempotency_key,
+           redelivery_turn_seq,
+           nil,
+           redelivery_turn_seq
+         )
 
   defp health_redelivery_key(session_key, source_turn_seq) do
     "health-redelivery:" <> JSON.encode!([session_key, source_turn_seq])
