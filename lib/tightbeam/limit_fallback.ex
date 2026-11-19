@@ -126,7 +126,12 @@ defmodule Tightbeam.LimitFallback do
 
     :ok = ensure_column!(txn, "attests", @attests_process_column)
     :ok = ensure_attests_process_branch!(txn)
+
+    fence_marker_added? =
+      column_state!(txn, "harness_park_fences", @fences_quota_column) == :absent
+
     :ok = ensure_column!(txn, "harness_park_fences", @fences_quota_column)
+    if fence_marker_added?, do: :ok = backfill_quota_fences!(txn)
 
     Enum.each(@objects, fn {type, name, sql} ->
       case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name]) do
@@ -162,6 +167,36 @@ defmodule Tightbeam.LimitFallback do
           refuse!("#{type} #{name} is missing or duplicated: #{inspect(rows)}")
       end
     end)
+
+    :ok
+  end
+
+  # A quota park already standing when this step runs was taken under the
+  # predecessor's key-based guard, so its fence carries no mark. Without one,
+  # the first boot's reconciliation would complete it: an unrecorded release.
+  # When the column is added (and only then, so a rewound re-run marks
+  # nothing anew), each fence takes the open rate-limit-dead incident of its
+  # own key, the rule that guard applied.
+  defp backfill_quota_fences!(txn) do
+    if Txn.q(
+         txn,
+         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
+       ) == [[1]] do
+      Txn.q(
+        txn,
+        """
+        UPDATE harness_park_fences
+           SET quotaIncidentId = (
+             SELECT i.id FROM harness_health_incidents i
+              WHERE i.state = 'open'
+                AND i.failureClass = 'rate-limit-dead'
+                AND i.harness || ':shared@' || i.host = harness_park_fences.adapterKey
+              ORDER BY i.openedAt DESC, i.id DESC
+              LIMIT 1)
+         WHERE quotaIncidentId IS NULL
+        """
+      )
+    end
 
     :ok
   end
