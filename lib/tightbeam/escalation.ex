@@ -2743,6 +2743,12 @@ defmodule Tightbeam.Escalation do
           session_key == request.raiser_session_key ->
             {:refused, GrantAuth.self_ruling_refusal(request.id, owner)}
 
+          # The Main route needs Main's own validated session credential (review B1):
+          # a principal named in a call map is not authentication.
+          session_key == Org.personal_session_key(owner) and
+              not GrantAuth.session_proven_in_txn?(txn, call, session_key) ->
+            {:refused, GrantAuth.ruling_refusal(request.id, owner)}
+
           session_key == Org.personal_session_key(owner) ->
             if GrantAuth.rationale_names_request_in_txn?(txn, answer.rationale, request.id),
               do: {:ok, "delegated-unverified"},

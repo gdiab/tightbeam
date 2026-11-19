@@ -17,6 +17,13 @@ defmodule Tightbeam.GrantAuth do
   It is never read from a request body. A call without it is treated as `none`,
   so an internal dispatch can never pass the device gate.
 
+  **The class is not trusted as a map field** (review B1). The transport also
+  attaches `auth_proof`: the SHA-256 of the exact credential it validated (the device
+  token, or the session token). Every gate re-derives authority inside its own
+  transaction by checking that proof against the credential stored for the named
+  device or session now. So no code path can synthesize device or session
+  authentication from ordinary map values: it would need the credential itself.
+
   The seven protected acts (`approve-device`, `add-user`, `promote-user`,
   `remove-user`, `register-host`, `revoke-device`, `deny-device`) run only for an
   admin-paired device: the check is repeated inside the act's own transaction.
@@ -116,27 +123,56 @@ defmodule Tightbeam.GrantAuth do
     %{class: auth_class(call), device_id: auth_device_id(call), pairing_freeze: freeze}
   end
 
+  @doc "The transport proof of a validated credential: its SHA-256."
+  @spec proof(String.t()) :: <<_::256>>
+  def proof(credential) when is_binary(credential), do: :crypto.hash(:sha256, credential)
+
   @doc """
-  The acting user of a device-authenticated call whose device still holds a token
-  of a non-removed user, read inside the caller's transaction; otherwise nil.
+  The acting user of a device-authenticated call, read inside the caller's
+  transaction: the named device must be allowlisted, belong to the call's user, be
+  that of a non-removed user, and hold the very token whose proof the transport
+  attached. Otherwise nil.
   """
   @spec device_user_in_txn(Txn.t(), map()) :: %{user_id: String.t(), is_admin: boolean()} | nil
   def device_user_in_txn(%Txn{} = txn, call) do
     with device_id when is_binary(device_id) <- auth_device_id(call),
          {:user, user_id} <- Map.get(call, :principal),
-         [[^user_id, is_admin]] <-
+         <<_::256>> = presented <- Map.get(call, :auth_proof),
+         [[^user_id, is_admin, token]] <-
            Txn.q(
              txn,
              """
-             SELECT d.userId, u.isAdmin FROM devices d JOIN users u ON u.userId = d.userId
+             SELECT d.userId, u.isAdmin, d.token FROM devices d JOIN users u ON u.userId = d.userId
              WHERE d.deviceId = ?1 AND d.status = 'allowlisted' AND d.token IS NOT NULL
                AND u.removedAt IS NULL
              """,
              [device_id]
-           ) do
+           ),
+         true <- :crypto.hash_equals(proof(token), presented) do
       %{user_id: user_id, is_admin: is_admin == 1}
     else
       _ -> nil
+    end
+  end
+
+  @doc """
+  Whether a call is authenticated as the active session `session_key`, by the proof
+  of that session's own credential, read inside the caller's transaction.
+  """
+  @spec session_proven_in_txn?(Txn.t(), map(), String.t()) :: boolean()
+  def session_proven_in_txn?(%Txn{} = txn, call, session_key) do
+    with "session" <- auth_class(call),
+         {:session, ^session_key} <- Map.get(call, :principal),
+         <<_::256>> = presented <- Map.get(call, :auth_proof),
+         [[token]] when is_binary(token) <-
+           Txn.q(
+             txn,
+             "SELECT cliToken FROM sessions WHERE sessionKey = ?1 AND state = 'active'",
+             [session_key]
+           ) do
+      :crypto.hash_equals(proof(token), presented)
+    else
+      _ -> false
     end
   end
 

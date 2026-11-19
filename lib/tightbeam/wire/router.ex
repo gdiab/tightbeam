@@ -364,6 +364,7 @@ defmodule Tightbeam.Wire.Router do
               # credential this request carried, and never from its body.
               auth_class: auth_class(auth),
               auth_device_id: auth_device_id(auth),
+              auth_proof: auth_proof(auth),
               # Retain the authenticated transport separately from the selected origin.
               transport_session_key: authenticated_session_key(auth),
               session_key: artifact_caller_session(verb, session_key, principal),
@@ -952,6 +953,7 @@ defmodule Tightbeam.Wire.Router do
             principal: {:user, device.user_id},
             auth_class: "device",
             auth_device_id: device.device_id,
+            auth_proof: Tightbeam.GrantAuth.proof(device.token),
             session_key: key,
             params: params
           }
@@ -3846,6 +3848,7 @@ defmodule Tightbeam.Wire.Router do
           # Core fix (A): the authentication class comes from the credential.
           auth_class: auth_class(auth),
           auth_device_id: auth_device_id(auth),
+          auth_proof: auth_proof(auth),
           session_key: session_key,
           params: params,
           transport: :rest
@@ -4054,6 +4057,11 @@ defmodule Tightbeam.Wire.Router do
 
   defp auth_device_id({:device, device}), do: device.device_id
   defp auth_device_id(_auth), do: nil
+
+  # The proof of the exact credential this request presented (review B1).
+  defp auth_proof({:device, device}), do: Tightbeam.GrantAuth.proof(device.token)
+  defp auth_proof({:session, session}), do: Tightbeam.GrantAuth.proof(session.cli_token)
+  defp auth_proof(:org), do: nil
 
   defp authenticated_session_key({:session, session}), do: session.session_key
   defp authenticated_session_key({:device, _device}), do: nil
