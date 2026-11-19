@@ -257,7 +257,9 @@ defmodule Tightbeam.TurnLifecycle do
   end
 
   defp system_terminal_authority?(event) do
-    (event.cause in ["operator:stale-running-turn", "operator:clear-stranded"] and
+    # `operator_settle`: settle-turn committing a quiet held turn as an
+    # unknown effect (stale-turn v1.3 R8), with the requesting principal.
+    (event.cause in ["operator:stale-running-turn", "operator:clear-stranded", "operator_settle"] and
        nonempty_string?(event.principal)) or
       (event.cause == "session-retired" and nonempty_string?(event.principal)) or
       (event.principal == "process:tightbeam" and
