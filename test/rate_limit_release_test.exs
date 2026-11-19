@@ -514,14 +514,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
        %{db: db} do
     pre = fail_turn(db, "c1", codex_error("try again later."))
 
-    {codex_incident, _} =
-      observe_codex(
-        db,
-        "codex-park",
-        "c2",
-        codex_error("try again later."),
-        System.system_time(:millisecond)
-      )
+    codex_incident = park_codex(db, "codex-park", "c2")
 
     {claude_incident, _} =
       observe_reset(db, "claude-park", @error, System.system_time(:millisecond))
@@ -553,14 +546,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
   end
 
   test "B2 (v1.2): no unnamed path lifts a quota park; other fences still complete", %{db: db} do
-    {incident, _} =
-      observe_codex(
-        db,
-        "held",
-        "c1",
-        codex_error("try again later."),
-        System.system_time(:millisecond)
-      )
+    incident = park_codex(db, "held", "c1")
 
     assert HarnessProcess.parked?(db, @codex_key)
 
@@ -800,6 +786,30 @@ defmodule Tightbeam.RateLimitReleaseTest do
              end)
 
     {incident, wake}
+  end
+
+  # Opens (or joins) the Codex incident with a limit that names no reset, so
+  # no reset wake exists.
+  defp park_codex(db, correlation, session_key) do
+    at = System.system_time(:millisecond)
+
+    assert {:ok, {_, incident}} =
+             DB.transaction(db, fn txn ->
+               result = observe_in_txn(txn, correlation, session_key, "testhost", at)
+
+               :ok =
+                 RateLimitReset.schedule_in_txn(
+                   txn,
+                   %{harness: :codex, host: "testhost", session_key: session_key},
+                   result,
+                   codex_error("try again later."),
+                   at
+                 )
+
+               result
+             end)
+
+    incident
   end
 
   defp resolve_codex(db, session_key, host) do
