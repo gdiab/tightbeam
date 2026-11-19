@@ -1494,6 +1494,48 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc """
+  The delivery owner of an OPEN assignment: the recipient the terminal-notice
+  candidate walk (`terminal_notice_recipient_in_txn/2`) would choose for it.
+  The limit-fallback outcome notice (contract c R13) addresses this session.
+  """
+  @spec delivery_owner_in_txn(Txn.t(), String.t()) :: {:ok, String.t()} | {:error, map()}
+  def delivery_owner_in_txn(%Txn{} = txn, assignment_id) when is_binary(assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.id,a.workItemId,owner.userId,a.openedByUser,a.openedBySession
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id=a.workItemId
+           LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
+           LEFT JOIN users owner ON owner.userId=CASE
+             WHEN a.openedBySession IS NOT NULL THEN parent.ownerUserId
+           ELSE COALESCE(a.openedByUser, w.ownerUserId) END
+           WHERE a.id=?1 AND a.state='open'
+           """,
+           [assignment_id]
+         ) do
+      [[id, work_item, owner, opened_user, opened_session]] ->
+        {opener_kind, opener_id} = terminal_opener_in_txn(txn, id, opened_user, opened_session)
+
+        terminal_notice_recipient_in_txn(txn, %{
+          assignment_id: id,
+          work_item_id: work_item,
+          owner_user_id: terminal_owner_in_txn(txn, id, owner),
+          opened_by_kind: opener_kind,
+          opened_by_id: opener_id
+        })
+
+      _ ->
+        wait_error("assignment_not_open", "assignment #{assignment_id} is not open")
+    end
+  rescue
+    # An assignment whose opener or owner relation cannot be read has no
+    # delivery owner; the caller names its fallback recipient.
+    error in [MatchError, KeyError] ->
+      wait_error("delivery_owner_unavailable", Exception.message(error))
+  end
+
   @doc "Persist a pending wake (id minted here, prefix `w_`). Returns the row."
   @spec schedule(db(), %{
           session_key: String.t(),
