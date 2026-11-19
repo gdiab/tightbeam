@@ -1235,7 +1235,8 @@ COMMANDS:
   approve-device [--user <userId>]
       Operator only: only an admin's paired device may issue a pairing code;
       George sends `/tightbeam approve-device` from Clawline or Chat and enters
-      the code on the new device himself. Agents never send it or enter a code.
+      the code on the new device himself. Agents never send it, ask another
+      agent to, or enter a code.
   recover-admin --user <userId>
       Operator only: George's full-lockout recovery, on the gateway host with the
       gateway stopped. It reads his recovery secret from the terminal and prints a

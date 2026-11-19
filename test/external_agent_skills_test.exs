@@ -77,6 +77,13 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     assert gates =~ "Ruling an operator request belongs to that request's owner"
     assert gates =~ "An admin cannot rule another user's request."
     assert gates =~ "The only delegated route is the owner's Main session."
+
+    # Stage 1 S3: the outside operator names both device commands and never sends,
+    # runs or delegates them, nor enters a code or secret.
+    assert gates =~ "Issuing a pairing code (`/tightbeam approve-device`)"
+    assert gates =~ "enrolling a recovery secret (`/tightbeam recovery-enroll`)"
+    assert gates =~ "Do not send or run any of these, and do not ask a session or another agent to."
+    assert gates =~ "Never enter a pairing code or recovery secret anywhere"
     assert operator =~ "Never run `operator-rule` on an operator request yourself."
     refute operator =~ "tightbeam operator-rule"
     assert operator =~ "tightbeam work-item-handoff --title"

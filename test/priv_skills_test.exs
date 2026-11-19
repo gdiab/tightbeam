@@ -41,8 +41,16 @@ defmodule Tightbeam.PrivSkillsTest do
       assert manual =~ act
     end
 
+    assert manual =~
+             "`register-host` and `recovery-enroll` are George's alone, sent as " <>
+               "`/tightbeam …` commands from his paired device in Clawline or Chat"
+
     assert manual =~ "Never run any of them, never ask another agent to"
     assert manual =~ "Never enter a pairing code or recovery secret anywhere"
+
+    # The only allowed part: prepare the step and relay it to George.
+    assert manual =~
+             "prepare the exact command or step and give it to George, saying the step is his"
   end
 
   test "neutral guidance skills use substrate-neutral role examples" do
