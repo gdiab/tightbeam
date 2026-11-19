@@ -1207,6 +1207,9 @@ COMMANDS:
   config get default-archetype|default-priority  read an organization default
   config set default-archetype <name>            set the default spawn archetype
   config set default-priority <0..8>              set the default card priority
+  config get owner-alerts-user|owner-alert-stall-ms  read an owner-alert setting
+  config set owner-alerts-user <userId>|""       send owner alerts to this user; "" clears it (alerts off)
+  config set owner-alert-stall-ms <ms>|""         set the no-progress alert threshold; "" clears it (4h default)
   host-env-set --host <host> --harness <harness> NAME=VALUE
       Set one host- and harness-scoped environment overlay. The result states
       when the adapter will observe the new value.
@@ -4103,7 +4106,17 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
         parsed.positional.get(3),
         parsed.positional.get(4),
     ) {
-        (Some("get"), Some(setting @ ("default-archetype" | "default-priority")), None, None) => Ok(Command::ConfigGet {
+        (
+            Some("get"),
+            Some(
+                setting @ ("default-archetype"
+                | "default-priority"
+                | "owner-alerts-user"
+                | "owner-alert-stall-ms"),
+            ),
+            None,
+            None,
+        ) => Ok(Command::ConfigGet {
             identity: identity(flags)?,
             setting: setting.to_owned(),
         }),
@@ -4122,8 +4135,29 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
                 value: value.clone(),
             })
         }
+        (Some("set"), Some("owner-alerts-user"), Some(value), None) => Ok(Command::ConfigSet {
+            identity: identity(flags)?,
+            setting: "owner-alerts-user".to_owned(),
+            value: value.clone(),
+        }),
+        (Some("set"), Some("owner-alert-stall-ms"), Some(value), None) => {
+            // "" clears the setting to its default.
+            if !value.is_empty()
+                && (value == "-0" || serde_json::from_str::<serde_json::Number>(value).is_err())
+            {
+                return Err(
+                    "owner-alert-stall-ms must be a positive integer number of milliseconds, or \"\" to clear it"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::ConfigSet {
+                identity: identity(flags)?,
+                setting: "owner-alert-stall-ms".to_owned(),
+                value: value.clone(),
+            })
+        }
         _ => Err(
-            "usage: tightbeam config get default-archetype|default-priority | config set default-archetype <name> | config set default-priority <0..8>"
+            "usage: tightbeam config get default-archetype|default-priority|owner-alerts-user|owner-alert-stall-ms | config set default-archetype <name> | config set default-priority <0..8> | config set owner-alerts-user <userId>|\"\" | config set owner-alert-stall-ms <ms>|\"\" (\"\" clears an owner-alert setting)"
                 .to_owned(),
         ),
     }
@@ -6299,6 +6333,9 @@ mod tests {
             "config get default-archetype|default-priority",
             "config set default-archetype <name>",
             "config set default-priority <0..8>",
+            "config get owner-alerts-user|owner-alert-stall-ms",
+            "config set owner-alerts-user <userId>|\"\"",
+            "config set owner-alert-stall-ms <ms>|\"\"",
             "host-env-set --host <host> --harness <harness> NAME=VALUE",
             "host-env-list [--host <host>] [--harness <harness>]",
             "host-env-unset --host <host> --harness <harness> NAME",

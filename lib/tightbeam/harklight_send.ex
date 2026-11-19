@@ -11,7 +11,9 @@ defmodule Tightbeam.HarklightSend do
            {:ok, input} <- inputs(call.params),
            nil <- HarklightLifecycle.unresolved(db, input.supersedes),
            {:ok, runner} <- runner(opts) do
-        op_id = Id.uuid4()
+        # A gateway-originated sender records its op id before the send runs,
+        # so a crash cannot separate it from the operation that may have run.
+        op_id = Keyword.get_lazy(opts, :op_id, &Id.uuid4/0)
 
         case invoke(runner, prepare_args(input, op_id), "prepared", op_id) do
           {:ok, prepared} ->

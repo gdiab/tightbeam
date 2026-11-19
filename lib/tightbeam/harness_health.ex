@@ -1133,6 +1133,15 @@ defmodule Tightbeam.HarnessHealth do
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
+        # Reads the observation and reset recorded above; changes neither.
+        Tightbeam.OwnerAlerts.usage_limit_failure_in_txn(
+          txn,
+          turn,
+          failure_class,
+          result,
+          observed_at
+        )
+
         post_commit(result)
     end
   end

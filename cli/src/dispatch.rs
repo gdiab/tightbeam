@@ -1775,7 +1775,11 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             setting,
             value,
         } => {
-            let encoded_value = if setting == "default-priority" {
+            // A number is sent bare. The owner-alert settings send "" as a
+            // string: it clears the setting.
+            let encoded_value = if setting == "default-priority"
+                || (setting == "owner-alert-stall-ms" && !value.is_empty())
+            {
                 format!("\"value\":{value}")
             } else {
                 string_field("value", value)
@@ -5914,6 +5918,46 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-priority","value":6}}"#
         );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "owner-alerts-user",
+                "george",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"owner-alerts-user","value":"george"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "owner-alert-stall-ms",
+                "7200000",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"owner-alert-stall-ms","value":7200000}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "get",
+                "owner-alert-stall-ms",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"owner-alert-stall-ms"}}"#
+        );
+        for setting in ["owner-alerts-user", "owner-alert-stall-ms"] {
+            assert_eq!(
+                body(&["config", "set", setting, "", "--as-user", "flynn"]),
+                format!(
+                    r#"{{"asUser":"flynn","verb":"config","params":{{"action":"set","setting":"{setting}","value":""}}}}"#
+                )
+            );
+        }
     }
 
     #[test]

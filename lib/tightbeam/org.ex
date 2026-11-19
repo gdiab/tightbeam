@@ -316,6 +316,28 @@ defmodule Tightbeam.Org do
     %{changed: changed, projection: Tightbeam.StateResources.query_config(txn, key)}
   end
 
+  @doc """
+  Clear an organization setting to unset by deleting its row. A real deletion
+  advances the setting's config row version, and its projection is the cleared
+  item: the key with a null value. Clearing an unset setting changes nothing
+  and has no projection.
+  """
+  def delete_setting_projected_in_txn(%Txn{} = txn, key) do
+    Txn.q(txn, "DELETE FROM org_settings WHERE key = ?1", [key])
+
+    if Txn.changes(txn) == 1 do
+      updated_at = now()
+      row_version = AdminProjection.allocate_in_txn(txn, "config", key, updated_at)
+
+      %{
+        changed: true,
+        projection: %{key: key, value: nil, updated_at: updated_at, row_version: row_version}
+      }
+    else
+      %{changed: false, projection: nil}
+    end
+  end
+
   @doc false
   @spec apply_notice_batching_lane_policy(
           map(),
