@@ -20,7 +20,6 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     Gateway,
     Model,
     Org,
-    PairingFreeze,
     Roles,
     Schema,
     TestDevices
@@ -32,7 +31,9 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
 
   # Each protected act, its wire params, and the /tightbeam command its refusal names.
   @protected [
-    {"approve-device", %{deviceId: "visitor"}, "/tightbeam approve-device visitor"},
+    # Stage 1 S2.1: approval issues a code for a user; S1.1 enrolment is protected too.
+    {"approve-device", %{userId: "guest"}, "/tightbeam approve-device guest"},
+    {"recovery-enroll", %{}, "/tightbeam recovery-enroll"},
     {"deny-device", %{deviceId: "iphone"}, "/tightbeam deny-device iphone"},
     {"revoke-device", %{deviceId: "iphone"}, "/tightbeam revoke-device iphone"},
     {"promote-user", %{userId: "guest", isAdmin: true}, "/tightbeam promote-user guest"},
@@ -146,7 +147,7 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
       refute message =~ "tbc_" or message =~ "tbt_"
       assert business_rows(ctx.db) == before
 
-      assert [%{auth_class: ^class, device_id: nil, freeze: "frozen"} | _] =
+      assert [%{auth_class: ^class, device_id: nil} | _] =
                events(ctx.db, verb, "denied") |> Enum.reverse()
     end
 
@@ -173,13 +174,12 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     assert Devices.user(ctx.db, "george").is_admin
   end
 
-  test "K4: with every admin device revoked, nothing but a device approves, frozen or lifted",
-       ctx do
+  # Stage 1 map: K4 kept, re-stated without the frozen/lifted variants.
+  test "K4: with every admin device revoked, nothing but a device approves", ctx do
     :ok = Devices.revoke(ctx.db, "iphone")
     :ok = Devices.revoke(ctx.db, "ipad")
 
-    for path <- [@absent, root_file()] do
-      Application.put_env(:tightbeam, :pairing_unfreeze_path, path)
+    for _once <- [1] do
       before = business_rows(ctx.db)
 
       for {bearer, body} <- [
@@ -206,13 +206,13 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
   test "K2/K6/K11: George's device performs each act by user command, with no turn", ctx do
     socket = connect(ctx, ctx.george)
 
-    lift!()
-    {socket, outcome} = command(socket, "/tightbeam approve-device visitor")
-    assert outcome =~ "Done: approve-device"
-    assert outcome =~ "Device visitor (Visitor"
-    assert outcome =~ "is allowlisted for user visitor"
-    assert %{status: "allowlisted"} = Devices.by_id(ctx.db, "visitor")
-    freeze!()
+    # Stage 1 S2.1: approval issues a one-time code, shown only in the ephemeral frame.
+    {socket, outcome, ephemeral} = command_with_ephemeral(socket, "/tightbeam approve-device")
+
+    assert outcome =~
+             ~r/Done: approve-device\. pairing code pc_[0-9a-f]{16} issued for george, expires /
+
+    assert ephemeral["content"] =~ ~r/TB-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}/
 
     {socket, outcome} = command(socket, "/tightbeam promote-user guest")
     assert outcome =~ "Done: promote-user"
@@ -259,7 +259,6 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     })
 
     assert [%{auth_class: "org", principal: "user:george"}] = events(ctx.db, "add-user", "denied")
-    assert [%{freeze: "lifted"} | _] = events(ctx.db, "approve-device", "verb")
   end
 
   test "K2: a non-admin user's device is refused forbidden for every act", ctx do
@@ -291,7 +290,7 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     socket = connect(ctx, ctx.george)
     before = business_rows(ctx.db)
 
-    {socket, outcome} = command(socket, "/tightbeam approve-device")
+    {socket, outcome} = command(socket, "/tightbeam approve-device a b")
     assert outcome =~ "Refused, nothing was executed: usage: /tightbeam approve-device"
     {socket, outcome} = command(socket, "/tightbeam frobnicate now")
     assert outcome =~ "Refused, nothing was executed: unknown command"
@@ -308,7 +307,7 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
         [Org.personal_session_key("george")]
       )
 
-    assert ["user", "/tightbeam approve-device"] in rows
+    assert ["user", "/tightbeam approve-device a b"] in rows
     assert Enum.any?(rows, &match?(["assistant", "Refused, nothing was executed" <> _], &1))
 
     for text <- ["please run /tightbeam add-user x", "/tightbeam add-user x\nthen more"] do
@@ -364,22 +363,63 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     assert [_] = events(ctx.db, "add-user", "verb")
   end
 
-  ## K12: the trusted pending list
+  ## Stage 1 W7 / P10 / P2 / P3: the code and the secret reach only the requesting socket
 
-  test "K12: pending-devices answers from rows, with the freeze state, to admins only", ctx do
+  test "W7/P10: a code and a secret travel only in the requesting socket's batch, never stored",
+       ctx do
     socket = connect(ctx, ctx.george)
-    {socket, outcome} = command(socket, "/tightbeam pending-devices")
-    assert outcome =~ "Pairing is frozen."
-    assert outcome =~ "- visitor: Visitor, claimed user visitor"
 
-    lift!()
-    {_socket, outcome} = command(socket, "/tightbeam pending-devices")
-    assert outcome =~ "Pairing is LIFTED"
-    freeze!()
+    {socket, outcome, frame} =
+      command_with_ephemeral(socket, "/tightbeam approve-device", "c_code")
 
-    {_guest, outcome} = command(connect(ctx, ctx.guest), "/tightbeam pending-devices")
-    assert outcome =~ "Refused (forbidden)"
-    refute outcome =~ "visitor"
+    assert outcome =~ "pairing code pc_"
+    [code] = Regex.run(~r/TB-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}/, frame["content"])
+
+    # The fields Clawline ddf31e2's ServerMessagePayload decoder requires, plus the
+    # W7 markers; an e_ id never becomes Clawline's replay cursor (only s_ ids do).
+    assert %{
+             "type" => "message",
+             "id" => "e_" <> _,
+             "role" => "assistant",
+             "sender" => "process:tightbeam",
+             "sessionKey" => session_key,
+             "content" => _,
+             "timestamp" => timestamp,
+             "streaming" => false,
+             "attachments" => [],
+             "ephemeral" => true,
+             "replyToClientMessageId" => "c_code"
+           } = frame
+
+    assert session_key == Org.personal_session_key("george")
+    assert is_integer(timestamp)
+    refute Map.has_key?(frame, "seq")
+
+    {_socket, outcome, secret_frame} =
+      command_with_ephemeral(socket, "/tightbeam recovery-enroll", "c_secret")
+
+    assert outcome =~ "recovery secret enrolled for george at "
+
+    [secret] =
+      Regex.run(~r/TBR-[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}/, secret_frame["content"])
+
+    # Nothing persisted or published carries either one.
+    for table <- ~w(messages events lifecycle_events owner_alerts wakes) do
+      {:ok, rows} = DB.query(ctx.db, "SELECT * FROM #{table}")
+      text = inspect(rows, limit: :infinity, printable_limit: :infinity)
+      refute text =~ code
+      refute text =~ secret
+    end
+
+    refute_received {:push_message, _, _, %{"content" => _}}
+
+    # A non-admin device's attempts send no ephemeral frame.
+    guest = connect(ctx, ctx.guest)
+
+    for text <- ["/tightbeam approve-device", "/tightbeam recovery-enroll"] do
+      {_guest, refused} = command(guest, text)
+      assert refused =~ "Refused (forbidden)"
+    end
   end
 
   ## K9: revocation takes effect on open connections
@@ -623,8 +663,18 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
 
     :ok = Devices.revoke(db, "ipad")
 
-    # Return the database to its shape before this fix, as an installed 0.1.14 has it.
+    # Return the database to its shape before core (A) and stage 1, as an installed
+    # 0.1.14 has it (stage 1 map: K18 kept, re-stated with the S5 records).
     for sql <- [
+          "DROP TABLE device_lifecycle_migration",
+          "DROP TABLE recovery_secrets",
+          "DROP INDEX pairing_codes_outstanding",
+          "DROP TABLE pairing_codes",
+          "DROP TABLE gateway_host_actions",
+          "ALTER TABLE devices DROP COLUMN tokenDelivered",
+          "ALTER TABLE devices DROP COLUMN deliveryDeadline",
+          "ALTER TABLE devices DROP COLUMN tokenGeneration",
+          "ALTER TABLE devices DROP COLUMN pairedCodeId",
           "DROP TABLE grant_auth_migration",
           "DROP TABLE decision_request_ruling_routes",
           "DROP TABLE pairing_freeze_observation",
@@ -638,8 +688,14 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
 
     before = history(db)
     :ok = GrantAuth.ensure_schema(db)
+    :ok = Tightbeam.DeviceLifecycle.ensure_schema(db)
     :ok = GrantAuth.ensure_schema(db)
+    :ok = Tightbeam.DeviceLifecycle.ensure_schema(db)
     after_rows = history(db)
+
+    # Every existing token is delivered (S5); no code or secret exists yet.
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM devices WHERE tokenDelivered = 0")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM pairing_codes")
 
     assert Map.delete(after_rows, :devices) == Map.delete(before, :devices)
 
@@ -658,8 +714,10 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
 
     # A restart: a fresh socket on the same rows signs in with the stored token and
     # a user command works at once.
-    {_socket, outcome} = command(connect(ctx, ctx.george), "/tightbeam pending-devices")
-    assert outcome =~ "Pairing is frozen."
+    {_socket, outcome, _ephemeral} =
+      command_with_ephemeral(connect(ctx, ctx.george), "/tightbeam approve-device")
+
+    assert outcome =~ "Done: approve-device"
   end
 
   ## helpers
@@ -741,13 +799,6 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     end)
   end
 
-  defp root_file do
-    TestDevices.valid_unfreeze_file!()
-  end
-
-  defp lift!, do: Application.put_env(:tightbeam, :pairing_unfreeze_path, root_file())
-  defp freeze!, do: Application.put_env(:tightbeam, :pairing_unfreeze_path, @absent)
-
   defp connect(ctx, device) do
     {:ok, state} = Socket.init(ctx.deps)
 
@@ -772,6 +823,19 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
       {:push, {:text, frame}, socket} ->
         {socket, [JSON.decode!(frame)]}
     end
+  end
+
+  # Stage 1 W7: ack, echo, outcome, then the one ephemeral frame, in one batch.
+  defp command_with_ephemeral(socket, text, id \\ nil) do
+    {socket, frames} = send_message(socket, text, id)
+
+    assert [%{"type" => "ack"}, %{"content" => ^text, "role" => "user"}, outcome, ephemeral] =
+             frames,
+           inspect(frames)
+
+    assert outcome["role"] == "assistant"
+    assert ephemeral["ephemeral"] == true
+    {socket, outcome["content"], ephemeral}
   end
 
   # A user command's frames: the ack, the recorded command, and the recorded outcome.
