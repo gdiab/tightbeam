@@ -1276,6 +1276,17 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
           assert terminal_cause(ctx.db, seq) == "harness_exited"
           assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
 
+          # R10: the reads show the terminal, its cause and the held state.
+          assert %{reason: "latest_terminal_failed", evidence: %{turn: breathing_turn}} =
+                   Tightbeam.Breathing.query(ctx.db, "session", key)
+
+          assert %{seq: ^seq, status: "failed_unknown", cause: "harness_exited"} = breathing_turn
+
+          assert %{turnSeq: ^seq, cause: "harness_exited", heldState: "harness_exited"} =
+                   Tightbeam.TurnSettlementView.settlement(
+                     Tightbeam.TurnSettlementView.latest_turn(ctx.db, key)
+                   )
+
           # R5: no replay vehicle, and a later delivered turn on the same
           # harness and host (today's redelivery trigger) re-sends nothing.
           assert redelivery_rows(ctx.db, seq) == 0
