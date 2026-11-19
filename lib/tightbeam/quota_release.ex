@@ -23,10 +23,135 @@ defmodule Tightbeam.QuotaRelease do
     ensured, so the queue drains in its original order.
   """
 
-  alias Tightbeam.{EventLog, LimitFallback, Org, Wakes}
+  alias Tightbeam.{EventLog, Harness, HarnessProcess, LimitFallback, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @process "process:tightbeam"
+
+  @doc """
+  The one recorded release step of a quota park (companion v1.6 §7 C1). Every
+  cause goes through it: `declared_reset` (B1), `later_success` (v3 R9(b)),
+  `explicit_resume` / `explicit_restart` (v3 R9(c)) and `recovery_probe`
+  (PR3). It records the release with its cause, actor and time, which ends
+  this quota cause of the hold. The fence is removed, and admission resumes,
+  only when no other standing reason still needs it:
+
+  - another open `rate-limit-dead` incident on the key;
+  - a harness-process row on the key that is being parked or failed to die;
+    for a probe release also a launching or running one, as upstream's
+    recovery release required.
+
+  Admission resuming is its own record, and only then are the key's pending
+  pre-activity quota turns re-admitted (B5, under C2's gate), for this
+  incident and any earlier release that a standing reason held. A held
+  release records the remaining reasons instead and re-admits nothing.
+  Returns `:admission_resumed` or `{:held, reasons}`.
+  """
+  @spec release_in_txn(Txn.t(), String.t(), String.t(), String.t(), keyword()) ::
+          :admission_resumed | {:held, [String.t()]}
+  def release_in_txn(%Txn{} = txn, incident_id, harness, host, opts) do
+    cause = Keyword.fetch!(opts, :cause)
+    at = System.system_time(:millisecond)
+    key = {Harness.parse!(harness).id(), "shared", host}
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "rate_limit_hold_released",
+      incident_id,
+      opts
+      |> Keyword.get(:detail, %{})
+      |> Map.merge(%{cause: cause, actor: Keyword.get(opts, :actor, @process), releasedAt: at})
+      |> JSON.encode!()
+    )
+
+    case standing_reasons_in_txn(txn, incident_id, harness, host, cause) do
+      [] ->
+        HarnessProcess.complete_park_in_txn(txn, key)
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "rate_limit_admission_resumed",
+          incident_id,
+          JSON.encode!(%{harness: harness, host: host, cause: cause, resumedAt: at})
+        )
+
+        released_in_txn(txn, incident_id, harness, host,
+          readmit: Keyword.get(opts, :readmit, false)
+        )
+
+        readmit_held_releases_in_txn(txn, incident_id, harness, host)
+        :admission_resumed
+
+      reasons ->
+        EventLog.lifecycle_in_txn(
+          txn,
+          "rate_limit_hold_remains",
+          incident_id,
+          JSON.encode!(%{harness: harness, host: host, cause: cause, reasons: reasons, at: at})
+        )
+
+        released_in_txn(txn, incident_id, harness, host)
+        {:held, reasons}
+    end
+  end
+
+  @readmitting_causes ["declared_reset", "explicit_resume", "explicit_restart", "recovery_probe"]
+
+  defp standing_reasons_in_txn(txn, incident_id, harness, host, cause) do
+    adapter_key = Atom.to_string(Harness.parse!(harness).id()) <> ":shared@" <> host
+
+    process_states =
+      if cause == "recovery_probe",
+        do: ["launching", "running", "park_requested", "kill_failed"],
+        else: ["park_requested", "kill_failed"]
+
+    incidents =
+      Txn.q(
+        txn,
+        """
+        SELECT id FROM harness_health_incidents
+        WHERE id != ?1 AND harness=?2 AND host=?3
+          AND failureClass='rate-limit-dead' AND state='open'
+        ORDER BY id
+        """,
+        [incident_id, harness, host]
+      )
+      |> Enum.map(fn [id] -> "open_incident:" <> id end)
+
+    placeholders = Enum.map_join(1..length(process_states), ",", &"?#{&1 + 1}")
+
+    processes =
+      Txn.q(
+        txn,
+        """
+        SELECT launchId FROM harness_processes
+        WHERE adapterKey=?1 AND state IN (#{placeholders}) AND resolvedAt IS NULL
+        ORDER BY launchId
+        """,
+        [adapter_key | process_states]
+      )
+      |> Enum.map(fn [id] -> "harness_process:#{id}" end)
+
+    incidents ++ processes
+  end
+
+  # A release that a standing reason held re-admitted nothing; its turns are
+  # re-admitted when admission does resume, once each (the selection skips
+  # rows already redelivered).
+  defp readmit_held_releases_in_txn(txn, incident_id, harness, host) do
+    Txn.q(
+      txn,
+      """
+      SELECT DISTINCT i.id FROM harness_health_incidents i
+      JOIN lifecycle_events e ON e.kind='rate_limit_hold_released' AND e.subject=i.id
+      WHERE i.harness=?1 AND i.host=?2 AND i.failureClass='rate-limit-dead' AND i.id != ?3
+        AND json_extract(e.detail, '$.cause') IN (#{Enum.map_join(@readmitting_causes, ",", &"'#{&1}'")})
+      ORDER BY i.id
+      """,
+      [harness, host, incident_id]
+    )
+    |> Enum.each(fn [held] -> Wakes.readmit_released_quota_intents_in_txn(txn, held) end)
+  end
 
   @spec released_in_txn(Txn.t(), String.t(), String.t(), String.t(), keyword()) :: :ok
   def released_in_txn(%Txn{} = txn, incident_id, harness, host, opts \\ [])
