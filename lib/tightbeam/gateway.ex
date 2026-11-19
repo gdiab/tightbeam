@@ -4155,7 +4155,10 @@ defmodule Tightbeam.Gateway do
                   turn,
                   failed_stage,
                   raw_reason,
-                  defer_redelivery: held?
+                  # R5: an unknown effect never gets a replay vehicle, whatever
+                  # its reason classifies as (only `interrupted-outcome-unknown`
+                  # would otherwise admit a failed_unknown source row).
+                  defer_redelivery: held? or not is_nil(unknown_cause)
                 )
 
               case hold do
