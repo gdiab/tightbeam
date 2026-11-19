@@ -1237,22 +1237,24 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
         "Internal error: The Claude Agent process exited unexpectedly. Please start a new session."
     }
 
-    for {label, failure} <- [
-          {"the adapter process dies (transport loss)",
+    for {label, harness, failure} <- [
+          {"the adapter process dies (transport loss)", :codex,
            Macro.escape({:adapter_unavailable, "acp exited with status 137"})},
-          {"the harness answers with its process-exit error", Macro.escape(@claude_process_exit)}
+          {"the harness answers with its process-exit error", :claude,
+           Macro.escape(@claude_process_exit)}
         ] do
       test "R4: a dispatched turn ended because #{label} settles unknown_effect, is surfaced once and never replayed" do
         failure = unquote(failure)
+        harness = unquote(harness)
 
         with_gateway(fn ctx ->
-          key = "s1-exit"
-          session!(ctx, key)
+          key = "s1-exit-#{harness}"
+          s1_session!(ctx, key, harness)
           lane!(ctx, key)
 
           :ok =
             GenServer.call(
-              ctx.codex,
+              Map.fetch!(ctx, harness),
               {:set, :prompt,
                fn
                  1, _text, opts ->
@@ -1308,6 +1310,22 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
         assert unknown_effect_notices(ctx.db) == []
       end)
     end
+  end
+
+  defp s1_session!(ctx, key, :codex), do: session!(ctx, key)
+
+  defp s1_session!(ctx, key, :claude) do
+    Org.create(ctx.db, %{
+      session_key: key,
+      display_name: "S1 " <> key,
+      owner_user_id: @owner,
+      origin: "user:" <> @owner,
+      archetype: @archetype,
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: fallback_model()
+    })
   end
 
   defp turn_error(db, seq) do
