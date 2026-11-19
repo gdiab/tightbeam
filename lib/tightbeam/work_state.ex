@@ -312,10 +312,20 @@ defmodule Tightbeam.WorkState do
   defp attests(txn, assignment_id) do
     Txn.q(
       txn,
-      "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+      "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, ts, byProcess FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
       [assignment_id]
     )
-    |> Enum.map(fn [id, assignment_id, kind, verdict_kind, note, by_session, by_user, ts] ->
+    |> Enum.map(fn [
+                     id,
+                     assignment_id,
+                     kind,
+                     verdict_kind,
+                     note,
+                     by_session,
+                     by_user,
+                     ts,
+                     by_process
+                   ] ->
       %{
         id: id,
         assignmentId: assignment_id,
@@ -326,6 +336,8 @@ defmodule Tightbeam.WorkState do
         byUser: by_user,
         ts: ts
       }
+      # A process-authored attest names its author (contract v3.1 R9(ii)).
+      |> then(&if(by_process, do: Map.put(&1, :byProcess, by_process), else: &1))
     end)
   end
 

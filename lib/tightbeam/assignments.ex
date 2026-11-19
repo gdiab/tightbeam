@@ -1323,7 +1323,7 @@ defmodule Tightbeam.Assignments do
     select_from = """
     SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
            att.bySession, att.byUser, att.producer, att.producerCommand,
-           att.byHarness, att.byProvider, att.commitRefs, att.ts
+           att.byHarness, att.byProvider, att.commitRefs, att.ts, att.byProcess
     FROM attests AS att
     JOIN assignments AS parent ON parent.id = att.assignmentId
     LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
@@ -1364,7 +1364,7 @@ defmodule Tightbeam.Assignments do
     select_from = """
     SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
            att.bySession, att.byUser, att.producer, att.producerCommand,
-           att.byHarness, att.byProvider, att.commitRefs, att.ts
+           att.byHarness, att.byProvider, att.commitRefs, att.ts, att.byProcess
     FROM attests AS att
     JOIN assignments AS parent ON parent.id = att.assignmentId
     LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
@@ -1449,8 +1449,11 @@ defmodule Tightbeam.Assignments do
          by_harness,
          by_provider,
          commit_refs,
-         ts
+         ts,
+         by_process
        ]) do
+    # A process-authored attest names its author (contract v3.1 R9(ii)); every
+    # other row is unchanged.
     %{
       id: id,
       assignment_id: assignment_id,
@@ -1466,6 +1469,7 @@ defmodule Tightbeam.Assignments do
       commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
       ts: ts
     }
+    |> then(&if(by_process, do: Map.put(&1, :by_process, by_process), else: &1))
   end
 
   @spec list_reopenings(DB.server(), String.t()) :: [map()]

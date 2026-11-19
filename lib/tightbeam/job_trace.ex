@@ -222,14 +222,14 @@ defmodule Tightbeam.JobTrace do
       DB.query(
         db,
         """
-        SELECT id, assignmentId, kind, verdictKind, commitRefs, ts
+        SELECT id, assignmentId, kind, verdictKind, commitRefs, ts, byProcess
         FROM attests
         WHERE assignmentId IN (#{clause})
         """,
         params
       )
 
-    Enum.map(rows, fn [id, assignment_id, kind, verdict, commit_refs, at] ->
+    Enum.map(rows, fn [id, assignment_id, kind, verdict, commit_refs, at, by_process] ->
       %{
         at: at,
         type: "attest",
@@ -239,6 +239,8 @@ defmodule Tightbeam.JobTrace do
         verdict: verdict,
         commitRefs: decode(commit_refs)
       }
+      # A process-authored attest names its author (contract v3.1 R9(ii)).
+      |> then(&if(by_process, do: Map.put(&1, :byProcess, by_process), else: &1))
       |> then(&Tightbeam.Mementos.attach(db, "attest", &1))
     end)
   end

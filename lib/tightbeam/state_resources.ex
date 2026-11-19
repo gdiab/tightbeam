@@ -243,7 +243,7 @@ defmodule Tightbeam.StateResources do
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId parentAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "attests" =>
-      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
+      ~w(id assignmentId kind verdictKind note bySession byUser byProcess producer producerCommand byHarness byProvider commitRefs ts rowVersion),
     "wakes" =>
       ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
@@ -307,11 +307,11 @@ defmodule Tightbeam.StateResources do
     },
     "attests" => %{
       strings:
-        ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider),
+        ~w(id assignmentId kind verdictKind note bySession byUser byProcess producer producerCommand byHarness byProvider),
       integers: ~w(ts rowVersion),
       booleans: [],
       nullable:
-        ~w(verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs)
+        ~w(verdictKind note bySession byUser byProcess producer producerCommand byHarness byProvider commitRefs)
     },
     "wakes" => %{
       strings:
@@ -1336,7 +1336,7 @@ defmodule Tightbeam.StateResources do
         db,
         """
         SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser,
-               producer, producerCommand, byHarness, byProvider, commitRefs, ts
+               producer, producerCommand, byHarness, byProvider, commitRefs, ts, byProcess
         FROM attests WHERE id = ?1
         """,
         [id]
@@ -1357,7 +1357,8 @@ defmodule Tightbeam.StateResources do
           by_harness,
           by_provider,
           commit_refs,
-          ts
+          ts,
+          by_process
         ]
       ] ->
         %{
@@ -1375,6 +1376,7 @@ defmodule Tightbeam.StateResources do
           commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
           ts: ts
         }
+        |> then(&if(by_process, do: Map.put(&1, :by_process, by_process), else: &1))
 
       [] ->
         nil
@@ -2584,6 +2586,14 @@ defmodule Tightbeam.StateResources do
     )
   end
 
+  # Only a process-authored attest carries byProcess (contract v3.1 R9(ii));
+  # every session or user attest keeps its exact field list.
+  defp conditional_fields!("attests", fields, item) do
+    if Map.has_key?(item, "byProcess"),
+      do: fields,
+      else: List.delete(fields, "byProcess")
+  end
+
   defp conditional_fields!("turns", fields, item) do
     fields =
       if Map.has_key?(item, "triggerSource"),
@@ -3544,7 +3554,7 @@ defmodule Tightbeam.StateResources do
     keys = Map.keys(row)
 
     if keys != [] and Enum.all?(keys, &is_binary/1) do
-      expected = Map.fetch!(@item_field_order, resource)
+      expected = conditional_fields!(resource, Map.fetch!(@item_field_order, resource), row)
 
       unless Enum.sort(keys) == Enum.sort(expected) do
         raise ArgumentError, "#{resource} public item has an extra or missing field"
