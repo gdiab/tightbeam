@@ -222,6 +222,13 @@ defmodule Tightbeam.GatewayTest do
       send(parent, {:ensure_lane_quiet, key})
       {:reply, :ok, parent}
     end
+
+    # A committed transaction's post-commit handoff (`Txn.handoff`) casts, as
+    # the real LaneManager receives it.
+    def handle_cast({:ensure_lane, key}, parent) do
+      send(parent, {:ensure_lane_handoff, key})
+      {:noreply, parent}
+    end
   end
 
   defmodule RepairCoordinatorStub do
@@ -3880,7 +3887,11 @@ defmodule Tightbeam.GatewayTest do
                ok: true,
                action: "resume",
                park: "released",
-               rerun: %{state: "queued", sourceTurnSeq: source, attemptTurnSeq: attempt}
+               rerun: %{
+                 "state" => "queued",
+                 "sourceTurnSeq" => source,
+                 "attemptTurnSeq" => attempt
+               }
              } = first = handler.(call)
 
       assert source == repair.source_seq
@@ -3896,7 +3907,11 @@ defmodule Tightbeam.GatewayTest do
       # A second resume finds nothing parked and nothing left to rerun.
       again = resume_call({:user, "flynn"}, repair.assignment_id, "resume-again", ctx.lane)
 
-      assert %{ok: true, park: "not_parked", rerun: %{state: "none", reason: "superseded"}} =
+      assert %{
+               ok: true,
+               park: "not_parked",
+               rerun: %{"state" => "none", "reason" => "superseded"}
+             } =
                handler.(again)
 
       assert turn_count(ctx.db, repair.assignment_id) == 2
@@ -3915,7 +3930,7 @@ defmodule Tightbeam.GatewayTest do
                incidentId: incident.id,
                assignmentId: id,
                park: "released",
-               rerun: %{state: "none", reason: "no_eligible_turn"}
+               rerun: %{"state" => "none", "reason" => "no_eligible_turn"}
              }
 
       refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
@@ -3939,7 +3954,11 @@ defmodule Tightbeam.GatewayTest do
 
       handler = resume_handler(ctx, :ok)
 
-      assert %{ok: true, park: "released", rerun: %{state: "none", reason: "not_from_incident"}} =
+      assert %{
+               ok: true,
+               park: "released",
+               rerun: %{"state" => "none", "reason" => "not_from_incident"}
+             } =
                handler.(resume_call({:user, "flynn"}, stale, "stale", ctx.lane))
 
       assert turn_count(ctx.db, stale) == 1
@@ -3951,7 +3970,11 @@ defmodule Tightbeam.GatewayTest do
 
       handler = resume_handler(ctx, :ok)
 
-      assert %{ok: true, park: "released", rerun: %{state: "none", reason: "unknown_effect"}} =
+      assert %{
+               ok: true,
+               park: "released",
+               rerun: %{"state" => "none", "reason" => "unknown_effect"}
+             } =
                handler.(resume_call({:user, "flynn"}, id, "unknown", ctx.lane))
 
       assert turn_count(ctx.db, id) == 1
