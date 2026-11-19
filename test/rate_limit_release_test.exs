@@ -481,6 +481,21 @@ defmodule Tightbeam.RateLimitReleaseTest do
     assert HarnessHealth.get(db, incident.id).state == "resolved"
   end
 
+  test "B5: a post-activity quota failure is recorded and surfaced at once, even with no incident",
+       %{db: db} do
+    # One session's failure leaves its observation pending: no incident, no
+    # park, and so no release would ever surface it.
+    post = fail_turn(db, "c1", codex_error("try again later."), started_work: true)
+    refute HarnessProcess.parked?(db, @codex_key)
+    assert redelivery_sources(db) == []
+
+    assert [%{"turnSeq" => ^post, "incidentId" => nil, "disposition" => "unknown_effect"}] =
+             lifecycle(db, "quota_failed_turn_not_replayed", "c1")
+
+    main = Org.personal_session_key("tester")
+    assert Enum.map(notices(db), & &1.session_key) == Enum.sort(["c1", main])
+  end
+
   test "B5: the reset release itself re-admits a sole pre-activity message turn, once, in seq order",
        %{db: db} do
     error = future_codex_error(System.system_time(:millisecond))
