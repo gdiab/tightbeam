@@ -204,16 +204,9 @@ defmodule Tightbeam.HarnessProcess.Recovery do
   defp remove_observed_fence(_txn, _adapter_key, :none), do: :ok
 
   defp remove_observed_fence(txn, adapter_key, generation) do
-    # Preserve the existing rate-limit incident fence, which has a separate owner.
-    incident_guard =
-      if DB.Txn.q(
-           txn,
-           "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
-         ) == [[1]] do
-        "AND NOT EXISTS (SELECT 1 FROM harness_health_incidents WHERE state='open' AND failureClass='rate-limit-dead' AND harness || ':shared@' || host = harness_park_fences.adapterKey)"
-      else
-        ""
-      end
+    # Preserve a quota park, which only the recorded release step lifts
+    # (companion v1.2 B2, the same guard as every other fence completion).
+    incident_guard = Tightbeam.HarnessProcess.quota_hold_guard_in_txn(txn)
 
     DB.Txn.q(
       txn,
@@ -224,6 +217,11 @@ defmodule Tightbeam.HarnessProcess.Recovery do
       """,
       [adapter_key, generation]
     )
+
+    # A quota release that a standing reason held resumes admission here
+    # (companion v1.7 C1).
+    if DB.Txn.changes(txn) == 1,
+      do: Tightbeam.QuotaRelease.fence_cleared_in_txn(txn, adapter_key)
 
     :ok
   end

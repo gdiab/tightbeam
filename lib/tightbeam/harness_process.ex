@@ -375,7 +375,15 @@ defmodule Tightbeam.HarnessProcess do
     count > 0
   end
 
-  @doc "Release the per-key fence after the park has reached a terminal state."
+  @doc """
+  Release the per-key fence after the park has reached a terminal state.
+
+  A quota park (an open `rate-limit-dead` incident on the key) is kept: only
+  the named releases lift it, through `release_quota_park_in_txn/2` (quota
+  companion v1.2 B2). That covers every adapter close, process-park
+  completion, launch reconciliation and proven-dead settlement, as the boot
+  and orphan sweeps already do.
+  """
   @spec complete_park(DB.server(), tuple()) :: :ok
   def complete_park(db, key) do
     {:ok, :ok} = DB.transaction(db, &complete_park_in_txn(&1, key))
@@ -383,17 +391,73 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  @doc "Release the park fence as part of a caller-owned recovery transaction."
+  @doc "Release the park fence as part of a caller-owned recovery transaction; a quota park is kept."
   @spec complete_park_in_txn(DB.Txn.t(), tuple()) :: :ok
   def complete_park_in_txn(%DB.Txn{} = txn, key) do
-    DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
+    DB.Txn.q(
+      txn,
+      "DELETE FROM harness_park_fences WHERE adapterKey = ?1 " <> quota_hold_guard_in_txn(txn),
+      [key_name(key)]
+    )
 
     # A quota release that a standing reason held resumes admission here
-    # (companion v1.6 C1).
+    # (companion v1.7 C1).
     if DB.Txn.changes(txn) == 1,
       do: Tightbeam.QuotaRelease.fence_cleared_in_txn(txn, key_name(key))
 
     :ok
+  end
+
+  @doc """
+  Lift a quota park's fence. Only the one recorded release step calls this,
+  `Tightbeam.QuotaRelease.release_in_txn/5`: the declared reset, a later
+  success, an explicit resume, a credential activation and a successful
+  recovery probe (companion v1.2 B2, B6; v1.7 §7 C1).
+  """
+  @spec release_quota_park_in_txn(DB.Txn.t(), tuple()) :: :ok
+  def release_quota_park_in_txn(%DB.Txn{} = txn, key) do
+    DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
+
+    if DB.Txn.changes(txn) == 1,
+      do: Tightbeam.QuotaRelease.fence_cleared_in_txn(txn, key_name(key))
+
+    :ok
+  end
+
+  # Companion v1.2 B2 on 0.1.16: a fence stays while its key has an open
+  # rate-limit-dead incident whose quota cause no named release has lifted. A
+  # release that a standing reason held (v1.7 C1, rate_limit_hold_remains with
+  # no later rate_limit_admission_resumed) has already ended the quota cause,
+  # so that reason's own settlement may complete the park. Every fence
+  # deletion other than the release step itself uses this guard.
+  @quota_hold_guard """
+  AND NOT EXISTS (
+    SELECT 1
+      FROM harness_health_incidents i
+     WHERE i.state = 'open'
+       AND i.failureClass = 'rate-limit-dead'
+       AND i.harness || ':shared@' || i.host = harness_park_fences.adapterKey
+       AND NOT EXISTS (
+         SELECT 1 FROM lifecycle_events h
+          WHERE h.kind = 'rate_limit_hold_remains' AND h.subject = i.id
+            AND NOT EXISTS (
+              SELECT 1 FROM lifecycle_events a
+               WHERE a.kind = 'rate_limit_admission_resumed' AND a.subject = i.id
+                 AND a.id > h.id
+            )
+       )
+  )
+  """
+
+  @doc false
+  @spec quota_hold_guard_in_txn(DB.Txn.t()) :: String.t()
+  def quota_hold_guard_in_txn(txn) do
+    if DB.Txn.q(
+         txn,
+         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('harness_health_incidents','lifecycle_events')"
+       ) == [[2]],
+       do: @quota_hold_guard,
+       else: ""
   end
 
   @doc "Deliver SIGKILL to a parked process group."
@@ -1691,16 +1755,24 @@ defmodule Tightbeam.HarnessProcess do
   defp complete_reconciled_park_name(db, adapter_key) do
     incident_guard = rate_limit_incident_guard(db)
 
-    {:ok, _} =
+    {:ok, released} =
       DB.query(
         db,
         """
         DELETE FROM harness_park_fences
          WHERE adapterKey = ?1
          #{incident_guard}
+         RETURNING adapterKey
         """,
         [adapter_key]
       )
+
+    # A quota release that a standing reason held resumes admission when its
+    # fence goes (companion v1.7 C1).
+    if released != [] do
+      {:ok, :ok} =
+        DB.transaction(db, &Tightbeam.QuotaRelease.fence_cleared_in_txn(&1, adapter_key))
+    end
 
     :ok
   end
@@ -1740,7 +1812,7 @@ defmodule Tightbeam.HarnessProcess do
       )
 
     # A quota release that a standing reason held resumes admission when its
-    # fence goes (companion v1.6 C1).
+    # fence goes (companion v1.7 C1).
     Enum.map(released, fn [adapter_key] ->
       {:ok, :ok} =
         DB.transaction(db, &Tightbeam.QuotaRelease.fence_cleared_in_txn(&1, adapter_key))
@@ -1750,29 +1822,13 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp rate_limit_incident_guard(db) do
-    if harness_health_schema?(db) do
-      """
-      AND NOT EXISTS (
-        SELECT 1
-          FROM harness_health_incidents
-         WHERE state = 'open'
-           AND failureClass = 'rate-limit-dead'
-           AND harness || ':shared@' || host = harness_park_fences.adapterKey
-      )
-      """
-    else
-      ""
-    end
-  end
-
-  defp harness_health_schema?(db) do
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('harness_health_incidents','lifecycle_events')"
       )
 
-    count == 1
+    if count == 2, do: @quota_hold_guard, else: ""
   end
 
   defp resolve(db, row, state) do
