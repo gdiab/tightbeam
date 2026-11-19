@@ -131,6 +131,42 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
     assert detail =~ "fixture-operator"
   end
 
+  # Companion v1.2 B2 and v1.7 C4 on 0.1.16: the launch-settlement fence
+  # removal (this line's harness_process_recovery path) keeps a quota park;
+  # only the recorded release step lifts it. The incident table is one stated
+  # fixture: this database holds the process and event-log schema only.
+  test "a settled launch keeps the fence of an open rate-limit incident on its key", ctx do
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TABLE harness_health_incidents (
+        id TEXT PRIMARY KEY, harness TEXT NOT NULL, host TEXT NOT NULL,
+        failureClass TEXT NOT NULL, state TEXT NOT NULL
+      );
+      INSERT INTO harness_health_incidents VALUES
+        ('hhi_quota', 'claude', 'fixture-host', 'rate-limit-dead', 'open');
+      """)
+
+    {row, _} = prepare(ctx)
+    File.write!(row.identity_path, "")
+    terminal(row)
+    assert {:error, _failure} = HarnessProcess.capture_identity(ctx.db, row.launch_id, 30)
+    assert HarnessProcess.fenced?(ctx.db, @key)
+
+    assert {:ok, %{proof: :terminal_pre_identity}} = settle(ctx, row)
+    assert [%{resolved_at: at}] = HarnessProcess.list(ctx.db)
+    assert is_integer(at)
+    assert HarnessProcess.fenced?(ctx.db, @key)
+
+    # Without the open quota incident the same settlement completes the park.
+    :ok = DB.execute(ctx.db, "UPDATE harness_health_incidents SET state='resolved'")
+    {next, _} = prepare(ctx)
+    File.write!(next.identity_path, "")
+    terminal(next)
+    assert {:error, _} = HarnessProcess.capture_identity(ctx.db, next.launch_id, 30)
+    assert {:ok, %{proof: :terminal_pre_identity}} = settle(ctx, next)
+    refute HarnessProcess.fenced?(ctx.db, @key)
+  end
+
   test "contradictory exit or wrong key refuses without any change", ctx do
     {row, _} = prepare(ctx)
     terminal(row)
