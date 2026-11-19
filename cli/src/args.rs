@@ -8596,7 +8596,10 @@ mod tests {
         let root = render_command_help(None, "root-admin").unwrap();
         let flat = root.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains("`/tightbeam recovery-enroll`"), "{root}");
-        assert!(flat.contains("Agents never run it or send either command"), "{root}");
+        assert!(
+            flat.contains("Agents never run it or send either command"),
+            "{root}"
+        );
     }
 
     #[test]
