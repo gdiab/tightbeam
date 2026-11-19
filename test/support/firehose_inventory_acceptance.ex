@@ -166,15 +166,47 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
         )
       end)
 
+    # Stage 1: approval is one-time-code pairing. The fixture user's paired admin
+    # device issues a code and the pending device redeems it; the redemption commits
+    # device.approved. deny and revoke are unchanged.
+    admission = :"a4_pairing_admission_#{System.unique_integer([:positive])}"
+
+    {:ok, _admission} =
+      Supervisor.start_child(fixture.supervisor, %{
+        id: admission,
+        start: {Tightbeam.PairingAdmission, :start_link, [[name: admission]]}
+      })
+
     notices =
       Enum.reduce(
         [
-          {"device.approved", "approve-device", "a4-approved", &Devices.approve_with_firehose/4},
-          {"device.denied", "deny-device", "a4-denied", &Devices.deny_with_firehose/3},
-          {"device.revoked", "revoke-device", "a4-revoked", &Devices.revoke_with_firehose/3}
+          {"device.approved", "a4-approved",
+           fn device_id ->
+             {code, _record} =
+               Tightbeam.TestDevices.issue_code!(fixture.db, fixture.device, fixture.user_id)
+
+             {:paired, _} =
+               Tightbeam.TestDevices.coded_pair(fixture.db, device_id, device_id, code, admission)
+           end},
+          {"device.denied", "a4-denied",
+           fn device_id ->
+             Devices.deny_with_firehose(
+               fixture.db,
+               device_id,
+               call.("deny-device", %{device_id: device_id})
+             )
+           end},
+          {"device.revoked", "a4-revoked",
+           fn device_id ->
+             Devices.revoke_with_firehose(
+               fixture.db,
+               device_id,
+               call.("revoke-device", %{device_id: device_id})
+             )
+           end}
         ],
         notices,
-        fn {class, verb, device_id, mutation}, notices ->
+        fn {class, device_id, mutation}, notices ->
           assert {:pending, _device} =
                    Tightbeam.TestDevices.pair(fixture.db, %{
                      device_id: device_id,
@@ -183,32 +215,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
                      model: nil
                    })
 
-          capture_classes(fixture, notices, [class], fn ->
-            case class do
-              "device.approved" ->
-                # Core fix (A) C6a: approval needs the freeze lifted.
-                frozen = Application.get_env(:tightbeam, :pairing_unfreeze_path)
-
-                lifted =
-                  Tightbeam.TestDevices.valid_unfreeze_file!()
-
-                Application.put_env(:tightbeam, :pairing_unfreeze_path, lifted)
-
-                try do
-                  mutation.(
-                    fixture.db,
-                    device_id,
-                    fixture.user_id,
-                    call.("approve-device", %{device_id: device_id})
-                  )
-                after
-                  Application.put_env(:tightbeam, :pairing_unfreeze_path, frozen)
-                end
-
-              _ ->
-                mutation.(fixture.db, device_id, call.(verb, %{device_id: device_id}))
-            end
-          end)
+          capture_classes(fixture, notices, [class], fn -> mutation.(device_id) end)
         end
       )
 

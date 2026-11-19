@@ -23,7 +23,8 @@ defmodule Tightbeam.Firehose.Publisher do
     "operator-ask" => {"decision_request.opened", &StateResources.decision_request/1},
     "operator-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
     "operator-withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
-    "approve-device" => {"device.approved", &StateResources.device/1},
+    # Stage 1: approve-device issues a code and changes no device; "device.approved"
+    # is published by the coded pairing that allowlists the device.
     "deny-device" => {"device.denied", &StateResources.device/1},
     "revoke-device" => {"device.revoked", &StateResources.device/1},
     "role-create" => {"role.created", &StateResources.role/1},
@@ -554,7 +555,7 @@ defmodule Tightbeam.Firehose.Publisher do
   end
 
   defp canonical_result(db, %{verb: verb} = call, result)
-       when verb in ~w(approve-device deny-device revoke-device) do
+       when verb in ~w(deny-device revoke-device) do
     StateResources.query_device(db, call.params[:device_id]) || result
   end
 
