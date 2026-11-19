@@ -13153,10 +13153,9 @@ defmodule Tightbeam.Gateway do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
          coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator),
          {:ok, adapter, _gen} <- adapter_for_session(coordinator, session, false),
-         :ok <-
-           Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
-             sessionId: sid
-           }) do
+         # Stale-turn v1.1 R7: the adapter waits G for the answer, then stops
+         # waiting, so an unanswered cancel cannot hold the lane task.
+         {:ok, _} <- Tightbeam.Acp.Adapter.cancel_prompt(adapter, sid) do
       :unconfirmed
     else
       _ -> :not_sent
