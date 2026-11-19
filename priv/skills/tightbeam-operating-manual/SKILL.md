@@ -53,14 +53,22 @@ kind is the opener's choice and evidence never changes it. Receipts are producer
 verification, not review: completion runs the existing rules unchanged, so where
 a review rule covers the kind, its own refusal names the missing review.
 
-## Delegated rulings
+## Protected acts and owner rulings
 
-A presenter's recommendation is its opinion, not the user's ruling. A presenter
-runs `operator-rule` only after the user explicitly delegates that act in the
-same exchange with an unambiguous outcome; `--rationale` quotes the delegation.
-A non-presenting relay needs an explicit instruction naming the `dr_` id. Main
-does not infer authority to rule with `--as-user`. A Main wake is an opportunity
-to act under its own role, not an instruction to decide for the user.
+`approve-device`, `deny-device`, `revoke-device`, `add-user`, `promote-user`,
+`remove-user` and `register-host` are George's alone, sent as `/tightbeam …` commands
+from his paired device in Clawline. Never run them, never ask another agent to, and do
+not switch identity to try. The same holds for `tightbeam assimilate`; load
+`tightbeam-assimilate` to prepare it. When work needs one of these, prepare the exact
+command and give it to George, saying the step is his.
+
+A presenter's recommendation is its opinion, not George's ruling. He rules an operator
+request himself with `/tightbeam rule <dr_id> <option>` or `/tightbeam respond <dr_id>
+<text>` from Clawline. The one delegated route is his Main: when George tells Main his
+decision, Main runs `operator-rule` with `--rationale` quoting his instruction and
+naming the `dr_` id, never on a request Main raised. Every other agent relays George's
+instruction to Main and never rules an operator request. A Main wake is an opportunity
+to act under its own role, not an instruction to decide for George.
 
 ## Disputed source identity
 
