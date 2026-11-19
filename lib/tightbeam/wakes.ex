@@ -3492,6 +3492,26 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc """
+  Re-admit the pending redelivery rows of an open quota incident's
+  pre-activity failed turns, once each, in source-seq order, when its park is
+  released by the declared reset or an explicit resume (companion v1.1 B5).
+  Such a release has no restoration turn, so the release itself is the
+  restoration: the row's `restorationTurnSeq` is its own redelivery turn.
+  Each re-admitted turn joins the session's queue behind the turns already
+  queued; their order is unchanged (v3 R12). A post-activity turn is skipped
+  by the consumption guard.
+  """
+  @spec readmit_released_quota_intents_in_txn(Txn.t(), String.t()) :: non_neg_integer()
+  def readmit_released_quota_intents_in_txn(%Txn{} = txn, incident_id)
+      when is_binary(incident_id) do
+    txn
+    |> health_redelivery_sources_in_txn(incident_id, "rate-limit-dead")
+    |> Enum.reduce(0, fn source, count ->
+      count + redeliver_health_source_in_txn(txn, source, :release)
+    end)
+  end
+
   defp health_redelivery_sources_in_txn(txn, incident_id, failure_class) do
     Txn.q(
       txn,
@@ -3560,6 +3580,11 @@ defmodule Tightbeam.Wakes do
                request_ref: request_ref
              }) do
           {:ok, redelivery_turn_seq} ->
+            restoration_turn_seq =
+              if restoration_turn_seq == :release,
+                do: redelivery_turn_seq,
+                else: restoration_turn_seq
+
             Txn.q(
               txn,
               """
