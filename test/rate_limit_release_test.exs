@@ -513,16 +513,19 @@ defmodule Tightbeam.RateLimitReleaseTest do
   test "B5: a post-activity quota failure is recorded and surfaced at once, even with no incident",
        %{db: db} do
     # One session's failure leaves its observation pending: no incident, no
-    # park, and so no release would ever surface it.
-    post = fail_turn(db, "c1", codex_error("try again later."), started_work: true)
-    refute HarnessProcess.parked?(db, @codex_key)
+    # park, and so no release would ever surface it. On 0.1.16 a typed Codex
+    # limit is authoritative and opens its incident at once (#668), so this
+    # case is a typed Claude limit, which still waits for a second session.
+    reset = System.system_time(:millisecond) + 3_600_000
+    post = fail_turn(db, "k1", reset_error(reset), started_work: true)
+    refute HarnessProcess.parked?(db, {:claude, "shared", "testhost"})
     assert redelivery_sources(db) == []
 
     assert [%{"turnSeq" => ^post, "incidentId" => nil, "disposition" => "unknown_effect"}] =
-             lifecycle(db, "quota_failed_turn_not_replayed", "c1")
+             lifecycle(db, "quota_failed_turn_not_replayed", "k1")
 
     main = Org.personal_session_key("tester")
-    assert Enum.map(notices(db), & &1.session_key) == Enum.sort(["c1", main])
+    assert Enum.map(notices(db), & &1.session_key) == Enum.sort(["k1", main])
   end
 
   test "B5: the reset release itself re-admits a sole pre-activity message turn, once, in seq order",
