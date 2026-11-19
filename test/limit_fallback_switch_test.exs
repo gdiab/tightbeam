@@ -155,6 +155,11 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     def handle_call({:apply_model, sid, model, _timeout}, from, state),
       do: handle_call({:apply_model, sid, model}, from, state)
 
+    # 0.1.16 tunes a resident session's model through switch_model_session; a
+    # harness whose model set stays live updates it in place and keeps its id.
+    def handle_call({:switch_model_session, sid, model, _cwd, _mcp, _guidance}, _from, state),
+      do: {:reply, {:ok, sid}, put_in(state.sessions[sid], model)}
+
     def handle_call({:prompt, _sid, text, opts}, _from, state) do
       n = state.prompts + 1
       send(state.parent, {:prompted, state.name, n, text})
@@ -197,8 +202,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
       {evaluation, seq} = await_hold!(ctx, key)
 
-      # The failed turn's terminal readies the recipient, which admits each
-      # staged post as its own queued turn, in posting order.
+      # The failed turn's terminal readies the recipient, which admits the
+      # staged posts as one batched notice turn, in posting order (0.1.16).
       queued = for token <- queued_tokens, do: await_turn_seq!(ctx.db, key, token)
       assert queued == Enum.sort(queued)
 
@@ -647,6 +652,9 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       assert session.harness == "codex"
       refute LimitFallback.fallback_active?(session)
 
+      # 0.1.16: one typed Codex limit also parks the Codex key (#668), so
+      # the next Codex turn runs only once Codex has recovered.
+      recover_codex!(ctx)
       deliver!(ctx, key, "second-limit")
       {again, again_seq} = await_hold!(ctx, key)
       assert again.() == :applied
@@ -686,6 +694,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
         assert after_publish.model == before.model
         refute LimitFallback.fallback_active?(after_publish)
 
+        # 0.1.16: the unconfigured typed limit parked the Codex key (#668).
+        recover_codex!(ctx)
         deliver!(ctx, key, "configured-limit")
         {evaluation, _seq} = await_hold!(ctx, key)
         assert evaluation.() == :applied
@@ -750,6 +760,12 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
       assert_withheld!(ctx, key, seq, "switch-failed:interrupted")
 
+      # 0.1.16: the typed Codex limit also parked the Codex key (#668); the
+      # released hold leaves the lane waiting on that park until Codex
+      # recovers, and then it claims.
+      SessionLane.nudge(key)
+      refute_receive {:prompted, :codex, 2, _text}, 500
+      recover_codex!(ctx)
       SessionLane.nudge(key)
       assert_receive {:prompted, :codex, 2, text}, 15_000
       assert text =~ "queued-after-restart"
@@ -774,6 +790,10 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       # Episode 1: three typed limits, no delivered turn between them.
       [first, second, third] =
         for token <- ~w(episode-one-a episode-one-b episode-one-c) do
+          # 0.1.16: each typed Codex limit parks the Codex key (#668); its
+          # recovery by another session is not a delivered turn of this one,
+          # so the episode goes on.
+          recover_codex!(ctx)
           deliver!(ctx, key, token)
           {evaluation, seq} = await_hold!(ctx, key)
           assert evaluation.() == :withheld
@@ -810,6 +830,7 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
       # A delivered turn ends the episode.
       :ok = GenServer.call(ctx.codex, {:set, :prompt, fn n, _text, _opts -> ok_reply(n) end})
+      recover_codex!(ctx)
       delivered = deliver!(ctx, key, "episode-break")
       await_turns_settled!(ctx.db, key)
       assert turn_status(ctx.db, delivered) == "delivered"
@@ -821,6 +842,7 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
           {:set, :prompt, fn _n, _text, _opts -> {:error, @codex_limit} end}
         )
 
+      recover_codex!(ctx)
       fourth = deliver!(ctx, key, "episode-two-a")
       {evaluation, ^fourth} = await_hold!(ctx, key)
       assert evaluation.() == :withheld
@@ -848,6 +870,7 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
           &LimitFallback.set_restriction_in_txn(&1, key, :on, "user:" <> @owner, nil)
         )
 
+      recover_codex!(ctx)
       fifth = deliver!(ctx, key, "episode-two-b")
       {evaluation, ^fifth} = await_hold!(ctx, key)
       assert evaluation.() == :applied
@@ -1321,7 +1344,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     end
   end
 
-  # Each token's post ran as exactly one turn, which delivered.
+  # Each token's post ran in exactly one turn, which delivered. On 0.1.16
+  # posts staged behind a running turn share one batched notice turn.
   defp assert_ran_once!(db, key, tokens) do
     for token <- tokens do
       assert {:ok, [["delivered"]]} =
@@ -1329,7 +1353,7 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
                  db,
                  """
                  SELECT t.status FROM turns t JOIN messages m ON m.id=t.messageId
-                 WHERE t.sessionKey=?1 AND m.content=?2
+                 WHERE t.sessionKey=?1 AND m.content LIKE '%' || ?2 || '%'
                  """,
                  [key, token]
                )
@@ -1412,6 +1436,25 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     end
   end
 
+  # Codex recovers on testhost: the supported normal-turn resolution of its
+  # open rate-limit incident, which releases the 0.1.16 park (#668). Nothing
+  # to resolve is fine.
+  defp recover_codex!(ctx) do
+    result =
+      HarnessHealth.resolve(ctx.db, %{
+        harness: "codex",
+        host: "testhost",
+        failure_class: "rate-limit-dead",
+        observed_at: System.system_time(:millisecond),
+        correlation_id: "test-codex-recovered-#{System.unique_integer([:positive])}",
+        cause: "codex recovered (test)",
+        principal: "process:tightbeam"
+      })
+
+    assert match?({:resolved, _}, result) or result == :already_healthy
+    :ok
+  end
+
   defp await_hold!(ctx, key) do
     assert_receive {:limit_fallback_evaluation, evaluation}, 15_000
 
@@ -1449,10 +1492,20 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     else
       receive do
         {:prompted, ^name, _n, text} ->
-          case Enum.find(tokens, &String.contains?(text, &1)) do
-            nil -> collect_tokens(name, tokens, seen)
-            token -> collect_tokens(name, tokens, [token | seen])
-          end
+          # On 0.1.16 staged posts reach a ready recipient as one batched
+          # notice turn, so one prompt can carry several tokens, in order.
+          found =
+            tokens
+            |> Enum.flat_map(fn token ->
+              case :binary.match(text, token) do
+                {at, _} -> [{at, token}]
+                :nomatch -> []
+              end
+            end)
+            |> Enum.sort()
+            |> Enum.map(&elem(&1, 1))
+
+          collect_tokens(name, tokens, Enum.reverse(found) ++ seen)
       after
         15_000 -> flunk("#{name} ran only #{inspect(Enum.reverse(seen))} of #{inspect(tokens)}")
       end
