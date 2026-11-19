@@ -1227,6 +1227,133 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     })
   end
 
+  ## Stale-turn settlement v1.1 R4/R5/R9 through the real turn runner. These
+  ## reuse this module's gateway harness; they involve no limit or fallback.
+
+  describe "stale-turn v1.1 R4/R5/R9" do
+    @claude_process_exit %{
+      "code" => -32_603,
+      "message" =>
+        "Internal error: The Claude Agent process exited unexpectedly. Please start a new session."
+    }
+
+    for {label, failure} <- [
+          {"the adapter process dies (transport loss)",
+           Macro.escape({:adapter_unavailable, "acp exited with status 137"})},
+          {"the harness answers with its process-exit error", Macro.escape(@claude_process_exit)}
+        ] do
+      test "R4: a dispatched turn ended because #{label} settles unknown_effect, is surfaced once and never replayed" do
+        failure = unquote(failure)
+
+        with_gateway(fn ctx ->
+          key = "s1-exit"
+          session!(ctx, key)
+          lane!(ctx, key)
+
+          :ok =
+            GenServer.call(
+              ctx.codex,
+              {:set, :prompt,
+               fn
+                 1, _text, opts ->
+                   # The prompt reached the adapter transport, then the
+                   # harness went away.
+                   Keyword.fetch!(opts, :trace_dispatch).(101)
+                   {:error, failure}
+
+                 n, _text, _opts ->
+                   ok_reply(n)
+               end}
+            )
+
+          seq = deliver!(ctx, key, "s1-killed-prompt")
+          await_turns_settled!(ctx.db, key)
+
+          assert turn_status(ctx.db, seq) == "failed_unknown"
+          assert turn_error(ctx.db, seq) == "unknown_effect"
+          assert terminal_cause(ctx.db, seq) == "harness_exited"
+          assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
+
+          # R5: no replay vehicle, and a later delivered turn on the same
+          # harness and host (today's redelivery trigger) re-sends nothing.
+          assert redelivery_rows(ctx.db, seq) == 0
+          next = deliver!(ctx, key, "s1-next-prompt")
+          await_turns_settled!(ctx.db, key)
+          assert turn_status(ctx.db, next) == "delivered"
+          assert same_message_turns(ctx.db, seq) == [seq]
+          assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
+        end)
+      end
+    end
+
+    test "R4: a turn whose prompt was never dispatched keeps its known failure" do
+      with_gateway(fn ctx ->
+        key = "s1-undispatched"
+        session!(ctx, key)
+        lane!(ctx, key)
+
+        :ok =
+          GenServer.call(
+            ctx.codex,
+            {:set, :prompt,
+             fn _n, _text, _opts ->
+               {:error, {:adapter_unavailable, "acp exited with status 137"}}
+             end}
+          )
+
+        seq = deliver!(ctx, key, "s1-not-dispatched")
+        await_turns_settled!(ctx.db, key)
+        assert turn_status(ctx.db, seq) == "failed"
+        refute turn_error(ctx.db, seq) == "unknown_effect"
+        assert unknown_effect_notices(ctx.db) == []
+      end)
+    end
+  end
+
+  defp turn_error(db, seq) do
+    {:ok, [[error]]} = DB.query(db, "SELECT error FROM turns WHERE seq=?1", [seq])
+    error
+  end
+
+  defp terminal_cause(db, seq) do
+    {:ok, [[cause]]} =
+      DB.query(
+        db,
+        "SELECT cause FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed'",
+        [seq]
+      )
+
+    cause
+  end
+
+  defp unknown_effect_notices(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT sessionKey FROM wakes WHERE wakeId LIKE 'w_turn_unknown_effect_%' ORDER BY sessionKey"
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
+  defp redelivery_rows(db, seq) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1", [seq])
+
+    count
+  end
+
+  defp same_message_turns(db, seq) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT t.seq FROM turns t JOIN turns s ON s.messageId=t.messageId WHERE s.seq=?1 ORDER BY t.seq",
+        [seq]
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
   defp extract_runner!(config) do
     {Tightbeam.LaneManager, lane_opts} =
       config

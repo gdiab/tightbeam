@@ -748,6 +748,17 @@ defmodule Tightbeam.SessionLane do
         do: Keyword.put(terminal_opts, :prewrite_evidence, prewrite_evidence),
         else: terminal_opts
 
+    # Stale-turn v1.1: an unknown-effect terminal names its cause on the
+    # terminal lifecycle row (harness_exited, response_missing, operator_settle).
+    terminal_opts =
+      case outcome do
+        {:error, %{terminal_cause: cause}} when is_binary(cause) ->
+          Keyword.put(terminal_opts, :cause, cause)
+
+        _ ->
+          terminal_opts
+      end
+
     {terminal, error, publish, in_txn, after_commit} =
       case outcome do
         {:ok, %{terminal_publish: fun, record_in_txn: action}}
