@@ -10,7 +10,7 @@ defmodule Tightbeam.RateLimitReset do
   success resolves it.
   """
 
-  alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, HostZone, QuotaRelease, Wakes}
+  alias Tightbeam.{DB, Harness, HarnessProcess, HostZone, QuotaRelease, Wakes}
   alias Tightbeam.DB.Txn
 
   @consumer "rate_limit_reset"
@@ -94,27 +94,16 @@ defmodule Tightbeam.RateLimitReset do
             [@consumer, at, incident_id]
           )
 
-        key = adapter_key(harness, host)
-
-        if later_resets == [] and HarnessProcess.parked_in_txn?(txn, key) do
-          HarnessProcess.complete_park_in_txn(txn, key)
-
-          # Reset permits another attempt; it is not a successful provider
-          # response and must not resolve health or authorize success redelivery.
-          EventLog.lifecycle_in_txn(
-            txn,
-            "rate_limit_hold_released",
-            incident_id,
-            JSON.encode!(%{
-              observationId: observation_id,
+        # Reset permits another attempt; it is not a successful provider
+        # response and must not resolve health or authorize success redelivery.
+        if later_resets == [],
+          do:
+            QuotaRelease.release_named_in_txn(txn, incident_id, harness, host, %{
               cause: "declared_reset",
-              resetAt: due_at,
-              releasedAt: at
+              actor: "process:tightbeam",
+              observationId: observation_id,
+              resetAt: due_at
             })
-          )
-
-          QuotaRelease.released_in_txn(txn, incident_id, harness, host, readmit: true)
-        end
 
         :ok
 

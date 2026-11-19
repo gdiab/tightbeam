@@ -510,6 +510,80 @@ defmodule Tightbeam.RateLimitReleaseTest do
     assert lifecycle(db, "quota_failed_turn_not_replayed", "c2") == []
   end
 
+  test "B6: a committed OpenAI activation releases the parked Codex key with a record; Claude stays",
+       %{db: db} do
+    pre = fail_turn(db, "c1", codex_error("try again later."))
+
+    {codex_incident, _} =
+      observe_codex(
+        db,
+        "codex-park",
+        "c2",
+        codex_error("try again later."),
+        System.system_time(:millisecond)
+      )
+
+    {claude_incident, _} =
+      observe_reset(db, "claude-park", @error, System.system_time(:millisecond))
+
+    assert HarnessProcess.parked?(db, @codex_key)
+    assert HarnessProcess.parked?(db, @key)
+
+    assert :ok = Tightbeam.Gateway.credential_activation_hook(db, "testhost").(:openai)
+
+    refute HarnessProcess.parked?(db, @codex_key)
+
+    assert [
+             %{
+               "cause" => "credential_replacement",
+               "actor" => "process:credentials",
+               "releasedAt" => at
+             }
+           ] =
+             lifecycle(db, "rate_limit_hold_released", codex_incident.id)
+
+    assert is_integer(at)
+    # B5: the pre-activity turn is re-admitted by the release.
+    assert queued_messages(db) == [source_message(db, pre)]
+    assert HarnessHealth.get(db, codex_incident.id).state == "open"
+
+    # Another provider's park is untouched.
+    assert HarnessProcess.parked?(db, @key)
+    assert lifecycle(db, "rate_limit_hold_released", claude_incident.id) == []
+  end
+
+  test "B2 (v1.2): no unnamed path lifts a quota park; other fences still complete", %{db: db} do
+    {incident, _} =
+      observe_codex(
+        db,
+        "held",
+        "c1",
+        codex_error("try again later."),
+        System.system_time(:millisecond)
+      )
+
+    assert HarnessProcess.parked?(db, @codex_key)
+
+    # An adapter close (idle or credential-change), process-park completion,
+    # launch reconciliation and proven-dead settlement all complete through
+    # here; so does a gateway restart's reconciliation.
+    assert :ok = HarnessProcess.complete_park(db, @codex_key)
+    assert {:ok, :ok} = DB.transaction(db, &HarnessProcess.complete_park_in_txn(&1, @codex_key))
+    assert :ok = HarnessProcess.reconcile(db)
+    assert {:ok, _} = HarnessProcess.reconcile_failed_parks(db)
+
+    assert HarnessProcess.parked?(db, @codex_key)
+    assert HarnessHealth.get(db, incident.id).state == "open"
+    assert lifecycle(db, "rate_limit_hold_released", incident.id) == []
+
+    # A fence with no quota incident behind it completes as before.
+    pi_key = {:pi, "shared", "testhost"}
+    {:ok, _} = HarnessProcess.begin_park(db, pi_key)
+    assert HarnessProcess.parked?(db, pi_key)
+    assert :ok = HarnessProcess.complete_park(db, pi_key)
+    refute HarnessProcess.parked?(db, pi_key)
+  end
+
   test "B5: a post-activity quota failure is recorded and surfaced at once, even with no incident",
        %{db: db} do
     # One session's failure leaves its observation pending: no incident, no

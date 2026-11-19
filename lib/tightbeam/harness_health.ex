@@ -2442,8 +2442,9 @@ defmodule Tightbeam.HarnessHealth do
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
         if input.failure_class == "rate-limit-dead" do
-          HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
-          # Quota v3 R9(b): a later success is a release like any other (B5, R12).
+          # Quota v3 R9(b), a named release (companion v1.2 B2): a later success
+          # lifts the quota park and does what every release does (B5, R12).
+          HarnessProcess.release_quota_park_in_txn(txn, adapter_key(input.harness, input.host))
           Tightbeam.QuotaRelease.released_in_txn(txn, incident.id, input.harness, input.host)
         end
 
