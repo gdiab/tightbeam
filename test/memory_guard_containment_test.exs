@@ -320,6 +320,18 @@ defmodule Tightbeam.MemoryGuardContainmentTest do
     assert String.to_integer(String.trim(oom)) ==
              min(String.to_integer(String.trim(adapter_oom)) + 100, 1000)
 
+    # The budget group outlives a test (T15 drives it to its limit on
+    # purpose), so its local counters are compared with their value now.
+    harness_before =
+      case MemoryGuard.host_view(@host) do
+        %{layout: %{} = layout} ->
+          {:ok, events} = Cgroup.local_events(layout.fs, layout.harness)
+          events
+
+        _ ->
+          nil
+      end
+
     started = System.system_time(:millisecond)
     b_turn = Task.async(fn -> Adapter.prompt(adapter, b, "sleep 20") end)
     a_turn = Task.async(fn -> Adapter.prompt(adapter, a, "runaway") end)
@@ -353,7 +365,9 @@ defmodule Tightbeam.MemoryGuardContainmentTest do
                  Enum.map(rows, &JSON.decode!(hd(&1)))
 
         assert events["oom"] >= 1 and events["oom_group_kill"] >= 1
-        assert {:ok, %{"oom" => 0}} = Cgroup.local_events(layout.fs, layout.harness)
+        # The budget was not the cause: no OOM at the budget group during T1.
+        assert {:ok, %{"oom" => harness_oom}} = Cgroup.local_events(layout.fs, layout.harness)
+        assert harness_oom == harness_before["oom"]
 
         assert {:ok, %{"oom_kill" => 0}} =
                  Cgroup.local_events(layout.fs, Cgroup.session_unit(layout, b))
