@@ -19,6 +19,10 @@ defmodule Tightbeam.MemoryGuard.Settings do
   | `floorRelease`       | 15 (%)                               | above `floorHold`, ≤ 60      |
   | `sessionOomScoreAdj` | 100                                  | 0–1000                       |
 
+  `sessionOomScoreAdj` is the amount a session process raises its own
+  `oom_score_adj` above the value it inherits from the gateway (v1.4 R14:
+  +100; the shared adapter is never written).
+
   `budget` and `sessionLimit` are stored either as a percentage of MemTotal
   (`"50%"`) or as bytes (`"17179869184"`, written from `16G`). The effective
   settings are recomputed on every read, so a change applies to the next

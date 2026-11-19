@@ -657,6 +657,394 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## v1.4 R3a / R3b / R7 / T16-T21: priority and the reserved slot
+
+  describe "priority and the reserved slot (v1.4 R3a, R3b, R7, T16-T21)" do
+    # The setup's first user, "owner", is this gateway's founding user, so its
+    # Main is the reserved Main; "guest"'s Main is another user's Main.
+    setup ctx do
+      # "owner" was created first; make that order strict.
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE users SET createdAt = createdAt + 1000 WHERE userId <> 'owner'")
+
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      guard!(ctx)
+      set_cap!(ctx, 3)
+      %{adapter: adapter!()}
+    end
+
+    defp set_cap!(ctx, cap) do
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(
+            &1,
+            @host,
+            "residentCap",
+            Integer.to_string(cap),
+            "user:owner",
+            16 * @gib
+          )
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+    end
+
+    defp main!(ctx, user, sid \\ nil) do
+      key = Org.personal_session_key(user)
+
+      Org.create(ctx.db, %{
+        session_key: key,
+        display_name: "Main",
+        kind: "main",
+        is_built_in: true,
+        owner_user_id: user,
+        origin: "user:" <> user,
+        archetype: "coder",
+        host: @host,
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
+      })
+
+      if sid, do: Org.append_pointer(ctx.db, key, sid, "created")
+      key
+    end
+
+    defp post!(ctx, key, origin, text) do
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: key,
+          message_id: "m-#{key}-#{text}-#{System.unique_integer([:positive])}",
+          origin: origin,
+          prompt: text
+        })
+
+      seq
+    end
+
+    # Three resident sessions, each with a turn running (busy).
+    defp full_cap!(ctx, adapter, n \\ 3) do
+      keys = for i <- 1..n, do: session!(ctx, "agent:busy-#{i}", "sid-busy-#{i}")
+      resident!(adapter, Enum.map(1..n, &"sid-busy-#{&1}"))
+
+      for key <- keys do
+        post!(ctx, key, "agent:boss", "working")
+        assert :ok = MemoryGuard.admit(key)
+      end
+
+      keys
+    end
+
+    # A busy session's turn ends: its process is idle and closable.
+    defp finish!(ctx, key) do
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE turns SET status='delivered' WHERE sessionKey=?1", [key])
+
+      MemoryGuard.turn_finished(key)
+      _ = :sys.get_state(MemoryGuard)
+    end
+
+    test "T16: at each free slot a Main, then a user-facing session, then workers oldest first; never past a standing reason",
+         ctx do
+      [b1, b2, b3] = full_cap!(ctx, ctx.adapter)
+
+      w1 = session!(ctx, "agent:w1")
+      post!(ctx, w1, "agent:boss", "w1")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(w1)
+      w2 = session!(ctx, "agent:w2")
+      post!(ctx, w2, "agent:boss", "w2")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(w2)
+      m = main!(ctx, "guest")
+      post!(ctx, m, "user:guest", "m")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(m)
+      u = session!(ctx, "agent:u")
+      post!(ctx, u, "user:owner", "u")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(u)
+
+      # No working session was ended or closed to make room.
+      refute_received {:closed, _, _}
+
+      # R7: class and place in line.
+      assert %{reasons: [%{priorityClass: "main", placeInLine: 1}]} =
+               HeldState.read(ctx.db, Org.get(ctx.db, m))
+
+      assert %{reasons: [%{priorityClass: "user-facing", placeInLine: 2}]} =
+               HeldState.read(ctx.db, Org.get(ctx.db, u))
+
+      assert %{reasons: [%{priorityClass: "worker", placeInLine: 3}]} =
+               HeldState.read(ctx.db, Org.get(ctx.db, w1))
+
+      # Each freed slot: every still-waiting lane asks (youngest first, to show
+      # arrival order does not decide); exactly one, the first in line, runs.
+      {admitted, _} =
+        Enum.map_reduce([b1, b2, b3], [w2, w1, u, m], fn busy, waiting ->
+          finish!(ctx, busy)
+          results = for key <- waiting, into: %{}, do: {key, MemoryGuard.admit(key)}
+          assert_receive {:closed, _, "resident_cap"}
+          settle_closes!()
+          assert [winner] = for(key <- waiting, results[key] == :ok, do: key)
+          {winner, waiting -- [winner]}
+        end)
+
+      assert admitted == [m, u, w1]
+    end
+
+    test "T16 variant: a waiter with another standing reason is not admitted past it; the next in line is",
+         ctx do
+      [b1 | _] = full_cap!(ctx, ctx.adapter)
+      m = main!(ctx, "guest")
+      post!(ctx, m, "user:guest", "m")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(m)
+      u = session!(ctx, "agent:u")
+      post!(ctx, u, "user:owner", "u")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(u)
+
+      # M is held by another standing reason (an open limit-fallback hold).
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO limit_fallback_evaluations (sessionKey, turnSeq, heldAt, createdAt) VALUES (?1, ?2, 1, 1)",
+          [m, oldest!(ctx, m)]
+        )
+
+      finish!(ctx, b1)
+      assert :ok = MemoryGuard.admit(u)
+      assert_receive {:closed, "sid-busy-1", "resident_cap"}
+    end
+
+    test "T17: idle workers close first, then user-facing, then an idle Main last", ctx do
+      a = session!(ctx, "agent:worker-a", "sid-a")
+      b = session!(ctx, "agent:facing-b", "sid-b")
+      m = main!(ctx, "guest", "sid-m")
+      resident!(ctx.adapter, ["sid-m", "sid-b", "sid-a"])
+      # B has a staged user post: user-facing, but its process is idle.
+      stage_user_post!(ctx, b)
+      _ = {a, m}
+
+      for {n, expected} <- [{1, "sid-a"}, {2, "sid-b"}, {3, "sid-m"}] do
+        key = session!(ctx, "agent:needs-#{n}")
+        post!(ctx, key, "agent:boss", "go")
+        assert :ok = MemoryGuard.admit(key)
+        assert_receive {:closed, ^expected, "resident_cap"}
+        settle_closes!()
+      end
+    end
+
+    test "T17 variant: R3 never closes the reserved Main; under the floor it closes last", ctx do
+      reserved = main!(ctx, "owner", "sid-r")
+      w = session!(ctx, "agent:idle-w", "sid-w")
+      resident!(ctx.adapter, ["sid-r", "sid-w"])
+      _ = {reserved, w}
+      set_cap!(ctx, 1)
+
+      n1 = session!(ctx, "agent:new-1")
+      post!(ctx, n1, "agent:boss", "go")
+      assert :ok = MemoryGuard.admit(n1)
+      assert_receive {:closed, "sid-w", "resident_cap"}
+      settle_closes!()
+      resident!(ctx.adapter, ["sid-r", "sid-n1"])
+      Org.append_pointer(ctx.db, n1, "sid-n1", "created")
+      post!(ctx, n1, "agent:boss", "busy")
+      MemoryGuard.admit(n1)
+
+      n2 = session!(ctx, "agent:new-2")
+      post!(ctx, n2, "agent:boss", "go")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(n2)
+      refute_received {:closed, "sid-r", _}
+
+      # The floor: the reserved Main is shed only after every idle worker.
+      finish!(ctx, n1)
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib, 10))
+      :ok = MemoryGuard.tick()
+      assert_receive {:closed, "sid-n1", "memory_floor"}
+      settle_closes!()
+      resident!(ctx.adapter, ["sid-r"])
+      :ok = MemoryGuard.tick()
+      assert_receive {:closed, "sid-r", "memory_floor"}
+    end
+
+    test "T19: the reserved Main starts at once in the reserved slot with all cap slots busy; the floor still holds it",
+         ctx do
+      full_cap!(ctx, ctx.adapter)
+      w = session!(ctx, "agent:waiting-w")
+      post!(ctx, w, "agent:boss", "w")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(w)
+
+      m = main!(ctx, "owner")
+      post!(ctx, m, "user:owner", "hello")
+      assert :ok = MemoryGuard.admit(m)
+      refute_received {:closed, _, _}
+
+      Org.append_pointer(ctx.db, m, "sid-main", "created")
+      resident!(ctx.adapter, ["sid-busy-1", "sid-busy-2", "sid-busy-3", "sid-main"])
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(w)
+
+      read = MemoryGuard.read(@host)
+      assert read.residentCount == 3
+      assert read.reservedSlot.inUse
+
+      assert read.reservedSlot.summary ==
+               "resident: 3 of 3, plus owner's Main in its reserved slot"
+
+      # Variant: under the floor the reserved Main is held by memory_floor, never resident_cap.
+      resident!(ctx.adapter, ["sid-busy-1", "sid-busy-2", "sid-busy-3"])
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib, 10))
+      :ok = MemoryGuard.tick()
+      post!(ctx, m, "user:owner", "again")
+      MemoryGuard.turn_finished(m)
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit(m)
+
+      assert %{reasons: [%{detail: "memory_floor", priorityClass: "main", placeInLine: 1}]} =
+               HeldState.read(ctx.db, Org.get(ctx.db, m))
+    end
+
+    test "T20: only the reserved Main uses the slot, even when it is empty; with a cap slot free it still takes the reserve",
+         ctx do
+      set_cap!(ctx, 2)
+      full_cap!(ctx, ctx.adapter, 2)
+      w = session!(ctx, "agent:w")
+      post!(ctx, w, "agent:boss", "w")
+      u = session!(ctx, "agent:u")
+      post!(ctx, u, "user:owner", "u")
+      m2 = main!(ctx, "guest")
+      post!(ctx, m2, "user:guest", "m2")
+
+      for key <- [w, u, m2], do: assert({:held, ["resident_cap"]} = MemoryGuard.admit(key))
+      assert MemoryGuard.read(@host).reservedSlot.inUse == false
+
+      # The reserved Main becomes resident and goes idle: still nobody else's.
+      m = main!(ctx, "owner", "sid-main")
+      resident!(ctx.adapter, ["sid-busy-1", "sid-busy-2", "sid-main"])
+      for key <- [w, u, m2], do: assert({:held, ["resident_cap"]} = MemoryGuard.admit(key))
+      refute_received {:closed, "sid-main", _}
+
+      # Cap slots free: M2, then U, then W.
+      {order, _} =
+        Enum.map_reduce(["agent:busy-1", "agent:busy-2"], [w, u, m2], fn busy, waiting ->
+          finish!(ctx, busy)
+          results = for key <- waiting, into: %{}, do: {key, MemoryGuard.admit(key)}
+          assert_receive {:closed, closed, "resident_cap"}
+          refute closed == "sid-main"
+          settle_closes!()
+          assert [winner] = for(key <- waiting, results[key] == :ok, do: key)
+          {winner, waiting -- [winner]}
+        end)
+
+      assert order == [m2, u]
+
+      # With a cap slot free, M still takes the reserved slot.
+      resident!(ctx.adapter, [])
+      post!(ctx, m, "user:owner", "hello")
+      assert :ok = MemoryGuard.admit(m)
+      assert %{reserved: true} = :sys.get_state(MemoryGuard).reservations[m]
+    end
+
+    test "T21: only the founding user's Main has the slot; an admin's Main waits; with the founder gone the slot stays empty",
+         ctx do
+      Devices.add_user(ctx.db, "synthetic-admin", true)
+      full_cap!(ctx, ctx.adapter)
+
+      # (a) another user's Main arrives first and waits; the founder's starts at once.
+      m2 = main!(ctx, "guest")
+      post!(ctx, m2, "user:guest", "first")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(m2)
+      m = main!(ctx, "owner")
+      post!(ctx, m, "user:owner", "second")
+      assert :ok = MemoryGuard.admit(m)
+
+      # (b) admin standing gives no claim to the slot.
+      admin = main!(ctx, "synthetic-admin")
+      post!(ctx, admin, "user:synthetic-admin", "admin")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(admin)
+
+      # (c) the founder is gone: no reserved Main, and nobody inherits the slot.
+      {:ok, _} = DB.query(ctx.db, "DELETE FROM devices WHERE userId='owner'")
+      {:ok, _} = DB.query(ctx.db, "DELETE FROM users WHERE userId='owner'")
+      MemoryGuard.turn_finished(m)
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(m2)
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(admin)
+      assert MemoryGuard.read(@host).reservedSlot.reservedMain == nil
+      assert MemoryGuard.read(@host).reservedSlot.summary =~ "there is no reserved Main"
+    end
+
+    test "T18: only gateway-recorded user origins make a session user-facing; a held user post gets one marker",
+         ctx do
+      full_cap!(ctx, ctx.adapter)
+
+      # (a) a session's own post, even claiming a user, is agent-originated.
+      a = session!(ctx, "agent:posted-by-agent")
+      post!(ctx, a, "agent:agent:worker", "as-user george")
+      assert Tightbeam.MemoryGuard.Priority.class(ctx.db, Org.get(ctx.db, a)) == "worker"
+
+      # (b) a worker naming itself main is not Main.
+      b = session!(ctx, "agent:main:clawline:owner:main-lookalike")
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE sessions SET displayName='main', archetype='main' WHERE sessionKey=?1",
+          [b]
+        )
+
+      post!(ctx, b, "agent:boss", "x")
+      assert Tightbeam.MemoryGuard.Priority.class(ctx.db, Org.get(ctx.db, b)) == "worker"
+
+      # (c) George posts from his device while the cap is full.
+      w = session!(ctx, "agent:worker-w")
+      post!(ctx, w, "agent:boss", "w")
+      assert {:held, _} = MemoryGuard.admit(w)
+      c = session!(ctx, "agent:talked-to")
+      post!(ctx, c, "user:owner", "hi")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(c)
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit(c)
+
+      assert %{reasons: [%{priorityClass: "user-facing", placeInLine: 1}]} =
+               HeldState.read(ctx.db, Org.get(ctx.db, c))
+
+      assert [{^c, %{"detail" => "resident_cap", "placeInLine" => 1}}] =
+               events(ctx.db, "memory_guard_waiting")
+
+      assert [[text]] = markers(ctx.db, c)
+      assert text =~ "Waiting for a free agent slot on #{@host}: all 3 are busy with other work."
+      assert text =~ "You are first in line, and nothing was stopped to make room."
+      # The worker's agent-originated hold posts no marker.
+      assert markers(ctx.db, w) == []
+    end
+  end
+
+  defp oldest!(ctx, key) do
+    {:ok, [[seq]]} =
+      DB.query(
+        ctx.db,
+        "SELECT seq FROM turns WHERE sessionKey=?1 AND status='queued' ORDER BY seq LIMIT 1",
+        [key]
+      )
+
+    seq
+  end
+
+  defp stage_user_post!(ctx, key) do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO wakes (wakeId, sessionKey, origin, prompt, dueAt, createdAt) VALUES (?1, ?2, 'user:owner', 'staged', 0, 0)",
+        ["w-staged-#{System.unique_integer([:positive])}", key]
+      )
+  end
+
+  defp markers(db, key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT content FROM messages WHERE sessionKey=?1 AND content LIKE 'Waiting for%' ORDER BY seq",
+        [key]
+      )
+
+    rows
+  end
+
   defp seq_of(db, key) do
     {:ok, [[seq]]} =
       DB.query(db, "SELECT seq FROM turns WHERE sessionKey=?1 ORDER BY seq DESC LIMIT 1", [key])
