@@ -2826,7 +2826,8 @@ defmodule Tightbeam.Assignments do
   # verification; that route is kept beside receipts (parity port of #618).
   defp require_producer_commit_refs_after_evidence(txn, call) do
     if call.params[:kind] == "verdict" and call.params[:verdict_kind] == "verified" and
-         call.params[:commit_refs] in [nil, []] and not Map.has_key?(call, :validated_receipts) and
+         call.params[:commit_refs] in [nil, []] and call.params[:receipts] in [nil, []] and
+         not Map.has_key?(call, :validated_receipts) and
          is_nil(call[:validated_operational_evidence]) do
       case Txn.q(
              txn,
@@ -2915,11 +2916,10 @@ defmodule Tightbeam.Assignments do
                JOIN sessions ps ON ps.sessionKey=producer.holderKey
                WHERE review.id=?1
                  AND (review.reviewsAssignmentId=art.producedByAssignmentId
-                      OR (review.reviewsAssignmentId IS NULL
-                          AND review.id=art.producedByAssignmentId
+                      OR (review.id=art.producedByAssignmentId
                           AND review.workItemId=art.workItemId
                           AND review.holderKey=?4
-                          AND ?3='verified'))
+                          AND (review.reviewsAssignmentId IS NOT NULL OR ?3='verified')))
                  AND rs.ownerUserId=wi.ownerUserId
                  AND ps.ownerUserId=wi.ownerUserId
                """,
@@ -2942,7 +2942,7 @@ defmodule Tightbeam.Assignments do
           [] ->
             error(
               "invalid_revision_binding",
-              "expected an artifact produced by this assignment for holder verification, " <>
+              "expected an artifact produced by this assignment for a holder verdict, " <>
                 "or by the assignment reviewed by this review card"
             )
         end

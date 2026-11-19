@@ -142,6 +142,8 @@ defmodule Tightbeam.OperationalReceiptsTest do
       # refused as not applicable, never silently dropped.
       assert {:ok, %{assignment: %{state: "closed"}}} = complete(ctx, card)
 
+      assert %{code: "assignment_closed"} = refused(verify(ctx, card, [first]))
+
       assert %{code: "operational_receipts_not_applicable"} =
                refused(
                  attest(ctx, ctx.holder, %{
