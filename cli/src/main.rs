@@ -10,6 +10,7 @@ mod contain;
 mod credential_health;
 mod cursor_execution_identity;
 mod cursor_rails;
+mod device_recovery;
 mod dispatch;
 mod github_auth;
 mod harness_process;
