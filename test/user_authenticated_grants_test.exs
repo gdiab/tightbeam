@@ -15,6 +15,7 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
   alias Tightbeam.{
     ConnRegistry,
     DB,
+    DeviceLifecycle,
     Devices,
     GrantAuth,
     Gateway,
@@ -501,7 +502,8 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     end
 
     params = %{
-      "approve-device" => %{device_id: "visitor"},
+      "approve-device" => %{user_id: "guest"},
+      "recovery-enroll" => %{},
       "deny-device" => %{device_id: "visitor"},
       "revoke-device" => %{device_id: "ipad"},
       "promote-user" => %{user_id: "guest", is_admin: true},
@@ -511,7 +513,7 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     }
 
     open = ask(ctx, ctx.worker, ["accept", "dismiss"])
-    before = business_rows(ctx.db)
+    before = {business_rows(ctx.db), credential_rows(ctx.db)}
 
     for {label, proof} <- forged_proofs do
       # Through the gateway's protected handlers...
@@ -523,11 +525,16 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
 
       # ...and straight into the in-transaction writers, past every handler.
       assert %{code: "user_authentication_required"} =
-               Devices.approve_with_firehose(
+               DeviceLifecycle.issue_code(
                  ctx.db,
-                 "visitor",
-                 nil,
-                 forge.(%{verb: "approve-device", params: %{device_id: "visitor"}}, proof)
+                 forge.(%{verb: "approve-device", params: %{user_id: "guest"}}, proof),
+                 "guest"
+               )
+
+      assert %{code: "user_authentication_required"} =
+               DeviceLifecycle.enroll(
+                 ctx.db,
+                 forge.(%{verb: "recovery-enroll", params: %{}}, proof)
                )
 
       assert %{code: "user_authentication_required"} =
@@ -544,21 +551,22 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
       assert %{code: "user_authentication_required"} = ruled, "operator-rule with #{label}"
     end
 
-    assert business_rows(ctx.db) == before
+    assert {business_rows(ctx.db), credential_rows(ctx.db)} == before
     assert {:ok, [["open", nil]]} = ruling(ctx.db, open)
     refute_received {:sh, _}
+    refute_received {:tightbeam_ephemeral, _}
 
     # Control: the same call carrying the named device's proof is accepted, so the
     # refusals above are the proof check and nothing else.
-    lift!()
-
-    assert %{approved: %{device_id: "visitor"}} =
+    assert %{code_id: "pc_" <> _} =
              handler(ctx, "approve-device").(
                TestDevices.device_call(ctx.george, %{
                  verb: "approve-device",
-                 params: %{device_id: "visitor"}
+                 params: %{user_id: "guest"}
                })
              )
+
+    assert_received {:tightbeam_ephemeral, _code}
   end
 
   test "K25 (C21.4): an internal call naming Main without Main's credential proof cannot rule",
@@ -885,6 +893,13 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
 
   defp ruling(db, id),
     do: DB.query(db, "SELECT status, ruledBy FROM decision_requests WHERE id = ?1", [id])
+
+  defp credential_rows(db) do
+    for table <- ~w(pairing_codes recovery_secrets) do
+      {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY 1")
+      {table, rows}
+    end
+  end
 
   defp business_rows(db) do
     for table <- ~w(users devices device_versions hosts) do

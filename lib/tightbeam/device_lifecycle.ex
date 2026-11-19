@@ -315,9 +315,9 @@ defmodule Tightbeam.DeviceLifecycle do
     end
   end
 
-  @doc false
   # Store a code, then keep at most 5 outstanding by invalidating the oldest (S0.3).
-  def insert_code_in_txn(txn, id, verifier, salt, user, device, recovery?, issued_at, expires_at) do
+  # Private: callers reach it only through the gated `issue_code/3` (review B1).
+  defp insert_code_in_txn(txn, id, verifier, salt, user, device, recovery?, issued_at, expires_at) do
     Txn.q(
       txn,
       """
@@ -417,8 +417,8 @@ defmodule Tightbeam.DeviceLifecycle do
     end
   end
 
-  @doc false
-  def enroll_in_txn(txn, user, verifier, salt, at) do
+  # Private: callers reach it only through the gated `enroll/2` (review B1).
+  defp enroll_in_txn(txn, user, verifier, salt, at) do
     Txn.q(
       txn,
       """

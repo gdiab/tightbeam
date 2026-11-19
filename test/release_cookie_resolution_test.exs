@@ -326,7 +326,9 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
             {Tightbeam.Devices, :add_user, 3},
             {Tightbeam.Devices, :set_user_admin, 3},
             {Tightbeam.Placement, :register_host, 3},
-            {Tightbeam.Devices, :approve_with_firehose, 4}
+            {Tightbeam.DeviceLifecycle, :insert_code_in_txn, 9},
+            {Tightbeam.DeviceLifecycle, :enroll_in_txn, 5},
+            {Tightbeam.DeviceLifecycle, :issue_code, 3}
           ] do
         {:module, ^m} = Code.ensure_loaded(m)
         IO.puts("EXPORTED #{inspect({m, f, a})}=#{function_exported?(m, f, a)}")
@@ -340,8 +342,10 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
           "EXPORTED {Tightbeam.Devices, :add_user, 3}=false",
           "EXPORTED {Tightbeam.Devices, :set_user_admin, 3}=false",
           "EXPORTED {Tightbeam.Placement, :register_host, 3}=false",
+          "EXPORTED {Tightbeam.DeviceLifecycle, :insert_code_in_txn, 9}=false",
+          "EXPORTED {Tightbeam.DeviceLifecycle, :enroll_in_txn, 5}=false",
           # The gated writer stays: it is the production path.
-          "EXPORTED {Tightbeam.Devices, :approve_with_firehose, 4}=true"
+          "EXPORTED {Tightbeam.DeviceLifecycle, :issue_code, 3}=true"
         ] do
       assert out =~ line, out
     end
