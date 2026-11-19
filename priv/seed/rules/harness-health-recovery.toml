@@ -1,12 +1,12 @@
 [[reaction]]
 name = "harness-health-recovery"
 family = "harness-health-recovery"
-settings = { eligible_failure_classes = ["rate-limit-dead"], interval_ms = 3600000, timeout_ms = 120000, start = "schedule_one_cycle_for_eligible_open_hold", withdraw = "withdraw_resolved_or_ineligible_cycle_at_delivery", reschedule = "move_the_single_pending_cycle_in_place", release = "resolve_only_after_all_constituent_routes_succeed" }
+settings = { eligible_failure_classes = ["rate-limit-dead"], first_interval_ms = 120000, interval_ms = 3600000, daily_probe_cap = 24, timeout_ms = 120000, start = "schedule_one_cycle_for_eligible_open_hold", withdraw = "withdraw_resolved_or_ineligible_cycle_at_delivery", reschedule = "move_the_single_pending_cycle_in_place", release = "resolve_only_after_all_constituent_routes_succeed" }
 english = """
 Trigger: a harness-health hold opens or resolves, a scheduled cycle becomes due, or cycle results are recorded.
-Conditions: the hold is open and its failure class is listed above; the seeded list contains rate-limit-dead only.
-Effect and recipient: schedule or withdraw the hold's one check cycle, and release only after every constituent route succeeds in the same cycle; no agent or user is notified.
-Timing, repetition, and stop: the first cycle is due one interval (one hour by default) after opening; later cycles are due one interval after the previous cycle started; resolved or ineligible holds stop, and missed intervals are not caught up.
+Conditions: the hold is open and its failure class is listed above; the seeded list contains rate-limit-dead only. A rate-limit hold is checked only while its reset is unknown: never while a declared reset is pending, and never after any release.
+Effect and recipient: schedule or withdraw the hold's one check cycle, which sends one fixed minimal request for the held key, and release only after it succeeds; each check is recorded by time, key and outcome, with no provider output; no agent or user is notified.
+Timing, repetition, and stop: the first cycle is due first_interval_ms (two minutes) after opening; each later cycle is due after the previous cycle started by double the last interval, capped at interval_ms (one hour); at most daily_probe_cap (24) checks start on one key in any rolling 24 hours; resolved, released or ineligible holds stop, and missed intervals are not caught up.
 Owning bundle: substrate base seed.
 Intentional change: an eligible availability hold can be reassessed without waiting for a human repair resume.
 """

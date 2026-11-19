@@ -64,8 +64,8 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
              {:ok, schedule, hold} ->
                if hold["routesComplete"] and hold["routes"] != [] do
                  checks =
-                   hold["routes"]
-                   |> Enum.sort_by(&route_key/1)
+                   txn
+                   |> probe_routes(hold)
                    |> Enum.flat_map(fn route ->
                      case insert_running_in_txn(txn, schedule, hold, route) do
                        {:inserted, check} -> [check]
@@ -209,7 +209,6 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
 
   defp record_result(db, check, {outcome, excerpt}) do
     now = System.system_time(:millisecond)
-    excerpt = sanitize_excerpt(excerpt)
 
     case DB.transaction(db, fn txn ->
            record_result_in_txn(
@@ -252,8 +251,12 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
           String.t() | nil,
           integer()
         ) :: :ok | {:released, map()}
-  def record_result_in_txn(txn, hold_id, cycle_id, route_key, outcome, excerpt, finished_at)
+  # Companion v1.6 PR5: a probe is recorded by time, key and outcome class;
+  # no provider output is stored or surfaced, whatever the caller passes.
+  def record_result_in_txn(txn, hold_id, cycle_id, route_key, outcome, _excerpt, finished_at)
       when outcome in ["succeeded", "failed", "inconclusive", "uncheckable"] do
+    excerpt = nil
+
     case Txn.q(
            txn,
            "SELECT routeJson,startedAt,eventId,org,outcome FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3",
@@ -342,11 +345,11 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
   defp all_current_routes_succeeded?(
          txn,
          hold_id,
-         %{"routesComplete" => true, "routes" => routes},
+         %{"routesComplete" => true, "routes" => routes} = hold,
          cycle_id
        )
        when is_list(routes) and routes != [] do
-    Enum.all?(routes, fn route ->
+    Enum.all?(probe_routes(txn, hold), fn route ->
       case Txn.q(
              txn,
              "SELECT outcome FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3",
@@ -359,6 +362,33 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
   end
 
   defp all_current_routes_succeeded?(_txn, _hold_id, _hold, _cycle_id), do: false
+
+  # Companion v1.6 PR2: one probe per held key ({harness,"shared",host}), not
+  # one per session or per model. Its model is fixed for the hold: the model
+  # of the incident's earliest observed failure, among the hold's routes. A
+  # model still limited after a success re-parks the key on its first real
+  # turn (B4).
+  defp probe_routes(txn, %{"id" => hold_id, "routes" => routes}) do
+    first_model =
+      case Txn.q(
+             txn,
+             """
+             SELECT t.model FROM harness_health_observations o
+             JOIN turns t ON o.correlationId='harness-turn:' || t.seq || ':' || o.failureClass
+             WHERE o.incidentId=?1
+               AND o.evidenceKind IN ('terminal-failure','authoritative-provider')
+               AND t.model IS NOT NULL
+             ORDER BY o.observedAt,o.id LIMIT 1
+             """,
+             [hold_id]
+           ) do
+        [[model]] -> model
+        [] -> nil
+      end
+
+    sorted = Enum.sort_by(routes, &route_key/1)
+    [Enum.find(sorted, hd(sorted), &(&1["model"] == first_model))]
+  end
 
   defp warn_uncheckable_in_txn(txn, hold_id, reason, at) do
     event_id = "harness-health-recovery-uncheckable:" <> hold_id
