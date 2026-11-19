@@ -1260,15 +1260,23 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
         "Internal error: The Claude Agent process exited unexpectedly. Please start a new session."
     }
 
-    for {label, harness, failure} <- [
-          {"the adapter process dies (transport loss)", :codex,
-           Macro.escape({:adapter_unavailable, "acp exited with status 137"})},
-          {"the harness answers with its process-exit error", :claude,
-           Macro.escape(@claude_process_exit)}
+    for {label, harness, failure, cause} <- [
+          {"the adapter process dies (R4, transport loss)", :codex,
+           Macro.escape({:adapter_unavailable, "acp exited with status 137"}), "harness_exited"},
+          {"the harness answers with its process-exit error (R4)", :claude,
+           Macro.escape(@claude_process_exit), "harness_exited"},
+          {"the harness never answered after its turn-end report (R6, R7)", :claude,
+           Macro.escape({:unknown_effect, "response_missing", %{}}), "response_missing"},
+          {"settle-turn settled the quiet held turn (R8)", :codex,
+           Macro.escape(
+             {:unknown_effect, "operator_settle", %{principal: "user:op", reason: "stale"}}
+           ), "operator_settle"}
         ] do
-      test "R4: a dispatched turn ended because #{label} settles unknown_effect, is surfaced once and never replayed" do
+      test "a dispatched turn ended because #{label} settles unknown_effect, is surfaced once and never replayed" do
         failure = unquote(failure)
         harness = unquote(harness)
+        cause = unquote(cause)
+        held_state = if cause == "harness_exited", do: "harness_exited"
 
         with_gateway(fn ctx ->
           key = "s1-exit-#{harness}"
@@ -1296,16 +1304,21 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
 
           assert turn_status(ctx.db, seq) == "failed_unknown"
           assert turn_error(ctx.db, seq) == "unknown_effect"
-          assert terminal_cause(ctx.db, seq) == "harness_exited"
+          assert terminal_cause(ctx.db, seq) == cause
+
+          # R8 records the requesting principal on the terminal.
+          if cause == "operator_settle",
+            do: assert(terminal_principal(ctx.db, seq) == "user:op")
+
           assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
 
           # R10: the reads show the terminal, its cause and the held state.
           assert %{reason: "latest_terminal_failed", evidence: %{turn: breathing_turn}} =
                    Tightbeam.Breathing.query(ctx.db, "session", key)
 
-          assert %{seq: ^seq, status: "failed_unknown", cause: "harness_exited"} = breathing_turn
+          assert %{seq: ^seq, status: "failed_unknown", cause: ^cause} = breathing_turn
 
-          assert %{turnSeq: ^seq, cause: "harness_exited", heldState: "harness_exited"} =
+          assert %{turnSeq: ^seq, cause: ^cause, heldState: ^held_state} =
                    Tightbeam.TurnSettlementView.settlement(
                      Tightbeam.TurnSettlementView.latest_turn(ctx.db, key)
                    )
@@ -1365,6 +1378,17 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
   defp turn_error(db, seq) do
     {:ok, [[error]]} = DB.query(db, "SELECT error FROM turns WHERE seq=?1", [seq])
     error
+  end
+
+  defp terminal_principal(db, seq) do
+    {:ok, [[principal]]} =
+      DB.query(
+        db,
+        "SELECT principal FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed'",
+        [seq]
+      )
+
+    principal
   end
 
   defp terminal_cause(db, seq) do
