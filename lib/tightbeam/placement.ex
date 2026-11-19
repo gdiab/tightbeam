@@ -835,6 +835,8 @@ defmodule Tightbeam.Placement do
   end
 
   @doc false
+  # Registers only for an admin-paired device (core-v8 C2); any other caller gets
+  # `{:refused, refusal}` and nothing is written.
   def register_host_with_firehose(db, name, config, call) do
     entry = %{
       ssh: Map.fetch!(config, :ssh),
@@ -845,6 +847,21 @@ defmodule Tightbeam.Placement do
 
     {:ok, result} =
       DB.transaction(db, fn txn ->
+        case Tightbeam.GrantAuth.authorize_in_txn(txn, call) do
+          :ok -> register_in_txn(txn, name, entry, call)
+          refusal -> {:refused, refusal}
+        end
+      end)
+
+    case result do
+      {:refused, refusal} -> {:refused, refusal}
+      registration -> {:ok, registration}
+    end
+  end
+
+  # C2: the admin-paired-device check above shares this transaction.
+  defp register_in_txn(txn, name, entry, call) do
+    (
         new_host? = DB.Txn.q(txn, "SELECT 1 FROM hosts WHERE name = ?1", [name]) == []
 
         needs_projection? =
@@ -877,9 +894,7 @@ defmodule Tightbeam.Placement do
           end
 
         %{entry: entry, projection: projection, changed: new_host?}
-      end)
-
-    {:ok, result}
+    )
   end
 
   @doc """

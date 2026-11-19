@@ -62,7 +62,7 @@ defmodule Tightbeam.OwnerAlerts do
   @owner_alerts_table_ddl """
   CREATE TABLE owner_alerts (
     alertId           TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback')),
+    kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback','pairing-freeze-lifted')),
     dedupeKey         TEXT NOT NULL,
     ownerUserId       TEXT NOT NULL,
     originSessionKey  TEXT NOT NULL,
@@ -531,6 +531,31 @@ defmodule Tightbeam.OwnerAlerts do
     if zone in [nil, "", "UTC", "Etc/UTC", "UCT", "Zulu", "Universal"],
       do: "Etc/UTC",
       else: zone
+  end
+
+  ## Pairing freeze lifted (core fix (A) C6a)
+
+  @doc """
+  Create the `pairing-freeze-lifted` alert for one frozen-to-lifted observation,
+  inside the transaction that recorded it. Its `dedupeKey` is the observation
+  time, so one transition alerts once. Alerts that are off create nothing.
+  """
+  @spec pairing_freeze_lifted_in_txn(Txn.t(), integer(), String.t()) ::
+          {:created, String.t()} | :exists | :off
+  def pairing_freeze_lifted_in_txn(%Txn{} = txn, observed_at, body) do
+    case owner_in_txn(txn) do
+      owner when is_binary(owner) ->
+        create_in_txn(txn, %{
+          kind: "pairing-freeze-lifted",
+          dedupe_key: "pairing-freeze-lifted:#{observed_at}",
+          owner: owner,
+          title: "The pairing freeze is lifted",
+          body: body
+        })
+
+      _ ->
+        :off
+    end
   end
 
   ## Shared record
