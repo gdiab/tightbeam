@@ -1,7 +1,7 @@
 defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Escalation, Model, Org, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Escalation, Model, Org, TestDevices, Wakes}
 
   defmodule LaneDoorbell do
     use GenServer
@@ -31,7 +31,10 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
       {Wakes, db: db, name: scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
     )
 
-    %{db: db, scheduler: scheduler, raiser: raiser}
+    # Core fix (A): flynn's operator-rule comes from flynn's paired device.
+    device = TestDevices.paired!(db, "flynn")
+
+    %{db: db, scheduler: scheduler, raiser: raiser, device: device}
   end
 
   test "a linked ruled dr_x corruption refuses after visibility and records request identity",
@@ -45,7 +48,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
     assert %{status: "ruled"} =
              Escalation.operator_rule(
                ctx.db,
-               owner_operator_rule(request.id, %{decision: "accept"}),
+               owner_operator_rule(ctx.device, request.id, %{decision: "accept"}),
                scheduler: ctx.scheduler
              )
 
@@ -99,7 +102,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
                [corrupt_id]
              )
 
-    owner_call = owner_operator_rule(corrupt_id, %{})
+    owner_call = owner_operator_rule(ctx.device, corrupt_id, %{})
 
     detail = Escalation.get(ctx.db, owner_call, corrupt_id)
     listed = Escalation.list(ctx.db, owner_call, "ruled", owner_user_id: "flynn")
@@ -107,7 +110,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
     replay =
       Escalation.operator_rule(
         ctx.db,
-        owner_operator_rule(corrupt_id, %{decision: "accept"}),
+        owner_operator_rule(ctx.device, corrupt_id, %{decision: "accept"}),
         scheduler: ctx.scheduler
       )
 
@@ -150,13 +153,11 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
     }
   end
 
-  defp owner_operator_rule(id, params) do
-    %{
+  defp owner_operator_rule(device, id, params) do
+    TestDevices.device_call(device, %{
       verb: "operator-rule",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
       transport_session_key: "agent:raiser:app",
       params: Map.put(params, :request, id)
-    }
+    })
   end
 end

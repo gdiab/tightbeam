@@ -34,13 +34,16 @@ defmodule Tightbeam.AdminProjectionTest do
 
       Devices.add_user(db, "flynn", true)
       Devices.add_user(db, "operator", false)
+      # Core fix (A): register-host and promote-user run only from an admin's paired
+      # device, so flynn acts for them through one.
+      flynn_device = Tightbeam.TestDevices.paired!(db, "flynn", admin: true)
 
       start_supervised!({Hub, name: Hub})
       :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
 
       on_exit(fn -> File.rm_rf!(base_dir) end)
 
-      %{base_dir: base_dir, db: db}
+      %{base_dir: base_dir, db: db, flynn_device: flynn_device}
     else
       :ok
     end
@@ -191,7 +194,7 @@ defmodule Tightbeam.AdminProjectionTest do
                  cli_bin: "/secret/bin",
                  adapter_bin_dir: "/secret/adapters"
                },
-               firehose_call("register-host", %{})
+               device_call(ctx, "register-host")
              )
 
     assert_notice("verb.accepted")
@@ -201,7 +204,7 @@ defmodule Tightbeam.AdminProjectionTest do
              Devices.promote_user_with_firehose(
                ctx.db,
                "operator",
-               firehose_call("promote-user", %{})
+               device_call(ctx, "promote-user")
              )
 
     assert_notice("verb.accepted")
@@ -498,7 +501,7 @@ defmodule Tightbeam.AdminProjectionTest do
              Devices.promote_user_with_firehose(
                ctx.db,
                "operator",
-               firehose_call("promote-user", %{})
+               device_call(ctx, "promote-user")
              )
 
     assert_notice("verb.accepted")
@@ -509,7 +512,7 @@ defmodule Tightbeam.AdminProjectionTest do
              Devices.promote_user_with_firehose(
                ctx.db,
                "operator",
-               firehose_call("promote-user", %{})
+               device_call(ctx, "promote-user")
              )
 
     assert_notice("verb.accepted")
@@ -644,7 +647,7 @@ defmodule Tightbeam.AdminProjectionTest do
                  cli_bin: "/secret/cli",
                  adapter_bin_dir: "/secret/adapters"
                },
-               firehose_call("register-host", %{})
+               device_call(ctx, "register-host")
              )
 
     assert_notice("verb.accepted")
@@ -654,7 +657,7 @@ defmodule Tightbeam.AdminProjectionTest do
              Devices.promote_user_with_firehose(
                ctx.db,
                "operator",
-               firehose_call("promote-user", %{})
+               device_call(ctx, "promote-user")
              )
 
     assert_notice("verb.accepted")
@@ -800,7 +803,7 @@ defmodule Tightbeam.AdminProjectionTest do
                  base_dir: "/synthetic/private",
                  cli_bin: "/synthetic/bin"
                },
-               firehose_call("register-host", %{})
+               device_call(ctx, "register-host")
              )
 
     host_bytes =
@@ -951,6 +954,11 @@ defmodule Tightbeam.AdminProjectionTest do
       params: params,
       firehose_in_txn: true
     }
+  end
+
+  # Core fix (A): a protected act carried on flynn's admin-paired device.
+  defp device_call(ctx, verb) do
+    Tightbeam.TestDevices.device_call(ctx.flynn_device, firehose_call(verb, %{}))
   end
 
   defp assert_notice(class) do

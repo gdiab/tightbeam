@@ -455,6 +455,10 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     alias Tightbeam.Firehose.Hub
     Devices.add_user(db, "synthetic-owner", true)
     Devices.add_user(db, "target-user", false)
+    # Core fix (A): promote-user runs only from a paired device; the admin acts and the
+    # non-admin is refused from their own devices.
+    owner_device = Tightbeam.TestDevices.paired!(db, "synthetic-owner")
+    target_device = Tightbeam.TestDevices.paired!(db, "target-user")
     hub = start_supervised!({Hub, name: Hub})
 
     :ok =
@@ -462,14 +466,13 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
 
     handlers = Tightbeam.Gateway.handlers(%{db: db})
 
-    call = %{
-      verb: "promote-user",
-      origin: "user:synthetic-owner",
-      principal: {:user, "synthetic-owner"},
-      session_key: nil,
-      params: %{user_id: "target-user"},
-      firehose_hub: hub
-    }
+    call =
+      Tightbeam.TestDevices.device_call(owner_device, %{
+        verb: "promote-user",
+        session_key: nil,
+        params: %{user_id: "target-user"},
+        firehose_hub: hub
+      })
 
     for {admin, class} <- [{true, "user.promoted"}, {false, "user.demoted"}] do
       current = put_in(call.params, %{user_id: "target-user", is_admin: admin})
@@ -487,7 +490,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       refute_receive {:firehose_notice, %{"class" => ^class}}
     end
 
-    denied = %{call | origin: "user:target-user", principal: {:user, "target-user"}}
+    denied = Tightbeam.TestDevices.device_call(target_device, call)
     assert {:error, %{code: "forbidden"}} = Dispatch.dispatch(db, handlers, denied)
     refute Devices.user(db, "target-user").is_admin
   end
@@ -581,7 +584,16 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       firehose_hub: hub
     }
 
-    assert {:ok, %{user: user}} = Dispatch.dispatch(db, handlers, call)
+    # Core fix (A): add-user runs only from an admin's paired device.
+    owner_device = Tightbeam.TestDevices.paired!(db, "synthetic-owner")
+
+    assert {:ok, %{user: user}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               Tightbeam.TestDevices.device_call(owner_device, call)
+             )
+
     assert user["userId"] == "new-user"
     assert user["isAdmin"] == false
     assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
@@ -724,15 +736,17 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     :ok =
       Hub.register(hub, self(), %{mode: :all, db: db, user_id: "synthetic-owner", is_admin: true})
 
-    registration_call = %{
-      verb: "register-host",
-      origin: "user:synthetic-owner",
-      principal: {:user, "synthetic-owner"},
-      session_key: nil,
-      params: %{name: "synthetic-host"},
-      firehose_hub: hub,
-      firehose_in_txn: true
-    }
+    # Core fix (A): register-host runs only from an admin's paired device.
+    registration_call =
+      db
+      |> Tightbeam.TestDevices.paired!("synthetic-owner")
+      |> Tightbeam.TestDevices.device_call(%{
+        verb: "register-host",
+        session_key: nil,
+        params: %{name: "synthetic-host"},
+        firehose_hub: hub,
+        firehose_in_txn: true
+      })
 
     assert {:ok, %{changed: true}} =
              Placement.register_host_with_firehose(
@@ -813,6 +827,21 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       model: nil
     })
 
+    # Core fix (A): the device acts run only from a paired device (the admin's acts,
+    # a non-admin's is refused `forbidden`), and approve-device only with the pairing
+    # freeze lifted.
+    owner_device = Tightbeam.TestDevices.paired!(db, "synthetic-owner")
+    outsider_device = Tightbeam.TestDevices.paired!(db, "outsider")
+    Application.put_env(:tightbeam, :pairing_unfreeze_path, "/usr/bin/env")
+
+    on_exit(fn ->
+      Application.put_env(
+        :tightbeam,
+        :pairing_unfreeze_path,
+        "/nonexistent/tightbeam-test/pairing-unfreeze"
+      )
+    end)
+
     hub = start_supervised!({Hub, name: nil})
 
     :ok =
@@ -836,20 +865,19 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
 
       before = StateResources.query_device(db, id)
 
-      call = %{
-        verb: verb,
-        origin: "user:outsider",
-        principal: {:user, "outsider"},
-        session_key: nil,
-        params: %{device_id: id, user_id: "synthetic-owner"},
-        firehose_hub: hub
-      }
+      call =
+        Tightbeam.TestDevices.device_call(outsider_device, %{
+          verb: verb,
+          session_key: nil,
+          params: %{device_id: id, user_id: "synthetic-owner"},
+          firehose_hub: hub
+        })
 
       assert {:error, %{code: "forbidden"}} = Dispatch.dispatch(db, handlers, call)
       assert StateResources.query_device(db, id) == before
       assert_receive {:firehose_notice, %{"class" => "verb.denied"}}
       Hub.delivered(hub, self())
-      allowed = %{call | origin: "user:synthetic-owner", principal: {:user, "synthetic-owner"}}
+      allowed = Tightbeam.TestDevices.device_call(owner_device, call)
       assert {:ok, _} = Dispatch.dispatch(db, handlers, allowed)
       assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
       Hub.delivered(hub, self())

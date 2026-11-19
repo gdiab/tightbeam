@@ -738,7 +738,8 @@ defmodule Tightbeam.D1ReadRouteTest do
                  cli_bin: "/tmp/tightbeam",
                  adapter_bin_dir: "/tmp/adapters"
                },
-               call
+               # Core fix (A): register-host runs only from an admin's paired device.
+               Tightbeam.TestDevices.device_call(ctx.admin, call)
              )
 
     _barrier = Hub.sequence(Hub, self())

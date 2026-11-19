@@ -1123,6 +1123,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Tightbeam.Schema.ensure_all(db)
     :ok = Hub.register(Hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
+    # Core fix (A): flynn rules the owner request from flynn's own paired device.
+    flynn_device = Tightbeam.TestDevices.paired!(db, "flynn", admin: true)
     register_testhost(db)
     assert observed_state_classes() == ["session.spawned"]
 
@@ -1186,14 +1188,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert replay_id == request.id
     assert observed_classes() == ["verb.accepted"]
 
-    rule = %{
-      verb: "operator-rule",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      transport_session_key: "operator-raiser",
-      session_key: nil,
-      params: %{request: request.id, decision: "ship"}
-    }
+    rule =
+      Tightbeam.TestDevices.device_call(flynn_device, %{
+        verb: "operator-rule",
+        transport_session_key: "operator-raiser",
+        session_key: nil,
+        params: %{request: request.id, decision: "ship"}
+      })
 
     assert {:ok, %{status: "ruled"}} = Dispatch.dispatch(db, handlers, rule)
 
