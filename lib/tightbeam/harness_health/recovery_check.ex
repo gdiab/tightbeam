@@ -207,11 +207,8 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
   @doc false
   def binary_selection_program(harness), do: HarnessCheck.binary_selection_program(harness)
 
-  # Companion v1.6 PR5: a probe is recorded by time, key and outcome class;
-  # no provider output is stored or surfaced.
-  defp record_result(db, check, {outcome, _provider_output}) do
+  defp record_result(db, check, {outcome, excerpt}) do
     now = System.system_time(:millisecond)
-    excerpt = nil
 
     case DB.transaction(db, fn txn ->
            record_result_in_txn(
@@ -254,8 +251,12 @@ defmodule Tightbeam.HarnessHealth.RecoveryCheck do
           String.t() | nil,
           integer()
         ) :: :ok | {:released, map()}
-  def record_result_in_txn(txn, hold_id, cycle_id, route_key, outcome, excerpt, finished_at)
+  # Companion v1.6 PR5: a probe is recorded by time, key and outcome class;
+  # no provider output is stored or surfaced, whatever the caller passes.
+  def record_result_in_txn(txn, hold_id, cycle_id, route_key, outcome, _excerpt, finished_at)
       when outcome in ["succeeded", "failed", "inconclusive", "uncheckable"] do
+    excerpt = nil
+
     case Txn.q(
            txn,
            "SELECT routeJson,startedAt,eventId,org,outcome FROM harness_health_recovery_checks WHERE holdId=?1 AND cycleId=?2 AND routeKey=?3",
