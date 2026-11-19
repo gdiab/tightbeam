@@ -455,6 +455,84 @@ defmodule Tightbeam.OwnerAlertsTest do
     assert [%{session_key: ^enabled}] = alerts(db)
   end
 
+  test "T14: a removed user is refused as the owner by name", %{db: db} do
+    config = config_handler(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users(userId,isAdmin,createdAt,removedAt,removedBy) VALUES('gone',0,1,2,'admin')"
+      )
+
+    assert %{code: "user_removed"} =
+             config.(%{action: "set", setting: "owner-alerts-user", value: "gone"})
+
+    assert Org.get_setting(db, "owner-alerts-user") == nil
+    fail_turn(db, session(db, "agent:george:refused-removed"), @codex_limit)
+    assert alerts(db) == []
+  end
+
+  test "T14: an owner removed after it was set gets no new alerts; its unsent ones are withdrawn as off",
+       %{db: db, main: main} do
+    enable(db)
+
+    # A pending alert after a definite failure, and one whose send is uncertain.
+    failed_session = session(db, "agent:george:before-removal")
+    fail_turn(db, failed_session, @codex_limit)
+    failed = alert_for(db, failed_session)
+    assert OwnerAlerts.deliver_due(db, now: failed.created_at, runner: failing(self())) == 0
+    assert_received {:harklight, ["send", "--prepare" | _]}
+
+    uncertain_session = session(db, "agent:george:uncertain-before-removal")
+    fail_turn(db, uncertain_session, @codex_limit)
+    uncertain = alert_for(db, uncertain_session)
+    unknown_runner = runner(self(), fn {:execute, op} -> unknown(op) end)
+    assert OwnerAlerts.deliver_due(db, now: uncertain.created_at, runner: unknown_runner) == 0
+    assert_received {:harklight, ["send", "--prepare", "--op-id", uncertain_op | _]}
+    assert_received {:harklight, ["send", "--execute", "--op-id", ^uncertain_op]}
+    refute_received {:harklight, _}
+
+    # The owner is removed (#622 stamps removedAt; its own remove-user refuses
+    # while the user still owns rows, so the state is written directly here).
+    {:ok, _} =
+      DB.query(db, "UPDATE users SET removedAt=?2, removedBy='admin' WHERE userId=?1", [
+        @owner,
+        System.system_time(:millisecond)
+      ])
+
+    # As if the setting were unset: a later failure creates no alert.
+    later = session(db, "agent:george:after-removal")
+    fail_turn(db, later, @codex_limit)
+    assert alert_for(db, later) == nil
+
+    due = max(failed.created_at, uncertain.created_at) + 5 * @minute
+
+    both =
+      runner(self(), fn
+        {:execute, op} -> committed(op, "send")
+        {:retry, op} -> committed(op, "retry")
+      end)
+
+    assert OwnerAlerts.deliver_due(db, now: due, runner: both) == 0
+
+    # The uncertain send is still settled on its own op, from the owner's Main.
+    assert_received {:harklight, ["retry", "--op-id", ^uncertain_op]}
+    # The definite-failure alert gets no new operation; it is withdrawn as off.
+    refute_received {:harklight, _}
+
+    assert %{state: "withdrawn", attempts: 1, next_attempt_at: nil} =
+             alert_for(db, failed_session)
+
+    assert withdrawn_as(db, failed.alert_id) == "off"
+    assert withdrawn_reasons(db, failed.alert_id) == ["alerts-off"]
+    assert %{state: "sent", op_id: ^uncertain_op} = alert_for(db, uncertain_session)
+
+    assert {:ok, [[^main]]} =
+             DB.query(db, "SELECT sessionKey FROM harklight_send_operations WHERE opId=?1", [
+               uncertain_op
+             ])
+  end
+
   test "T14: the stall threshold defaults to four hours and accepts only positive integers",
        %{db: db} do
     config = config_handler(db)
