@@ -35,6 +35,8 @@ defmodule Tightbeam.GatewayTest do
 
     expected = expected ++ ~w(memento-set mementos)
     expected = expected ++ ~w(users remove-user)
+    # Stage 1 S1.1: recovery enrolment is a protected act of its own.
+    expected = expected ++ ~w(recovery-enroll)
 
     expected =
       expected ++ ~w(subtree-guidance-set subtree-guidance-withdraw subtree-guidance-show)
