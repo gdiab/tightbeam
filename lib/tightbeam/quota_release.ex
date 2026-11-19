@@ -125,6 +125,12 @@ defmodule Tightbeam.QuotaRelease do
       JOIN turns t ON o.correlationId = 'harness-turn:' || t.seq || ':rate-limit-dead'
       WHERE o.incidentId=?1 AND o.evidenceKind IN ('terminal-failure','authoritative-provider')
         AND t.status='failed'
+        -- A c1-applied switch already disposed of and announced its failed
+        -- turn (contract c R9b, R13); no second item (stale-turn R9).
+        AND NOT EXISTS (
+          SELECT 1 FROM limit_fallback_evaluations e
+          WHERE e.turnSeq=t.seq AND e.outcome='applied'
+        )
       ORDER BY t.seq
       """,
       [incident_id]

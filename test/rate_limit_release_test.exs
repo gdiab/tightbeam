@@ -481,6 +481,35 @@ defmodule Tightbeam.RateLimitReleaseTest do
     assert HarnessHealth.get(db, incident.id).state == "resolved"
   end
 
+  test "B5: a release adds no item for a turn a c1-applied switch already disposed of",
+       %{db: db} do
+    error = future_codex_error(System.system_time(:millisecond))
+    fail_turn(db, "c1", error)
+    # Held for its limit-fallback evaluation, which then applied the switch.
+    held = fail_turn(db, "c2", error, started_work: true, held: true)
+
+    {:ok, []} =
+      DB.query(
+        db,
+        """
+        INSERT INTO limit_fallback_evaluations (sessionKey,turnSeq,heldAt,outcome,createdAt,decidedAt)
+        VALUES ('c2',?1,1,'applied',1,2)
+        """,
+        [held]
+      )
+
+    assert HarnessProcess.parked?(db, @codex_key)
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE consumer='rate_limit_reset'")
+
+    {:ok, [[wake_id] | _]} =
+      DB.query(db, "SELECT wakeId FROM wakes WHERE consumer='rate_limit_reset'")
+
+    assert {:ok, :ok} = RateLimitReset.release(db, %{wake_id: wake_id})
+    refute HarnessProcess.parked?(db, @codex_key)
+    assert notices(db) == []
+    assert lifecycle(db, "quota_failed_turn_not_replayed", "c2") == []
+  end
+
   test "B5: a post-activity quota failure is recorded and surfaced at once, even with no incident",
        %{db: db} do
     # One session's failure leaves its observation pending: no incident, no
@@ -878,7 +907,8 @@ defmodule Tightbeam.RateLimitReleaseTest do
           session,
           Map.put(turn, :session_key, key),
           :prompt,
-          reason
+          reason,
+          defer_redelivery: Keyword.get(opts, :held, false)
         )
       end)
 
