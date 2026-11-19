@@ -28,6 +28,22 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
   alias Tightbeam.OwnerAlerts.MemoryPressure
   alias Tightbeam.OwnerAlerts.MemoryPressure.Marker
 
+  # T29's waiter is woken through the ordinary delivery path, which nudges
+  # the lane manager; this stands in for it, as in the condition fact tests.
+  defmodule LaneDoorbell do
+    use GenServer
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:ensure_lane, session_key}, _from, parent) do
+      send(parent, {:lane_nudged, session_key})
+      {:reply, :ok, parent}
+    end
+  end
+
   @owner "george"
   @host "sirius"
   @minute 60_000
@@ -854,6 +870,8 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
     enable(ctx.db)
     scheduler = :"g1_scheduler_#{System.unique_integer([:positive])}"
     parent = self()
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneDoorbell, parent})
 
     start_supervised!(
       {Wakes,
