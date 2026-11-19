@@ -742,8 +742,7 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
   end
 
   defp root_file do
-    Enum.find(["/usr/bin/env", "/bin/sh", "/usr/bin/true"], &PairingFreeze.read(&1).lifted) ||
-      flunk("this host offers no root-owned fixture file for a valid unfreeze file")
+    TestDevices.valid_unfreeze_file!()
   end
 
   defp lift!, do: Application.put_env(:tightbeam, :pairing_unfreeze_path, root_file())

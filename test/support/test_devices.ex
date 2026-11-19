@@ -133,6 +133,67 @@ defmodule Tightbeam.TestDevices do
     })
   end
 
+  @doc """
+  A path that passes every core fix (A) C6a check, for tests that lift the freeze:
+  a regular file owned by uid 0 and gid 0, not writable by group or others, whose
+  directory and that directory's parent are root-owned and not group- or
+  other-writable.
+
+  An existing system file is used when one passes. Otherwise, on a CI runner with
+  passwordless sudo, one is built once with sudo in a temporary tree. Elsewhere the
+  test fails, naming each candidate's failing check. Nothing here ever writes a
+  host's real `/etc`.
+  """
+  @spec valid_unfreeze_file!() :: String.t()
+  def valid_unfreeze_file! do
+    candidates = ["/usr/bin/env", "/bin/sh", "/usr/bin/true", "/etc/hostname", "/etc/passwd"]
+
+    case Enum.find(candidates, &Tightbeam.PairingFreeze.read(&1).lifted) do
+      nil -> sudo_built_unfreeze_file!(candidates)
+      path -> path
+    end
+  end
+
+  defp sudo_built_unfreeze_file!(candidates) do
+    case :persistent_term.get({__MODULE__, :unfreeze_file}, nil) do
+      nil ->
+        if System.get_env("CI") == "true" and
+             match?({_, 0}, System.cmd("sudo", ["-n", "true"], stderr_to_stdout: true)) do
+          base = Path.join(System.tmp_dir!(), "tb-unfreeze-#{System.unique_integer([:positive])}")
+          File.mkdir_p!(base)
+          etc = Path.join(base, "etc")
+          dir = Path.join(etc, "tightbeam")
+          file = Path.join(dir, "pairing-unfreeze")
+          sudo!(["install", "-d", "-o", "root", "-g", "0", "-m", "0755", etc, dir])
+          sudo!(["install", "-o", "root", "-g", "0", "-m", "0644", "/dev/null", file])
+
+          unless Tightbeam.PairingFreeze.read(file).lifted,
+            do:
+              raise(
+                "sudo-built unfreeze file is not valid: #{inspect(Tightbeam.PairingFreeze.read(file))}"
+              )
+
+          :persistent_term.put({__MODULE__, :unfreeze_file}, file)
+          file
+        else
+          checks = Enum.map(candidates, &{&1, Tightbeam.PairingFreeze.read(&1)})
+
+          raise "this host offers no root-owned fixture file for a valid unfreeze file " <>
+                  "and no passwordless sudo on CI: #{inspect(checks)}"
+        end
+
+      file ->
+        file
+    end
+  end
+
+  defp sudo!(args) do
+    case System.cmd("sudo", ["-n" | args], stderr_to_stdout: true) do
+      {_, 0} -> :ok
+      {output, status} -> raise "sudo #{inspect(args)} exited #{status}: #{output}"
+    end
+  end
+
   # Users go through the ordinary in-process writer so their projections exist;
   # the first user of an organization is admin by the shared cold-start rule.
   defp ensure_user(db, user_id, admin) do

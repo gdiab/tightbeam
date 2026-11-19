@@ -189,10 +189,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
                 frozen = Application.get_env(:tightbeam, :pairing_unfreeze_path)
 
                 lifted =
-                  Enum.find(
-                    ["/usr/bin/env", "/bin/sh", "/usr/bin/true"],
-                    &Tightbeam.PairingFreeze.read(&1).lifted
-                  )
+                  Tightbeam.TestDevices.valid_unfreeze_file!()
 
                 Application.put_env(:tightbeam, :pairing_unfreeze_path, lifted)
 

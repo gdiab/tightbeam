@@ -881,7 +881,12 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     # freeze lifted.
     owner_device = Tightbeam.TestDevices.paired!(db, "synthetic-owner")
     outsider_device = Tightbeam.TestDevices.paired!(db, "outsider")
-    Application.put_env(:tightbeam, :pairing_unfreeze_path, "/usr/bin/env")
+
+    Application.put_env(
+      :tightbeam,
+      :pairing_unfreeze_path,
+      Tightbeam.TestDevices.valid_unfreeze_file!()
+    )
 
     on_exit(fn ->
       Application.put_env(

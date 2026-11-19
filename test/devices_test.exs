@@ -25,9 +25,7 @@ defmodule Tightbeam.DevicesTest do
   # file owned by root and not writable by group or others, whose directory and
   # that directory's parent are root-owned and not group- or other-writable.
   defp lift! do
-    path =
-      Enum.find(["/usr/bin/env", "/bin/sh", "/usr/bin/true"], &PairingFreeze.read(&1).lifted) ||
-        flunk("this host offers no root-owned fixture file for a valid unfreeze file")
+    path = TestDevices.valid_unfreeze_file!()
 
     Application.put_env(:tightbeam, :pairing_unfreeze_path, path)
     path

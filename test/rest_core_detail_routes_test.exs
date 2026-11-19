@@ -1980,7 +1980,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   test "AC11 captures real committed raw frames and compares payload bytes to HTTP item bytes",
        ctx do
     # Core fix (A): approve-device needs the pairing freeze lifted.
-    Application.put_env(:tightbeam, :pairing_unfreeze_path, "/usr/bin/env")
+    Application.put_env(
+      :tightbeam,
+      :pairing_unfreeze_path,
+      Tightbeam.TestDevices.valid_unfreeze_file!()
+    )
 
     on_exit(fn ->
       Application.put_env(
