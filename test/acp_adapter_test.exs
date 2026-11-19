@@ -530,6 +530,13 @@ defmodule Tightbeam.Acp.AdapterTest do
           stalledPrompts.set(sid, m.id);
           return;
         }
+        if (gateMode === "folded-turn") {
+          // P folded into a harness turn already running: that turn's activity
+          // and its turn-end report arrive, then the adapter answers P (R2).
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "folded " + text } } } });
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "usage_update", used: 120, size: 200000, cost: { amount: 0.01, currency: "USD" } } } });
+          return setTimeout(() => send({ id: m.id, result: { stopReason: "end_turn" } }), 150);
+        }
         if (gateMode === "delay-turn") {
           return setTimeout(() => {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "delayed" } } } });
@@ -724,6 +731,24 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert_receive {:unanswered, ^sid, "response_missing"}, 2_000
       assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) >= 1
       assert {:error, :not_pending} = Adapter.prompt_liveness(adapter, sid, request_id)
+    end
+  end
+
+  describe "stale-turn v1.1 R2 folded prompt" do
+    test "activity and a turn-end report, then end_turn: delivered, and the next prompt starts" do
+      {adapter, capture} = start_adapter(gate_mode: "folded-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+      first = Task.async(fn -> Adapter.prompt(adapter, sid, "one") end)
+      _request_id = s1_request_id(adapter, sid)
+      second = Task.async(fn -> Adapter.prompt(adapter, sid, "two") end)
+
+      assert {:ok, %{stop_reason: "end_turn", text: "folded one"}} = Task.await(first, 5_000)
+      assert {:ok, %{stop_reason: "end_turn", text: "folded two"}} = Task.await(second, 5_000)
+
+      requests = captured_requests(capture)
+      assert Enum.count(requests, &(&1["method"] == "session/prompt")) == 2
+      refute Enum.any?(requests, &(&1["method"] == "session/cancel"))
     end
   end
 
