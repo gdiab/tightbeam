@@ -442,6 +442,17 @@ defmodule Tightbeam.Acp.Adapter do
   def settle_prompt_unknown(adapter, sid, request_id, cause, detail \\ %{}),
     do: call(adapter, {:settle_prompt_unknown, sid, request_id, cause, detail}, 5_000)
 
+  @doc """
+  Cancel `sid`'s pending prompt for a route that already wrote its own
+  terminal (assignment stop, stale-turn v1.1 R7): send the supported
+  `session/cancel` and wait G. Any response within G is passed through as it
+  is; no response ends the prompt with
+  `{:prompt_interrupted, {:cancel_unacknowledged, sid}}`, so its lane task is
+  released. Returns `:settling`, or `:sent` when no dispatched prompt is
+  pending for `sid` (only the cancel is sent).
+  """
+  def cancel_prompt(adapter, sid), do: call(adapter, {:cancel_prompt, sid}, 5_000)
+
   ## Server
 
   @impl true
@@ -832,6 +843,20 @@ defmodule Tightbeam.Acp.Adapter do
 
       _ ->
         {:reply, {:error, :not_pending}, state}
+    end
+  end
+
+  defp session_call({:cancel_prompt, sid}, _from, state) do
+    case state.prompts[sid] do
+      %{settling: _} ->
+        {:reply, {:ok, :settling}, state}
+
+      %{request_id: request_id} when not is_nil(request_id) ->
+        {:reply, {:ok, :settling}, begin_settle(state, sid, nil, %{})}
+
+      _ ->
+        Conn.notify(state.conn, "session/cancel", %{sessionId: sid})
+        {:reply, {:ok, :sent}, state}
     end
   end
 
@@ -1722,6 +1747,10 @@ defmodule Tightbeam.Acp.Adapter do
       # Stale-turn v1.1 R6/R8: a prompt being settled after its cancel. A
       # response with a stop reason other than cancelled decides the outcome
       # (the harness answered); cancelled, or an error, is an unknown effect.
+      # A route that wrote its own terminal: the answer stands as it is.
+      %{from: ^from, settling: %{cause: nil}} ->
+        settle_prompt(state, sid, from, result)
+
       %{from: ^from, settling: %{cause: cause, detail: detail}} ->
         result =
           case result do
@@ -1744,6 +1773,16 @@ defmodule Tightbeam.Acp.Adapter do
   # quiescence evidence, nothing more), and the turn ends as an unknown effect.
   def handle_info({:settle_grace_expired, sid, ref}, state) do
     case state.prompts[sid] do
+      %{from: from, settling: %{ref: ^ref, cause: nil}} ->
+        emit_settle_unanswered(state, sid, "canceled")
+
+        settle_prompt(
+          state,
+          sid,
+          from,
+          {:error, {:prompt_interrupted, {:cancel_unacknowledged, sid}}}
+        )
+
       %{from: from, settling: %{ref: ^ref, cause: cause, detail: detail}} ->
         emit_settle_unanswered(state, sid, cause)
         settle_prompt(state, sid, from, {:error, {:unknown_effect, cause, detail}})
