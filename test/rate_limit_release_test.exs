@@ -8,6 +8,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
     LaneManager,
     Ledger,
     Org,
+    QuotaRelease,
     RateLimitReset,
     Wakes
   }
@@ -568,6 +569,65 @@ defmodule Tightbeam.RateLimitReleaseTest do
     assert HarnessProcess.parked?(db, pi_key)
     assert :ok = HarnessProcess.complete_park(db, pi_key)
     refute HarnessProcess.parked?(db, pi_key)
+  end
+
+  test "B2: after a named release, close, shutdown and crash fences complete; only a limit met again re-parks and holds",
+       %{db: db} do
+    incident = park_codex(db, "held", "c1")
+    assert HarnessProcess.parked?(db, @codex_key)
+
+    assert {:ok, :released} =
+             DB.transaction(db, fn txn ->
+               QuotaRelease.release_named_in_txn(txn, incident.id, "codex", "testhost", %{
+                 cause: "explicit_resume",
+                 actor: "user:tester"
+               })
+             end)
+
+    refute HarnessProcess.parked?(db, @codex_key)
+
+    # An adapter close (idle reap, repair close or restart) fences the key and
+    # completes: it is not the quota park, so the guard does not keep it.
+    {:ok, _} = HarnessProcess.begin_park(db, @codex_key)
+    assert HarnessProcess.parked?(db, @codex_key)
+    assert :ok = HarnessProcess.complete_park(db, @codex_key)
+    refute HarnessProcess.parked?(db, @codex_key)
+
+    # A gateway shutdown fences the key; the next boot's reconciliation clears it.
+    deadline = System.monotonic_time(:millisecond) + 60_000
+    {:ok, _} = HarnessProcess.begin_park_many_until(db, [@codex_key], deadline)
+    assert HarnessProcess.parked?(db, @codex_key)
+    assert :ok = HarnessProcess.reconcile(db)
+    refute HarnessProcess.parked?(db, @codex_key)
+
+    # A proven-dead settlement fences the key and completes.
+    assert HarnessProcess.settle_proven_dead(db, @codex_key) in [:ok, :already_resolved]
+    refute HarnessProcess.parked?(db, @codex_key)
+
+    # None of these resolves the incident; it waits for a later success.
+    assert HarnessHealth.get(db, incident.id).state == "open"
+
+    # B4: a limit met again after all that re-parks, and that quota park holds
+    # through the same completions.
+    later = System.system_time(:millisecond)
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               RateLimitReset.schedule_in_txn(
+                 txn,
+                 %{harness: :codex, host: "testhost", session_key: "c2"},
+                 observe_in_txn(txn, "after-close", "c2", "testhost", later),
+                 codex_error("try again later."),
+                 later
+               )
+             end)
+
+    assert HarnessProcess.parked?(db, @codex_key)
+    {:ok, _} = HarnessProcess.begin_park(db, @codex_key)
+    assert :ok = HarnessProcess.complete_park(db, @codex_key)
+    assert :ok = HarnessProcess.reconcile(db)
+    assert HarnessProcess.settle_proven_dead(db, @codex_key) in [:ok, :already_resolved]
+    assert HarnessProcess.parked?(db, @codex_key)
   end
 
   test "B5: a post-activity quota failure is recorded and surfaced at once, even with no incident",

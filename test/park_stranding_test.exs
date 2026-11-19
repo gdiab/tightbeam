@@ -318,6 +318,45 @@ defmodule Tightbeam.ParkStrandingTest do
     assert length(lifecycle(db, "rate_limit_park_stranding_notified")) == 2
   end
 
+  test "after a named release, a close fence completes: nothing is stranded and nothing is sent",
+       %{db: db} do
+    incident = open_codex_park!(db)
+    enqueue(db, "c1", "asg_held")
+    assert [stranding] = stranding_wakes(db)
+
+    resume!(db, incident)
+    {:ok, _} = HarnessProcess.begin_park(db, @codex_key)
+    assert :ok = HarnessProcess.complete_park(db, @codex_key)
+    refute HarnessProcess.parked?(db, @codex_key)
+
+    assert {:ok, {:skipped, "park_released"}} =
+             ParkStranding.notify(db, stranding, stranding.due_at)
+
+    assert notices(db) == []
+    assert stranding_wakes(db) |> length() == 1
+  end
+
+  test "a B4 re-park survives an adapter close and a boot reconcile, and is reported at its six hours",
+       %{db: db} do
+    incident = open_codex_park!(db)
+    enqueue(db, "c1", "asg_held")
+
+    resume!(db, incident)
+    fail_turn(db, "c2", @codex_limit)
+    assert [_first, second] = stranding_wakes(db)
+    assert second.wake_id == episode_wake_id(db, incident)
+
+    # The close joins the standing quota fence (same generation); its
+    # completion and the boot reconcile keep the quota park.
+    {:ok, _} = HarnessProcess.begin_park(db, @codex_key)
+    assert :ok = HarnessProcess.complete_park(db, @codex_key)
+    assert :ok = HarnessProcess.reconcile(db)
+    assert HarnessProcess.parked?(db, @codex_key)
+    assert second.wake_id == episode_wake_id(db, incident)
+
+    assert {:ok, {:notified, [_, _]}} = ParkStranding.notify(db, second, second.due_at)
+  end
+
   test "a re-park of the same incident and a retried consumer do not duplicate the notice",
        %{db: db} do
     incident = open_codex_park!(db)
