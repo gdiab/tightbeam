@@ -130,11 +130,19 @@ defmodule Tightbeam.Harness do
   @callback records_tool_calls?() :: boolean()
   @callback accepts_inline_images?() :: boolean()
 
+  @doc """
+  Whether a prompt's error response reports that the harness process serving
+  the session ended (stale-turn settlement v1.1 §1 "harness-exit error", R4).
+  A harness without one is covered by transport loss alone.
+  """
+  @callback harness_exit_error?(term()) :: boolean()
+
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       local_client_model_authority?: 1,
                       records_tool_calls?: 0,
+                      harness_exit_error?: 1,
                       accepts_inline_images?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
