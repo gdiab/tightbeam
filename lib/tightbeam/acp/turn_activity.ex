@@ -14,9 +14,12 @@ defmodule Tightbeam.Acp.TurnActivity do
   activity.
 
   P's turn is **live** while turn activity arrived within the last W (5 min)
-  or a tool call is open. Before any activity, the window runs from the
+  or a tool call is open: one the harness reported and has not yet reported
+  `completed` or `failed`. Before any activity, the window runs from the
   dispatch itself, so a prompt is not quiet the moment it is sent.
   """
+
+  alias Tightbeam.ToolCalls
 
   @w_ms 5 * 60_000
 
@@ -27,6 +30,7 @@ defmodule Tightbeam.Acp.TurnActivity do
           dispatched_at: integer(),
           last_activity_at: integer() | nil,
           turn_end_at: integer() | nil,
+          open: MapSet.t(),
           seen: map()
         }
 
@@ -34,7 +38,14 @@ defmodule Tightbeam.Acp.TurnActivity do
   def w_ms, do: @w_ms
 
   @spec new(integer()) :: t()
-  def new(now), do: %{dispatched_at: now, last_activity_at: nil, turn_end_at: nil, seen: %{}}
+  def new(now),
+    do: %{
+      dispatched_at: now,
+      last_activity_at: nil,
+      turn_end_at: nil,
+      open: MapSet.new(),
+      seen: %{}
+    }
 
   @doc """
   Observe one update for P's session. `turn_end?` is the harness's turn-end
@@ -54,11 +65,14 @@ defmodule Tightbeam.Acp.TurnActivity do
         if new_content?(update), do: %{activity | last_activity_at: now}, else: activity
 
       kind == "tool_call" ->
-        changed(activity, {:tool_call, update["toolCallId"]}, :seen, now)
+        activity
+        |> track_open(update)
+        |> changed({:tool_call, update["toolCallId"]}, :seen, now)
 
       kind == "tool_call_update" ->
-        changed(
-          activity,
+        activity
+        |> track_open(update)
+        |> changed(
           {:tool_call_update, update["toolCallId"]},
           Map.take(update, ["status", "content", "rawOutput"]),
           now
@@ -75,10 +89,14 @@ defmodule Tightbeam.Acp.TurnActivity do
     end
   end
 
+  @doc "Tool calls P's harness reported and has not finished."
+  @spec open_tool_calls(t()) :: non_neg_integer()
+  def open_tool_calls(%{open: open}), do: MapSet.size(open)
+
   @doc "Whether P's harness turn is live (R3): activity within W, or a tool call open."
-  @spec live?(t(), integer(), non_neg_integer(), pos_integer()) :: boolean()
-  def live?(%{} = activity, now, open_tool_calls, w_ms \\ @w_ms) do
-    open_tool_calls > 0 or now - last_advance(activity) < w_ms
+  @spec live?(t(), integer(), pos_integer()) :: boolean()
+  def live?(%{} = activity, now, w_ms \\ @w_ms) do
+    open_tool_calls(activity) > 0 or now - last_advance(activity) < w_ms
   end
 
   @doc """
@@ -86,14 +104,14 @@ defmodule Tightbeam.Acp.TurnActivity do
   after dispatch, no tool call is open, and P has been quiet for W since its
   last turn activity.
   """
-  @spec missing_response?(t(), integer(), non_neg_integer(), pos_integer()) :: boolean()
-  def missing_response?(activity, now, open_tool_calls, w_ms \\ @w_ms)
+  @spec missing_response?(t(), integer(), pos_integer()) :: boolean()
+  def missing_response?(activity, now, w_ms \\ @w_ms)
 
-  def missing_response?(%{turn_end_at: turn_end_at} = activity, now, open_tool_calls, w_ms)
+  def missing_response?(%{turn_end_at: turn_end_at} = activity, now, w_ms)
       when is_integer(turn_end_at),
-      do: open_tool_calls == 0 and now - last_advance(activity) >= w_ms
+      do: open_tool_calls(activity) == 0 and now - last_advance(activity) >= w_ms
 
-  def missing_response?(_activity, _now, _open_tool_calls, _w_ms), do: false
+  def missing_response?(_activity, _now, _w_ms), do: false
 
   @doc "When R6's W elapses for P, or nil while it cannot apply."
   @spec missing_response_at(t(), pos_integer()) :: integer() | nil
@@ -112,6 +130,14 @@ defmodule Tightbeam.Acp.TurnActivity do
   defp new_content?(%{"content" => %{"text" => text}}) when is_binary(text), do: text != ""
   defp new_content?(%{"content" => content}) when is_map(content), do: map_size(content) > 0
   defp new_content?(_update), do: false
+
+  defp track_open(activity, %{"toolCallId" => id} = update) when is_binary(id) and id != "" do
+    if ToolCalls.terminal_status?(update["status"]),
+      do: %{activity | open: MapSet.delete(activity.open, id)},
+      else: %{activity | open: MapSet.put(activity.open, id)}
+  end
+
+  defp track_open(activity, _update), do: activity
 
   # An item's update is activity only when it differs from the last one for
   # the same item.

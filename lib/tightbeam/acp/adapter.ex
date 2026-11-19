@@ -816,14 +816,13 @@ defmodule Tightbeam.Acp.Adapter do
     case {state.prompts[sid], state.turn_activity[sid]} do
       {%{request_id: ^request_id} = prompt, %{} = activity} ->
         now = now_ms()
-        open = open_tool_calls(state, sid)
 
         {:reply,
          {:ok,
           %{
-            live: TurnActivity.live?(activity, now, open, state.quiet_bound_ms),
+            live: TurnActivity.live?(activity, now, state.quiet_bound_ms),
             settling: Map.has_key?(prompt, :settling),
-            open_tool_calls: open,
+            open_tool_calls: TurnActivity.open_tool_calls(activity),
             quiet_ms: now - TurnActivity.last_advance(activity),
             turn_end_reported: not is_nil(activity.turn_end_at)
           }}, state}
@@ -1668,6 +1667,35 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  # Stale-turn v1.1 R6: the harness reported its turn's end but never
+  # answered P. After W of quiet with no tool call open, cancel P and give it
+  # G to answer; later turn activity or an open tool call defers the check.
+  def handle_info({:missing_response_check, sid, request_id}, state) do
+    case {state.prompts[sid], state.turn_activity[sid]} do
+      {%{request_id: ^request_id} = prompt, %{} = activity}
+      when not is_map_key(prompt, :settling) ->
+        now = now_ms()
+
+        if TurnActivity.missing_response?(activity, now, state.quiet_bound_ms) do
+          Logger.warning("acp prompt unanswered after turn end session=#{sid}")
+          {:noreply, begin_settle(state, sid, "response_missing", %{})}
+        else
+          at = TurnActivity.missing_response_at(activity, state.quiet_bound_ms)
+
+          delay =
+            if TurnActivity.open_tool_calls(activity) > 0,
+              do: state.quiet_bound_ms,
+              else: max(at - now, 0)
+
+          Process.send_after(self(), {:missing_response_check, sid, request_id}, delay)
+          {:noreply, state}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
   defp settle_prompt(state, sid, from, result) do
     case state.prompts[sid] do
       %{from: ^from} = prompt ->
@@ -1767,11 +1795,14 @@ defmodule Tightbeam.Acp.Adapter do
       %{} = activity ->
         module = Harness.module!(state.harness)
         turn_end? = &turn_end_report?(module, &1)
+        observed = TurnActivity.observe(activity, update, now_ms(), turn_end?)
 
-        put_in(
-          state.turn_activity[root],
-          TurnActivity.observe(activity, update, now_ms(), turn_end?)
-        )
+        # R6 needs a turn-end report: the first one arms the missing-response
+        # check, which then re-arms itself from the latest turn activity.
+        if is_nil(activity.turn_end_at) and is_integer(observed.turn_end_at),
+          do: arm_missing_response(state, root, observed)
+
+        put_in(state.turn_activity[root], observed)
 
       nil ->
         state
@@ -1780,13 +1811,23 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp observe_turn_activity(state, _sid, _update), do: state
 
+  defp arm_missing_response(state, sid, activity) do
+    case {state.prompts[sid], TurnActivity.missing_response_at(activity, state.quiet_bound_ms)} do
+      {%{request_id: request_id}, at} when not is_nil(request_id) and is_integer(at) ->
+        delay = max(at - now_ms(), 0)
+        Process.send_after(self(), {:missing_response_check, sid, request_id}, delay)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
   defp turn_end_report?(module, update) do
     Code.ensure_loaded(module)
     function_exported?(module, :turn_end_report?, 1) and module.turn_end_report?(update)
   end
-
-  defp open_tool_calls(state, sid),
-    do: Enum.count(state.pending_tool_calls, fn {{root, _id}, _pending} -> root == sid end)
 
   defp now_ms, do: System.monotonic_time(:millisecond)
 

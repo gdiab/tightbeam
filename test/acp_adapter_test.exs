@@ -781,6 +781,88 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  describe "stale-turn v1.1 R6 missing response" do
+    @s1_turn_end %{
+      "used" => 120,
+      "size" => 200_000,
+      "cost" => %{"amount" => 0.01, "currency" => "USD"}
+    }
+
+    test "a turn-end report then W of quiet cancels P; cancelled ends it response_missing" do
+      {adapter, capture} =
+        start_adapter(gate_mode: "stall-turn", probe: false, quiet_bound_ms: 300)
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      send(
+        adapter,
+        {:acp_notification, "session/update", s1_update(sid, "usage_update", @s1_turn_end)}
+      )
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(caller, 5_000)
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+      assert {:error, :not_pending} = Adapter.prompt_liveness(adapter, sid, request_id)
+    end
+
+    test "a non-cancelled answer within G settles the turn normally" do
+      {adapter, _capture} =
+        start_adapter(gate_mode: "late-success-turn", probe: false, quiet_bound_ms: 300)
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+
+      send(
+        adapter,
+        {:acp_notification, "session/update", s1_update(sid, "usage_update", @s1_turn_end)}
+      )
+
+      assert {:ok, %{stop_reason: "end_turn"}} = Task.await(caller, 5_000)
+    end
+
+    test "an open tool call or later turn activity defers it; no turn-end report never starts it" do
+      {adapter, capture} =
+        start_adapter(gate_mode: "stall-turn", probe: false, quiet_bound_ms: 300)
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      # Quiet well past W, but no turn-end report: R6 does not apply.
+      Process.sleep(900)
+      refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/cancel"))
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "tool_call", %{"toolCallId" => "t1", "status" => "in_progress"})}
+      )
+
+      send(
+        adapter,
+        {:acp_notification, "session/update", s1_update(sid, "usage_update", @s1_turn_end)}
+      )
+
+      # The open tool call holds the turn live past W.
+      Process.sleep(900)
+      refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/cancel"))
+
+      assert {:ok, %{live: true, settling: false, open_tool_calls: 1}} =
+               Adapter.prompt_liveness(adapter, sid, request_id)
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "tool_call_update", %{"toolCallId" => "t1", "status" => "completed"})}
+      )
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(caller, 5_000)
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+    end
+  end
+
   defp s1_update(sid, kind, fields),
     do: %{"sessionId" => sid, "update" => Map.put(fields, "sessionUpdate", kind)}
 
