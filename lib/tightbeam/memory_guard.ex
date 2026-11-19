@@ -1470,7 +1470,7 @@ defmodule Tightbeam.MemoryGuard do
 
   defp alive?(_table, _record), do: false
 
-  # "claude:shared@sirius" -> {:claude, "shared", "sirius"}
+  # A stored adapterKey name, "<harness>:<preset>@<host>", back to its key.
   defp parse_key(name) when is_binary(name) do
     case Regex.run(~r/^([^:]+):([^@]+)@(.+)$/, name) do
       [_, harness, preset, host] -> {Harness.parse!(harness).id(), preset, host}

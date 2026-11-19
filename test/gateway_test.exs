@@ -27,6 +27,8 @@ defmodule Tightbeam.GatewayTest do
 
     expected = expected ++ ~w(clear-stranded settle-turn harness-process-settle)
     expected = expected ++ ~w(kungfu-setup sentinel-enable sentinel-disable sentinel-list)
+    # Memory limits v1.4 R12b (the host read) and R17 (the admin setting).
+    expected = expected ++ ~w(host-memory host-memory-set)
     expected = expected ++ ~w(memento-set mementos)
     expected = expected ++ ~w(users remove-user)
 

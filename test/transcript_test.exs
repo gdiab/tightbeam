@@ -459,6 +459,9 @@ defmodule Tightbeam.TranscriptTest do
 
     assert Enum.filter(qualified, &(elem(&1, 2) == :enqueue_in_txn)) == [
              {"lib/tightbeam/gateway.ex", "enqueue_message_in_txn/9", :enqueue_in_txn},
+             # Memory limits v1.4 R9: a not-started turn ended by a memory kill is
+             # re-admitted once with its own message, as health redelivery does.
+             {"lib/tightbeam/memory_guard/admission.ex", "readmit_in_txn/3", :enqueue_in_txn},
              {"lib/tightbeam/wakes.ex", "redeliver_health_source_in_txn/3", :enqueue_in_txn}
            ]
 
