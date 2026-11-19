@@ -151,7 +151,7 @@ defmodule Tightbeam.RateLimitReset do
   # Codex states the reset in its usageLimitExceeded message, in the local
   # time of the host running Codex, with no zone marker: "… try again at
   # 9:59 AM." (`%-I:%M %p`) or "… try again at Nov 18th, 2026 9:59 AM."
-  # (`%b %-d<ordinal>, %Y %-I:%M %p`). codex-acp carries that text as
+  # (`%b %-d<ordinal>, %Y %-I:%M %p`). Its ACP adapter carries that text as
   # `data.message` (additionalDetails, else the error's message).
   def from_error(
         %{"data" => %{"codexErrorInfo" => "usageLimitExceeded"} = data} = reason,
