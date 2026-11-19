@@ -1915,12 +1915,45 @@ defmodule Tightbeam.MemoryGuard do
     _ -> []
   end
 
-  defp remove_adapter_unit(state, %{layout: %{} = layout}, launch_id) when is_binary(launch_id) do
-    _ = Cgroup.remove(layout.fs, Cgroup.adapter_unit(layout, launch_id))
+  # Before the unit goes, keep the kernel's verdict on it (R10): a budget kill
+  # of the adapter unit is recorded so a turn settled after this still finds it.
+  defp remove_adapter_unit(state, %{layout: %{} = layout} = host_state, launch_id)
+       when is_binary(launch_id) do
+    unit = Cgroup.adapter_unit(layout, launch_id)
+    id = "adapter:" <> launch_id
+
+    with {:ok, %{"oom_group_kill" => group}} when group >= 1 <-
+           Cgroup.local_events(layout.fs, unit),
+         [] <- lookup({:kill, id}),
+         %{host: host} <- adapter_row(state, launch_id) do
+      kill = %{
+        host: host,
+        scope: "adapter",
+        limit: "budget",
+        sid: nil,
+        key: parse_key(adapter_row(state, launch_id).adapter_key),
+        launch_id: launch_id,
+        bytes: nil,
+        limit_bytes: host_state.settings.budget,
+        mode: "enforced",
+        at: state.clock.()
+      }
+
+      :ets.insert(table(), {{:kill, id}, kill})
+      record_ended(state, host, kill)
+    end
+
+    _ = Cgroup.remove(layout.fs, unit)
     state
   end
 
   defp remove_adapter_unit(state, _host_state, _launch_id), do: state
+
+  defp adapter_row(state, launch_id) do
+    Enum.find(HarnessProcess.list(state.db), &(&1.launch_id == launch_id))
+  rescue
+    _ -> nil
+  end
 
   @doc false
   # The tree kill: `cgroup.kill` on an enforced unit, else the existing
