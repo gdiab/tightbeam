@@ -151,6 +151,12 @@ defmodule Tightbeam.Wire.Socket do
 
   defp device_revoked?(_state), do: false
 
+  # The proof of the device token this connection authenticated with (review B1).
+  defp device_proof(%{auth_class: "device", device_token: token}) when is_binary(token),
+    do: Tightbeam.GrantAuth.proof(token)
+
+  defp device_proof(_state), do: nil
+
   defp stop_device_revoked(state) do
     stop_with(
       Payloads.wire_error("token_revoked", "this device's credential was revoked or denied"),
@@ -604,6 +610,7 @@ defmodule Tightbeam.Wire.Socket do
           origin: "user:#{state.user_id}",
           auth_class: state.auth_class,
           auth_device_id: if(state.auth_class == "device", do: state.device_id),
+          auth_proof: device_proof(state),
           session_key: session_key,
           params: %{
             content: content,
@@ -668,7 +675,8 @@ defmodule Tightbeam.Wire.Socket do
             db: db(state),
             handlers: state.deps.handlers,
             user_id: state.user_id,
-            device_id: state.device_id
+            device_id: state.device_id,
+            auth_proof: device_proof(state)
           })
 
         result = UserCommands.record_outcome(db(state), session_key, outcome)

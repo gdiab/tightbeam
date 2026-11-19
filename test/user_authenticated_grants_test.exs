@@ -435,6 +435,127 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     assert Devices.user(ctx.db, "ghost") == nil
   end
 
+  ## Review B1: an in-process caller cannot synthesize user authentication
+
+  test "B1: an internal call naming George's device without its credential proof is refused",
+       ctx do
+    forged_proofs = [
+      {:absent, nil},
+      {:random, :crypto.strong_rand_bytes(32)},
+      # Another of George's real devices: a valid proof, but not of the named device.
+      {:other_device, GrantAuth.proof(ctx.ipad.token)},
+      {:raw_token, ctx.george.token}
+    ]
+
+    forge = fn call, proof ->
+      call
+      |> Map.merge(%{
+        origin: "user:george",
+        principal: {:user, "george"},
+        auth_class: "device",
+        auth_device_id: "iphone"
+      })
+      |> then(fn call ->
+        if proof, do: Map.put(call, :auth_proof, proof), else: Map.delete(call, :auth_proof)
+      end)
+    end
+
+    params = %{
+      "approve-device" => %{device_id: "visitor"},
+      "deny-device" => %{device_id: "visitor"},
+      "revoke-device" => %{device_id: "ipad"},
+      "promote-user" => %{user_id: "guest", is_admin: true},
+      "add-user" => %{user_id: "newbie"},
+      "remove-user" => %{user_id: "guest"},
+      "register-host" => %{name: "tycho", ssh: "gd@tycho", base_dir: "/home/gd/.tightbeam"}
+    }
+
+    open = ask(ctx, ctx.worker, ["accept", "dismiss"])
+    before = business_rows(ctx.db)
+
+    for {label, proof} <- forged_proofs do
+      # Through the gateway's protected handlers...
+      for {verb, verb_params} <- params do
+        assert %{code: "user_authentication_required"} =
+                 handler(ctx, verb).(forge.(%{verb: verb, params: verb_params}, proof)),
+               "#{verb} with #{label} proof"
+      end
+
+      # ...and straight into the in-transaction writers, past every handler.
+      assert %{code: "user_authentication_required"} =
+               Devices.approve_with_firehose(
+                 ctx.db,
+                 "visitor",
+                 nil,
+                 forge.(%{verb: "approve-device", params: %{device_id: "visitor"}}, proof)
+               )
+
+      assert %{code: "user_authentication_required"} =
+               Tightbeam.UserAdmin.remove(
+                 ctx.db,
+                 forge.(%{verb: "remove-user", params: %{user_id: "guest"}}, proof)
+               )
+
+      ruled =
+        handler(ctx, "operator-rule").(
+          forge.(%{verb: "operator-rule", params: %{request: open, decision: "accept"}}, proof)
+        )
+
+      assert %{code: "user_authentication_required"} = ruled, "operator-rule with #{label}"
+    end
+
+    assert business_rows(ctx.db) == before
+    assert {:ok, [["open", nil]]} = ruling(ctx.db, open)
+    refute_received {:sh, _}
+
+    # Control: the same call carrying the named device's proof is accepted, so the
+    # refusals above are the proof check and nothing else.
+    lift!()
+
+    assert %{approved: %{device_id: "visitor"}} =
+             handler(ctx, "approve-device").(
+               TestDevices.device_call(ctx.george, %{
+                 verb: "approve-device",
+                 params: %{device_id: "visitor"}
+               })
+             )
+  end
+
+  test "B1: an internal call naming Main without Main's credential proof cannot rule", ctx do
+    id = ask(ctx, ctx.worker, ["accept"])
+
+    forged = %{
+      verb: "operator-rule",
+      origin: "user:george",
+      principal: {:session, ctx.main.session_key},
+      auth_class: "session",
+      params: %{request: id, decision: "accept", rationale: "George said accept #{id}"}
+    }
+
+    for proof <- [
+          nil,
+          :crypto.strong_rand_bytes(32),
+          GrantAuth.proof(ctx.worker.cli_token),
+          ctx.main.cli_token
+        ] do
+      call = if proof, do: Map.put(forged, :auth_proof, proof), else: forged
+
+      assert %{code: "user_authentication_required"} =
+               handler(ctx, "operator-rule").(call)
+    end
+
+    assert {:ok, [["open", nil]]} = ruling(ctx.db, id)
+
+    # Control: with Main's proof the quoted delegation records.
+    assert %{} =
+             handler(ctx, "operator-rule").(
+               Map.put(forged, :auth_proof, GrantAuth.proof(ctx.main.cli_token))
+             )
+
+    main_principal = "session:" <> ctx.main.session_key
+    assert {:ok, [["ruled", ^main_principal]]} = ruling(ctx.db, id)
+  end
+
   ## K13-K17: rulings on owner requests
 
   test "K13: the owner's device rules by command and on dispatch; others are refused", ctx do
@@ -686,6 +807,8 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
   end
+
+  defp handler(ctx, verb), do: Map.fetch!(ctx.opts[:handlers], verb)
 
   defp ask(ctx, raiser, labels) do
     response =

@@ -46,7 +46,7 @@ defmodule Tightbeam.TestDevices do
         ensure_user(db, user_id, first?)
 
         status = if first?, do: "allowlisted", else: "pending"
-        token = if first?, do: mint_token()
+        token = if first?, do: fixture_token(device_id)
 
         :ok =
           exec(
@@ -105,7 +105,7 @@ defmodule Tightbeam.TestDevices do
           device_id,
           user_id,
           Keyword.get(opts, :claimed_name, user_id <> "'s phone"),
-          mint_token(),
+          fixture_token(device_id),
           Keyword.get(opts, :platform, "ios"),
           Keyword.get(opts, :model, "iPhone"),
           now()
@@ -122,16 +122,38 @@ defmodule Tightbeam.TestDevices do
     Devices.by_id(db, device_id)
   end
 
-  @doc "The transport fields of a call made on `device`'s authenticated connection."
+  @doc """
+  The transport fields of a call made on `device`'s authenticated connection,
+  including the proof of its token (core fix (A), review B1).
+  """
   @spec device_call(map(), map()) :: map()
   def device_call(device, call \\ %{}) do
     Map.merge(call, %{
       origin: "user:#{device.user_id}",
       principal: {:user, device.user_id},
       auth_class: "device",
-      auth_device_id: device.device_id
+      auth_device_id: device.device_id,
+      auth_proof: Tightbeam.GrantAuth.proof(device.token)
     })
   end
+
+  @doc """
+  The token a fixture first mints for `device_id`. It is derived from the id so a
+  test can name a device's credential proof (`proof/1`) without holding its row.
+  """
+  @spec fixture_token(String.t()) :: String.t()
+  def fixture_token(device_id),
+    do:
+      "tbt_" <>
+        String.slice(
+          Base.url_encode64(:crypto.hash(:sha256, "fixture:" <> device_id), padding: false),
+          0,
+          32
+        )
+
+  @doc "The transport proof of a fixture device's first-minted token."
+  @spec proof(String.t()) :: binary()
+  def proof(device_id), do: Tightbeam.GrantAuth.proof(fixture_token(device_id))
 
   @doc """
   A path that passes every core fix (A) C6a check, for tests that lift the freeze:

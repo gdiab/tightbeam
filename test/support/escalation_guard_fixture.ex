@@ -214,6 +214,7 @@ defmodule Tightbeam.EscalationGuardFixture do
       principal: {:user, "flynn"},
       auth_class: "device",
       auth_device_id: "flynn-guard-device",
+      auth_proof: Tightbeam.TestDevices.proof("flynn-guard-device"),
       transport_session_key: submitting_session_key,
       params: Map.put(params, :request, id)
     }

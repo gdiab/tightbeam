@@ -212,6 +212,7 @@ defmodule Tightbeam.UserCommands do
       principal: {:user, ctx.user_id},
       auth_class: "device",
       auth_device_id: ctx.device_id,
+      auth_proof: Map.get(ctx, :auth_proof),
       session_key: nil,
       params: params
     }

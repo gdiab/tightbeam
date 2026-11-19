@@ -466,6 +466,7 @@ defmodule Tightbeam.EscalationTest do
                principal: {:user, "flynn"},
                auth_class: "device",
                auth_device_id: "admin-device",
+               auth_proof: Tightbeam.TestDevices.proof("admin-device"),
                params: %{request_id: id, decision: "later"}
              })
 
@@ -516,6 +517,7 @@ defmodule Tightbeam.EscalationTest do
           principal: {:user, "flynn"},
           auth_class: "device",
           auth_device_id: "admin-device",
+          auth_proof: Tightbeam.TestDevices.proof("admin-device"),
           params: %{request_id: first}
         },
         authorized: true,
@@ -546,6 +548,7 @@ defmodule Tightbeam.EscalationTest do
                  principal: {:user, "flynn"},
                  auth_class: "device",
                  auth_device_id: "admin-device",
+                 auth_proof: Tightbeam.TestDevices.proof("admin-device"),
                  params: %{waiver_id: waiver.id}
                },
                authorized: true
@@ -570,6 +573,7 @@ defmodule Tightbeam.EscalationTest do
         principal: {:user, "flynn"},
         auth_class: "device",
         auth_device_id: "admin-device",
+        auth_proof: Tightbeam.TestDevices.proof("admin-device"),
         params: %{request_id: id}
       },
       authorized: true
@@ -599,6 +603,7 @@ defmodule Tightbeam.EscalationTest do
                principal: {:user, "flynn"},
                auth_class: "device",
                auth_device_id: "admin-device",
+               auth_proof: Tightbeam.TestDevices.proof("admin-device"),
                params: %{request_id: id, reason: "no"}
              })
 
@@ -612,6 +617,7 @@ defmodule Tightbeam.EscalationTest do
           principal: {:user, "flynn"},
           auth_class: "device",
           auth_device_id: "admin-device",
+          auth_proof: Tightbeam.TestDevices.proof("admin-device"),
           params: %{session_key: ctx.raiser.session_key, statute_name: "review"}
         },
         authorized: true
@@ -779,6 +785,7 @@ defmodule Tightbeam.EscalationTest do
       principal: {:user, "flynn"},
       auth_class: "device",
       auth_device_id: "admin-device",
+      auth_proof: Tightbeam.TestDevices.proof("admin-device"),
       session_key: nil,
       params: %{assignment_id: "a-origin", kind: "completion"}
     }
@@ -946,6 +953,7 @@ defmodule Tightbeam.EscalationTest do
                principal: {:user, "flynn"},
                auth_class: "device",
                auth_device_id: "admin-device",
+               auth_proof: Tightbeam.TestDevices.proof("admin-device"),
                params: %{question: "not session-filed"}
              })
 
@@ -1542,6 +1550,7 @@ defmodule Tightbeam.EscalationTest do
       principal: {:user, "flynn"},
       auth_class: "device",
       auth_device_id: "admin-device",
+      auth_proof: Tightbeam.TestDevices.proof("admin-device"),
       params: %{}
     }
 
@@ -1574,6 +1583,7 @@ defmodule Tightbeam.EscalationTest do
       principal: {:user, "flynn"},
       auth_class: "device",
       auth_device_id: "admin-device",
+      auth_proof: Tightbeam.TestDevices.proof("admin-device"),
       params: %{}
     }
 
@@ -2097,6 +2107,7 @@ defmodule Tightbeam.EscalationTest do
       principal: {:user, "flynn"},
       auth_class: "device",
       auth_device_id: "admin-device",
+      auth_proof: Tightbeam.TestDevices.proof("admin-device"),
       params: %{request: owner_request.id, reason: "moot"}
     }
 
@@ -2132,6 +2143,7 @@ defmodule Tightbeam.EscalationTest do
       principal: {:user, "flynn"},
       auth_class: "device",
       auth_device_id: "admin-device",
+      auth_proof: Tightbeam.TestDevices.proof("admin-device"),
       params: %{}
     }
 
@@ -2860,6 +2872,7 @@ defmodule Tightbeam.EscalationTest do
                principal: {:user, "flynn"},
                auth_class: "device",
                auth_device_id: "admin-device",
+               auth_proof: Tightbeam.TestDevices.proof("admin-device"),
                session_key: asked.session_key,
                params: %{question: "user ask"}
              })
@@ -2944,6 +2957,7 @@ defmodule Tightbeam.EscalationTest do
                principal: {:user, "flynn"},
                auth_class: "device",
                auth_device_id: "admin-device",
+               auth_proof: Tightbeam.TestDevices.proof("admin-device"),
                params: %{request: request.id, answer: "asker owner is not the expecter"}
              })
 
@@ -3254,6 +3268,7 @@ defmodule Tightbeam.EscalationTest do
         principal: {:user, "flynn"},
         auth_class: "device",
         auth_device_id: "admin-device",
+        auth_proof: Tightbeam.TestDevices.proof("admin-device"),
         params: %{request: request_id, reason: "race withdrawal"}
       },
       opts
@@ -3613,6 +3628,7 @@ defmodule Tightbeam.EscalationTest do
       principal: {:user, "flynn"},
       auth_class: "device",
       auth_device_id: "admin-device",
+      auth_proof: Tightbeam.TestDevices.proof("admin-device"),
       params: %{request_id: id, decision: decision}
     }
   end
@@ -3663,6 +3679,7 @@ defmodule Tightbeam.EscalationTest do
       principal: {:user, "flynn"},
       auth_class: "device",
       auth_device_id: "admin-device",
+      auth_proof: Tightbeam.TestDevices.proof("admin-device"),
       transport_session_key: nil,
       params: Map.put(params, :request, id)
     }
