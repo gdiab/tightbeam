@@ -109,13 +109,18 @@ defmodule Tightbeam.OperationalReceipts do
   end
 
   defp not_applicable!(call, assignment) do
+    if is_nil(assignment) do
+      refuse!(
+        "operational_receipts_not_applicable",
+        "receipts verify only producing assignments, not review cards; attach a review " <>
+          "report to its verdict with --artifact <artifactId> --sha256 <sha256>"
+      )
+    end
+
     verified_verdict!(call)
 
     reason =
       cond do
-        is_nil(assignment) ->
-          "receipts verify only producing assignments, not review cards"
-
         call.principal != {:session, assignment.holder_key} ->
           "only the assignment's holder #{assignment.holder_key} may verify it from receipts"
 

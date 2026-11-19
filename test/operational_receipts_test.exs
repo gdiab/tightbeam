@@ -177,17 +177,24 @@ defmodule Tightbeam.OperationalReceiptsTest do
       for {who, params} <- [
             {ctx.reviewer, verified_params(operational, [receipt])},
             {ctx.holder,
-             %{assignment_id: operational.id, kind: "progress", receipts: [cite(receipt)]}},
-            {ctx.reviewer,
-             %{
-               assignment_id: review.id,
-               kind: "verdict",
-               verdict_kind: "reviewed-clean",
-               receipts: [cite(receipt)]
-             }}
+             %{assignment_id: operational.id, kind: "progress", receipts: [cite(receipt)]}}
           ] do
         assert %{code: "operational_receipts_not_applicable"} = refused(attest(ctx, who, params))
       end
+
+      assert %{code: "operational_receipts_not_applicable", message: review_message} =
+               refused(
+                 attest(ctx, ctx.reviewer, %{
+                   assignment_id: review.id,
+                   kind: "verdict",
+                   verdict_kind: "reviewed-clean",
+                   receipts: [cite(receipt)]
+                 })
+               )
+
+      assert review_message =~ "review cards"
+      assert review_message =~ "--artifact <artifactId>"
+      assert review_message =~ "--sha256 <sha256>"
 
       assert attests(ctx, code) == []
       assert attests(ctx, operational) == []
