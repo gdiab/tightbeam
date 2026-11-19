@@ -91,9 +91,31 @@ defmodule Tightbeam.Acp.TurnActivityTest do
 
   test "R3: live within W of the last activity (or of dispatch), or while a tool call is open" do
     activity = TurnActivity.new(0)
-    assert TurnActivity.live?(activity, @w - 1, 0)
-    refute TurnActivity.live?(activity, @w, 0)
-    assert TurnActivity.live?(activity, 10 * @w, 1)
+    assert TurnActivity.live?(activity, @w - 1)
+    refute TurnActivity.live?(activity, @w)
+
+    open = observe(activity, %{"sessionUpdate" => "tool_call", "toolCallId" => "t1"}, 0)
+    assert TurnActivity.open_tool_calls(open) == 1
+    assert TurnActivity.live?(open, 10 * @w)
+
+    closed =
+      observe(
+        open,
+        %{"sessionUpdate" => "tool_call_update", "toolCallId" => "t1", "status" => "failed"},
+        10
+      )
+
+    assert TurnActivity.open_tool_calls(closed) == 0
+    refute TurnActivity.live?(closed, 10 + @w)
+
+    done_at_once =
+      observe(
+        activity,
+        %{"sessionUpdate" => "tool_call", "toolCallId" => "t2", "status" => "completed"},
+        0
+      )
+
+    assert TurnActivity.open_tool_calls(done_at_once) == 0
 
     activity =
       observe(
@@ -102,8 +124,8 @@ defmodule Tightbeam.Acp.TurnActivityTest do
         60_000
       )
 
-    assert TurnActivity.live?(activity, 60_000 + @w - 1, 0)
-    refute TurnActivity.live?(activity, 60_000 + @w, 0)
+    assert TurnActivity.live?(activity, 60_000 + @w - 1)
+    refute TurnActivity.live?(activity, 60_000 + @w)
   end
 
   test "R3 acceptance: periodic non-advancing signals never make a quiet turn live" do
@@ -121,20 +143,26 @@ defmodule Tightbeam.Acp.TurnActivityTest do
       end)
 
     # Six minutes after the last activity, with no tool call open.
-    refute TurnActivity.live?(activity, 360_000, 0)
+    refute TurnActivity.live?(activity, 360_000)
     assert TurnActivity.last_advance(activity) == 0
   end
 
   test "R6: missing response needs a turn-end report after dispatch, no open tool call, and W of quiet" do
     activity = TurnActivity.new(0)
-    refute TurnActivity.missing_response?(activity, 10 * @w, 0)
+    refute TurnActivity.missing_response?(activity, 10 * @w)
     assert TurnActivity.missing_response_at(activity) == nil
 
     activity = observe(activity, @turn_end, 1_000)
-    refute TurnActivity.missing_response?(activity, 1_000 + @w - 1, 0)
-    assert TurnActivity.missing_response?(activity, 1_000 + @w, 0)
-    refute TurnActivity.missing_response?(activity, 1_000 + @w, 1)
+    refute TurnActivity.missing_response?(activity, 1_000 + @w - 1)
+    assert TurnActivity.missing_response?(activity, 1_000 + @w)
     assert TurnActivity.missing_response_at(activity) == 1_000 + @w
+
+    # An open tool call holds it off however long the quiet.
+    open =
+      activity
+      |> Map.update!(:open, &MapSet.put(&1, "t9"))
+
+    refute TurnActivity.missing_response?(open, 1_000 + 10 * @w)
 
     # A genuine chunk at minute 4 restarts W from that chunk.
     later =
@@ -144,7 +172,7 @@ defmodule Tightbeam.Acp.TurnActivityTest do
         241_000
       )
 
-    refute TurnActivity.missing_response?(later, 1_000 + @w, 0)
+    refute TurnActivity.missing_response?(later, 1_000 + @w)
     assert TurnActivity.missing_response_at(later) == 241_000 + @w
   end
 end
