@@ -35,7 +35,8 @@ defmodule Tightbeam.OwnerAlerts.MemoryPressure do
   seams `:host`, `:proc_root`, `:cgroup_root`, `:clock` (monotonic
   milliseconds), `:wall_clock` (wall milliseconds), `:interval` (`:manual`
   samples only on `sample_now/2`), `:os`, `:clock_source`, `:trace` (a pid
-  told of every file read and marker write), `:db_hook` and `:marker_hook`.
+  told of every file read and marker write), `:db_hook` and `:marker_hook`,
+  and `:owner_alerts` (the delivery process told once the boot is recorded).
   """
   def start_link(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
@@ -334,6 +335,9 @@ defmodule Tightbeam.OwnerAlerts.MemoryPressure.Marker do
   end
 
   @sample_counts ~w(memTotalKiB memAvailableKiB swapTotalKiB swapFreeKiB)
+  # runEndedAt arrived after the first markers; a marker without it is a run
+  # that had not ended.
+  @marker_keys ~w(host runStartedAt runEndedAt episodeOpenedAt lastSampleAt lastSample)
 
   defp valid?(
          %{
@@ -345,7 +349,9 @@ defmodule Tightbeam.OwnerAlerts.MemoryPressure.Marker do
          } = marker
        )
        when is_binary(host) and host != "" and is_integer(started_at) and is_integer(sampled_at) do
-    map_size(marker) == 5 and (is_nil(opened_at) or is_integer(opened_at)) and
+    Enum.all?(Map.keys(marker), &(&1 in @marker_keys)) and
+      (is_nil(opened_at) or is_integer(opened_at)) and
+      (is_nil(marker["runEndedAt"]) or is_integer(marker["runEndedAt"])) and
       Enum.all?(@sample_counts, &(is_integer(sample[&1]) and sample[&1] >= 0)) and
       sample["memTotalKiB"] > 0 and
       Enum.all?(~w(someAvg10 someAvg60), &(is_nil(sample[&1]) or is_number(sample[&1])))
@@ -646,22 +652,32 @@ defmodule Tightbeam.OwnerAlerts.MemoryPressure.Sampler do
       run: nil,
       episode: nil,
       last_write_at: nil,
-      delete_at: nil
+      delete_at: nil,
+      owner_alerts: Keyword.get(opts, :owner_alerts, Tightbeam.OwnerAlerts),
+      ready_waiters: []
     }
 
-    {:ok, boot(state)}
+    # The boot reads the database, so it runs after init returns: a slow
+    # database does not hold up the gateway's later children.
+    {:ok, state, {:continue, :boot}}
   end
 
+  @impl true
+  def handle_continue(:boot, state), do: {:noreply, boot(state)}
+
   # M6: a marker found at start is reported and deleted before sampling
-  # starts afresh. This runs once, before the first sample, so the restart is
-  # recorded before the delivery process's boot pass sees the episode's alert.
+  # starts afresh. Once that is recorded (or there was nothing to record),
+  # the delivery process is told it may run its boot pass, so a first alert
+  # the restart supersedes is withdrawn before anything can send it.
   defp boot(state) do
     found = Marker.read(state.state_dir)
 
     case Recorder.boot(state.recorder, found, state.wall_clock.()) do
       {:ok, owner} ->
         if found != :none, do: Marker.delete(state.marker)
-        alerts(%{state | booted?: true}, owner)
+        GenServer.cast(state.owner_alerts, :memory_pressure_ready)
+        Enum.each(state.ready_waiters, &GenServer.cast(&1, :memory_pressure_ready))
+        alerts(%{state | booted?: true, ready_waiters: []}, owner)
 
       {:error, reason} ->
         Logger.error("memory pressure start deferred: #{reason}")
@@ -686,6 +702,16 @@ defmodule Tightbeam.OwnerAlerts.MemoryPressure.Sampler do
 
   def handle_cast({:opened, opened_at, result}, state),
     do: {:noreply, opened(state, opened_at, result)}
+
+  # A delivery process that started gated asks whether the boot is recorded.
+  # It may ask before or after the boot finishes; either way it is told once.
+  def handle_cast({:notify_ready, pid}, %{booted?: true} = state) do
+    GenServer.cast(pid, :memory_pressure_ready)
+    {:noreply, state}
+  end
+
+  def handle_cast({:notify_ready, pid}, state),
+    do: {:noreply, %{state | ready_waiters: [pid | state.ready_waiters]}}
 
   @impl true
   def handle_info(:boot, %{booted?: false} = state), do: {:noreply, boot(state)}
@@ -814,10 +840,17 @@ defmodule Tightbeam.OwnerAlerts.MemoryPressure.Sampler do
     cond do
       state.episode -> in_episode(state, sample, at, wall)
       state.run && pressure? -> state |> keep(sample, wall) |> continue_run(at, late?)
-      state.run -> %{state | run: nil, delete_at: at + @unopened_delete_ms}
+      state.run -> end_run(state, at, wall)
       pressure? -> start_run(state, sample, at, wall, late?)
       true -> idle(state, at)
     end
+  end
+
+  # M1's write at the run's end: the marker records when the run ended, so a
+  # restart inside the R4 window does not report the spike as ongoing (M6).
+  defp end_run(state, at, wall) do
+    state = write(state, at, :run_end, wall)
+    %{state | run: nil, delete_at: at + @unopened_delete_ms}
   end
 
   defp keep(%{run: run} = state, sample, wall),
@@ -926,15 +959,17 @@ defmodule Tightbeam.OwnerAlerts.MemoryPressure.Sampler do
       else: write(state, at, :latest)
   end
 
-  defp write(state, at, reason) do
-    Marker.put(state.marker, marker(state), reason)
+  defp write(state, at, reason, ended_at \\ nil) do
+    Marker.put(state.marker, marker(state, ended_at), reason)
     %{state | last_write_at: at}
   end
 
-  defp marker(%{run: run, episode: episode} = state) do
+  # runEndedAt is null while the run stands; a new run's first write resets it.
+  defp marker(%{run: run, episode: episode} = state, ended_at) do
     %{
       "host" => state.host,
       "runStartedAt" => run.started_wall,
+      "runEndedAt" => ended_at,
       "episodeOpenedAt" => if(episode && episode.committed?, do: episode.opened_at),
       "lastSampleAt" => run.last_at,
       "lastSample" => run.last

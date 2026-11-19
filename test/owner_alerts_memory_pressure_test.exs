@@ -138,6 +138,8 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
 
     memory(ctx, 50, psi: {4.0, 4.0})
     assert %{run: false, episode: false} = sample(ctx, 120_000)
+    ended_at = ctx.wall0 + 120_000
+    assert {:marker, %{"runEndedAt" => ^ended_at, "episodeOpenedAt" => nil}} = marker(ctx)
 
     # R4: the marker of a run that ended unopened is deleted after 60 s with
     # no new run.
@@ -333,29 +335,41 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
     assert alert.dedupe_key == "memory-pressure:#{@host}:#{ctx.wall0 + 125_000}"
   end
 
-  test "R4: a run that ends unopened keeps its marker 60 s; a new run inside it rewrites once",
+  test "R4: a run that ends unopened keeps its marker 60 s; a new run inside it rewrites it",
        ctx do
     enable(ctx.db)
     stack = start_stack(ctx)
 
     pressure(ctx)
     sample(ctx, 0)
-    assert_received {:memory_pressure_marker, :put, :run_start, %{"runStartedAt" => first}}
 
+    assert_received {:memory_pressure_marker, :put, :run_start,
+                     %{"runStartedAt" => first, "runEndedAt" => nil}}
+
+    # N1: the run's end is written once, with the time it ended.
     calm(ctx)
     sample(ctx, 15_000)
+
+    assert_received {:memory_pressure_marker, :put, :run_end,
+                     %{"runStartedAt" => ^first, "runEndedAt" => ended}}
+
+    assert ended == ctx.wall0 + 15_000
     pressure(ctx)
     sample(ctx, 30_000)
 
-    # One write for the flap: no delete between the two runs.
-    assert_received {:memory_pressure_marker, :put, :run_start, %{"runStartedAt" => second}}
+    # No delete between the two runs; the new run's first write resets the end.
+    assert_received {:memory_pressure_marker, :put, :run_start,
+                     %{"runStartedAt" => second, "runEndedAt" => nil}}
+
     refute_received {:memory_pressure_marker, :delete}
     assert {first, second} == {ctx.wall0, ctx.wall0 + 30_000}
 
     calm(ctx)
     for t <- [45, 60, 75, 90], do: sample(ctx, t * 1_000)
     refute_received {:memory_pressure_marker, :delete}
-    assert {:marker, %{"runStartedAt" => ^second}} = marker(ctx)
+    second_end = ctx.wall0 + 45_000
+
+    assert {:marker, %{"runStartedAt" => ^second, "runEndedAt" => ^second_end}} = marker(ctx)
 
     sample(ctx, 105_000)
     assert_received {:memory_pressure_marker, :delete}
@@ -468,6 +482,74 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
     assert closed_events(ctx.db) == []
   end
 
+  test "N1: a kill inside the window after a spike ended gives one restart alert saying it ended",
+       ctx do
+    enable(ctx.db)
+    stack = start_stack(ctx)
+    pressure(ctx)
+    for t <- 0..45//15, do: sample(ctx, t * 1_000)
+    calm(ctx)
+    sample(ctx, 60_000)
+    sample(ctx, 75_000)
+
+    # Inside the 60 s window the marker still stands, now with its end.
+    ended_at = ctx.wall0 + 60_000
+    assert {:marker, %{"runEndedAt" => ^ended_at}} = marker(ctx)
+
+    kill_stack(stack)
+    start_stack(ctx)
+
+    assert [restart] = memory_alerts(ctx.db)
+    assert restart.dedupe_key == "memory-pressure-restart:#{@host}:#{ctx.wall0}"
+
+    assert restart.body ==
+             "Tightbeam restarted on sirius shortly after a brief memory-pressure spike that " <>
+               "began at #{OwnerAlerts.format_local(ctx.wall0)} and ended at " <>
+               "#{OwnerAlerts.format_local(ended_at)}, before an alert was due. " <>
+               "The last kept sample, at #{OwnerAlerts.format_local(ctx.wall0 + 45_000)}, " <>
+               "showed 16.0 GiB of 32.0 GiB free (50%), with swap 0.0 of 8.0 GiB used. " <>
+               "Programs were stalled waiting for memory 12% of the last 10 seconds and 12% " <>
+               "of the last minute. Tightbeam is only watching. It has not stopped or changed " <>
+               "anything. If free memory keeps falling, the machine may stop responding."
+
+    refute restart.body =~ "ongoing"
+    assert marker(ctx) == :none
+    assert closed_events(ctx.db) == []
+    assert pressure_facts(ctx.db) == []
+  end
+
+  test "N1: a marker written before runEndedAt existed still parses as a standing run", ctx do
+    enable(ctx.db)
+
+    File.write!(
+      Marker.path(ctx.state_dir),
+      JSON.encode!(%{
+        "host" => @host,
+        "runStartedAt" => ctx.wall0,
+        "episodeOpenedAt" => nil,
+        "lastSampleAt" => ctx.wall0 + 15_000,
+        "lastSample" => %{
+          "memTotalKiB" => @total,
+          "memAvailableKiB" => div(@total, 2),
+          "swapTotalKiB" => 0,
+          "swapFreeKiB" => 0,
+          "someAvg10" => 12.0,
+          "someAvg60" => 12.0
+        }
+      })
+    )
+
+    assert {:marker, marker} = marker(ctx)
+    refute Map.has_key?(marker, "runEndedAt")
+    start_stack(ctx)
+
+    assert [restart] = memory_alerts(ctx.db)
+    assert restart.dedupe_key == "memory-pressure-restart:#{@host}:#{ctx.wall0}"
+    assert restart.body =~ "Tightbeam restarted on sirius while memory pressure was ongoing."
+    assert restart.body =~ "The episode had not yet opened."
+    assert marker(ctx) == :none
+  end
+
   test "T32: an orderly stop deletes an unopened run's marker, and the next start sends nothing",
        ctx do
     enable(ctx.db)
@@ -555,6 +637,79 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
     assert restart.body =~ "could not be read"
     assert marker(ctx) == :none
     assert_received {:memory_pressure_marker, :delete}
+  end
+
+  # N2: the boot runs after init, and the delivery process's passes wait for
+  # it, so a slow database neither blocks later children nor lets a
+  # superseded first alert out.
+  for gated? <- [true, false] do
+    @tag gated: gated?
+    test "N2: a slow boot blocks no later child; gated delivery never sends the superseded alert (gated=#{gated?})",
+         ctx do
+      enable(ctx.db)
+      parent = self()
+
+      # A previous run left an open episode whose first alert is unsent.
+      stack = start_stack(ctx)
+      pressure(ctx)
+      for t <- 0..120//15, do: sample(ctx, t * 1_000)
+      assert [%{state: "pending", attempts: 0} = first] = memory_alerts(ctx.db)
+      kill_stack(stack)
+
+      # The next start's boot transaction is held until the test lets it go.
+      hook = fn
+        :boot ->
+          send(parent, {:boot_stalled, self()})
+
+          receive do
+            :release_db -> :ok
+          end
+
+        _operation ->
+          :ok
+      end
+
+      start_stack(ctx, db_hook: hook, settle: false)
+      assert_receive {:boot_stalled, recorder}, 5_000
+
+      # The later child starts while the boot is still held.
+      sending = runner(self(), fn {:execute, op} -> committed(op, "send") end)
+
+      start_supervised!(
+        {OwnerAlerts, db: ctx.db, send_runner: sending, await_memory_pressure: ctx.gated}
+      )
+
+      # A post-commit nudge before the boot is recorded.
+      GenServer.cast(OwnerAlerts, :due)
+      :sys.get_state(OwnerAlerts)
+
+      if ctx.gated do
+        refute_received {:harklight, _}
+
+        send(recorder, :release_db)
+        settle()
+        :sys.get_state(OwnerAlerts)
+
+        # Only the restart alert went out; the superseded first alert never did.
+        assert_received {:harklight, ["send", "--prepare", "--op-id", op | rest]}
+        assert flag(rest, "--title") == "sirius: Tightbeam restarted during memory pressure"
+        refute_received {:harklight, ["send", "--prepare" | _]}
+
+        assert [
+                 %{alert_id: first_id, state: "withdrawn", withdrawn_as: "stale", attempts: 0},
+                 %{state: "sent", op_id: ^op}
+               ] = memory_alerts(ctx.db)
+
+        assert first_id == first.alert_id
+        assert count(ctx.db, "SELECT count(*) FROM harklight_send_operations") == 1
+      else
+        # Control: without the gate the superseded first alert goes out.
+        assert_received {:harklight, ["send", "--prepare", "--op-id", _op | rest]}
+        assert flag(rest, "--title") == "sirius is running low on memory"
+        send(recorder, :release_db)
+        settle()
+      end
+    end
   end
 
   test "T15: a memory-pressure alert created before a restart is sent once after it", ctx do
@@ -1024,6 +1179,7 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
   end
 
   defp start_stack(ctx, opts \\ []) do
+    {settle?, opts} = Keyword.pop(opts, :settle, true)
     clock = ctx.clock
 
     defaults = [
@@ -1053,7 +1209,7 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
         Supervisor.child_spec({MemoryPressure, opts}, id: id, restart: :temporary)
       )
 
-    settle()
+    if settle?, do: settle()
     %{id: id, pid: pid}
   end
 

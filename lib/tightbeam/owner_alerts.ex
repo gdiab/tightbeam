@@ -1127,6 +1127,7 @@ defmodule Tightbeam.OwnerAlerts do
             lifecycle: %{
               host: run.host,
               runStartedAt: run.run_started_at,
+              runEndedAt: run.run_ended_at,
               episodeOpenedAt: opened_at,
               restart: true
             }
@@ -1158,6 +1159,7 @@ defmodule Tightbeam.OwnerAlerts do
     %{
       host: marker["host"],
       run_started_at: marker["runStartedAt"],
+      run_ended_at: marker["runEndedAt"],
       episode_opened_at: marker["episodeOpenedAt"],
       last_sample_at: marker["lastSampleAt"],
       last_sample: marker["lastSample"],
@@ -1173,6 +1175,7 @@ defmodule Tightbeam.OwnerAlerts do
     %{
       host: host,
       run_started_at: nil,
+      run_ended_at: nil,
       episode_opened_at: nil,
       last_sample_at: nil,
       last_sample: nil,
@@ -1313,23 +1316,25 @@ defmodule Tightbeam.OwnerAlerts do
     )
   end
 
+  # A run that ended unopened inside the R4 window: the spike is over, so the
+  # alert says so instead of calling the pressure ongoing.
+  def memory_restart_body(%{run_ended_at: ended_at, episode_opened_at: nil} = run)
+      when is_integer(ended_at) do
+    Enum.join(
+      [
+        "Tightbeam restarted on #{run.host} shortly after a brief memory-pressure spike that " <>
+          "began at #{format_local(run.run_started_at)} and ended at " <>
+          "#{format_local(ended_at)}, before an alert was due."
+      ] ++ last_sample_text(run) ++ [@memory_closing],
+      " "
+    )
+  end
+
   def memory_restart_body(run) do
     opened =
       case run.episode_opened_at do
         nil -> "The episode had not yet opened."
         at -> "The episode opened at #{format_local(at)}."
-      end
-
-    last =
-      case {run.last_sample_at, run.last_sample} do
-        {at, %{} = sample} when is_integer(at) ->
-          [
-            "The last kept sample, at #{format_local(at)}, showed #{memory_text(sample)}.",
-            stalled_text(sample)
-          ]
-
-        _ ->
-          []
       end
 
     first =
@@ -1354,9 +1359,22 @@ defmodule Tightbeam.OwnerAlerts do
         "Tightbeam restarted on #{run.host} while memory pressure was ongoing.",
         "The pressure began at #{format_local(run.run_started_at)}.",
         opened
-      ] ++ last ++ first ++ [@memory_closing],
+      ] ++ last_sample_text(run) ++ first ++ [@memory_closing],
       " "
     )
+  end
+
+  defp last_sample_text(run) do
+    case {run.last_sample_at, run.last_sample} do
+      {at, %{} = sample} when is_integer(at) ->
+        [
+          "The last kept sample, at #{format_local(at)}, showed #{memory_text(sample)}.",
+          stalled_text(sample)
+        ]
+
+      _ ->
+        []
+    end
   end
 
   defp memory_text(sample) do
@@ -1944,24 +1962,51 @@ defmodule Tightbeam.OwnerAlerts do
 
   @impl true
   def init(opts) do
-    # The boot pass finds every stall that came due while the gateway was
-    # down (S7) and every pending delivery, from the tables alone.
-    send(self(), {:pass, :boot})
+    # `await_memory_pressure: true` (set where the G1 sampler runs): no pass
+    # runs until the sampler has recorded its boot. A restart (M6) withdraws
+    # an episode's unsent first alert, and every pass delivers whatever is
+    # due, so until then no pass may run, whatever asks for one.
+    gated? = Keyword.get(opts, :await_memory_pressure, false)
+
+    if gated? do
+      sampler =
+        Keyword.get_lazy(opts, :memory_pressure, fn ->
+          __MODULE__.MemoryPressure.names().sampler
+        end)
+
+      GenServer.cast(sampler, {:notify_ready, self()})
+    else
+      # The boot pass finds every stall that came due while the gateway was
+      # down (S7) and every pending delivery, from the tables alone.
+      send(self(), {:pass, :boot})
+    end
 
     {:ok,
      %{
        db: Keyword.get(opts, :db, DB),
        runner: Keyword.get(opts, :send_runner),
        timer: nil,
-       last_pass_at: nil
+       last_pass_at: nil,
+       ready?: not gated?
      }}
   end
 
   @impl true
+  # Before the signal, the boot pass that follows it covers every event: it
+  # works from the tables alone.
+  def handle_cast(message, %{ready?: false} = state)
+      when message in [:due, :stall_inputs],
+      do: {:noreply, state}
+
+  def handle_cast(:memory_pressure_ready, %{ready?: false} = state),
+    do: {:noreply, run(%{state | ready?: true}, :boot)}
+
+  def handle_cast(:memory_pressure_ready, state), do: {:noreply, state}
   def handle_cast(:due, state), do: {:noreply, run(state, :event)}
   def handle_cast(:stall_inputs, state), do: {:noreply, run(state, :inputs)}
 
   @impl true
+  def handle_info({:pass, _reason}, %{ready?: false} = state), do: {:noreply, state}
   def handle_info({:pass, reason}, state), do: {:noreply, run(state, reason)}
 
   defp run(state, reason) do

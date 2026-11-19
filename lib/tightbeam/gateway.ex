@@ -348,11 +348,16 @@ defmodule Tightbeam.Gateway do
           tick_ms: config.wake_tick_ms,
           name: Tightbeam.WakeScheduler},
          {Tightbeam.HarklightWakes, db: db, send_runner: Map.get(config, :harklight_send_runner)},
-         # Before OwnerAlerts: a memory-pressure restart (M6) is recorded before
-         # the delivery boot pass can send the episode alert it supersedes.
+         # Before OwnerAlerts, which waits for its boot: a memory-pressure
+         # restart (M6) is recorded before any delivery pass can send the
+         # episode alert it supersedes.
          {Tightbeam.OwnerAlerts.MemoryPressure,
           db: db, scheduler: Tightbeam.WakeScheduler, state_dir: config.base_dir},
-         {Tightbeam.OwnerAlerts, db: db, send_runner: Map.get(config, :harklight_send_runner)},
+         # Its passes wait until the sampler has recorded any restart (M6).
+         {Tightbeam.OwnerAlerts,
+          db: db,
+          send_runner: Map.get(config, :harklight_send_runner),
+          await_memory_pressure: true},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
