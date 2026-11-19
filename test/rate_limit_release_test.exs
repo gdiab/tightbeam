@@ -571,6 +571,35 @@ defmodule Tightbeam.RateLimitReleaseTest do
     refute HarnessProcess.parked?(db, pi_key)
   end
 
+  test "B2: the quota park's own fence keeps its incident through close, shutdown and crash re-insertion",
+       %{db: db} do
+    incident = park_codex(db, "held", "c1")
+    marked = fn -> quota_mark(db) end
+    assert marked.() == incident.id
+
+    # Each of these inserts only where no fence stands, so the quota park's
+    # instance (and its mark) stays, and the completions keep it.
+    {:ok, _} = HarnessProcess.begin_park(db, @codex_key)
+    assert marked.() == incident.id
+    assert :ok = HarnessProcess.complete_park(db, @codex_key)
+
+    deadline = System.monotonic_time(:millisecond) + 60_000
+    {:ok, _} = HarnessProcess.begin_park_many_until(db, [@codex_key], deadline)
+    assert marked.() == incident.id
+    assert :ok = HarnessProcess.reconcile(db)
+
+    assert HarnessProcess.settle_proven_dead(db, @codex_key) in [:ok, :already_resolved]
+    assert marked.() == incident.id
+    assert HarnessProcess.parked?(db, @codex_key)
+
+    # A fence that is not the quota park is never kept by the guard, even on a
+    # key whose quota incident is still open: here the Pi key, unmarked.
+    pi_key = {:pi, "shared", "testhost"}
+    {:ok, _} = HarnessProcess.begin_park(db, pi_key)
+    assert :ok = HarnessProcess.complete_park(db, pi_key)
+    refute HarnessProcess.parked?(db, pi_key)
+  end
+
   test "B2: after a named release, close, shutdown and crash fences complete; only a limit met again re-parks and holds",
        %{db: db} do
     incident = park_codex(db, "held", "c1")
@@ -884,6 +913,18 @@ defmodule Tightbeam.RateLimitReleaseTest do
       cause: "normal turn delivered",
       principal: "process:test"
     })
+  end
+
+  defp quota_mark(db) do
+    {:ok, rows} =
+      DB.query(db, "SELECT quotaIncidentId FROM harness_park_fences WHERE adapterKey=?1", [
+        "codex:shared@testhost"
+      ])
+
+    case rows do
+      [[incident_id]] -> incident_id
+      [] -> :no_fence
+    end
   end
 
   defp lifecycle(db, kind, subject) do

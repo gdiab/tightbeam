@@ -204,9 +204,9 @@ defmodule Tightbeam.HarnessProcess.Recovery do
   defp remove_observed_fence(_txn, _adapter_key, :none), do: :ok
 
   defp remove_observed_fence(txn, adapter_key, generation) do
-    # Preserve a quota park, which only the recorded release step lifts
-    # (companion v1.2 B2, the same guard as every other fence completion).
-    incident_guard = Tightbeam.HarnessProcess.quota_hold_guard_in_txn(txn)
+    # Preserve the quota park's own fence, which has a separate owner
+    # (quota companion B2); any other fence on the key is removed as observed.
+    incident_guard = Tightbeam.HarnessProcess.quota_fence_guard_in_txn(txn)
 
     DB.Txn.q(
       txn,

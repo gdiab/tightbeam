@@ -50,7 +50,7 @@ defmodule Tightbeam.RateLimitReset do
     # not.
     case status != :duplicate and open_incident(txn, observation_id) do
       [[incident_id, _harness, _host]] ->
-        HarnessProcess.begin_park_in_txn(txn, key)
+        HarnessProcess.begin_quota_park_in_txn(txn, key, incident_id)
         # Quota v3 R11: a park begun anew after a release is a new episode
         # with its own six-hour stranding check.
         ParkStranding.repark_in_txn(txn, incident_id, session.session_key, observed_at)

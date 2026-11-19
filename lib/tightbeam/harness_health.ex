@@ -2440,7 +2440,11 @@ defmodule Tightbeam.HarnessHealth do
     )
 
     if input.failure_class == "rate-limit-dead" do
-      HarnessProcess.begin_park_in_txn(txn, adapter_key(input.harness, input.host))
+      HarnessProcess.begin_quota_park_in_txn(
+        txn,
+        adapter_key(input.harness, input.host),
+        incident_id
+      )
     end
 
     snapshot_affected_work(txn, incident_id, input)
