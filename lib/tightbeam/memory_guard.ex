@@ -225,7 +225,7 @@ defmodule Tightbeam.MemoryGuard do
   take now. A held turn stays `queued`; the guard nudges its lane when it can
   run. The call may wait for an idle session process to close first.
   """
-  @spec admit(String.t()) :: :ok | {:held, [String.t()]}
+  @spec admit(String.t()) :: :ok | :no_turn | {:held, [String.t()]}
   def admit(session_key) do
     if running?(), do: GenServer.call(__MODULE__, {:admit, session_key}, 120_000), else: :ok
   catch
@@ -350,6 +350,9 @@ defmodule Tightbeam.MemoryGuard do
 
       {:held, details, state} ->
         {:reply, {:held, details}, publish_all(state)}
+
+      {:no_turn, state} ->
+        {:reply, :no_turn, state}
 
       {:closing, ref, state} ->
         # The reply waits for the idle close; the lane's call is blocked, the
@@ -614,6 +617,10 @@ defmodule Tightbeam.MemoryGuard do
         decide(state, session, host_state, seq)
       end
     else
+      # No queued turn yet: nothing is decided, so the lane claims nothing. A
+      # turn queued after this answer nudges the lane, which asks again;
+      # claiming it now would admit a launch nobody checked.
+      nil -> {:no_turn, state}
       _ -> {:ok, state}
     end
   end
@@ -1046,6 +1053,10 @@ defmodule Tightbeam.MemoryGuard do
 
         {:held, details, acc} ->
           GenServer.reply(from, {:held, details})
+          acc
+
+        {:no_turn, acc} ->
+          GenServer.reply(from, :no_turn)
           acc
 
         {:closing, ref, acc} ->
