@@ -144,7 +144,7 @@ defmodule Tightbeam.UserAdminTest do
       assert {:refused, "pairing_frozen"} = real_pair(ctx.db, "guest-new-dev", "guest")
       assert Devices.by_id(ctx.db, "guest-new-dev") == nil
 
-      lifted = Enum.find(["/usr/bin/env", "/bin/sh"], &Tightbeam.PairingFreeze.read(&1).lifted)
+      lifted = Tightbeam.TestDevices.valid_unfreeze_file!()
       frozen = Application.get_env(:tightbeam, :pairing_unfreeze_path)
       Application.put_env(:tightbeam, :pairing_unfreeze_path, lifted)
       on_exit(fn -> Application.put_env(:tightbeam, :pairing_unfreeze_path, frozen) end)

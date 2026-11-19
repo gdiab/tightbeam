@@ -41,10 +41,7 @@ defmodule GuardClientWire do
              SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
 
     valid =
-      Enum.find(
-        ["/usr/bin/env", "/bin/sh", "/usr/bin/true"],
-        &Tightbeam.PairingFreeze.read(&1).lifted
-      )
+      Tightbeam.TestDevices.valid_unfreeze_file!()
 
     Application.put_env(:tightbeam, :pairing_unfreeze_path, valid)
 
