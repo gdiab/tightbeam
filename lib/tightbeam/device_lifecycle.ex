@@ -40,6 +40,7 @@ defmodule Tightbeam.DeviceLifecycle do
                            "device, then enter `<name> <code>` as this device's name."
   @code_invalid_message "The pairing code was not accepted: it may be mistyped, used or " <>
                           "expired. Ask the owner for a new code."
+  @rate_limited_message "Too many pairing attempts; try again shortly."
   @name_too_long_message "The device name is too long: keep the name before the code to " <>
                            "46 characters or fewer, then enter `<name> <code>` again."
 
@@ -111,7 +112,9 @@ defmodule Tightbeam.DeviceLifecycle do
   @indexes [{"pairing_codes_outstanding", @pairing_codes_outstanding_ddl}]
 
   @device_columns [
-    {"tokenDelivered", "INTEGER", "tokenDelivered INTEGER NOT NULL DEFAULT 0"},
+    # Delivered unless a coded pairing minted the token (S2.3): that is the only
+    # writer of 0, and it always sets the deadline.
+    {"tokenDelivered", "INTEGER", "tokenDelivered INTEGER NOT NULL DEFAULT 1"},
     {"deliveryDeadline", "INTEGER", "deliveryDeadline INTEGER"},
     {"tokenGeneration", "INTEGER", "tokenGeneration INTEGER NOT NULL DEFAULT 0"},
     {"pairedCodeId", "TEXT", "pairedCodeId TEXT"}
@@ -142,8 +145,7 @@ defmodule Tightbeam.DeviceLifecycle do
           :ok = Txn.exec(txn, "ALTER TABLE devices ADD COLUMN #{definition}")
         end)
 
-        # S5: every token that exists at installation is delivered.
-        Txn.q(txn, "UPDATE devices SET tokenDelivered = 1 WHERE token IS NOT NULL")
+        # S5: every token that exists at installation is delivered (the default).
 
         Enum.each(@tables ++ @indexes, fn {name, ddl} ->
           if Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE name = ?1", [name]) != [],
@@ -457,51 +459,52 @@ defmodule Tightbeam.DeviceLifecycle do
         {:refused, "pairing_code_required", @code_required_message}
 
       %{"name" => name, "code" => code} ->
-        cond do
-          String.length(String.trim(claimed)) > @max_name_length ->
-            {:refused, "pairing_code_invalid", @name_too_long_message}
-
-          outstanding(db) == [] ->
-            {:refused, "pairing_code_invalid", @code_invalid_message}
-
-          true ->
-            admission = Keyword.get(opts, :admission, PairingAdmission)
-
-            case PairingAdmission.run(admission, fn -> match(db, code) end) do
-              {:ok, nil} ->
-                {:refused, "pairing_code_invalid", @code_invalid_message}
-
-              {:ok, code_id} ->
-                redeem(db, code_id, input, String.trim(name))
-
-              {:error, :rate_limited} ->
-                {:refused, "rate_limited", "Too many pairing attempts; try again shortly."}
-            end
+        if String.length(String.trim(claimed)) > @max_name_length do
+          {:refused, "pairing_code_invalid", @name_too_long_message}
+        else
+          case outstanding(db) do
+            # A database too busy for the cheap check refuses like the rate limit.
+            :busy -> {:refused, "rate_limited", @rate_limited_message}
+            [] -> {:refused, "pairing_code_invalid", @code_invalid_message}
+            _some -> admit_and_redeem(db, input, name, code, opts)
+          end
         end
     end
   end
 
-  defp outstanding(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT codeId, verifier, salt FROM pairing_codes
-        WHERE usedAt IS NULL AND invalidatedAt IS NULL AND expiresAt > ?1
-        ORDER BY issuedAt LIMIT #{@max_outstanding}
-        """,
-        [now()]
-      )
+  defp admit_and_redeem(db, input, name, code, opts) do
+    admission = Keyword.get(opts, :admission, PairingAdmission)
 
-    rows
+    case PairingAdmission.run(admission, fn -> match(db, code) end) do
+      {:ok, nil} -> {:refused, "pairing_code_invalid", @code_invalid_message}
+      {:ok, code_id} -> redeem(db, code_id, input, String.trim(name))
+      {:error, :rate_limited} -> {:refused, "rate_limited", @rate_limited_message}
+    end
+  end
+
+  defp outstanding(db) do
+    case DB.query(
+           db,
+           """
+           SELECT codeId, verifier, salt FROM pairing_codes
+           WHERE usedAt IS NULL AND invalidatedAt IS NULL AND expiresAt > ?1
+           ORDER BY issuedAt LIMIT #{@max_outstanding}
+           """,
+           [now()]
+         ) do
+      {:ok, rows} -> rows
+      {:error, _overloaded_or_failed} -> :busy
+    end
   end
 
   # At most 5 Argon2id checks, every one computed so timing does not reveal a match.
   defp match(db, code) do
     candidate = canonical(code)
 
-    db
-    |> outstanding()
+    case outstanding(db) do
+      :busy -> []
+      rows -> rows
+    end
     |> Enum.reduce(nil, fn [id, stored, salt], found ->
       if :crypto.hash_equals(Native.argon2id(candidate, salt), stored) and is_nil(found),
         do: id,
