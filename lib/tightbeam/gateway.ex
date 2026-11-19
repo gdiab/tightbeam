@@ -2317,32 +2317,25 @@ defmodule Tightbeam.Gateway do
   # releases the park and records the release with its actor and time; the
   # release then does what every reset or resume release does (companion B5,
   # v3 R12). close_adapter has usually removed the fence already.
-  defp release_quota_park(db, call, session, key, incident_id) do
+  defp release_quota_park(db, call, session, _key, incident_id) do
     {:ok, park} =
       DB.transaction(db, fn txn ->
-        HarnessProcess.complete_park_in_txn(txn, key)
-
-        EventLog.lifecycle_in_txn(
-          txn,
-          "rate_limit_hold_released",
-          incident_id,
-          JSON.encode!(%{
-            cause: "explicit_#{call.params[:action]}",
-            actor: repair_principal(call.principal),
-            releasedAt: System.system_time(:millisecond),
-            assignmentId: call.params[:assignment_id]
-          })
-        )
-
-        Tightbeam.QuotaRelease.released_in_txn(
-          txn,
-          incident_id,
-          to_string(session.harness),
-          session.host,
-          readmit: true
-        )
-
-        "released"
+        # Companion v1.6 C1: the one recorded release step. A standing reason
+        # (another open quota incident on the key, a process being parked)
+        # keeps the fence; the result then says the park is unchanged.
+        case Tightbeam.QuotaRelease.release_in_txn(
+               txn,
+               incident_id,
+               to_string(session.harness),
+               session.host,
+               cause: "explicit_#{call.params[:action]}",
+               actor: repair_principal(call.principal),
+               detail: %{assignmentId: call.params[:assignment_id]},
+               readmit: true
+             ) do
+          :admission_resumed -> "released"
+          {:held, _reasons} -> "unchanged"
+        end
       end)
 
     park
