@@ -62,6 +62,44 @@ defmodule Tightbeam.ParkStranding do
   end
 
   @doc """
+  At gateway start: give every standing quota park whose episode has no
+  stranding check one, due six hours after its fence was taken. This covers a
+  park carried over from a build without this check, whose fence the
+  limit-fallback step marked when it added `quotaIncidentId`. Parks that
+  already have their episode's wake are left alone.
+  """
+  @spec arm_standing(DB.server()) :: :ok
+  def arm_standing(db) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        txn
+        |> Txn.q(
+          """
+          SELECT f.quotaIncidentId, f.requestedAt, i.harness, i.host
+            FROM harness_park_fences f
+            JOIN harness_health_incidents i ON i.id = f.quotaIncidentId
+           WHERE i.state = 'open' AND i.failureClass = ?1 AND f.generation IS NOT NULL
+          """,
+          [@class]
+        )
+        |> Enum.each(fn [incident_id, requested_at, harness, host] ->
+          episode_in_txn(
+            txn,
+            incident_id,
+            harness,
+            host,
+            anchor_session(txn, incident_id, nil),
+            requested_at
+          )
+        end)
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  @doc """
   Companion B4: a limit met again parked the key under the still-open
   incident. Persist the stranding wake of the park episode now standing, due
   six hours after `parked_at`, unless that episode already has one.

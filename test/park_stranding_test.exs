@@ -19,6 +19,7 @@ defmodule Tightbeam.ParkStrandingTest do
     Org,
     ParkStranding,
     QuotaRelease,
+    Schema,
     Wakes
   }
 
@@ -355,6 +356,52 @@ defmodule Tightbeam.ParkStrandingTest do
     assert second.wake_id == episode_wake_id(db, incident)
 
     assert {:ok, {:notified, [_, _]}} = ParkStranding.notify(db, second, second.due_at)
+  end
+
+  test "upgrade: a quota park standing before the fold survives the first boot, marked, and gets its check",
+       %{db: db} do
+    incident = open_codex_park!(db)
+    enqueue(db, "c1", "asg_held")
+    pi_key = {:pi, "shared", "testhost"}
+    {:ok, _} = HarnessProcess.begin_park(db, pi_key)
+
+    # The shape an earlier build leaves: no quotaIncidentId column, the stamp
+    # before limit-fallback, and no stranding wake (that build had no R11).
+    {:ok, _} = DB.query(db, "DELETE FROM wakes WHERE consumer='park_stranding'")
+    :ok = DB.execute(db, "ALTER TABLE harness_park_fences DROP COLUMN quotaIncidentId")
+    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='session-identity-v1-0114'")
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [["limit-fallback-v1-0114"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    # The step marks the standing quota park from its key's open incident; a
+    # fence with no open quota incident on its key stays unmarked.
+    assert {:ok, [["codex:shared@testhost", marked], ["pi:shared@testhost", nil]]} =
+             DB.query(
+               db,
+               "SELECT adapterKey, quotaIncidentId FROM harness_park_fences ORDER BY adapterKey"
+             )
+
+    assert marked == incident.id
+
+    # The first boot's reconciliation keeps the quota park and completes the other.
+    assert :ok = HarnessProcess.reconcile(db)
+    assert HarnessProcess.parked?(db, @codex_key)
+    refute HarnessProcess.parked?(db, pi_key)
+
+    # Start-up arms the carried-over park's stranding check, once.
+    assert :ok = ParkStranding.arm_standing(db)
+    assert :ok = ParkStranding.arm_standing(db)
+    assert [stranding] = stranding_wakes(db)
+    assert stranding.wake_id == episode_wake_id(db, incident)
+
+    {:ok, [[requested_at]]} =
+      DB.query(db, "SELECT requestedAt FROM harness_park_fences WHERE adapterKey=?1", [
+        "codex:shared@testhost"
+      ])
+
+    assert stranding.due_at == requested_at + ParkStranding.after_ms()
+    assert {:ok, {:notified, [_, _]}} = ParkStranding.notify(db, stranding, stranding.due_at)
   end
 
   test "a re-park of the same incident and a retried consumer do not duplicate the notice",

@@ -182,6 +182,9 @@ defmodule Tightbeam.Gateway do
     File.mkdir_p!(config.base_dir)
 
     :ok = Schema.ensure_all(db)
+    # Quota v3 R11: a quota park carried over from an earlier build gets its
+    # six-hour stranding check (migration contract v3.11 R13 backfill).
+    :ok = Tightbeam.ParkStranding.arm_standing(db)
     :ok = AdminProjection.bootstrap_served(db, config.base_dir)
     :ok = TerminalCredentialFailure.reconcile_all(db)
     # Core fix (A) C6a: boot reads the unfreeze file only to record and alert.
