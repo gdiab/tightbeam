@@ -2154,6 +2154,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Retirements.ensure_schema(db)
     :ok = upgrade_retirement_cancellation(db)
     :ok = Tightbeam.RecordEvents.ensure_schema(db)
+    :ok = Tightbeam.DeviceLifecycle.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)

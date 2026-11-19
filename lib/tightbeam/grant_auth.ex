@@ -24,15 +24,16 @@ defmodule Tightbeam.GrantAuth do
   device or session now. So no code path can synthesize device or session
   authentication from ordinary map values: it would need the credential itself.
 
-  The seven protected acts (`approve-device`, `add-user`, `promote-user`,
-  `remove-user`, `register-host`, `revoke-device`, `deny-device`) run only for an
-  admin-paired device: the check is repeated inside the act's own transaction.
+  The protected acts (`approve-device`, `add-user`, `promote-user`, `remove-user`,
+  `register-host`, `revoke-device`, `deny-device`, and stage 1's `recovery-enroll`)
+  run only for an admin-paired device: the check is repeated inside the act's own
+  transaction.
   """
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @protected_verbs ~w(approve-device add-user promote-user remove-user register-host revoke-device deny-device)
+  @protected_verbs ~w(approve-device add-user promote-user remove-user register-host revoke-device deny-device recovery-enroll)
 
   @shape "user-authenticated-grants-v1-0114"
 
@@ -107,8 +108,7 @@ defmodule Tightbeam.GrantAuth do
   end
 
   @doc """
-  The event-row authentication fields of a call (C4): its class, its device, and
-  for a protected act the pairing freeze state at the call.
+  The event-row authentication fields of a call (C4): its class and its device.
   """
   @spec audit(map()) :: %{
           class: auth_class(),
@@ -116,11 +116,8 @@ defmodule Tightbeam.GrantAuth do
           pairing_freeze: String.t() | nil
         }
   def audit(call) do
-    freeze =
-      if protected_verb?(Map.get(call, :verb) || ""),
-        do: if(Tightbeam.PairingFreeze.read().lifted, do: "lifted", else: "frozen")
-
-    %{class: auth_class(call), device_id: auth_device_id(call), pairing_freeze: freeze}
+    # Stage 1 retires the freeze (S0.1); the column stays, unused (core K6 map).
+    %{class: auth_class(call), device_id: auth_device_id(call), pairing_freeze: nil}
   end
 
   @doc "The transport proof of a validated credential: its SHA-256."
@@ -321,7 +318,10 @@ defmodule Tightbeam.GrantAuth do
 
     case verb do
       "approve-device" ->
-        join(["/tightbeam approve-device", p.(:device_id) || "<deviceId>", p.(:user_id)])
+        join(["/tightbeam approve-device", p.(:user_id)])
+
+      "recovery-enroll" ->
+        "/tightbeam recovery-enroll"
 
       "deny-device" ->
         join(["/tightbeam deny-device", p.(:device_id) || "<deviceId>"])

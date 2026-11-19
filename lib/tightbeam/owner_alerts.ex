@@ -1048,6 +1048,33 @@ defmodule Tightbeam.OwnerAlerts do
     end
   end
 
+  ## Device lifecycle stage 1 (S0.2, S1.1, S1.3, S1.5)
+
+  @device_lifecycle_kinds ~w(pairing-unfreeze-ignored recovery-enrolled admin-recovered root-recovery-enroll root-pairing-code)
+
+  @doc """
+  Create one stage 1 device-lifecycle alert inside the transaction that records its
+  trigger. Its text names users and times only, never a code or secret.
+  """
+  @spec device_lifecycle_in_txn(Txn.t(), String.t(), String.t(), String.t(), String.t()) ::
+          {:created, String.t()} | :exists | :off
+  def device_lifecycle_in_txn(%Txn{} = txn, kind, dedupe_key, title, body)
+      when kind in @device_lifecycle_kinds do
+    case owner_in_txn(txn) do
+      owner when is_binary(owner) ->
+        create_in_txn(txn, %{
+          kind: kind,
+          dedupe_key: dedupe_key,
+          owner: owner,
+          title: title,
+          body: body
+        })
+
+      _ ->
+        :off
+    end
+  end
+
   ## Shared record
 
   defp create_in_txn(txn, input) do
