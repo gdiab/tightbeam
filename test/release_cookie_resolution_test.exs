@@ -351,6 +351,29 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     end
   end
 
+  test "the production release carries and loads the native helpers", %{launcher: launcher} do
+    # Stage 1: the Argon2id and base-lock NIF ships in the release's priv and loads
+    # there. The vector is the CLI's (cli/src/device_recovery_vector.txt).
+    vector =
+      Path.expand("../cli/src/device_recovery_vector.txt", __DIR__)
+      |> File.read!()
+      |> String.trim()
+
+    lock = Path.join(System.tmp_dir!(), "tb-release-nif-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm(lock) end)
+
+    out =
+      eval!(launcher, ~s"""
+      verifier = Tightbeam.Native.argon2id("TB-7K3M-Q9ZD-2WH8", :binary.copy(<<7>>, 16))
+      IO.puts("ARGON2=" <> Base.encode16(verifier, case: :lower))
+      held = Tightbeam.Native.base_lock(#{inspect(lock)})
+      IO.puts("LOCK=" <> to_string(is_reference(held)))
+      """)
+
+    assert value(out, "ARGON2") == vector
+    assert value(out, "LOCK") == "true"
+  end
+
   test "the gateway's :global.trans locks still exclude with distribution off",
        %{launcher: launcher} do
     # The lock ids of the eight `:global.trans` call sites (identity.ex x2,
