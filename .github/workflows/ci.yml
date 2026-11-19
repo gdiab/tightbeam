@@ -210,6 +210,35 @@ jobs:
         working-directory: cli
         run: cargo test
 
+      # Memory limits v1.4 §8 T1/T2/T15: a real runaway process, contained by
+      # Tightbeam's own limits. Each run sits in a cgroup with a finite memory
+      # limit of its own (6G, no swap), so a failure of Tightbeam's limits can
+      # only end that environment; the tests refuse to start without it.
+      # watched: a root-owned scope, so nothing is delegated to the gateway.
+      - name: memory containment (watched)
+        if: env.FULL_SUITE == 'true' && matrix.name == 'linux'
+        run: |
+          sudo systemd-run --scope --quiet -p MemoryMax=6G -p MemorySwapMax=0 -- \
+            sudo -u "$(id -un)" env PATH="$PATH" HOME="$HOME" MIX_ENV=test \
+              TIGHTBEAM_MEMORY_CONTAINMENT=1 TIGHTBEAM_MEMORY_CONTAINMENT_MODE=watched \
+              bash -c 'cd "$0" && mix test test/memory_guard_containment_test.exs' "$GITHUB_WORKSPACE"
+
+      # enforced: a cgroup delegated to the runner user the way systemd's
+      # Delegate= with DelegateSubgroup=gateway does (proposal P1): the user owns
+      # the root of the subtree, and the gateway runs in its `gateway` child.
+      - name: memory containment (enforced)
+        if: env.FULL_SUITE == 'true' && matrix.name == 'linux'
+        run: |
+          CG=/sys/fs/cgroup/tb-containment
+          echo "+memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          sudo mkdir -p "$CG/gateway"
+          echo 6G | sudo tee "$CG/memory.max"
+          echo 0 | sudo tee "$CG/memory.swap.max"
+          sudo chown -R "$(id -u):$(id -g)" "$CG"
+          echo $$ | sudo tee "$CG/gateway/cgroup.procs"
+          TIGHTBEAM_MEMORY_CONTAINMENT=1 TIGHTBEAM_MEMORY_CONTAINMENT_MODE=enforced \
+            mix test test/memory_guard_containment_test.exs
+
   # THE DEPLOY ARTIFACT IS BUILT HERE, from the pushed SHA, by a machine nobody
   # develops or smoke-tests on. Building it from a dev tree conflates "what I
   # have" with "what was reviewed"; building it on the smoke host conflates the

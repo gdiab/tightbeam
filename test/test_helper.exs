@@ -277,7 +277,20 @@ end
 cursor_bundle_exclusions =
   if System.find_executable("cursor-agent"), do: [], else: [cursor_bundle: true]
 
-ExUnit.start(assert_receive_timeout: 1_000, exclude: cursor_bundle_exclusions)
+# Memory limits v1.4 §8: the containment tests (:memory_containment) drive a
+# real runaway process and run only where their own environment has a finite
+# memory limit of its own: the CI step that sets one up exports
+# TIGHTBEAM_MEMORY_CONTAINMENT=1, and the test still refuses without the limit.
+# Never against a developer's or Sirius's live host: a declared exclusion here.
+memory_containment_exclusions =
+  if System.get_env("TIGHTBEAM_MEMORY_CONTAINMENT") == "1",
+    do: [],
+    else: [memory_containment: true]
+
+ExUnit.start(
+  assert_receive_timeout: 1_000,
+  exclude: cursor_bundle_exclusions ++ memory_containment_exclusions
+)
 
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 
