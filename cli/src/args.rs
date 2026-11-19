@@ -1370,10 +1370,9 @@ COMMANDS:
       user can no longer authenticate, be selected or act. Refuses self, the
       last admin and any user who owns rows; nothing is reassigned.
   approve-device [--user <userId>]
-      Operator only: only an admin's paired device app may approve a device.
-      George sends `/tightbeam approve-device` from his paired device; it shows a
-      one-time pairing code there, which he types into the new device's name.
-      Agents never run it, never ask another agent to, and never enter a code.
+      Operator only: only an admin's paired device may issue a pairing code;
+      George sends `/tightbeam approve-device` from Clawline or Chat and enters
+      the code on the new device himself. Agents never send it or enter a code.
   recover-admin --user <userId>
       Operator only: George's full-lockout recovery, on the gateway host with the
       gateway stopped. It reads his recovery secret from the terminal and prints a

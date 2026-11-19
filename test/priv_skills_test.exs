@@ -24,6 +24,27 @@ defmodule Tightbeam.PrivSkillsTest do
     end
   end
 
+  # Stage 1 P11 / S3: the operating manual tells agents never to run or ask another
+  # agent to run the recovery and pairing acts, nor to enter a code or secret.
+  test "the operating manual keeps recovery and pairing acts with George" do
+    manual =
+      Application.app_dir(:tightbeam, "priv/skills/tightbeam-operating-manual/SKILL.md")
+      |> File.read!()
+      |> String.replace(~r/\s+/, " ")
+
+    for act <- [
+          "`tightbeam recover-admin`",
+          "every `tightbeam root-admin` form",
+          "`recovery-enroll` are George's alone",
+          "`approve-device`, `deny-device`"
+        ] do
+      assert manual =~ act
+    end
+
+    assert manual =~ "Never run any of them, never ask another agent to"
+    assert manual =~ "Never enter a pairing code or recovery secret anywhere"
+  end
+
   test "neutral guidance skills use substrate-neutral role examples" do
     authoring =
       Application.app_dir(:tightbeam, "priv/skills/tightbeam-guidance-authoring/SKILL.md")
