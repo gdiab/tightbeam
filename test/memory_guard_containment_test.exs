@@ -113,7 +113,20 @@ defmodule Tightbeam.MemoryGuardContainmentTest do
     claude = Path.join(root, "fake-claude")
     File.write!(claude, "#!/usr/bin/env python3\n" <> @claude)
     File.chmod!(claude, 0o755)
-    on_exit(fn -> File.rm_rf(root) end)
+
+    on_exit(fn ->
+      # No test process outlives the test, whatever it asserted.
+      for identity <- Path.wildcard(Path.join(root, "*.identity")),
+          {:ok, text} <- [File.read(identity)],
+          [_pid, pgid | _] <- [String.split(text, "\t")],
+          do: System.cmd("kill", ["-KILL", "--", "-" <> pgid], stderr_to_stdout: true)
+
+      for file <- Path.wildcard(Path.join(out, "*.{pid,tool}")),
+          {:ok, pid} <- [File.read(file)],
+          do: System.cmd("kill", ["-KILL", String.trim(pid)], stderr_to_stdout: true)
+
+      File.rm_rf(root)
+    end)
 
     db_name = :"contain_db_#{System.unique_integer([:positive])}"
     db = start_supervised!({DB, path: ":memory:", name: db_name}, id: db_name)
@@ -330,12 +343,16 @@ defmodule Tightbeam.MemoryGuardContainmentTest do
     case mode do
       "enforced" ->
         layout = MemoryGuard.host_view(@host).layout
-        unit = Cgroup.session_unit(layout, a)
 
-        assert {:ok, %{"oom" => oom_count, "oom_group_kill" => group}} =
-                 Cgroup.local_events(layout.fs, unit)
+        # A's unit is removed once its end is recorded; the guard keeps the
+        # kernel's local counters for it (R10, R12c).
+        {:ok, rows} =
+          DB.query(ctx.db, "SELECT detail FROM lifecycle_events WHERE kind='memory_tree_ended'")
 
-        assert oom_count >= 1 and group >= 1
+        assert [%{"limit" => "session", "unitEvents" => events, "bytes" => peak}] =
+                 Enum.map(rows, &JSON.decode!(hd(&1)))
+
+        assert events["oom"] >= 1 and events["oom_group_kill"] >= 1
         assert {:ok, %{"oom" => 0}} = Cgroup.local_events(layout.fs, layout.harness)
 
         assert {:ok, %{"oom_kill" => 0}} =
@@ -344,13 +361,10 @@ defmodule Tightbeam.MemoryGuardContainmentTest do
         assert {:ok, %{"oom_kill" => 0}} =
                  Cgroup.local_events(layout.fs, Cgroup.adapter_unit(layout, "L1"))
 
-        peak =
-          case File.read(Path.join(Cgroup.dir(layout.fs, unit), "memory.peak")) do
-            {:ok, text} -> String.trim(text)
-            _ -> "unavailable"
-          end
-
-        IO.puts("T1 evidence: session unit memory.peak #{peak} (limit #{512 * @mib})")
+        IO.puts(
+          "T1 evidence: session unit memory.events.local #{inspect(events)}, " <>
+            "memory.peak #{inspect(peak)} (limit #{512 * @mib})"
+        )
 
       "watched" ->
         # T2: the overshoot bound, 512 MiB + 300 MiB, at the observed peak.
@@ -379,13 +393,14 @@ defmodule Tightbeam.MemoryGuardContainmentTest do
     %{adapter: adapter, os_pid: adapter_pid} = start_adapter!(ctx, "L2")
     sessions = for _ <- 1..3, do: new_session!(adapter)
     session_pids = Enum.map(sessions, &pid_of!(ctx, &1))
-    [a, b, _d] = sessions
+    [a, b, d] = sessions
     monitor = Process.monitor(adapter)
     started = System.system_time(:millisecond)
 
     # A and B have dispatched turns in progress; the adapter itself runs away.
     turns = for sid <- [a, b], do: Task.async(fn -> Adapter.prompt(adapter, sid, "sleep 60") end)
-    _runaway = Task.async(fn -> Adapter.prompt(adapter, a, "adapter-runaway") end)
+    # D's prompt makes the adapter itself run away (the agent allocates).
+    _runaway = Task.async(fn -> Adapter.prompt(adapter, d, "adapter-runaway") end)
 
     assert_receive {:DOWN, ^monitor, :process, ^adapter, _reason}, 60_000
     for turn <- turns, do: assert({:error, _transport_loss} = Task.await(turn, 30_000))

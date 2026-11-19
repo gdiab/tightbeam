@@ -1695,9 +1695,24 @@ defmodule Tightbeam.MemoryGuard do
         sessionId: kill.sid,
         launchId: kill.launch_id,
         bytes: kill.bytes,
-        mode: kill.mode
+        mode: kill.mode,
+        unitEvents: Map.get(kill, :events)
       })
     )
+  end
+
+  # `memory.peak` (kernel 5.19+) of an enforced unit, when the kernel has it.
+  defp unit_peak(layout, unit) do
+    case File.read(Path.join(Cgroup.dir(layout.fs, unit), "memory.peak")) do
+      {:ok, text} ->
+        case Integer.parse(String.trim(text)) do
+          {bytes, _} -> bytes
+          :error -> nil
+        end
+
+      _ ->
+        nil
+    end
   end
 
   # Kernel kills (enforced) and ended session processes (both modes, R11a).
@@ -1734,6 +1749,9 @@ defmodule Tightbeam.MemoryGuard do
             state
 
           limit ->
+            # The unit is removed below: keep the kernel's own verdict on it.
+            {:ok, counters} = Cgroup.local_events(layout.fs, record["unit"])
+
             kill = %{
               host: host,
               scope: "session",
@@ -1741,7 +1759,8 @@ defmodule Tightbeam.MemoryGuard do
               sid: record["sessionId"],
               key: nil,
               launch_id: record["launchId"],
-              bytes: nil,
+              bytes: unit_peak(layout, record["unit"]),
+              events: counters,
               limit_bytes:
                 if(limit == "session",
                   do: record["sessionLimit"],
