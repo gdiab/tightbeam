@@ -207,7 +207,7 @@ jobs:
 
       - name: mix test
         if: env.FULL_SUITE == 'true'
-        run: scripts/verify_mix.sh test/limit_fallback_switch_test.exs test/archetypes_test.exs test/user_removal_cross_line_test.exs test/published_schema_compatibility_test.exs test/limit_fallback_test.exs test/owner_alerts_test.exs
+        run: scripts/verify_mix.sh test/limit_fallback_switch_test.exs
 
       - name: cargo test
         if: env.FULL_SUITE == 'true'

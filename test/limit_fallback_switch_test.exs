@@ -1012,6 +1012,10 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
           result =
             owner_tune(ctx, key, %{setting: "set_reasoning", reasoningLevel: "medium"})
 
+          IO.puts(
+            "SCRATCHDIAG stale owner_tune=#{inspect(result, limit: :infinity)} model=#{inspect(Org.get(ctx.db, key).model)} pending=#{inspect(DB.query(ctx.db, "SELECT seq,status FROM turns WHERE sessionKey=?1", [key]))}"
+          )
+
           send(ctx.parent, {:owner_tune, result})
         end)
 
