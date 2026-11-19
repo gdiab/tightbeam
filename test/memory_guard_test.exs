@@ -631,6 +631,34 @@ defmodule Tightbeam.MemoryGuardTest do
       assert events(ctx.db, "memory_guard_idle_closed") == []
     end
 
+    test "R17a: lowering residentCap below the resident count closes idle processes only", ctx do
+      queue!(ctx, "agent:s3", "working")
+      assert :ok = MemoryGuard.admit("agent:s3")
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "residentCap", "1", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+      assert_receive {:closed, first, "resident_cap"}
+      assert_receive {:closed, second, "resident_cap"}
+      settle_closes!()
+      assert Enum.sort([first, second]) == ["sid-1", "sid-2"]
+      # The working one finishes; nothing more closes.
+      MemoryGuard.turn_finished("agent:none")
+      _ = :sys.get_state(MemoryGuard)
+      refute_received {:closed, "sid-3", _}
+
+      # host-memory, the supported read (R12b), shows it.
+      assert %{residentCount: 1, settings: %{residentCap: 1}} =
+               Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})["host-memory"].(%{
+                 origin: "agent:any",
+                 params: %{host: @host}
+               })
+    end
+
     test "R4: a session with a queued or running turn is not idle", ctx do
       for n <- 1..3, do: queue!(ctx, "agent:s#{n}", "pending")
       session!(ctx, "agent:s4")

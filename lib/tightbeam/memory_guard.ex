@@ -373,7 +373,7 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   def handle_call({:settings_changed, host}, _from, state) do
-    state = state |> determine(host) |> publish_all() |> release_check(host)
+    state = state |> determine(host) |> publish_all() |> trim_to_cap(host) |> release_check(host)
     {:reply, :ok, state}
   end
 
@@ -396,7 +396,7 @@ defmodule Tightbeam.MemoryGuard do
     state = %{state | busy: Map.delete(state.busy, session_key)}
     state = %{state | reservations: Map.delete(state.reservations, session_key)}
     state = touch_session(state, session_key)
-    state = if host, do: release_check(state, host), else: state
+    state = if host, do: state |> trim_to_cap(host) |> release_check(host), else: state
     {:noreply, publish_all(state)}
   end
 
@@ -454,6 +454,7 @@ defmodule Tightbeam.MemoryGuard do
       {closing, rest} ->
         state = %{state | closing: rest}
         state = finish_close(state, closing, result)
+        state = if result == :ok, do: trim_to_cap(state, closing.host), else: state
         {:noreply, publish_all(state)}
     end
   end
@@ -1288,7 +1289,7 @@ defmodule Tightbeam.MemoryGuard do
         state = put_in(state.hosts[host].available, available)
         state = watched_limits(state, host, measured, settings)
         state = observe_ended(state, host, measured)
-        shed(state, host)
+        state |> shed(host) |> trim_to_cap(host)
 
       :error ->
         if host_state.sampling_failed do
@@ -1820,6 +1821,23 @@ defmodule Tightbeam.MemoryGuard do
       end
     else
       _ -> nil
+    end
+  end
+
+  # R17a: after `residentCap` is lowered below the resident count, idle
+  # session processes close, one at a time, until the count is back under the
+  # cap; working ones finish.
+  defp trim_to_cap(state, host) do
+    host_state = Map.get(state.hosts, host)
+
+    with %{mode: mode, settings: %{resident_cap: cap}} when mode != "off" and is_integer(cap) <-
+           host_state,
+         true <- resident_count(state, host, nil) > cap,
+         false <- Enum.any?(state.closing, fn {_ref, c} -> c.host == host end),
+         {:ok, _ref, state} <- start_close(state, host, "resident_cap") do
+      state
+    else
+      _ -> state
     end
   end
 
