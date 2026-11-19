@@ -6,7 +6,7 @@ defmodule Tightbeam.MixProject do
       app: :tightbeam,
       version: cli_version(),
       elixir: "~> 1.19",
-      compilers: [:topline_unicode] ++ Mix.compilers(),
+      compilers: [:topline_unicode, :tightbeam_native] ++ Mix.compilers(),
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -148,4 +148,63 @@ defmodule Mix.Tasks.Compile.ToplineUnicode do
       other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
     end
   end
+end
+
+defmodule Mix.Tasks.Compile.TightbeamNative do
+  @moduledoc false
+  # Builds native/tightbeam_native (Argon2id verifiers and the base-directory lock,
+  # stage 1 S0.3 and S1.2) exactly as Compile.ToplineUnicode builds its extension.
+  use Mix.Task.Compiler
+
+  @crate "native/tightbeam_native"
+
+  @impl Mix.Task.Compiler
+  def run(_args) do
+    root = File.cwd!()
+    target = Path.join(root, "priv/#{target_name()}")
+
+    if current?(root, target), do: {:noop, []}, else: build(root, target)
+  end
+
+  defp build(root, target) do
+    cargo = System.find_executable("cargo") || Mix.raise("cargo is required to build Tightbeam")
+    manifest = Path.join(root, "#{@crate}/Cargo.toml")
+
+    {output, status} =
+      System.cmd(cargo, ["build", "--locked", "--release", "--manifest-path", manifest],
+        cd: root,
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: Mix.raise("Tightbeam native extension build failed:\n#{output}")
+
+    source = Path.join(root, "#{@crate}/target/release/#{source_name()}")
+    File.mkdir_p!(Path.dirname(target))
+    File.cp!(source, target)
+    {:ok, []}
+  end
+
+  defp current?(root, target) do
+    with {:ok, target_stat} <- File.stat(target, time: :posix) do
+      [Path.join(root, "#{@crate}/Cargo.toml"), Path.join(root, "#{@crate}/Cargo.lock")]
+      |> Kernel.++(Path.wildcard(Path.join(root, "#{@crate}/src/**/*.rs")))
+      |> Enum.all?(fn source ->
+        {:ok, source_stat} = File.stat(source, time: :posix)
+        source_stat.mtime <= target_stat.mtime
+      end)
+    else
+      _ -> false
+    end
+  end
+
+  defp source_name do
+    case :os.type() do
+      {:unix, :darwin} -> "libtightbeam_native.dylib"
+      {:unix, _} -> "libtightbeam_native.so"
+      other -> Mix.raise("Tightbeam native extension does not support #{inspect(other)}")
+    end
+  end
+
+  # Erlang loads a NIF from "<path>.so" on every Unix, macOS included.
+  defp target_name, do: "tightbeam_native.so"
 end

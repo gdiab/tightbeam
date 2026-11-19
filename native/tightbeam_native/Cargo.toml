@@ -1,0 +1,13 @@
+[package]
+name = "tightbeam_native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
+libc = "0.2"
+rustler = "=0.39.0"

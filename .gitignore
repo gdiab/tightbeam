@@ -31,3 +31,5 @@ doc/
 .claude/worktrees/
 /priv/cursor_signing_native.so
 /priv/live_base_lock.so
+/native/tightbeam_native/target/
+/priv/tightbeam_native.so
