@@ -9,7 +9,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
 
   @family "harness-health-recovery"
   @slot "cycle"
-  @settings ~w(eligible_failure_classes interval_ms timeout_ms start withdraw reschedule release)
+  @settings ~w(eligible_failure_classes first_interval_ms interval_ms daily_probe_cap timeout_ms start withdraw reschedule release)
   @reactions %{
     "start" => "schedule_one_cycle_for_eligible_open_hold",
     "withdraw" => "withdraw_resolved_or_ineligible_cycle_at_delivery",
@@ -76,7 +76,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
 
     case policy do
       {:ok, settings, digest} ->
-        if eligible?(hold, settings) do
+        if eligible?(txn, hold, settings) do
           upsert(txn, hold, source_event_id, settings, digest, now, opts)
         else
           withdraw(txn, hold["id"], now)
@@ -169,7 +169,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
 
       case policy() do
         {:ok, settings, _digest} when not is_nil(hold) ->
-          if eligible?(hold, settings) do
+          if eligible?(txn, hold, settings) do
             Txn.q(
               txn,
               "UPDATE harness_health_recovery_schedules SET status='due',startedAt=?3,previousStartedAt=?3,updatedAt=?3 WHERE holdId=?1 AND cycleId=?2 AND status='pending'",
@@ -302,7 +302,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
 
         case {hold, policy()} do
           {%{"state" => "open"} = hold, {:ok, settings, _digest}} ->
-            if eligible?(hold, settings) do
+            if eligible?(txn, hold, settings) do
               {:ok, %{cycle_id: cycle_id, started_at: started_at, timeout_ms: timeout_ms}, hold}
             else
               finish_cycle_in_txn(txn, hold_id, cycle_id, now)
@@ -320,7 +320,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
   end
 
   defp reconcile_with_policy(txn, hold, source_event_id, settings, digest, now, opts) do
-    if eligible?(hold, settings) do
+    if eligible?(txn, hold, settings) do
       upsert(txn, hold, source_event_id, settings, digest, now, opts)
     else
       withdraw(txn, hold["id"], now)
@@ -337,7 +337,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
            [hold_id]
          ) do
       [] ->
-        due_at = initial_due_at(hold, settings, now, opts, nil)
+        due_at = initial_due_at(txn, hold, settings, now, opts, nil)
         insert_cycle(txn, hold, source_event_id, settings, digest, due_at, now)
 
       [[cycle_id, "pending", ^digest, ^interval_ms, _previous_started_at]] ->
@@ -350,11 +350,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
         cycle_id
 
       [[cycle_id, "pending", _old_digest, _old_interval, previous_started_at]] ->
-        due_at =
-          max(
-            hold["openedAt"] + settings["interval_ms"],
-            if(previous_started_at, do: previous_started_at + settings["interval_ms"], else: 0)
-          )
+        due_at = backoff_due_at(txn, hold, settings, previous_started_at)
 
         Txn.q(
           txn,
@@ -377,7 +373,7 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
         :ok
 
       [[_cycle_id, "withdrawn", _old_digest, _old_interval, previous_started_at]] ->
-        due_at = initial_due_at(hold, settings, now, opts, previous_started_at)
+        due_at = initial_due_at(txn, hold, settings, now, opts, previous_started_at)
         insert_cycle(txn, hold, source_event_id, settings, digest, due_at, now, replace: true)
     end
   end
@@ -433,16 +429,57 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
     cycle_id
   end
 
-  defp initial_due_at(hold, settings, now, opts, previous_started_at) do
-    interval_ms = settings["interval_ms"]
-
-    due_at =
-      max(
-        hold["openedAt"] + interval_ms,
-        if(previous_started_at, do: previous_started_at + interval_ms, else: 0)
-      )
-
+  defp initial_due_at(txn, hold, settings, now, opts, previous_started_at) do
+    due_at = backoff_due_at(txn, hold, settings, previous_started_at)
     if Keyword.get(opts, :cutover, false), do: max(due_at, now), else: due_at
+  end
+
+  # Companion v1.6 PR3: the first probe is due first_interval_ms after the
+  # hold opens; each later one doubles that interval after the previous
+  # probe started, capped at interval_ms. At most daily_probe_cap automatic
+  # probes start on one key in any rolling 24 hours; past the cap the next
+  # waits until the window allows one.
+  defp backoff_due_at(txn, hold, settings, previous_started_at) do
+    first = settings["first_interval_ms"]
+    cap = settings["interval_ms"]
+
+    started =
+      txn
+      |> Txn.q(
+        "SELECT COUNT(DISTINCT cycleId) FROM harness_health_recovery_checks WHERE holdId=?1",
+        [hold["id"]]
+      )
+      |> then(fn [[count]] -> count end)
+
+    # A cycle that started counts as a probe even if it recorded no check.
+    due_at =
+      if is_integer(previous_started_at),
+        do: previous_started_at + min(first * Integer.pow(2, max(started, 1)), cap),
+        else: hold["openedAt"] + first
+
+    window_due_at(txn, hold, settings["daily_probe_cap"], due_at)
+  end
+
+  @day_ms 86_400_000
+
+  defp window_due_at(txn, hold, daily_cap, due_at) do
+    starts =
+      Txn.q(
+        txn,
+        """
+        SELECT MIN(c.startedAt) FROM harness_health_recovery_checks c
+        JOIN harness_health_incidents i ON i.id=c.holdId
+        WHERE i.harness=?1 AND i.host=?2 AND c.startedAt>?3
+        GROUP BY c.holdId,c.cycleId
+        ORDER BY 1 DESC
+        """,
+        [hold["harness"], hold["host"], due_at - @day_ms]
+      )
+      |> List.flatten()
+
+    if length(starts) >= daily_cap,
+      do: max(due_at, Enum.at(starts, daily_cap - 1) + @day_ms),
+      else: due_at
   end
 
   defp withdraw(txn, hold_id, now) do
@@ -483,14 +520,40 @@ defmodule Tightbeam.HarnessHealth.RecoverySchedule do
       length(settings["eligible_failure_classes"]) ==
         length(Enum.uniq(settings["eligible_failure_classes"])) and
       is_integer(settings["interval_ms"]) and settings["interval_ms"] > 0 and
+      is_integer(settings["first_interval_ms"]) and settings["first_interval_ms"] > 0 and
+      settings["first_interval_ms"] <= settings["interval_ms"] and
+      is_integer(settings["daily_probe_cap"]) and settings["daily_probe_cap"] > 0 and
       is_integer(settings["timeout_ms"]) and settings["timeout_ms"] > 0 and
       Enum.all?(@reactions, fn {key, expected} -> settings[key] == expected end)
   end
 
-  defp eligible?(%{"state" => "open", "failureClass" => failure_class}, settings),
-    do: failure_class != "other" and failure_class in settings["eligible_failure_classes"]
+  defp eligible?(txn, %{"state" => "open", "failureClass" => failure_class} = hold, settings),
+    do:
+      failure_class != "other" and failure_class in settings["eligible_failure_classes"] and
+        probe_permitted?(txn, hold)
 
-  defp eligible?(_, _settings), do: false
+  defp eligible?(_txn, _, _settings), do: false
+
+  # Companion v1.6 PR1: a quota hold is probed only while its reset is
+  # unknown. Never while a declared reset (B1) is pending for the incident,
+  # and never again once any trigger has released the hold.
+  defp probe_permitted?(txn, %{"id" => hold_id, "failureClass" => "rate-limit-dead"}) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM wakes w
+      JOIN harness_health_observations o ON o.id=w.prompt
+      WHERE w.consumer='rate_limit_reset' AND w.state='pending' AND o.incidentId=?1
+      UNION ALL
+      SELECT 1 FROM lifecycle_events
+      WHERE kind='rate_limit_hold_released' AND subject=?1
+      LIMIT 1
+      """,
+      [hold_id]
+    ) == []
+  end
+
+  defp probe_permitted?(_txn, _hold), do: true
 
   defp validate_schema!(txn) do
     columns =
