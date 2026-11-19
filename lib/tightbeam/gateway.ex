@@ -2492,6 +2492,38 @@ defmodule Tightbeam.Gateway do
     ) != []
   end
 
+  # Stale-turn v1.1 R4: the end of a dispatched prompt by transport loss (the
+  # adapter process or its Conn ended: `{:adapter_unavailable, _}`, `:closed`,
+  # or a shared-connection teardown) or by a harness-exit error. Claude's form:
+  # claude-agent-acp 0.81.0 rejects every turn with
+  # `RequestError.internalError(undefined, "The Claude Agent process exited
+  # unexpectedly. Please start a new session.")` (dist/acp-agent.js:4537), i.e.
+  # code -32603, message "Internal error: The Claude Agent process exited
+  # unexpectedly…". A prompt never dispatched keeps its not-started semantics.
+  defp harness_exit_cause(db, seq, raw_reason) when is_integer(seq) do
+    if harness_exit?(raw_reason) do
+      case DB.query(
+             db,
+             "SELECT 1 FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='prompt_dispatched' LIMIT 1",
+             [seq]
+           ) do
+        {:ok, [[1]]} -> "harness_exited"
+        _ -> nil
+      end
+    end
+  end
+
+  defp harness_exit_cause(_db, _seq, _raw_reason), do: nil
+
+  defp harness_exit?({:adapter_unavailable, _}), do: true
+  defp harness_exit?(:closed), do: true
+  defp harness_exit?({:prompt_interrupted, {:cancel_unacknowledged, _}}), do: true
+
+  defp harness_exit?(%{"code" => -32_603, "message" => message}) when is_binary(message),
+    do: String.contains?(message, "process exited unexpectedly")
+
+  defp harness_exit?(_raw_reason), do: false
+
   # The public message stays the inspected classification; the reason's own
   # structure and any carried node ride in the diagnostic.
   defp repair_failed(reason, facts) do
@@ -4278,6 +4310,12 @@ defmodule Tightbeam.Gateway do
             classified_reason = ErrorDiagnostic.classified(reason)
             raw_reason = model_selection_record_reason(classified_reason)
 
+            # Stale-turn v1.1 R4: a dispatched prompt ended by transport loss or a
+            # harness-exit error is an unknown effect (cause harness_exited), not a
+            # known failure. Being failed_unknown, it gets no health-redelivery row
+            # and no retry (R5).
+            unknown_cause = harness_exit_cause(db, turn.seq, raw_reason)
+
             prewrite_evidence =
               Tightbeam.NoticeSubmission.prewrite_evidence(failed_stage, raw_reason)
 
@@ -4369,6 +4407,9 @@ defmodule Tightbeam.Gateway do
                 )
               end
 
+              if unknown_cause,
+                do: :ok = Tightbeam.UnknownEffect.record_in_txn(txn, turn.seq, unknown_cause)
+
               if prewrite_evidence do
                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, prewrite_evidence)
               end
@@ -4411,12 +4452,15 @@ defmodule Tightbeam.Gateway do
 
             {:error,
              %{
-               reason: reason,
+               reason: if(unknown_cause, do: Tightbeam.UnknownEffect.error(), else: reason),
                terminal:
-                 if(match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason),
+                 if(
+                   unknown_cause != nil or
+                     match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason),
                    do: "failed_unknown",
                    else: "failed"
                  ),
+               terminal_cause: unknown_cause,
                terminal_publish: failure_publish,
                record_in_txn: record_in_txn,
                prewrite_evidence: prewrite_evidence
