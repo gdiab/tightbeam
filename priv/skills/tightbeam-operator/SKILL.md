@@ -28,19 +28,24 @@ kungfu and editing identity each need the person's instruction for that operatio
 the CLI refuses an action, report the exact code and message. Do not work around a
 refusal, and do not switch identity to get past one.
 
-Two kinds of act never come from this CLI. The gateway accepts them only as
-`/tightbeam …` commands sent in Clawline from a paired device, and each has its own
-gate:
+Some acts never come from you. The gateway accepts device, user and host acts and
+operator rulings only as `/tightbeam …` commands sent from a paired device in Clawline
+or Chat, and each has its own gate:
 
 - Approving, denying or revoking a device; adding, promoting, demoting or removing a
   user; and registering a host need a device paired to an admin user. A user who is not
   an admin cannot send them.
 - Ruling an operator request belongs to that request's owner, from the owner's own
   paired device. An admin cannot rule another user's request.
+- Recovering an admin's access, and issuing a pairing code without a paired device,
+  are that admin's own acts at a root shell on the gateway host:
+  `tightbeam recover-admin` and every `tightbeam root-admin` form.
 
-Do not run either kind, and do not ask a session to. Prepare the exact command and give
-it to whoever can send it, saying the step is theirs. If that is not the person you act
-for, say so. The same holds for `tightbeam assimilate`, which ends in registering a host.
+Do not run any of these, and do not ask a session to. Never enter a pairing code or
+recovery secret anywhere; they are shown only to the person who asked for them. Prepare
+the exact command or step and give it to whoever can perform it, saying the step is
+theirs. If that is not the person you act for, say so. The same holds for
+`tightbeam assimilate`, which ends in registering a host.
 
 ## Reach the right organization
 

@@ -56,15 +56,19 @@ a review rule covers the kind, its own refusal names the missing review.
 ## Protected acts and owner rulings
 
 `approve-device`, `deny-device`, `revoke-device`, `add-user`, `promote-user`,
-`remove-user` and `register-host` are George's alone, sent as `/tightbeam …` commands
-from his paired device in Clawline. Never run them, never ask another agent to, and do
-not switch identity to try. The same holds for `tightbeam assimilate`; load
-`tightbeam-assimilate` to prepare it. When work needs one of these, prepare the exact
-command and give it to George, saying the step is his.
+`remove-user`, `register-host` and `recovery-enroll` are George's alone, sent as
+`/tightbeam …` commands from his paired device in Clawline or Chat. So are the commands
+he runs himself at a root shell on the gateway host: `tightbeam recover-admin` and every
+`tightbeam root-admin` form. Never run any of them, never ask another agent to, and do
+not switch identity or use root-level access to try. Never enter a pairing code or
+recovery secret anywhere, including a device's pairing screen; they are shown only to
+George. The same holds for `tightbeam assimilate`; load `tightbeam-assimilate` to
+prepare it. When work needs one of these, prepare the exact command or step and give it
+to George, saying the step is his.
 
 A presenter's recommendation is its opinion, not George's ruling. He rules an operator
 request himself with `/tightbeam rule <dr_id> <option>` or `/tightbeam respond <dr_id>
-<text>` from Clawline. The one delegated route is his Main: when George tells Main his
+<text>` from Clawline or Chat. The one delegated route is his Main: when George tells Main his
 decision, Main runs `operator-rule` with `--rationale` quoting his instruction and
 naming the `dr_` id, never on a request Main raised. Every other agent relays George's
 instruction to Main and never rules an operator request. A Main wake is an opportunity
