@@ -1099,6 +1099,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
         id: db_name
       )
 
+    Process.put(:scratch_db, db_name)
+
     :ok = DB.assert_base_admitted!(db, base)
     :initialized = Identity.init!(base)
     write_archetype!(base, opts)
@@ -1454,7 +1456,22 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
             token -> collect_tokens(name, tokens, [token | seen])
           end
       after
-        15_000 -> flunk("#{name} ran only #{inspect(Enum.reverse(seen))} of #{inspect(tokens)}")
+        15_000 ->
+          {:ok, rows} =
+            Tightbeam.DB.query(
+              Process.get(:scratch_db),
+              "SELECT t.seq,t.sessionKey,t.status,t.origin,substr(m.content,1,400) FROM turns t LEFT JOIN messages m ON m.id=t.messageId ORDER BY t.seq"
+            )
+
+          {:ok, fences} =
+            Tightbeam.DB.query(Process.get(:scratch_db), "SELECT * FROM harness_processes")
+
+          IO.puts(
+            "SCRATCHDIAG turns=#{inspect(rows, limit: :infinity, printable_limit: :infinity)}"
+          )
+
+          IO.puts("SCRATCHDIAG processes=#{inspect(fences, limit: :infinity)}")
+          flunk("#{name} ran only #{inspect(Enum.reverse(seen))} of #{inspect(tokens)}")
       end
     end
   end
