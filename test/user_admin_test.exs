@@ -138,29 +138,32 @@ defmodule Tightbeam.UserAdminTest do
 
     test "no device of the removed user authenticates or obtains a token", ctx do
       assert Devices.by_token(ctx.db, ctx.guest_device.token) == nil
-      # Core fix (A) C6: pairing is frozen, so no pair_request obtains a token;
-      # while the freeze is lifted, a removed user's device still gets none.
-      assert {:refused, "pairing_frozen"} = real_pair(ctx.db, "guest-dev", "guest")
-      assert {:refused, "pairing_frozen"} = real_pair(ctx.db, "guest-new-dev", "guest")
+      # Stage 1: pairing is one-time-code only, so an uncoded pair_request obtains
+      # no token, and no code can be issued for the removed user to pair with.
+      assert {:refused, "pairing_code_required", _} = real_pair(ctx.db, "guest-dev", "guest")
+      assert {:refused, "pairing_code_required", _} = real_pair(ctx.db, "guest-new-dev", "guest")
       assert Devices.by_id(ctx.db, "guest-new-dev") == nil
 
-      lifted = Tightbeam.TestDevices.valid_unfreeze_file!()
-      frozen = Application.get_env(:tightbeam, :pairing_unfreeze_path)
-      Application.put_env(:tightbeam, :pairing_unfreeze_path, lifted)
-      on_exit(fn -> Application.put_env(:tightbeam, :pairing_unfreeze_path, frozen) end)
-      assert {:refused, "user_removed"} = real_pair(ctx.db, "guest-dev", "guest")
-      assert {:refused, "user_removed"} = real_pair(ctx.db, "guest-new-dev", "guest")
+      call =
+        Tightbeam.TestDevices.device_call(ctx.admin_device, %{verb: "approve-device", params: %{}})
+
+      assert %{code: "user_removed"} = Tightbeam.DeviceLifecycle.issue_code(ctx.db, call, "guest")
+
+      refute_received {:tightbeam_ephemeral, _}
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM pairing_codes")
       assert Devices.by_id(ctx.db, "guest-new-dev") == nil
       assert Devices.by_id(ctx.db, "guest-dev").user_removed
     end
 
     test "writes naming the removed user are refused and write nothing", ctx do
-      assert {:pending, _} = pair(ctx.db, "other-dev", "other")
       before = users_table(ctx.db)
 
+      # Stage 1: approve-device issues a pairing code for the named user; with no
+      # freeze left, naming the removed user is refused user_removed like the rest.
       for {verb, params} <- [
             {"add-user", %{user_id: "guest", is_admin: false}},
-            {"promote-user", %{user_id: "guest", is_admin: true}}
+            {"promote-user", %{user_id: "guest", is_admin: true}},
+            {"approve-device", %{user_id: "guest"}}
           ] do
         assert {:error, %{code: "user_removed", message: message}} =
                  run(ctx, verb, "admin", params)
@@ -168,12 +171,9 @@ defmodule Tightbeam.UserAdminTest do
         assert message =~ "guest"
       end
 
-      # Core fix (A) C6: while frozen, approval is refused before any user check.
-      assert {:error, %{code: "pairing_frozen"}} =
-               run(ctx, "approve-device", "admin", %{device_id: "other-dev", user_id: "guest"})
-
       assert users_table(ctx.db) == before
-      assert Devices.by_id(ctx.db, "other-dev").status == "pending"
+      refute_received {:tightbeam_ephemeral, _}
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM pairing_codes")
     end
 
     test "a stored admin bit confers no standing once removed", ctx do
