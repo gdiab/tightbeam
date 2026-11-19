@@ -35,10 +35,12 @@ and give it to George, saying the step is his.
    (rsync), run `cargo build --release` there (it needs a Rust toolchain), install the
    result at `<base-dir>/bin/tightbeam`, and have George re-run the ceremony. Every
    other step is idempotent.
-5. Credentials. Credentials never travel between machines. Each harness on the new host
-   is onboarded there with `tightbeam onboard`, which needs an interactive login: give
-   George the command and say the step is his. Until then, turns placed there fail with
-   an auth marker.
+5. Credentials. Never carry or copy a credential to another machine yourself. The
+   organization credential goes only to hosts George registers: the gateway copies it to
+   a host when he registers it, and again to every registered host at each boot. Harness
+   credentials are not copied. Each harness on the new host is onboarded there with
+   `tightbeam onboard`, which needs an interactive login: give George the command and say
+   the step is his. Until then, turns placed there fail with an auth marker.
 6. Placement. A registered host is used only where an archetype's `where` admits it.
    Add the host through the identity seam with `tightbeam identity edit <archetype>
    --manifest`. It applies when the edit publishes; no restart is needed. Editing

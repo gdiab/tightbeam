@@ -28,12 +28,19 @@ kungfu and editing identity each need the person's instruction for that operatio
 the CLI refuses an action, report the exact code and message. Do not work around a
 refusal, and do not switch identity to get past one.
 
-Some acts belong to the person alone: approving, denying or revoking a device; adding,
-promoting, demoting or removing a user; registering a host; and ruling an operator
-request. The gateway accepts them only from the person's own paired device, as
-`/tightbeam …` commands sent in Clawline, never from this CLI. Do not run them, and do
-not ask a session to. Prepare the exact command, give it to the person and say the step
-is theirs. The same holds for `tightbeam assimilate`, which ends in registering a host.
+Two kinds of act never come from this CLI. The gateway accepts them only as
+`/tightbeam …` commands sent in Clawline from a paired device, and each has its own
+gate:
+
+- Approving, denying or revoking a device; adding, promoting, demoting or removing a
+  user; and registering a host need a device paired to an admin user. A user who is not
+  an admin cannot send them.
+- Ruling an operator request belongs to that request's owner, from the owner's own
+  paired device. An admin cannot rule another user's request.
+
+Do not run either kind, and do not ask a session to. Prepare the exact command and give
+it to whoever can send it, saying the step is theirs. If that is not the person you act
+for, say so. The same holds for `tightbeam assimilate`, which ends in registering a host.
 
 ## Reach the right organization
 
@@ -112,17 +119,17 @@ For each live operator request, tell the person the background in plain words, t
 choice being asked, what each option would change, and the evidence on record. Do not
 add options and do not make the choice yourself.
 
-The person records their choice from their paired device, with its exact option label,
-or their own words when the request has no options or they answered freely. Prepare the
-line for them to send in Clawline:
+The request's owner records their choice from their own paired device, with its exact
+option label, or their own words when the request has no options or they answered
+freely. Prepare the line for them to send in Clawline:
 
 ```text
 /tightbeam rule <decisionRequestId> <exact label>
 /tightbeam respond <decisionRequestId> <their answer>
 ```
 
-The only delegated route is the person's Main session. If they ask for it to be recorded
-for them, relay their exact words, naming the request id, to their Main with
+The only delegated route is the owner's Main session. If the owner asks for it to be
+recorded for them, relay their exact words, naming the request id, to their Main with
 `tightbeam wake --session <their Main's key> --prompt "<their words>" --as-user <userId>`;
 Main records it, quoting them. Never run `operator-rule` on an operator request yourself.
 Withdraw a request that is no longer needed only with the person's instruction:

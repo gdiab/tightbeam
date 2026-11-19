@@ -68,6 +68,15 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
 
     assert operator =~ "Pass `--as-user <userId>` on every command"
     assert operator =~ "/tightbeam rule <decisionRequestId> <exact label>"
+
+    # Core fix (A): device, user and host acts need an admin-paired device (C2);
+    # an operator ruling belongs to the request's owner on their own device (C12).
+    gates = String.replace(operator, ~r/\s+/, " ")
+    assert gates =~ "registering a host need a device paired to an admin user"
+    assert gates =~ "A user who is not an admin cannot send them."
+    assert gates =~ "Ruling an operator request belongs to that request's owner"
+    assert gates =~ "An admin cannot rule another user's request."
+    assert gates =~ "The only delegated route is the owner's Main session."
     assert operator =~ "Never run `operator-rule` on an operator request yourself."
     refute operator =~ "tightbeam operator-rule"
     assert operator =~ "tightbeam work-item-handoff --title"
