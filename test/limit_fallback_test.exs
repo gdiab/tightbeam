@@ -167,6 +167,68 @@ defmodule Tightbeam.LimitFallbackTest do
     end
   end
 
+  describe "the folded quota fence column (migration contract v3.11 R13)" do
+    test "a rewound stamp re-runs over harness_park_fences.quotaIncidentId and keeps every mark",
+         ctx do
+      assert {:ok, [["TEXT", 0, nil, 0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT type, \"notnull\", dflt_value, pk FROM pragma_table_info('harness_park_fences') WHERE name='quotaIncidentId'"
+               )
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO harness_park_fences (adapterKey, requestedAt, generation, quotaIncidentId) VALUES ('codex:shared@testhost', 1, 'g1', 'hhi_marked')"
+        )
+
+      {:ok, _} = DB.query(ctx.db, "UPDATE schema_stamp SET shape=?1", [@predecessor])
+      assert :ok = Schema.ensure_all(ctx.db)
+      assert {:ok, [[@shape]]} = DB.query(ctx.db, "SELECT shape FROM schema_stamp")
+
+      assert {:ok, [["codex:shared@testhost", "g1", "hhi_marked"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT adapterKey, generation, quotaIncidentId FROM harness_park_fences"
+               )
+    end
+
+    test "a missing quotaIncidentId column is refused by name", ctx do
+      :ok = DB.execute(ctx.db, "ALTER TABLE harness_park_fences DROP COLUMN quotaIncidentId")
+      error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(ctx.db) end
+      assert error.message =~ "harness_park_fences.quotaIncidentId is missing"
+    end
+
+    test "a quotaIncidentId column with any other text is refused by name", ctx do
+      {:ok, [[sql]]} =
+        DB.query(
+          ctx.db,
+          "SELECT sql FROM sqlite_master WHERE type='table' AND name='harness_park_fences'"
+        )
+
+      changed =
+        String.replace(
+          sql,
+          "quotaIncidentId TEXT",
+          "quotaIncidentId TEXT CHECK (length(quotaIncidentId) > 0)"
+        )
+
+      refute changed == sql
+      {:ok, [[version]]} = DB.query(ctx.db, "PRAGMA schema_version")
+
+      :ok =
+        DB.execute(ctx.db, """
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master SET sql = '#{String.replace(changed, "'", "''")}' WHERE type='table' AND name='harness_park_fences';
+        PRAGMA schema_version = #{version + 1};
+        PRAGMA writable_schema = RESET;
+        """)
+
+      error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(ctx.db) end
+      assert error.message =~ "harness_park_fences.quotaIncidentId has an unexpected definition"
+    end
+  end
+
   describe "session state" do
     test "the fallback-off marker records actor, time and reason, and clears", ctx do
       refute LimitFallback.restricted?(Org.get(ctx.db, "holder"))

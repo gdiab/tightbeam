@@ -142,11 +142,11 @@ defmodule Tightbeam.LimitFallback do
   @spec validate_in_txn!(Txn.t()) :: :ok
   def validate_in_txn!(%Txn{} = txn) do
     for column <- [@sessions_off_column, @sessions_active_column] do
-      :present = column_state!(txn, "sessions", column)
+      :ok = present!(txn, "sessions", column)
     end
 
-    :present = column_state!(txn, "attests", @attests_process_column)
-    :present = column_state!(txn, "harness_park_fences", @fences_quota_column)
+    :ok = present!(txn, "attests", @attests_process_column)
+    :ok = present!(txn, "harness_park_fences", @fences_quota_column)
 
     unless String.contains?(table_sql(txn, "attests"), normalize(@attests_process_branch)) do
       refuse!("attests CHECK lacks the process progress alternative")
@@ -173,8 +173,18 @@ defmodule Tightbeam.LimitFallback do
     end
   end
 
+  defp present!(txn, table, column) do
+    case column_state!(txn, table, column) do
+      :present -> :ok
+      :absent -> refuse!("#{table}.#{column_name(column)} is missing")
+    end
+  end
+
+  defp column_name(column), do: column |> String.split(" ", parts: 2) |> hd()
+
   # :absent when the column does not exist, :present when it exists with
-  # exactly the declared definition; anything else is refused.
+  # exactly the declared definition, ending where the table's next column or
+  # its closing parenthesis begins; anything else is refused.
   defp column_state!(txn, table, column) do
     [name | _] = String.split(column, " ", parts: 2)
 
@@ -190,7 +200,7 @@ defmodule Tightbeam.LimitFallback do
         :absent
 
       [["TEXT", 0, nil, 0]] ->
-        if String.contains?(table_sql(txn, table), normalize(column)),
+        if Regex.match?(~r/#{Regex.escape(normalize(column))}\s*[,)]/, table_sql(txn, table)),
           do: :present,
           else: refuse!("#{table}.#{name} has an unexpected definition")
 
