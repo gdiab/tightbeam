@@ -1377,11 +1377,15 @@ COMMANDS:
   recover-admin --user <userId>
       Operator only: George's full-lockout recovery, on the gateway host with the
       gateway stopped. It reads his recovery secret from the terminal and prints a
-      60-minute pairing code. Agents never run it or enter a secret.
+      60-minute pairing code. Agents never run it, ask another agent to, or enter
+      a secret.
   root-admin recovery-enroll|pairing-code --user <userId>
       Operator only, last resort: run with sudo and George's own password, on the
       gateway host with the gateway stopped. Enrols a recovery secret or issues a
-      60-minute pairing code, shown only on the terminal. Agents never run it.
+      60-minute pairing code, shown only on the terminal. From a paired device
+      George sends `/tightbeam recovery-enroll` or `/tightbeam approve-device`
+      instead. Agents never run it or send either command, ask another agent
+      to, or enter the code or secret it prints.
   deny-device <deviceId>
       Operator only: George sends `/tightbeam deny-device` from Clawline.
   revoke-device <deviceId>
@@ -8583,6 +8587,16 @@ mod tests {
             let entry = render_command_help(None, verb).unwrap();
             assert!(entry.contains("Operator only"), "{verb}: {entry}");
         }
+        // Stage 1 P11 / S3: the help keeps the recovery and pairing acts with George.
+        for verb in ["approve-device", "recover-admin", "root-admin"] {
+            let entry = render_command_help(None, verb).unwrap();
+            let flat = entry.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("ask another agent to"), "{verb}: {entry}");
+        }
+        let root = render_command_help(None, "root-admin").unwrap();
+        let flat = root.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("`/tightbeam recovery-enroll`"), "{root}");
+        assert!(flat.contains("Agents never run it or send either command"), "{root}");
     }
 
     #[test]
