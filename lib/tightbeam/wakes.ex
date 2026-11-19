@@ -3665,12 +3665,35 @@ defmodule Tightbeam.Wakes do
         0
 
       Ledger.enqueueable_in_txn?(txn, session_key) ->
-        enqueue_health_redelivery_in_txn(
-          txn,
-          [idempotency_key, session_key, message_id, origin, prompt, role_ref, role_fallback] ++
-            [assignment_id, job_ref, request_ref, cycle_release_correlation],
-          marker
-        )
+        case Ledger.enqueue_in_txn(txn, %{
+               session_key: session_key,
+               message_id: message_id,
+               origin: origin,
+               prompt: prompt,
+               role_ref: role_ref,
+               role_fallback: role_fallback == 1,
+               assignment_id: assignment_id,
+               job_ref: job_ref,
+               request_ref: request_ref
+             }) do
+          {:ok, redelivery_turn_seq} ->
+            mark_health_redelivery_enqueued_in_txn(
+              txn,
+              idempotency_key,
+              marker,
+              cycle_release_correlation,
+              redelivery_turn_seq
+            )
+
+            if Txn.changes(txn) != 1,
+              do: raise("health redelivery attempt lost its enqueue")
+
+            Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
+            1
+
+          {:error, :no_session} ->
+            0
+        end
 
       true ->
         0
@@ -3683,54 +3706,6 @@ defmodule Tightbeam.Wakes do
       "SELECT 1 FROM health_redelivery_attempts WHERE idempotencyKey=?1 AND failureClass='rate-limit-dead'",
       [idempotency_key]
     ) == [[1]]
-  end
-
-  defp enqueue_health_redelivery_in_txn(
-         txn,
-         [
-           idempotency_key,
-           session_key,
-           message_id,
-           origin,
-           prompt,
-           role_ref,
-           role_fallback,
-           assignment_id,
-           job_ref,
-           request_ref,
-           cycle_release_correlation
-         ],
-         marker
-       ) do
-    case Ledger.enqueue_in_txn(txn, %{
-           session_key: session_key,
-           message_id: message_id,
-           origin: origin,
-           prompt: prompt,
-           role_ref: role_ref,
-           role_fallback: role_fallback == 1,
-           assignment_id: assignment_id,
-           job_ref: job_ref,
-           request_ref: request_ref
-         }) do
-      {:ok, redelivery_turn_seq} ->
-        mark_health_redelivery_enqueued_in_txn(
-          txn,
-          idempotency_key,
-          marker,
-          cycle_release_correlation,
-          redelivery_turn_seq
-        )
-
-        if Txn.changes(txn) != 1,
-          do: raise("health redelivery attempt lost its enqueue")
-
-        Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
-        1
-
-      {:error, :no_session} ->
-        0
-    end
   end
 
   defp mark_health_redelivery_enqueued_in_txn(

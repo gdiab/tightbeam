@@ -2307,8 +2307,10 @@ defmodule Tightbeam.Gateway do
       DB.transaction(db, fn txn -> rerun_eligibility_in_txn(txn, call, assignment, incident) end)
 
     case eligibility do
+      # The nested result is string-keyed: a replay of the same --key returns
+      # the persisted (JSON) result, and it must be identical (A1).
       {:none, reason} ->
-        {:ok, %{state: "none", reason: reason}}
+        {:ok, %{"state" => "none", "reason" => reason}}
 
       {:eligible, source_seq} ->
         principal = repair_principal(call.principal)
@@ -2322,7 +2324,9 @@ defmodule Tightbeam.Gateway do
             )
 
             state = if status == :duplicate, do: "duplicate", else: "queued"
-            {:ok, %{state: state, sourceTurnSeq: source_seq, attemptTurnSeq: attempt_seq}}
+
+            {:ok,
+             %{"state" => state, "sourceTurnSeq" => source_seq, "attemptTurnSeq" => attempt_seq}}
 
           {:error, reason} ->
             {:error, repair_failed(reason, operation: "repair_terminal", phase: "repair_rerun")}
