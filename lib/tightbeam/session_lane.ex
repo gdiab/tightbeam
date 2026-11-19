@@ -568,6 +568,7 @@ defmodule Tightbeam.SessionLane do
     Process.demonitor(ref, [:flush])
     finalize(state, seq, outcome)
     report_state(state, nil)
+    Tightbeam.MemoryGuard.turn_finished(state.session_key)
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -580,10 +581,12 @@ defmodule Tightbeam.SessionLane do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
     finalize(state, seq, crash_outcome(reason, seq))
     report_state(state, nil)
+    Tightbeam.MemoryGuard.turn_finished(state.session_key)
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _}, %{task_ref: ref} = state) do
+    Tightbeam.MemoryGuard.turn_finished(state.session_key)
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -615,6 +618,7 @@ defmodule Tightbeam.SessionLane do
     end
 
     Process.demonitor(ref, [:flush])
+    Tightbeam.MemoryGuard.turn_finished(state.session_key)
 
     state = %{
       state
@@ -670,9 +674,17 @@ defmodule Tightbeam.SessionLane do
     cond do
       harness_parked?(state) -> state
       limit_fallback_held?(state) -> state
+      memory_held?(state) -> state
       true -> claim_next(state)
     end
   end
+
+  # Memory limits v1.1 R3, R5, R2, R6: a turn that needs a launch the host
+  # cannot take now stays queued and unclaimed. Each standing reason is checked
+  # on its own (R6a): a memory release never lifts the park above, nor a park
+  # release this hold. The guard nudges the lane when the turn can run.
+  defp memory_held?(state),
+    do: match?({:held, _details}, Tightbeam.MemoryGuard.admit(state.session_key))
 
   # Contract c R5: while a limit-fallback evaluation of this session's failed
   # turn has no committed outcome, the lane claims nothing. The outcome's
@@ -717,12 +729,15 @@ defmodule Tightbeam.SessionLane do
         |> Map.put(:current_owner_lease, turn.owner_lease)
 
       :busy ->
+        Tightbeam.MemoryGuard.turn_finished(state.session_key)
         state
 
       :none ->
+        Tightbeam.MemoryGuard.turn_finished(state.session_key)
         state
 
       {:unclaimable, reason} ->
+        Tightbeam.MemoryGuard.turn_finished(state.session_key)
         # Backstop. `Ledger.enqueue_in_txn/2` refuses to write a turn nobody can
         # claim, so reaching here means a row predates that guard or a session
         # retired between the enqueue and this claim. Either way the wait is

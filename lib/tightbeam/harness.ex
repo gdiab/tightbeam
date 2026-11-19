@@ -145,7 +145,20 @@ defmodule Tightbeam.Harness do
   """
   @callback turn_end_report?(map()) :: boolean()
 
+  @doc """
+  The executable that starts this harness's session processes (memory limits
+  v1.1 §1: a process the adapter runs for exactly one harness session), given
+  the adapter's launch command and environment, as
+  `{:ok, %{env_name: name, executable: path}}`: the adapter starts each session
+  process through the program named by `env_name`. A harness without session
+  processes (one shared process serves every session, like Codex) does not
+  implement it and has no heavy processes under that contract.
+  """
+  @callback session_process_executable(cmd :: [String.t()], env :: [{String.t(), String.t()}]) ::
+              {:ok, %{env_name: String.t(), executable: String.t()}} | {:error, String.t()}
+
   @optional_callbacks preflight_launch: 3,
+                      session_process_executable: 2,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       local_client_model_authority?: 1,
@@ -156,6 +169,13 @@ defmodule Tightbeam.Harness do
                       submission_text_limit: 0,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
+
+  @doc "Whether `module`'s adapter runs one process per harness session."
+  @spec session_processes?(module()) :: boolean()
+  def session_processes?(module) do
+    Code.ensure_loaded(module)
+    function_exported?(module, :session_process_executable, 2)
+  end
 
   @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
   def preflight_launch(module, target, home, opts) do

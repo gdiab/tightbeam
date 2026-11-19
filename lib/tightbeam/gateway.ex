@@ -355,6 +355,11 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.HarklightWakes, db: db, send_runner: Map.get(config, :harklight_send_runner)},
          {Tightbeam.OwnerAlerts, db: db, send_runner: Map.get(config, :harklight_send_runner)},
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
+         # Memory limits v1.1: ahead of the adapters, whose residency it counts,
+         # and the lanes, whose launches it admits.
+         if(Map.get(config, :memory_guard, Application.get_env(:tightbeam, :memory_guard, true)),
+           do: {Tightbeam.MemoryGuard, db: db, base_dir: config.base_dir, cli_bin: cli_bin}
+         ),
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
           adapter_sup: Tightbeam.AdapterSupervisor,
@@ -1132,6 +1137,28 @@ defmodule Tightbeam.Gateway do
               denial
           end
         end),
+      # Memory limits v1.1 R12b: any caller may read a host's mode, what it
+      # lacks, its effective settings and counts. No process list, pid or
+      # command line.
+      {"host-memory", []} => fn call ->
+        host = Map.get(call.params, :host) || Placement.local_host_name()
+
+        case Tightbeam.MemoryGuard.read(host) do
+          nil ->
+            if Tightbeam.MemoryGuard.running?(),
+              do: Placement.unknown_host_denial(host),
+              else: %{
+                code: "memory_guard_unavailable",
+                message: "the memory guard is not running"
+              }
+
+          read ->
+            read
+        end
+      end,
+      # R17: an admin changes one setting; it applies without a restart.
+      {"host-memory-set", []} =>
+        admin_call_handler(db, fn call -> host_memory_set(config, db, call) end),
       # Readable by any caller, like kungfu-list: names, states and shipped setup
       # text only, never a setting value, so doctor can report it from a session.
       {"sentinel-list", []} => fn call ->
@@ -2362,6 +2389,103 @@ defmodule Tightbeam.Gateway do
 
   defp harness_exit_cause(_db, _session, _seq, _raw_reason), do: nil
 
+  # Memory limits v1.1 R8: a memory kill is never a quota or harness-health
+  # event. Its turn skips the limit-fallback hold, the failed-intent retry and
+  # the harness-health observation (classification, evidence, incidents,
+  # parks, resets) that every other failure passes through.
+  defp memory_record_in_txn(_txn, nil, classify), do: classify.()
+  defp memory_record_in_txn(_txn, _memory_kill, _classify), do: nil
+
+  defp memory_kill_for(db, %{host: host, harness: harness} = session, turn)
+       when is_binary(host) and not is_nil(harness) do
+    if Tightbeam.MemoryGuard.running?() do
+      key = {Harness.parse!(to_string(harness)).id(), "shared", host}
+      started = turn_started_at(db, turn.seq)
+
+      Tightbeam.MemoryGuard.memory_kill(%{
+        host: host,
+        harness_session_id:
+          case Org.current_pointer(db, session.session_key) do
+            %{harness_session_id: sid} -> sid
+            _ -> nil
+          end,
+        adapter_key: key,
+        adapter_launch_id: adapter_launch_at(db, key, started),
+        since: started || 0
+      })
+    end
+  end
+
+  defp memory_kill_for(_db, _session, _turn), do: nil
+
+  defp turn_started_at(db, seq) do
+    case DB.query(db, "SELECT startedAt FROM turns WHERE seq=?1", [seq]) do
+      {:ok, [[started]]} when is_integer(started) -> started
+      _ -> nil
+    end
+  end
+
+  defp dispatched_turn?(db, seq) do
+    match?(
+      {:ok, [[1]]},
+      DB.query(
+        db,
+        "SELECT 1 FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='prompt_dispatched' LIMIT 1",
+        [seq]
+      )
+    )
+  end
+
+  # The adapter launch of `key` that was current when the turn started.
+  defp adapter_launch_at(db, key, started) do
+    name = HarnessProcess.adapter_key_name(key)
+
+    db
+    |> HarnessProcess.list()
+    |> Enum.find(&(&1.adapter_key == name and (is_nil(started) or &1.created_at <= started)))
+    |> case do
+      %{launch_id: launch_id} -> launch_id
+      nil -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  # Memory limits v1.1 R15: an exit that was not a memory kill records the
+  # exit signal where the helper reported it and whether the host was below
+  # the floor then, so an owner can read "stopped by a signal while the host
+  # was low on memory". Tightbeam never guesses that earlyoom sent it.
+  defp harness_exit_detail(db, %{host: host, harness: harness}, turn)
+       when is_binary(host) and not is_nil(harness) do
+    key = {Harness.parse!(to_string(harness)).id(), "shared", host}
+
+    case Tightbeam.MemoryGuard.adapter_exit(
+           adapter_launch_at(db, key, turn_started_at(db, turn.seq))
+         ) do
+      %{status: status, host_low: low} ->
+        %{
+          exitSignal: if(is_integer(status) and status > 128, do: status - 128),
+          exitStatus: status,
+          hostLowOnMemory: low
+        }
+
+      nil ->
+        %{hostLowOnMemory: host_low_now(host)}
+    end
+  end
+
+  defp harness_exit_detail(_db, _session, _turn), do: %{}
+
+  defp host_low_now(host) do
+    case Tightbeam.MemoryGuard.host_view(host) do
+      %{available: available, settings: %{floor_hold: hold}} when is_number(available) ->
+        available < hold
+
+      _ ->
+        nil
+    end
+  end
+
   # R8: an operator settle records its requesting principal on the terminal.
   defp settle_principal({:unknown_effect, "operator_settle", %{principal: principal}})
        when is_binary(principal),
@@ -3271,7 +3395,10 @@ defmodule Tightbeam.Gateway do
             messageId: nil,
             startedAt: nil,
             queueDepth: depth,
-            settlement: status_turn_settlement(db, session)
+            settlement: status_turn_settlement(db, session),
+            # Memory limits v1.1 R7: every standing reason holding the next turn.
+            held: Tightbeam.MemoryGuard.HeldState.read(db, session),
+            memoryGuardEvents: memory_guard_events(db, session_key)
           },
           context: nil,
           approval: nil,
@@ -3605,6 +3732,7 @@ defmodule Tightbeam.Gateway do
     item
     |> Map.put(:po_association, SessionPoAssociations.get(db, session.session_key))
     |> Map.put(:turn_settlement, list_turn_settlement(db, session))
+    |> Map.put(:held_state, Tightbeam.MemoryGuard.HeldState.read(db, session))
   end
 
   defp list_turn_settlement(db, session) do
@@ -3622,6 +3750,30 @@ defmodule Tightbeam.Gateway do
     )
   rescue
     _ -> false
+  end
+
+  # Memory limits v1.1 R4/R7/R11: the memory guard's lifecycle records for one
+  # session (holds, idle closes, ended trees, admission resumption), newest
+  # first. Counts and reasons only.
+  defp memory_guard_events(db, session_key) do
+    case DB.query(
+           db,
+           """
+           SELECT ts,kind,detail FROM lifecycle_events
+           WHERE subject=?1 AND kind IN ('memory_guard_hold','memory_guard_idle_closed',
+             'memory_tree_ended','admission_resumed','admission_hold_remaining')
+           ORDER BY id DESC LIMIT 10
+           """,
+           [session_key]
+         ) do
+      {:ok, rows} ->
+        Enum.map(rows, fn [ts, kind, detail] ->
+          %{at: ts, kind: kind, detail: (detail && JSON.decode!(detail)) || nil}
+        end)
+
+      _ ->
+        []
+    end
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -4085,7 +4237,25 @@ defmodule Tightbeam.Gateway do
             # harness-exit error is an unknown effect (cause harness_exited), not a
             # known failure. Being failed_unknown, it gets no health-redelivery row
             # and no retry (R5).
-            unknown_cause = harness_exit_cause(db, active_session, turn.seq, raw_reason)
+            #
+            # Memory limits v1.1 R8-R10: the guard's own record of a memory kill
+            # decides first, before any error-text classification. A dispatched
+            # prompt so ended is an unknown effect with cause memory_limit; one
+            # never dispatched follows R9's not-started rule.
+            memory_kill = memory_kill_for(db, active_session, turn)
+            dispatched? = memory_kill != nil and dispatched_turn?(db, turn.seq)
+
+            unknown_cause =
+              cond do
+                memory_kill != nil and dispatched? -> "memory_limit"
+                memory_kill != nil -> nil
+                true -> harness_exit_cause(db, active_session, turn.seq, raw_reason)
+              end
+
+            exit_detail =
+              if unknown_cause == "harness_exited",
+                do: harness_exit_detail(db, active_session, turn),
+                else: %{}
 
             prewrite_evidence =
               Tightbeam.NoticeSubmission.prewrite_evidence(failed_stage, raw_reason)
@@ -4095,6 +4265,11 @@ defmodule Tightbeam.Gateway do
                 {:refused, message} -> message
                 :not_applicable -> classified_reason
               end
+
+            reason =
+              if memory_kill != nil and not dispatched?,
+                do: Tightbeam.MemoryGuard.Settlement.not_started_reason(memory_kill),
+                else: reason
 
             failure_publish = fn _terminal ->
               # THE ERROR MUST REACH THE CHAT. Every failed turn gets the marker
@@ -4159,49 +4334,72 @@ defmodule Tightbeam.Gateway do
               EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)
 
               if unknown_cause,
-                do: :ok = Tightbeam.UnknownEffect.record_in_txn(txn, turn.seq, unknown_cause)
+                do:
+                  :ok =
+                    Tightbeam.UnknownEffect.record_in_txn(
+                      txn,
+                      turn.seq,
+                      unknown_cause,
+                      if(memory_kill, do: memory_kill, else: exit_detail)
+                    )
+
+              if memory_kill != nil and not dispatched?,
+                do:
+                  Tightbeam.MemoryGuard.Admission.not_started_in_txn(
+                    txn,
+                    turn.seq,
+                    active_session.host
+                  )
 
               if prewrite_evidence do
                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, prewrite_evidence)
               end
 
-              # Contract c R4 T1 / R5: a typed usage limit on a session whose
-              # archetype declares `[limit_fallback]` holds the session's lane in
-              # this same transaction. The failed turn's replay vehicles are then
-              # written by the evaluation's outcome (R9b), not here.
-              hold = limit_fallback_hold_in_txn(txn, active_session, turn, raw_reason)
-              held? = match?({:held, _evidence}, hold)
+              memory_record_in_txn(txn, memory_kill, fn ->
+                # Contract c R4 T1 / R5: a typed usage limit on a session whose
+                # archetype declares `[limit_fallback]` holds the session's lane in
+                # this same transaction. The failed turn's replay vehicles are then
+                # written by the evaluation's outcome (R9b), not here.
+                hold = limit_fallback_hold_in_txn(txn, active_session, turn, raw_reason)
+                held? = match?({:held, _evidence}, hold)
 
-              unless held?,
-                do: Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
+                unless held?,
+                  do: Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
 
-              health_publication =
-                HarnessHealth.observe_turn_failure_in_txn(
-                  txn,
-                  active_session,
-                  turn,
-                  failed_stage,
-                  raw_reason,
-                  # R5: an unknown effect never gets a replay vehicle, whatever
-                  # its reason classifies as (only `interrupted-outcome-unknown`
-                  # would otherwise admit a failed_unknown source row).
-                  defer_redelivery: held? or not is_nil(unknown_cause)
-                )
+                health_publication =
+                  HarnessHealth.observe_turn_failure_in_txn(
+                    txn,
+                    active_session,
+                    turn,
+                    failed_stage,
+                    raw_reason,
+                    # R5: an unknown effect never gets a replay vehicle, whatever
+                    # its reason classifies as (only `interrupted-outcome-unknown`
+                    # would otherwise admit a failed_unknown source row).
+                    defer_redelivery: held? or not is_nil(unknown_cause)
+                  )
 
-              case hold do
-                {:held, evidence} ->
-                  # R5 / N1: the evaluation starts first, in its own supervised
-                  # task. This closure runs in the lane after the terminal
-                  # commit; if anything after the start raises, the lane
-                  # crashes but the evaluation still ends the hold.
-                  fn ->
-                    start_limit_fallback_evaluation(config, turn.session_key, turn.seq, evidence)
-                    publish_held_failure_health(config, health_publication)
-                  end
+                case hold do
+                  {:held, evidence} ->
+                    # R5 / N1: the evaluation starts first, in its own supervised
+                    # task. This closure runs in the lane after the terminal
+                    # commit; if anything after the start raises, the lane
+                    # crashes but the evaluation still ends the hold.
+                    fn ->
+                      start_limit_fallback_evaluation(
+                        config,
+                        turn.session_key,
+                        turn.seq,
+                        evidence
+                      )
 
-                :none ->
-                  health_publication
-              end
+                      publish_held_failure_health(config, health_publication)
+                    end
+
+                  :none ->
+                    health_publication
+                end
+              end)
             end
 
             {:error,
@@ -4214,7 +4412,7 @@ defmodule Tightbeam.Gateway do
                    do: "failed_unknown",
                    else: "failed"
                  ),
-               terminal_cause: unknown_cause,
+               terminal_cause: unknown_cause || if(memory_kill, do: "memory_limit"),
                terminal_principal: settle_principal(raw_reason),
                terminal_publish: failure_publish,
                record_in_txn: record_in_txn,
@@ -5504,6 +5702,58 @@ defmodule Tightbeam.Gateway do
           message: message,
           live_revision: Identity.live_revision!(config.base_dir)
         }
+    end
+  end
+
+  defp host_memory_set(config, db, call) do
+    p = call.params
+
+    with host when is_binary(host) <- p[:host],
+         name when is_binary(name) <- p[:name],
+         value when is_binary(value) <- p[:value],
+         true <-
+           Map.has_key?(Placement.hosts(config.base_dir, db), host) ||
+             {:error, Placement.unknown_host_denial(host)} do
+      mem_total =
+        case Tightbeam.MemoryGuard.host_view(host) do
+          %{settings: %{mem_total: total}} -> total
+          _ -> nil
+        end
+
+      case DB.transaction(db, fn txn ->
+             Tightbeam.MemoryGuard.Settings.set_in_txn(
+               txn,
+               host,
+               name,
+               value,
+               call.origin,
+               mem_total
+             )
+           end) do
+        {:ok, {:ok, row}} ->
+          :ok = Tightbeam.MemoryGuard.settings_changed(host)
+
+          %{
+            setting: %{
+              host: row.host,
+              name: row.name,
+              value: row.value,
+              setBy: row.set_by,
+              setAt: row.set_at
+            },
+            effect: "applies to the next decision on #{host}, without a restart",
+            hostMemory: Tightbeam.MemoryGuard.read(host)
+          }
+
+        {:ok, {:error, denial}} ->
+          denial
+
+        {:error, error} ->
+          raise error
+      end
+    else
+      {:error, denial} -> denial
+      _ -> %{code: "invalid_params", message: "usage: host-memory set --host <host> NAME VALUE"}
     end
   end
 
@@ -7658,6 +7908,7 @@ defmodule Tightbeam.Gateway do
           wake_response(wake)
           |> maybe_add_producer_warning(wake)
           |> maybe_add_after_fact_hint(db, p)
+          |> maybe_add_recipient_held(db, session_key)
         else
           wake
         end
@@ -8141,6 +8392,19 @@ defmodule Tightbeam.Gateway do
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
+  end
+
+  # Memory limits v1.1 R7: a sender addressing a held session sees the hold.
+  defp maybe_add_recipient_held(response, db, session_key) do
+    with %{} = session <- Org.get(db, session_key),
+         result when is_binary(result) <-
+           Tightbeam.MemoryGuard.HeldState.sender_result(
+             Tightbeam.MemoryGuard.HeldState.read(db, session)
+           ) do
+      Map.put(response, :queued, result)
+    else
+      _ -> response
+    end
   end
 
   defp maybe_add_after_fact_hint(response, db, params) do

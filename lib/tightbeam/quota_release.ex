@@ -115,8 +115,20 @@ defmodule Tightbeam.QuotaRelease do
     # restoration of the key's pending pre-activity message turns: re-admitting
     # them must not wait for an unrelated turn to succeed (v3 V1). A release by
     # a later success already redelivers them from that success.
-    if Keyword.get(opts, :readmit, false),
-      do: Wakes.readmit_released_quota_intents_in_txn(txn, incident_id)
+    #
+    # Memory limits v1.1 R6a: a release ends only the quota reason. While a
+    # memory reason still stands on the host the re-admission is deferred and
+    # runs once, when the last one clears (`MemoryGuard.Admission`).
+    if Keyword.get(opts, :readmit, false) do
+      case Tightbeam.MemoryGuard.Admission.quota_released_in_txn(txn, incident_id, harness, host) do
+        :resume ->
+          Wakes.readmit_released_quota_intents_in_txn(txn, incident_id)
+          Tightbeam.MemoryGuard.Admission.resumed_in_txn(txn, incident_id, host, "quota_park")
+
+        :deferred ->
+          :ok
+      end
+    end
 
     Txn.q(
       txn,

@@ -343,6 +343,9 @@ defmodule Tightbeam.Acp.Conn do
     }
 
     state = %{state | launch_exit: receipt}
+    # Memory limits v1.1 R15: the exit (128 + signal from the helper) is known
+    # before any pending prompt fails, so its settlement can record it.
+    Tightbeam.MemoryGuard.note_adapter_exit(state.launch_id, status)
     emit(state, {:acp_exit, status})
     {:noreply, fail_all(%{state | closed: true, closed_by: {:exit, status}})}
   end

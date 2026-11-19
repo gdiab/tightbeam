@@ -109,7 +109,11 @@ fn session_exec_with_mode(
     }
     drop(child_report);
 
+    // Memory limits v1.1 R12c: in enforced mode the adapter joins its own unit
+    // before it runs harness code.
+    crate::memory_guard::join_adapter_cgroup();
     let mut command = child_command(&args[separator + 1], &args[separator + 2..], fixed_path);
+    command.env_remove("TIGHTBEAM_ADAPTER_CGROUP");
     let error = command.exec();
 
     Err(format!("harness command could not be executed: {error}"))
@@ -130,7 +134,7 @@ fn failure_step(step: &str) -> bool {
     )
 }
 
-fn prepare_session_identity(
+pub(crate) fn prepare_session_identity(
     path: &Path,
     identity: &mut fs::File,
     launch: &str,

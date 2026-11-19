@@ -12,6 +12,7 @@ mod cursor_rails;
 mod dispatch;
 mod github_auth;
 mod harness_process;
+mod memory_guard;
 mod harnesses;
 mod lease;
 mod onboard_emit;
@@ -25,6 +26,13 @@ mod transport_receipt;
 mod users;
 
 fn main() {
+    // Memory limits v1.1 AS2: the Claude adapter starts each session process
+    // through this binary's `tightbeam-session-exec` link.
+    if memory_guard::invoked_as_step(std::env::args().next().as_deref()) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        std::process::exit(memory_guard::session_step(&args));
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if cursor_execution_identity::running_as_launcher()

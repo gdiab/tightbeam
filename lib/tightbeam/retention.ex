@@ -27,6 +27,9 @@ defmodule Tightbeam.Retention do
   # productions/bubble.ex: lineage_exhausted is the exhaustion deduplication fence.
   # wakes.ex: wake_undeliverable supplies durable delivery-failure evidence.
   # gateway.ex: queued_message_suppressed prevents old queued messages reappearing;
+  # memory_guard/admission.ex: quota_readmission_deferred/_resumed and
+  # memory_readmission_pending/_done are deferred re-admission state (memory
+  # limits v1.1 R6a, R9) and must not expire;
   # Workspace cleanup progress lives in its queue, independently of lifecycle history.
   # EventLog.lifecycle_events/1 lists history without interpreting kinds; it has
   # no callers in lib/. Its observational history can expire for the kinds below.

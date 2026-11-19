@@ -1876,6 +1876,27 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         Command::HarnessProcesses { identity } => {
             Ok(request(identity, "harness-processes", vec![], vec![]))
         }
+        Command::HostMemory { identity, host } => Ok(request(
+            identity,
+            "host-memory",
+            vec![],
+            host.iter().map(|host| string_field("host", host)).collect(),
+        )),
+        Command::HostMemorySet {
+            identity,
+            host,
+            name,
+            value,
+        } => Ok(request(
+            identity,
+            "host-memory-set",
+            vec![],
+            vec![
+                string_field("host", host),
+                string_field("name", name),
+                string_field("value", value),
+            ],
+        )),
     }
 }
 
@@ -3972,6 +3993,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HostToolchainSet { identity, .. }
         | Command::SessionDiagnose { identity, .. }
         | Command::HarnessProcessSettle { identity, .. }
+        | Command::HostMemory { identity, .. }
+        | Command::HostMemorySet { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
