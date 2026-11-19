@@ -3002,6 +3002,27 @@ fn assimilate_with_asset_fetcher(
         );
         match io.dispatch(&request).map(|_| ()) {
             Ok(()) => io.log("[assimilate] REGISTER... ok"),
+            // Core fix (A) C19: only George's paired device registers a host. The
+            // gateway refuses this caller and creates nothing; the step hands him
+            // the exact command to send from Clawline and the ceremony stops.
+            Err(reason) if reason.starts_with("user_authentication_required") => {
+                let command = register_host_user_command(
+                    &host_name,
+                    &args.ssh_dest,
+                    &resolved_base,
+                    &cli_bin,
+                    &adapter_bin_dir,
+                );
+                io.log("[assimilate] REGISTER... registration pending George");
+                io.log(
+                    "  Registering a host must come from George's own paired Tightbeam device app. \
+                     Send this exact command from Clawline:",
+                );
+                io.log(&format!("  {command}"));
+                return Err(format!(
+                    "registration pending George: send `{command}` from Clawline"
+                ));
+            }
             Err(reason) => {
                 io.log(&format!("[assimilate] REGISTER... FAILED: {reason}"));
                 return Err(reason);
@@ -3019,6 +3040,19 @@ fn assimilate_with_asset_fetcher(
         "  next: add \"{host_name}\" to an archetype's `where`"
     ));
     Ok(())
+}
+
+/// The `/tightbeam register-host` user command George sends from Clawline (core-v8 C9).
+fn register_host_user_command(
+    name: &str,
+    ssh_dest: &str,
+    base_dir: &str,
+    cli_bin: &str,
+    adapter_bin_dir: &str,
+) -> String {
+    format!(
+        "/tightbeam register-host {name} {ssh_dest} {base_dir} --cli-bin {cli_bin} --adapter-bin-dir {adapter_bin_dir}"
+    )
 }
 
 fn step<T>(
@@ -6932,6 +6966,46 @@ mod tests {
         );
         assert!(io.logs.contains(&"[assimilate] PROBE... ok".to_owned()));
         assert!(io.logs.contains(&"[assimilate] CLI... ok".to_owned()));
+    }
+
+    /// Core fix (A) K21 / C19: a non-device REGISTER is refused by the gateway, which
+    /// creates nothing; the ceremony prints George's exact Clawline command and exits
+    /// non-zero with the status "registration pending George".
+    #[test]
+    fn refused_register_prints_georges_clawline_command_and_fails() {
+        let mut io = FakeIo {
+            responses: vec![
+                Ok(healthy_probe()),
+                Ok(String::new()),
+                Ok("/Users/remote/.tightbeam\n".to_owned()),
+                Ok("harvested\n".to_owned()),
+                Ok("present\n".to_owned()),
+                Ok(String::new()),
+                Ok(String::new()),
+                Ok(format!("{}\n", env!("CARGO_PKG_VERSION"))),
+                Ok(String::new()),
+            ],
+            dispatch_responses: vec![Err(
+                "user_authentication_required: register-host must come from an admin's own paired Tightbeam device app"
+                    .to_owned(),
+            )],
+            ..FakeIo::default()
+        };
+        let error = assimilate_with(&mut io, args()).unwrap_err();
+        let command = "/tightbeam register-host work-1.local flynn@work-1.local /Users/remote/.tightbeam --cli-bin /Users/remote/.tightbeam/bin --adapter-bin-dir /Users/remote/.tightbeam/adapters/node_modules/.bin";
+        assert!(error.starts_with("registration pending George"), "{error}");
+        assert!(error.contains(command), "{error}");
+        assert!(
+            io.logs
+                .contains(&"[assimilate] REGISTER... registration pending George".to_owned())
+        );
+        assert!(io.logs.contains(&format!("  {command}")), "{:?}", io.logs);
+        assert_eq!(io.dispatched.len(), 1);
+        assert!(
+            !io.logs
+                .iter()
+                .any(|line| line.starts_with("Assimilation summary"))
+        );
     }
 
     #[test]
