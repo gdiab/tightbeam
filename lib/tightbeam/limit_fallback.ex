@@ -65,6 +65,12 @@ defmodule Tightbeam.LimitFallback do
   # (`Tightbeam.Assignments` attests DDL, unchanged since cannot-proceed).
   @attests_session_branch ~r/\(kind IN \('progress', 'completion', 'surrender', 'cannot-proceed'\) AND bySession IS NOT NULL AND\s+byUser IS NULL AND verdictKind IS NULL\)/
 
+  # Quota companion B2 (b0 ruling on asg_44e8352a, folded into this step): the
+  # quota park's own fence instance names its open rate-limit-dead incident.
+  # Only such a fence is kept by the quota-hold guard; any other fence on the
+  # key (a close, shutdown or recovery fence) completes as before.
+  @fences_quota_column "quotaIncidentId TEXT"
+
   @attests_process_branch "(kind = 'progress' AND bySession IS NULL AND byUser IS NULL " <>
                             "AND verdictKind IS NULL AND byProcess IS NOT NULL)"
 
@@ -121,6 +127,12 @@ defmodule Tightbeam.LimitFallback do
     :ok = ensure_column!(txn, "attests", @attests_process_column)
     :ok = ensure_attests_process_branch!(txn)
 
+    fence_marker_added? =
+      column_state!(txn, "harness_park_fences", @fences_quota_column) == :absent
+
+    :ok = ensure_column!(txn, "harness_park_fences", @fences_quota_column)
+    if fence_marker_added?, do: :ok = backfill_quota_fences!(txn)
+
     Enum.each(@objects, fn {type, name, sql} ->
       case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name]) do
         [] -> :ok = Txn.exec(txn, sql)
@@ -135,10 +147,11 @@ defmodule Tightbeam.LimitFallback do
   @spec validate_in_txn!(Txn.t()) :: :ok
   def validate_in_txn!(%Txn{} = txn) do
     for column <- [@sessions_off_column, @sessions_active_column] do
-      :present = column_state!(txn, "sessions", column)
+      :ok = present!(txn, "sessions", column)
     end
 
-    :present = column_state!(txn, "attests", @attests_process_column)
+    :ok = present!(txn, "attests", @attests_process_column)
+    :ok = present!(txn, "harness_park_fences", @fences_quota_column)
 
     unless String.contains?(table_sql(txn, "attests"), normalize(@attests_process_branch)) do
       refuse!("attests CHECK lacks the process progress alternative")
@@ -158,6 +171,36 @@ defmodule Tightbeam.LimitFallback do
     :ok
   end
 
+  # A quota park already standing when this step runs was taken under the
+  # predecessor's key-based guard, so its fence carries no mark. Without one,
+  # the first boot's reconciliation would complete it: an unrecorded release.
+  # When the column is added (and only then, so a rewound re-run marks
+  # nothing anew), each fence takes the open rate-limit-dead incident of its
+  # own key, the rule that guard applied.
+  defp backfill_quota_fences!(txn) do
+    if Txn.q(
+         txn,
+         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
+       ) == [[1]] do
+      Txn.q(
+        txn,
+        """
+        UPDATE harness_park_fences
+           SET quotaIncidentId = (
+             SELECT i.id FROM harness_health_incidents i
+              WHERE i.state = 'open'
+                AND i.failureClass = 'rate-limit-dead'
+                AND i.harness || ':shared@' || i.host = harness_park_fences.adapterKey
+              ORDER BY i.openedAt DESC, i.id DESC
+              LIMIT 1)
+         WHERE quotaIncidentId IS NULL
+        """
+      )
+    end
+
+    :ok
+  end
+
   defp ensure_column!(txn, table, column) do
     case column_state!(txn, table, column) do
       :absent -> Txn.exec(txn, "ALTER TABLE #{table} ADD COLUMN #{column}")
@@ -165,8 +208,18 @@ defmodule Tightbeam.LimitFallback do
     end
   end
 
+  defp present!(txn, table, column) do
+    case column_state!(txn, table, column) do
+      :present -> :ok
+      :absent -> refuse!("#{table}.#{column_name(column)} is missing")
+    end
+  end
+
+  defp column_name(column), do: column |> String.split(" ", parts: 2) |> hd()
+
   # :absent when the column does not exist, :present when it exists with
-  # exactly the declared definition; anything else is refused.
+  # exactly the declared definition, ending where the table's next column or
+  # its closing parenthesis begins; anything else is refused.
   defp column_state!(txn, table, column) do
     [name | _] = String.split(column, " ", parts: 2)
 
@@ -182,7 +235,7 @@ defmodule Tightbeam.LimitFallback do
         :absent
 
       [["TEXT", 0, nil, 0]] ->
-        if String.contains?(table_sql(txn, table), normalize(column)),
+        if Regex.match?(~r/#{Regex.escape(normalize(column))}\s*[,)]/, table_sql(txn, table)),
           do: :present,
           else: refuse!("#{table}.#{name} has an unexpected definition")
 
