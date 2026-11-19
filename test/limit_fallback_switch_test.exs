@@ -115,10 +115,25 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
 
     def init(opts),
-      do: {:ok, Map.merge(%{sessions: %{}, prompts: 0, candidate: :ok}, opts)}
+      do:
+        {:ok, Map.merge(%{sessions: %{}, prompts: 0, candidate: :ok, fenced: MapSet.new()}, opts)}
 
     def handle_call({:knows_session?, sid}, _from, state),
-      do: {:reply, Map.has_key?(state.sessions, sid), state}
+      do: {:reply, Map.has_key?(state.sessions, sid) and sid not in state.fenced, state}
+
+    # Stale-turn v1.3 R7, as the real adapter: a fenced harness session cannot
+    # be loaded; its replacement is created with new_fenced_session.
+    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance, _timeout}, _from, state) do
+      if sid in state.fenced,
+        do: {:reply, {:error, {:harness_session_fenced, sid}}, state},
+        else: {:reply, {:error, {:unsupported_in_test, "load_session"}}, state}
+    end
+
+    def handle_call({:new_fenced_session, model, _cwd, _mcp, guidance}, _from, state) do
+      sid = "#{state.name}-fresh-#{map_size(state.sessions) + 1}"
+      send(state.parent, {:new_fenced_session, state.name, sid, guidance})
+      {:reply, {:ok, sid}, put_in(state.sessions[sid], model)}
+    end
 
     def handle_call({:new_session, model, _cwd, _mcp, _guidance}, _from, state) do
       sid = "#{state.name}-session-#{map_size(state.sessions) + 1}"
@@ -160,10 +175,22 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     def handle_call({:switch_model_session, sid, model, _cwd, _mcp, _guidance}, _from, state),
       do: {:reply, {:ok, sid}, put_in(state.sessions[sid], model)}
 
-    def handle_call({:prompt, _sid, text, opts}, _from, state) do
+    def handle_call({:prompt, sid, text, opts}, _from, state) do
       n = state.prompts + 1
       send(state.parent, {:prompted, state.name, n, text})
-      {:reply, state.prompt.(n, text, opts), %{state | prompts: n}}
+      reply = state.prompt.(n, text, opts)
+
+      # The real adapter refuses this only for a session it has fenced.
+      state =
+        case reply do
+          {:error, {:acp_request_not_dispatched, {:harness_session_fenced, ^sid}}} ->
+            %{state | fenced: MapSet.put(state.fenced, sid)}
+
+          _ ->
+            state
+        end
+
+      {:reply, reply, %{state | prompts: n}}
     end
 
     def handle_call({:close_session, _sid}, _from, state), do: {:reply, :ok, state}
@@ -1313,26 +1340,71 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
           assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
 
           # R10: the reads show the terminal, its cause and the held state.
-          assert %{reason: "latest_terminal_failed", evidence: %{turn: breathing_turn}} =
-                   Tightbeam.Breathing.query(ctx.db, "session", key)
-
-          assert %{seq: ^seq, status: "failed_unknown", cause: ^cause} = breathing_turn
-
+          # (The R9 notice to the holder is itself a later turn, so the
+          # settled turn is read by its seq.)
           assert %{turnSeq: ^seq, cause: ^cause, heldState: ^held_state} =
                    Tightbeam.TurnSettlementView.settlement(
-                     Tightbeam.TurnSettlementView.latest_turn(ctx.db, key)
+                     Tightbeam.TurnSettlementView.turn(ctx.db, seq)
                    )
 
           # R5: no replay vehicle, and a later delivered turn on the same
           # harness and host (today's redelivery trigger) re-sends nothing.
           assert redelivery_rows(ctx.db, seq) == 0
-          next = deliver!(ctx, key, "s1-next-prompt")
+          # The R9 notice may still hold the lane; the next prompt then waits
+          # behind it as a pending wake.
+          assert post(ctx, key, "s1-next-prompt") in [:appended, :queued]
+          next = await_turn_seq!(ctx.db, key, "s1-next-prompt")
           await_turns_settled!(ctx.db, key)
           assert turn_status(ctx.db, next) == "delivered"
           assert same_message_turns(ctx.db, seq) == [seq]
           assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
         end)
       end
+    end
+
+    test "R7: a prompt refused on its fenced harness session runs on a fresh one with the durable handoff" do
+      with_gateway(fn ctx ->
+        key = "s1-fenced"
+        s1_session!(ctx, key, :claude)
+        lane!(ctx, key)
+
+        first = deliver!(ctx, key, "s1-before-the-fence")
+        await_turns_settled!(ctx.db, key)
+        assert turn_status(ctx.db, first) == "delivered"
+        fenced_sid = Org.current_pointer(ctx.db, key).harness_session_id
+
+        :ok =
+          GenServer.call(
+            ctx.claude,
+            {:set, :prompt,
+             fn
+               2, _text, _opts ->
+                 {:error, {:acp_request_not_dispatched, {:harness_session_fenced, fenced_sid}}}
+
+               n, _text, _opts ->
+                 ok_reply(n)
+             end}
+          )
+
+        next = deliver!(ctx, key, "s1-after-the-fence")
+        await_turns_settled!(ctx.db, key)
+
+        # Not queued behind the old prompt and not failed: delivered on a new
+        # harness session that carries the session's history.
+        assert turn_status(ctx.db, next) == "delivered"
+        assert_receive {:new_fenced_session, :claude, fresh_sid, guidance}
+        assert fresh_sid != fenced_sid
+        assert guidance =~ "stopped answering"
+        assert guidance =~ "s1-before-the-fence"
+        refute guidance =~ "s1-after-the-fence"
+        assert Org.current_pointer(ctx.db, key).harness_session_id == fresh_sid
+        assert_receive {:prompted, :claude, 3, _text}
+
+        assert Enum.any?(
+                 Tightbeam.EventLog.lifecycle_events(ctx.db),
+                 &(&1.kind == "pointer_fallback" and &1.detail =~ "harness_session_fenced")
+               )
+      end)
     end
 
     test "R4: a turn whose prompt was never dispatched keeps its known failure" do

@@ -65,6 +65,7 @@ defmodule Tightbeam.Acp.Adapter do
     :on_guidance_verified,
     :on_subagent_event,
     :on_cancel_unanswered,
+    :on_unresponsive,
     settle_grace_ms: 60_000,
     quiet_bound_ms: 300_000,
     stderr_offset: 0,
@@ -85,7 +86,11 @@ defmodule Tightbeam.Acp.Adapter do
     tool_turns: %{},
     pending_tool_calls: %{},
     # Stale-turn v1.1: per-session turn liveness of the pending prompt (R3).
-    turn_activity: %{}
+    turn_activity: %{},
+    # Stale-turn v1.3 R7: harness sessions closed after an unanswered cancel,
+    # and why this adapter is unresponsive (nil while it answers).
+    fenced_sessions: MapSet.new(),
+    unresponsive: nil
   ]
 
   ## Client
@@ -463,6 +468,19 @@ defmodule Tightbeam.Acp.Adapter do
   """
   def cancel_prompt(adapter, sid), do: call(adapter, {:cancel_prompt, sid}, 5_000)
 
+  @doc """
+  Create the fresh harness session that replaces a fenced one (stale-turn
+  v1.3 R7). The creation is bounded by G: unanswered within G, the adapter
+  is unresponsive, takes no new turn, and is replaced once nothing is pending.
+  """
+  def new_fenced_session(adapter, model, cwd, mcp_servers, guidance),
+    do:
+      call(
+        adapter,
+        {:new_fenced_session, model, cwd, mcp_servers, guidance},
+        @cancel_grace_ms + 5_000
+      )
+
   ## Server
 
   @impl true
@@ -563,6 +581,7 @@ defmodule Tightbeam.Acp.Adapter do
       on_guidance_verified: Keyword.get(opts, :on_guidance_verified),
       on_subagent_event: Keyword.get(opts, :on_subagent_event),
       on_cancel_unanswered: Keyword.get(opts, :on_cancel_unanswered),
+      on_unresponsive: Keyword.get(opts, :on_unresponsive),
       settle_grace_ms: Keyword.get(opts, :settle_grace_ms, @cancel_grace_ms),
       quiet_bound_ms: Keyword.get(opts, :quiet_bound_ms, TurnActivity.w_ms())
     }
@@ -642,6 +661,7 @@ defmodule Tightbeam.Acp.Adapter do
       elem(message, 0) in [
         :new_session,
         :new_candidate_session,
+        :new_fenced_session,
         :load_session,
         :switch_model_session,
         :close_session,
@@ -652,14 +672,18 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp session_operation?(_message), do: false
 
-  defp operation_key(message) when elem(message, 0) in [:new_session, :new_candidate_session],
-    do: make_ref()
+  defp operation_key(message)
+       when elem(message, 0) in [:new_session, :new_candidate_session, :new_fenced_session],
+       do: make_ref()
 
   defp operation_key(message), do: elem(message, 1)
 
   @impl true
   def handle_call(message, from, state) do
     cond do
+      refusal = fence_refusal(state, message) ->
+        {:reply, refusal, state}
+
       session_operation?(message) ->
         enqueue_operation(state, message, from)
 
@@ -690,7 +714,14 @@ defmodule Tightbeam.Acp.Adapter do
 
       monitor = Process.monitor(pid)
 
-      operation = %{pid: pid, monitor: monitor, from: from, notified_fields: MapSet.new()}
+      operation = %{
+        pid: pid,
+        monitor: monitor,
+        from: from,
+        notified_fields: MapSet.new(),
+        kind: elem(message, 0)
+      }
+
       {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
     end
   end
@@ -706,11 +737,16 @@ defmodule Tightbeam.Acp.Adapter do
     sid =
       case {kind, reply} do
         {kind, {:ok, sid}}
-        when kind in [:new_session, :new_candidate_session, :switch_model_session] and
+        when kind in [
+               :new_session,
+               :new_candidate_session,
+               :new_fenced_session,
+               :switch_model_session
+             ] and
                is_binary(sid) ->
           sid
 
-        {kind, _} when kind in [:new_session, :new_candidate_session] ->
+        {kind, _} when kind in [:new_session, :new_candidate_session, :new_fenced_session] ->
           nil
 
         _ ->
@@ -797,7 +833,16 @@ defmodule Tightbeam.Acp.Adapter do
     Process.demonitor(operation.monitor, [:flush])
     GenServer.reply(operation.from, reply)
     state = merge_operation(state, updates, operation.notified_fields)
-    drain_operations(%{state | operations: Map.delete(state.operations, key)})
+
+    # Stale-turn v1.3 R7: a fresh session's creation unanswered within G.
+    state =
+      if Map.get(operation, :kind) == :new_fenced_session and timed_out?(reply),
+        do: become_unresponsive(state, :creation_unanswered),
+        else: state
+
+    %{state | operations: Map.delete(state.operations, key)}
+    |> drain_operations()
+    |> stop_if_drained()
   end
 
   defp drain_operations(%{operations: operations} = state) when map_size(operations) > 0,
@@ -809,9 +854,11 @@ defmodule Tightbeam.Acp.Adapter do
     state = %{state | operation_queue: rest}
 
     result =
-      if session_operation?(message),
-        do: enqueue_operation(state, message, from),
-        else: session_call(message, from, state)
+      cond do
+        refusal = fence_refusal(state, message) -> {:reply, refusal, state}
+        session_operation?(message) -> enqueue_operation(state, message, from)
+        true -> session_call(message, from, state)
+      end
 
     case result do
       {:reply, reply, next} ->
@@ -820,6 +867,9 @@ defmodule Tightbeam.Acp.Adapter do
 
       {:noreply, next} ->
         drain_operations(next)
+
+      {:stop, _reason, _state} = stop ->
+        stop
     end
   end
 
@@ -885,6 +935,9 @@ defmodule Tightbeam.Acp.Adapter do
        ) do
     new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout, false)
   end
+
+  defp session_call({:new_fenced_session, model, cwd, mcp_servers, guidance}, _from, state),
+    do: new_session_reply(state, model, cwd, mcp_servers, guidance, state.settle_grace_ms, false)
 
   defp session_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
     load_session_reply(state, sid, model, cwd, mcp_servers, guidance, 60_000)
@@ -1690,8 +1743,9 @@ defmodule Tightbeam.Acp.Adapter do
       %{from: from, settling: %{ref: ^ref, cause: nil}} ->
         emit_settle_unanswered(state, sid, "canceled")
 
-        settle_prompt(
-          state,
+        state
+        |> fence_session(sid)
+        |> settle_prompt(
           sid,
           from,
           {:error, {:prompt_interrupted, {:cancel_unacknowledged, sid}}}
@@ -1699,7 +1753,10 @@ defmodule Tightbeam.Acp.Adapter do
 
       %{from: from, settling: %{ref: ^ref, cause: cause, detail: detail}} ->
         emit_settle_unanswered(state, sid, cause)
-        settle_prompt(state, sid, from, {:error, {:unknown_effect, cause, detail}})
+
+        state
+        |> fence_session(sid)
+        |> settle_prompt(sid, from, {:error, {:unknown_effect, cause, detail}})
 
       _ ->
         {:noreply, state}
@@ -1728,6 +1785,43 @@ defmodule Tightbeam.Acp.Adapter do
 
           Process.send_after(self(), {:missing_response_check, sid, request_id}, delay)
           {:noreply, state}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  # Stale-turn v1.3 R7: the fenced session's close, answered or not within G.
+  def handle_info({:fence_close_done, sid, result}, state) do
+    if timed_out?(result) do
+      {:noreply, become_unresponsive(state, {:close_unanswered, sid})}
+      |> stop_if_drained()
+    else
+      Logger.info("acp fenced session closed session=#{sid} result=#{inspect(elem(result, 0))}")
+      {:noreply, state}
+    end
+  end
+
+  # Stale-turn v1.3 R7: on an unresponsive adapter, a pending prompt that is
+  # not live (quiet for W, no tool call open) is settled as in R6. The
+  # adapter's failure to answer stands in for the turn-end report.
+  def handle_info({:unresponsive_check, sid, request_id}, state) do
+    case {state.prompts[sid], state.turn_activity[sid]} do
+      {%{request_id: ^request_id} = prompt, %{} = activity}
+      when not is_map_key(prompt, :settling) ->
+        now = now_ms()
+
+        if TurnActivity.live?(activity, now, state.quiet_bound_ms) do
+          delay =
+            if TurnActivity.open_tool_calls(activity) > 0,
+              do: state.quiet_bound_ms,
+              else: max(TurnActivity.last_advance(activity) + state.quiet_bound_ms - now, 0)
+
+          Process.send_after(self(), {:unresponsive_check, sid, request_id}, delay)
+          {:noreply, state}
+        else
+          {:noreply, begin_settle(state, sid, "response_missing", %{})}
         end
 
       _ ->
@@ -1775,10 +1869,33 @@ defmodule Tightbeam.Acp.Adapter do
         turn_activity: Map.delete(state.turn_activity, sid)
     }
 
-    next_prompt(state, sid)
+    state
+    |> next_prompt(sid)
+    |> stop_if_drained()
   end
 
   defp next_prompt(state, sid) do
+    if MapSet.member?(state.fenced_sessions, sid) do
+      # Stale-turn v1.3 R7: nothing queued behind the unanswered prompt runs
+      # on its fenced session; each such call is refused undispatched.
+      {fenced, rest} = Enum.split_with(state.queued_prompts, &(&1.sid == sid))
+
+      for queued <- fenced do
+        if queued.timer, do: Process.cancel_timer(queued.timer)
+
+        GenServer.reply(
+          queued.from,
+          {:error, {:acp_request_not_dispatched, {:harness_session_fenced, sid}}}
+        )
+      end
+
+      {:noreply, %{state | queued_prompts: rest}}
+    else
+      next_queued_prompt(state, sid)
+    end
+  end
+
+  defp next_queued_prompt(state, sid) do
     case Enum.find_index(state.queued_prompts, &(&1.sid == sid)) do
       nil ->
         {:noreply, state}
@@ -1826,6 +1943,110 @@ defmodule Tightbeam.Acp.Adapter do
 
     :ok
   end
+
+  # Stale-turn v1.3 R7: a harness session that left a cancel unanswered serves
+  # no other turn. It is forgotten here at once, so its next turn gets a fresh
+  # session, and closed with G to answer; an unanswered close makes the
+  # adapter unresponsive. Other sessions are untouched.
+  defp fence_session(state, sid) do
+    state = %{
+      state
+      | fenced_sessions: MapSet.put(state.fenced_sessions, sid),
+        known: MapSet.delete(state.known, sid),
+        models: Map.delete(state.models, sid),
+        unprompted: MapSet.delete(state.unprompted, sid),
+        switchable_models: Map.delete(state.switchable_models, sid),
+        config_options: Map.delete(state.config_options, sid)
+    }
+
+    if is_nil(state.unresponsive) do
+      parent = self()
+      conn = state.conn
+      grace = state.settle_grace_ms
+
+      spawn(fn ->
+        result =
+          try do
+            Conn.request(conn, "session/close", %{sessionId: sid},
+              timeout: grace,
+              diagnostic: true
+            )
+          catch
+            :exit, reason -> {:error, {:close_failed, reason}}
+          end
+
+        send(parent, {:fence_close_done, sid, result})
+      end)
+    end
+
+    state
+  end
+
+  defp become_unresponsive(%{unresponsive: nil} = state, why) do
+    Logger.warning("acp adapter unresponsive: #{inspect(why)}; no new turns")
+
+    if is_function(state.on_unresponsive, 1), do: state.on_unresponsive.(why)
+
+    for {sid, %{request_id: request_id}} <- state.prompts,
+        not is_nil(request_id),
+        do: send(self(), {:unresponsive_check, sid, request_id})
+
+    for queued <- state.queued_prompts do
+      if queued.timer, do: Process.cancel_timer(queued.timer)
+
+      GenServer.reply(
+        queued.from,
+        {:error, {:acp_request_not_dispatched, :adapter_unresponsive}}
+      )
+    end
+
+    %{state | unresponsive: why, queued_prompts: []}
+  end
+
+  defp become_unresponsive(state, _why), do: state
+
+  # An unresponsive adapter with no prompt pending is replaced: it stops, and
+  # the coordinator's death handling resolves its launch and starts one fresh.
+  defp stop_if_drained({:noreply, %{unresponsive: why, prompts: prompts} = state})
+       when not is_nil(why) and map_size(prompts) == 0 do
+    Process.unlink(state.conn)
+    Process.exit(state.conn, :kill)
+    {:stop, {:shutdown, {:adapter_unresponsive, why}}, state}
+  end
+
+  defp stop_if_drained(result), do: result
+
+  # New turns refused: on a fenced harness session (R7 session fence), and on
+  # an unresponsive adapter (R7) except for what is already pending.
+  defp fence_refusal(state, message) when is_tuple(message) and tuple_size(message) >= 2 do
+    kind = elem(message, 0)
+    sid = elem(message, 1)
+
+    cond do
+      kind == :prompt and MapSet.member?(state.fenced_sessions, sid) ->
+        {:error, {:acp_request_not_dispatched, {:harness_session_fenced, sid}}}
+
+      kind == :load_session and MapSet.member?(state.fenced_sessions, sid) ->
+        {:error, {:harness_session_fenced, sid}}
+
+      is_nil(state.unresponsive) ->
+        nil
+
+      kind == :prompt ->
+        {:error, {:acp_request_not_dispatched, :adapter_unresponsive}}
+
+      kind in [:new_session, :new_candidate_session, :new_fenced_session, :load_session] ->
+        {:error, {:adapter_unavailable, "adapter unresponsive: no new turns"}}
+
+      true ->
+        nil
+    end
+  end
+
+  defp fence_refusal(_state, _message), do: nil
+
+  defp timed_out?({:error, reason}), do: ErrorDiagnostic.classified(reason) == :timeout
+  defp timed_out?(_result), do: false
 
   defp observe_turn_activity(state, sid, update) when is_binary(sid) and is_map(update) do
     root = Map.get(state.subagent_roots, sid, sid)

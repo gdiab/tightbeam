@@ -193,6 +193,21 @@ defmodule Tightbeam.AdapterCoordinator do
   @spec ready?(GenServer.server(), adapter_key()) :: boolean()
   def ready?(server \\ __MODULE__, key), do: GenServer.call(server, {:ready?, key})
 
+  @doc """
+  Whether the key's live adapter is unresponsive (stale-turn v1.3 R7): it left
+  a fenced session's close or a fresh session's creation unanswered within G.
+  Such an adapter takes no new turn; it is replaced once nothing is pending.
+  """
+  @spec unresponsive?(adapter_key()) :: boolean()
+  def unresponsive?(key) do
+    # Read on every lane claim, written only when an adapter turns
+    # unresponsive or dies: a persistent term, valid while that pid lives.
+    case :persistent_term.get({__MODULE__, :unresponsive, key}, nil) do
+      pid when is_pid(pid) -> Process.alive?(pid)
+      _ -> false
+    end
+  end
+
   @doc "The canonical key string `<harness>:<preset>@<host>`, exactly as /version renders it."
   @spec key_name(adapter_key()) :: String.t()
   def key_name({harness, archetype, host}), do: "#{harness}:#{archetype}@#{host}"
@@ -1190,6 +1205,8 @@ defmodule Tightbeam.AdapterCoordinator do
           generation = entry.generation + 1
           timer = schedule_restart(state, key, generation, failures)
 
+          was_unresponsive? = Map.get(entry, :unresponsive, false)
+
           entry = %{
             entry
             | pid: nil,
@@ -1203,7 +1220,15 @@ defmodule Tightbeam.AdapterCoordinator do
               last_failure: {died_at, reason}
           }
 
+          entry = Map.put(entry, :unresponsive, false)
           state = %{state | adapters: Map.put(state.adapters, key, entry)}
+
+          # Stale-turn v1.3 R7: the drained unresponsive adapter is replaced;
+          # the lanes it held back claim their queued turns on the fresh one.
+          if was_unresponsive? do
+            :persistent_term.erase({__MODULE__, :unresponsive, key})
+            wake_held_lanes(state.db, key)
+          end
 
           state =
             if entry.waiters != [] do
@@ -1241,6 +1266,22 @@ defmodule Tightbeam.AdapterCoordinator do
       # died between announcing and being heard; the entry now describes a
       # successor that has not booted, and crediting it would declare a
       # not-yet-serving adapter ready.
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:adapter_unresponsive, key, pid, why}, state) do
+    case state.adapters[key] do
+      %{pid: ^pid} = entry ->
+        Logger.warning(
+          "adapter #{key_name(key)} unresponsive (#{inspect(why)}): no new turns until it drains"
+        )
+
+        :persistent_term.put({__MODULE__, :unresponsive, key}, pid)
+        entry = Map.put(entry, :unresponsive, true)
+        {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
+
       _ ->
         {:noreply, state}
     end
@@ -1507,6 +1548,9 @@ defmodule Tightbeam.AdapterCoordinator do
       |> Keyword.put(:on_ready, fn ->
         send(coordinator, {:adapter_ready, key, self(), generation, token})
       end)
+      |> Keyword.put(:on_unresponsive, fn why ->
+        send(coordinator, {:adapter_unresponsive, key, self(), why})
+      end)
 
     child = %{
       id: {Tightbeam.Acp.Adapter, key},
@@ -1672,6 +1716,30 @@ defmodule Tightbeam.AdapterCoordinator do
   defp last_failure_node({generation, reason}),
     do: ErrorDiagnostic.with_facts(reason, generation: generation)
 
+  defp wake_held_lanes(db, {harness, _preset, host}) do
+    case Tightbeam.DB.query(
+           db,
+           """
+           SELECT DISTINCT s.sessionKey,s.harness FROM sessions s
+           JOIN turns t ON t.sessionKey=s.sessionKey
+           WHERE s.host=?1 AND s.state='active' AND t.status='queued'
+           """,
+           [host]
+         ) do
+      {:ok, rows} ->
+        for [session_key, session_harness] <- rows,
+            Tightbeam.Harness.parse!(session_harness).id() == harness,
+            do: GenServer.cast(Tightbeam.LaneManager, {:ensure_lane, session_key})
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
   defp fresh_entry do
     %{
       pid: nil,
@@ -1688,7 +1756,8 @@ defmodule Tightbeam.AdapterCoordinator do
       readiness_timer: nil,
       readiness_token: nil,
       rendezvous: false,
-      waiters: []
+      waiters: [],
+      unresponsive: false
     }
   end
 
