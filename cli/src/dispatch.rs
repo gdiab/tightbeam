@@ -166,6 +166,8 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_)
+        | Command::RecoverAdmin { .. }
+        | Command::RootAdmin { .. }
         | Command::SessionConnect { .. } => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
@@ -1763,10 +1765,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         )),
         Command::ApproveDevice {
             identity,
-            device_id,
+            device_id: _,
             user_id,
         } => {
-            let mut params = vec![string_field("deviceId", device_id)];
+            let mut params = vec![];
             if let Some(user_id) = user_id {
                 params.push(string_field("userId", user_id));
             }
@@ -3726,6 +3728,10 @@ where
         }
         Command::UpdateClients { identity } => crate::ceremonies::update_clients(&identity),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::RecoverAdmin { user_id } => crate::device_recovery::recover_admin(&user_id),
+        Command::RootAdmin { action, user_id } => {
+            crate::device_recovery::root_admin(action, &user_id)
+        }
         Command::SessionConnect { .. } => {
             unreachable!("session-connect is routed before the shared dispatcher")
         }
@@ -4025,6 +4031,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ToolCallObserved
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
+        | Command::RecoverAdmin { .. }
+        | Command::RootAdmin { .. }
         | Command::Assimilate(_) => None,
     }
 }
