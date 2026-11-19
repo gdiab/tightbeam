@@ -185,10 +185,11 @@ try do
   end
 
   if System.get_env("FIREHOSE_REOPEN_PROOF") == "1" and fresh do
-    {:ok, device} =
-      Tightbeam.ClientE2E.SimClient.pair("127.0.0.1", port,
-        device_id: "reopen-restart",
-        claimed_name: "Synthetic reopen"
+    # Core fix (A): pairing issues no token; the device is paired by fixture.
+    device =
+      Tightbeam.TestDevices.paired!(DB, "synthetic-reopen",
+        admin: true,
+        device_id: "reopen-restart"
       )
 
     holder =
@@ -214,6 +215,21 @@ try do
     )
   end
 
+  # Core fix (A): pairing issues no token, so the devices a test asks for are
+  # paired here by fixture and their tokens handed back in the receipt.
+  devices =
+    (System.get_env("FIREHOSE_PAIRED_DEVICES") || "")
+    |> String.split(",", trim: true)
+    |> Map.new(fn spec ->
+      [id, user] = String.split(spec, "=", parts: 2)
+
+      device =
+        Tightbeam.Devices.by_id(DB, id) ||
+          Tightbeam.TestDevices.paired!(DB, user, admin: true, device_id: id)
+
+      {id, %{"token" => device.token, "userId" => device.user_id}}
+    end)
+
   receipt = Path.join(base, phase <> "-ready.json")
 
   File.write!(
@@ -223,7 +239,8 @@ try do
       "port" => port,
       "base" => base,
       "marker" => marker,
-      "payload" => payload
+      "payload" => payload,
+      "devices" => devices
     })
   )
 

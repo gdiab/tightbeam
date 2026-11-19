@@ -85,8 +85,8 @@ try do
   Tightbeam.Readiness.await_settled()
   :ok = DB.assert_base_admitted!(DB, base)
 
-  {:ok, device} =
-    SimClient.pair("127.0.0.1", port, device_id: "cold-firehose", claimed_name: "Synthetic")
+  # Core fix (A): pairing issues no token; the device is paired by fixture.
+  device = Tightbeam.TestDevices.paired!(DB, "synthetic", admin: true, device_id: "cold-firehose")
 
   session =
     Org.create(DB, %{

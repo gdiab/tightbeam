@@ -185,12 +185,27 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
           capture_classes(fixture, notices, [class], fn ->
             case class do
               "device.approved" ->
-                mutation.(
-                  fixture.db,
-                  device_id,
-                  fixture.user_id,
-                  call.("approve-device", %{device_id: device_id})
-                )
+                # Core fix (A) C6a: approval needs the freeze lifted.
+                frozen = Application.get_env(:tightbeam, :pairing_unfreeze_path)
+
+                lifted =
+                  Enum.find(
+                    ["/usr/bin/env", "/bin/sh", "/usr/bin/true"],
+                    &Tightbeam.PairingFreeze.read(&1).lifted
+                  )
+
+                Application.put_env(:tightbeam, :pairing_unfreeze_path, lifted)
+
+                try do
+                  mutation.(
+                    fixture.db,
+                    device_id,
+                    fixture.user_id,
+                    call.("approve-device", %{device_id: device_id})
+                  )
+                after
+                  Application.put_env(:tightbeam, :pairing_unfreeze_path, frozen)
+                end
 
               _ ->
                 mutation.(fixture.db, device_id, call.(verb, %{device_id: device_id}))
@@ -882,9 +897,11 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     }
   end
 
+  # Core fix (A): production acts come from the fixture user's paired admin device.
   defp production_call(fixture, verb, params) do
     firehose_call(fixture, verb, params)
     |> Map.put(:firehose_hub, fixture.hub)
+    |> Map.merge(%{auth_class: "device", auth_device_id: fixture.device.device_id})
   end
 
   defp capture_classes(fixture, notices, classes, mutation) do
