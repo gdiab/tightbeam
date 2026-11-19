@@ -56,7 +56,7 @@ defmodule Tightbeam.Wire.Socket do
   @behaviour WebSock
 
   alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, ErrorDiagnostic, Org, Projection}
-  alias Tightbeam.UserAdmin
+  alias Tightbeam.{UserAdmin, UserCommands}
   alias Tightbeam.Wire.{OperatorSession, Payloads}
 
   @typedoc "Socket state; `conn_ref` is nil until authed."
@@ -64,6 +64,8 @@ defmodule Tightbeam.Wire.Socket do
           conn_ref: reference() | nil,
           user_id: String.t() | nil,
           device_id: String.t() | nil,
+          auth_class: String.t() | nil,
+          device_token: String.t() | nil,
           is_admin: boolean(),
           selected_session_key: String.t() | nil,
           phase: :unauthed | :replaying | :live,
@@ -77,6 +79,10 @@ defmodule Tightbeam.Wire.Socket do
             registry_monitor: nil,
             user_id: nil,
             device_id: nil,
+            # Core fix (A): "device" for a device-token connection, "org" for an
+            # operator connection on the organization credential.
+            auth_class: nil,
+            device_token: nil,
             is_admin: false,
             selected_session_key: nil,
             phase: :unauthed,
@@ -93,9 +99,11 @@ defmodule Tightbeam.Wire.Socket do
 
   @impl true
   def handle_in({data, opcode: :text}, state) do
-    if user_removed?(state),
-      do: stop_user_removed(state),
-      else: handle_text(data, state)
+    cond do
+      user_removed?(state) -> stop_user_removed(state)
+      device_revoked?(state) -> stop_device_revoked(state)
+      true -> handle_text(data, state)
+    end
   end
 
   def handle_in({_data, opcode: :binary}, state),
@@ -127,6 +135,24 @@ defmodule Tightbeam.Wire.Socket do
   defp stop_user_removed(state) do
     message = UserAdmin.removed_refusal(state.user_id).message
     stop_with(Payloads.wire_error("user_removed", message), state)
+  end
+
+  # Core fix (A) C7: a device connection stops being accepted once its device is
+  # revoked or denied (its token no longer resolves to this device). Checked
+  # before every inbound frame and on every keepalive tick, so no user command
+  # rides a revoked device's open socket.
+  defp device_revoked?(%{auth_class: "device", device_token: token, device_id: id} = state)
+       when is_binary(token) do
+    not match?(%{device_id: ^id}, Devices.by_token(db(state), token))
+  end
+
+  defp device_revoked?(_state), do: false
+
+  defp stop_device_revoked(state) do
+    stop_with(
+      Payloads.wire_error("token_revoked", "this device's credential was revoked or denied"),
+      state
+    )
   end
 
   @impl true
@@ -190,6 +216,9 @@ defmodule Tightbeam.Wire.Socket do
 
           user_removed?(state) ->
             stop_user_removed(state)
+
+          device_revoked?(state) ->
+            stop_device_revoked(state)
 
           true ->
             state = schedule_ping(state)
@@ -304,10 +333,22 @@ defmodule Tightbeam.Wire.Socket do
 
         payload =
           case result do
-            {:paired, device} -> Payloads.pair_result({:ok, device.token, device.user_id})
-            {:pending, _device} -> Payloads.pair_result({:error, "pair_pending"})
-            :denied -> Payloads.pair_result({:error, "pair_denied"})
-            {:refused, reason} -> Payloads.pair_result({:error, reason})
+            {:paired, device} ->
+              Payloads.pair_result({:ok, device.token, device.user_id})
+
+            {:pending, _device} ->
+              Payloads.pair_result({:error, "pair_pending"})
+
+            :denied ->
+              Payloads.pair_result({:error, "pair_denied"})
+
+            {:refused, "pairing_frozen"} ->
+              Payloads.pair_result(
+                {:error, "pairing_frozen", Tightbeam.PairingFreeze.frozen_message()}
+              )
+
+            {:refused, reason} ->
+              Payloads.pair_result({:error, reason})
           end
 
         stop_with(payload, state)
@@ -350,6 +391,7 @@ defmodule Tightbeam.Wire.Socket do
         state
         | user_id: user.user_id,
           device_id: device_id,
+          auth_class: "org",
           is_admin: user.is_admin,
           selected_session_key: session.session_key,
           subscriptions: subscriptions,
@@ -382,7 +424,7 @@ defmodule Tightbeam.Wire.Socket do
         stop_with(Payloads.auth_result_failure(reason), state)
 
       device ->
-        auth_success(msg, device, state)
+        auth_success(msg, device, %{state | auth_class: "device", device_token: token})
     end
   end
 
@@ -564,10 +606,15 @@ defmodule Tightbeam.Wire.Socket do
       is_nil(session) or (session.owner_user_id != state.user_id and not state.is_admin) ->
         push(Payloads.wire_error("not_found", nil, id), state)
 
+      UserCommands.command?(content) ->
+        user_command(id, content, session_key, state)
+
       true ->
         call = %{
           verb: "post",
           origin: "user:#{state.user_id}",
+          auth_class: state.auth_class,
+          auth_device_id: if(state.auth_class == "device", do: state.device_id),
           session_key: session_key,
           params: %{
             content: content,
@@ -610,6 +657,61 @@ defmodule Tightbeam.Wire.Socket do
             )
         end
     end
+  end
+
+  # Core fix (A) C9-C11. A user command is executed only on a device-authenticated
+  # connection; it is never posted, so no model sees it and no turn is queued. On
+  # any other connection it is refused, not executed and not delivered.
+  defp user_command(id, content, session_key, %{auth_class: "device"} = state) do
+    input = %{
+      session_key: session_key,
+      user_id: state.user_id,
+      device_id: state.device_id,
+      client_message_id: id
+    }
+
+    case UserCommands.record(db(state), input, content) do
+      {:recorded, command} ->
+        outcome =
+          content
+          |> UserCommands.parse()
+          |> UserCommands.execute(%{
+            db: db(state),
+            handlers: state.deps.handlers,
+            user_id: state.user_id,
+            device_id: state.device_id
+          })
+
+        result = UserCommands.record_outcome(db(state), session_key, outcome)
+
+        push_many(
+          [
+            Payloads.ack(id),
+            Payloads.server_message(command),
+            Payloads.server_message(result)
+          ],
+          state
+        )
+
+      # A client retry of the same command is acknowledged and not run again.
+      {:duplicate, _command} ->
+        push(Payloads.ack(id), state)
+
+      {:conflict, _command} ->
+        push(
+          Payloads.wire_error(
+            "invalid_message",
+            "clientMessageId reused with different content",
+            id
+          ),
+          state
+        )
+    end
+  end
+
+  defp user_command(id, _content, _session_key, state) do
+    refusal = UserCommands.unauthenticated_refusal()
+    push(Payloads.wire_error(refusal.code, refusal.message, id), state)
   end
 
   # A handler error keeps its own code, message and diagnostic. Every dispatch

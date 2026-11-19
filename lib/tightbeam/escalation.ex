@@ -9,7 +9,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, GrantAuth, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Publisher}
 
@@ -2705,34 +2705,12 @@ defmodule Tightbeam.Escalation do
           {error("invalid", "agent requests use answer or return"), nil}
 
         request ->
-          case request.status do
-            "ruled" ->
-              replay_operator_ruling_in_txn(txn, call, request, answer)
+          case ruling_authority_in_txn(txn, call, request, answer) do
+            {:ok, route} ->
+              operator_rule_status_in_txn(txn, call, request, answer, route, opts)
 
-            "consumed" ->
-              case validate_terminal_request_in_txn(txn, request) do
-                %{failures: []} ->
-                  {error("not_open", "decision request is not open"), nil}
-
-                validation ->
-                  {record_integrity_refusal_in_txn(
-                     txn,
-                     request.id,
-                     validation,
-                     :detail,
-                     observer_principal(call)
-                   ), nil}
-              end
-
-            "open" ->
-              with {:ok, decision} <- operator_decision(request, answer) do
-                rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
-              else
-                {:error, reason} -> {reason, nil}
-              end
-
-            _terminal_or_closed ->
-              {error("not_open", "decision request is not open"), nil}
+            {:refused, refusal} ->
+              {refusal, nil}
           end
       end
 
@@ -2743,6 +2721,79 @@ defmodule Tightbeam.Escalation do
     end
 
     {result, fact_id}
+  end
+
+  # Core fix (A) C12-C15. An owner request is ruled only by the owner's own
+  # device, or recorded by the owner's Main under the quoted delegation (C14).
+  # The raiser session never rules its own request (C13). Every other caller is
+  # refused (C15): any other session, the organization credential in any form,
+  # any process and any device of another user.
+  defp ruling_authority_in_txn(txn, call, request, answer) do
+    owner = request.owner_user_id
+
+    case {GrantAuth.auth_class(call), Map.get(call, :principal)} do
+      {"device", _principal} ->
+        case GrantAuth.device_user_in_txn(txn, call) do
+          %{user_id: ^owner} -> {:ok, "device"}
+          _ -> {:refused, GrantAuth.ruling_refusal(request.id, owner)}
+        end
+
+      {_class, {:session, session_key}} ->
+        cond do
+          session_key == request.raiser_session_key ->
+            {:refused, GrantAuth.self_ruling_refusal(request.id, owner)}
+
+          session_key == Org.personal_session_key(owner) ->
+            if GrantAuth.rationale_names_request_in_txn?(txn, answer.rationale, request.id),
+              do: {:ok, "delegated-unverified"},
+              else: {:refused, GrantAuth.delegation_refusal(request.id)}
+
+          true ->
+            {:refused, GrantAuth.ruling_refusal(request.id, owner)}
+        end
+
+      _other ->
+        {:refused, GrantAuth.ruling_refusal(request.id, owner)}
+    end
+  end
+
+  defp operator_rule_status_in_txn(txn, call, request, answer, route, opts) do
+    case request.status do
+      "ruled" ->
+        replay_operator_ruling_in_txn(txn, call, request, answer)
+
+      "consumed" ->
+        case validate_terminal_request_in_txn(txn, request) do
+          %{failures: []} ->
+            {error("not_open", "decision request is not open"), nil}
+
+          validation ->
+            {record_integrity_refusal_in_txn(
+               txn,
+               request.id,
+               validation,
+               :detail,
+               observer_principal(call)
+             ), nil}
+        end
+
+      "open" ->
+        with {:ok, decision} <- operator_decision(request, answer) do
+          rule_operator_request_in_txn(
+            txn,
+            call,
+            request,
+            decision,
+            answer,
+            Keyword.put(opts, :ruling_route, route)
+          )
+        else
+          {:error, reason} -> {reason, nil}
+        end
+
+      _terminal_or_closed ->
+        {error("not_open", "decision request is not open"), nil}
+    end
   end
 
   defp replay_operator_ruling_in_txn(txn, call, request, answer) do
@@ -2857,11 +2908,14 @@ defmodule Tightbeam.Escalation do
 
           terminal_test_step(opts, :after_cas)
 
+          route = Keyword.fetch!(opts, :ruling_route)
+          :ok = GrantAuth.record_ruling_route_in_txn(txn, request.id, route, call)
+
           EventLog.lifecycle_in_txn(
             txn,
             "decision_request_ruled",
             request.id,
-            "by=#{ruled_by} decision=#{decision} factId=#{fact_id} mode=#{answer.mode} via=#{via || "direct"}"
+            "by=#{ruled_by} decision=#{decision} factId=#{fact_id} mode=#{answer.mode} via=#{via || "direct"} route=#{route} authClass=#{GrantAuth.auth_class(call)} device=#{GrantAuth.auth_device_id(call) || "none"}"
           )
 
           terminal_test_step(opts, :after_event)
