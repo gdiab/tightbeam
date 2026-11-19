@@ -1694,6 +1694,14 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
   ## Identity and host files
 
   defp write_archetype!(base, opts) do
+    # On 0.1.16 a fallback's harness must equal its preference entry's
+    # (contract c §12), so a pinned fallback harness pins the entry too.
+    entry_harness =
+      case Keyword.get(opts, :fallback_harness) do
+        nil -> ""
+        value -> "harness = \"#{value}\"\n"
+      end
+
     fallback =
       if Keyword.get(opts, :fallback, true) do
         harness =
@@ -1724,7 +1732,7 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     [[model_preferences]]
     model = "synthetic-claude"
     effort = "high"
-    #{fallback}
+    #{entry_harness}#{fallback}
     """)
   end
 
