@@ -10,7 +10,7 @@ defmodule Tightbeam.RateLimitReset do
   success resolves it.
   """
 
-  alias Tightbeam.{DB, Harness, HarnessProcess, HostZone, QuotaRelease, Wakes}
+  alias Tightbeam.{DB, Harness, HarnessProcess, HostZone, ParkStranding, QuotaRelease, Wakes}
   alias Tightbeam.DB.Txn
 
   @consumer "rate_limit_reset"
@@ -48,8 +48,15 @@ defmodule Tightbeam.RateLimitReset do
     # still-open incident. It reinstates admission's hold whether or not its
     # error names a reset; a duplicate of an observation already handled does
     # not.
-    if status != :duplicate and open_incident(txn, observation_id) != [] do
-      HarnessProcess.begin_park_in_txn(txn, key)
+    case status != :duplicate and open_incident(txn, observation_id) do
+      [[incident_id, _harness, _host]] ->
+        HarnessProcess.begin_park_in_txn(txn, key)
+        # Quota v3 R11: a park begun anew after a release is a new episode
+        # with its own six-hour stranding check.
+        ParkStranding.repark_in_txn(txn, incident_id, session.session_key, observed_at)
+
+      _ ->
+        :ok
     end
 
     :ok

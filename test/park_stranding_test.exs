@@ -18,6 +18,7 @@ defmodule Tightbeam.ParkStrandingTest do
     Model,
     Org,
     ParkStranding,
+    QuotaRelease,
     Wakes
   }
 
@@ -55,7 +56,7 @@ defmodule Tightbeam.ParkStrandingTest do
     queued = enqueue(db, "c1", "asg_held")
 
     assert [stranding] = stranding_wakes(db)
-    assert stranding.wake_id == ParkStranding.wake_id(incident.id)
+    assert stranding.wake_id == episode_wake_id(db, incident)
     assert stranding.prompt == incident.id
     assert stranding.origin == "process:tightbeam"
     assert stranding.state == "pending"
@@ -91,8 +92,10 @@ defmodule Tightbeam.ParkStrandingTest do
       assert notice.prompt =~ "- Codex c1 (c1)"
       assert notice.prompt =~ "- asg_held, held by Codex c1 (c1)"
 
+      assert notice.prompt =~ HarnessHealth.repair_message("rate-limit-dead")
+
       assert notice.prompt =~
-               "The harness remains parked until an opener or admin explicitly resumes it after the limit clears."
+               "Otherwise the opener, an admin, the holder's delivery owner or Main explicitly resumes it after the limit clears."
     end
 
     assert [notified] = lifecycle(db, "rate_limit_park_stranding_notified")
@@ -223,16 +226,18 @@ defmodule Tightbeam.ParkStrandingTest do
     assert [%{state: "fired"}, %{state: "pending"} = next_wake] =
              Enum.sort_by(stranding_wakes(db), &(&1.state == "pending"))
 
-    assert next_wake.wake_id == ParkStranding.wake_id(next.id)
+    assert next_wake.wake_id == episode_wake_id(db, next)
   end
 
   test "a park released before 6 hours with the incident still open sends no notice", %{db: db} do
-    open_codex_park!(db)
+    incident = open_codex_park!(db)
     enqueue(db, "c1", "asg_held")
 
-    # This is what an explicit `repair-assignment --action resume` does to a
-    # rate-limit park on this line: it completes the park, the incident stays open.
-    :ok = HarnessProcess.complete_park(db, @codex_key)
+    # An explicit resume is a named release (companion B2): it lifts the park,
+    # and the incident stays open until a later success.
+    resume!(db, incident)
+    refute HarnessProcess.parked?(db, @codex_key)
+    assert open_incident!(db, "codex").id == incident.id
     assert [stranding] = stranding_wakes(db)
 
     assert {:ok, {:skipped, "park_released"}} =
@@ -240,6 +245,71 @@ defmodule Tightbeam.ParkStrandingTest do
 
     assert notices(db) == []
     assert lifecycle(db, "rate_limit_park_stranding_notified") == []
+  end
+
+  test "a fence completion that is not a named release keeps the park, and the notice still goes out",
+       %{db: db} do
+    open_codex_park!(db)
+    enqueue(db, "c1", "asg_held")
+
+    # Companion B2: only named releases lift a quota park.
+    :ok = HarnessProcess.complete_park(db, @codex_key)
+    assert HarnessProcess.parked?(db, @codex_key)
+    assert [stranding] = stranding_wakes(db)
+
+    assert {:ok, {:notified, [_, _]}} = ParkStranding.notify(db, stranding, stranding.due_at)
+  end
+
+  test "a re-park after a release before 6 hours is a new episode: no early notice, one at its own 6 hours",
+       %{db: db} do
+    incident = open_codex_park!(db)
+    enqueue(db, "c1", "asg_held")
+    assert [first] = stranding_wakes(db)
+
+    resume!(db, incident)
+    # Companion B4: a limit met again parks the key anew under the same incident.
+    fail_turn(db, "c2", @codex_limit)
+    assert HarnessProcess.parked?(db, @codex_key)
+    assert open_incident!(db, "codex").id == incident.id
+
+    assert [^first, second] = stranding_wakes(db)
+    assert second.wake_id == episode_wake_id(db, incident)
+    refute second.wake_id == first.wake_id
+    assert second.due_at >= first.due_at
+
+    # The released episode's check sends nothing early...
+    assert {:ok, {:skipped, "park_released"}} = ParkStranding.notify(db, first, first.due_at)
+    assert notices(db) == []
+
+    # ...and the new episode's check sends once, at its own six hours.
+    assert {:ok, {:deferred, :before_deadline}} =
+             ParkStranding.notify(db, second, second.due_at - 1)
+
+    assert {:ok, {:notified, [_, _]}} = ParkStranding.notify(db, second, second.due_at)
+    assert length(notices(db)) == 2
+  end
+
+  test "a re-park after the notice went out gets its own notice six hours later", %{db: db} do
+    incident = open_codex_park!(db)
+    enqueue(db, "c1", "asg_held")
+    assert [first] = stranding_wakes(db)
+
+    assert {:ok, {:notified, [_, _] = first_notices}} =
+             ParkStranding.notify(db, first, first.due_at)
+
+    resume!(db, incident)
+    fail_turn(db, "c2", @codex_limit)
+    assert HarnessProcess.parked?(db, @codex_key)
+
+    assert [%{state: "fired"}, second] = stranding_wakes(db)
+    assert second.wake_id == episode_wake_id(db, incident)
+
+    assert {:ok, {:notified, [_, _] = second_notices}} =
+             ParkStranding.notify(db, second, second.due_at)
+
+    assert MapSet.disjoint?(MapSet.new(first_notices), MapSet.new(second_notices))
+    assert length(notices(db)) == 4
+    assert length(lifecycle(db, "rate_limit_park_stranding_notified")) == 2
   end
 
   test "a re-park of the same incident and a retried consumer do not duplicate the notice",
@@ -426,6 +496,26 @@ defmodule Tightbeam.ParkStrandingTest do
     fail_turn(db, "c2", @codex_limit)
     assert HarnessProcess.parked?(db, @codex_key)
     open_incident!(db, "codex")
+  end
+
+  defp resume!(db, incident) do
+    assert {:ok, :released} =
+             DB.transaction(db, fn txn ->
+               QuotaRelease.release_named_in_txn(txn, incident.id, "codex", "testhost", %{
+                 cause: "explicit_resume",
+                 actor: "user:#{@owner}"
+               })
+             end)
+  end
+
+  # The stranding wake id of the park episode now standing on the Codex key.
+  defp episode_wake_id(db, incident) do
+    {:ok, [[generation]]} =
+      DB.query(db, "SELECT generation FROM harness_park_fences WHERE adapterKey=?1", [
+        "codex:shared@testhost"
+      ])
+
+    ParkStranding.wake_id(incident.id, generation)
   end
 
   defp open_incident!(db, harness) do
