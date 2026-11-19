@@ -861,40 +861,38 @@ defmodule Tightbeam.Placement do
 
   # C2: the admin-paired-device check above shares this transaction.
   defp register_in_txn(txn, name, entry, call) do
-    (
-        new_host? = DB.Txn.q(txn, "SELECT 1 FROM hosts WHERE name = ?1", [name]) == []
+    new_host? = DB.Txn.q(txn, "SELECT 1 FROM hosts WHERE name = ?1", [name]) == []
 
-        needs_projection? =
-          new_host? or AdminProjection.version(txn, "hosts", name) == nil
+    needs_projection? =
+      new_host? or AdminProjection.version(txn, "hosts", name) == nil
 
-        upsert_host_in_txn(txn, name, entry)
-        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+    upsert_host_in_txn(txn, name, entry)
+    Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
-        projection =
-          if needs_projection? do
-            AdminProjection.allocate_in_txn(
-              txn,
-              "hosts",
-              name,
-              System.system_time(:millisecond)
-            )
+    projection =
+      if needs_projection? do
+        AdminProjection.allocate_in_txn(
+          txn,
+          "hosts",
+          name,
+          System.system_time(:millisecond)
+        )
 
-            item = StateResources.query_host(txn, name)
+        item = StateResources.query_host(txn, name)
 
-            Tightbeam.Firehose.Publisher.committed_in_txn(
-              txn,
-              "host.registered",
-              item,
-              %{"host" => name}
-            )
+        Tightbeam.Firehose.Publisher.committed_in_txn(
+          txn,
+          "host.registered",
+          item,
+          %{"host" => name}
+        )
 
-            item
-          else
-            StateResources.query_host(txn, name)
-          end
+        item
+      else
+        StateResources.query_host(txn, name)
+      end
 
-        %{entry: entry, projection: projection, changed: new_host?}
-    )
+    %{entry: entry, projection: projection, changed: new_host?}
   end
 
   @doc """

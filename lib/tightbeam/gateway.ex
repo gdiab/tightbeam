@@ -1192,14 +1192,14 @@ defmodule Tightbeam.Gateway do
 
           with {:ok, registration} <-
                  Placement.register_host_with_firehose(
-              db,
-              p.name,
-              %{
-                ssh: p[:ssh] || p.name,
-                base_dir: Map.fetch!(p, :base_dir),
-                cli_bin: p[:cli_bin],
-                adapter_bin_dir: p[:adapter_bin_dir]
-              },
+                   db,
+                   p.name,
+                   %{
+                     ssh: p[:ssh] || p.name,
+                     base_dir: Map.fetch!(p, :base_dir),
+                     cli_bin: p[:cli_bin],
+                     adapter_bin_dir: p[:adapter_bin_dir]
+                   },
                    call
                  ) do
             register_host_effects(config, db, p, previous_entry, registration)

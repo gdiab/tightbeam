@@ -180,7 +180,8 @@ defmodule Tightbeam.EventLog do
           String.t() | nil,
           term(),
           term(),
-          non_neg_integer()
+          non_neg_integer(),
+          map() | nil
         ) :: pos_integer()
   def append_event_in_txn(
         %Txn{} = txn,
@@ -190,22 +191,50 @@ defmodule Tightbeam.EventLog do
         session_key,
         payload,
         principal,
-        ts
+        ts,
+        auth \\ nil
       )
       when kind in ~w(verb denied) and is_integer(ts) and ts >= 0 do
     payload =
       denial_payload_with_message_position(txn, kind, session_key, principal, payload)
 
     [[event_id]] =
-      Txn.q(
-        txn,
-        """
-        INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        RETURNING id
-        """,
-        [ts, kind, verb, origin, serialize_principal(principal), session_key, encode(payload)]
-      )
+      case auth do
+        # Core fix (A) C4: a transport-authenticated call records its
+        # authentication class and authenticating device beside its principal.
+        %{class: class, device_id: device_id} when is_binary(class) ->
+          Txn.q(
+            txn,
+            """
+            INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload,
+              authClass, authDeviceId)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            RETURNING id
+            """,
+            [
+              ts,
+              kind,
+              verb,
+              origin,
+              serialize_principal(principal),
+              session_key,
+              encode(payload),
+              class,
+              device_id
+            ]
+          )
+
+        nil ->
+          Txn.q(
+            txn,
+            """
+            INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            RETURNING id
+            """,
+            [ts, kind, verb, origin, serialize_principal(principal), session_key, encode(payload)]
+          )
+      end
 
     Tightbeam.DBObservation.audit_recorded(verb, event_id)
     event_id

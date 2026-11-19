@@ -65,14 +65,22 @@ defmodule Tightbeam.Wire.Payloads do
   @typedoc "prompt_turn_state names: accepted | queued | running | delivered | canceled | failed."
   @type turn_state :: String.t()
 
-  @doc "pair_result: `{success: true, token, userId}` or `{success: false, reason}`."
-  @spec pair_result({:ok, String.t(), String.t()} | {:error, String.t()}) :: payload()
+  @doc "pair_result: `{success: true, token, userId}` or `{success: false, reason[, message]}`."
+  @spec pair_result(
+          {:ok, String.t(), String.t()}
+          | {:error, String.t()}
+          | {:error, String.t(), String.t()}
+        ) :: payload()
   def pair_result({:ok, token, user_id}) do
     %{"type" => "pair_result", "success" => true, "token" => token, "userId" => user_id}
   end
 
   def pair_result({:error, reason}) do
     %{"type" => "pair_result", "success" => false, "reason" => reason}
+  end
+
+  def pair_result({:error, reason, message}) do
+    %{"type" => "pair_result", "success" => false, "reason" => reason, "message" => message}
   end
 
   @doc "auth_result success frame — takes the full assembled field map (see socket.ex)."

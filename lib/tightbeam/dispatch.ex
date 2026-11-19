@@ -90,10 +90,15 @@ defmodule Tightbeam.Dispatch do
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
     previous_audit = Process.delete(:tightbeam_dispatch_audit)
     previous_audited = Process.delete(:tightbeam_dispatch_audited)
+    previous_auth = Process.put(:tightbeam_dispatch_auth, event_auth(call))
 
     try do
       Rules.with_snapshot(fn -> dispatch_call(db, handlers, call) end)
     after
+      if previous_auth,
+        do: Process.put(:tightbeam_dispatch_auth, previous_auth),
+        else: Process.delete(:tightbeam_dispatch_auth)
+
       if previous_audit,
         do: Process.put(:tightbeam_dispatch_audit, previous_audit),
         else: Process.delete(:tightbeam_dispatch_audit)
@@ -102,6 +107,12 @@ defmodule Tightbeam.Dispatch do
         do: Process.put(:tightbeam_dispatch_audited, previous_audited),
         else: Process.delete(:tightbeam_dispatch_audited)
     end
+  end
+
+  # Core fix (A) C4: a call whose transport derived an authentication class
+  # records it, and the authenticating device, on every event row it writes.
+  defp event_auth(call) do
+    if Map.has_key?(call, :auth_class), do: Tightbeam.GrantAuth.audit(call)
   end
 
   defp dispatch_call(db, handlers, call) do
@@ -503,7 +514,9 @@ defmodule Tightbeam.Dispatch do
     previous =
       Process.put(
         :tightbeam_dispatch_audit,
-        Map.take(call, [:verb, :origin, :session_key, :principal])
+        call
+        |> Map.take([:verb, :origin, :session_key, :principal])
+        |> Map.put(:auth, Process.get(:tightbeam_dispatch_auth))
       )
 
     Process.delete(:tightbeam_dispatch_audited)
@@ -538,6 +551,7 @@ defmodule Tightbeam.Dispatch do
          async \\ false
        ) do
     audited = Process.delete(:tightbeam_dispatch_audited)
+    auth = Process.get(:tightbeam_dispatch_auth)
 
     # Successful reads audit identity and verb only, including body reads.
     payload =
@@ -559,7 +573,8 @@ defmodule Tightbeam.Dispatch do
             session_key,
             payload,
             principal,
-            System.system_time(:millisecond)
+            System.system_time(:millisecond),
+            auth
           )
         end
       rescue

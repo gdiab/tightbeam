@@ -342,6 +342,10 @@ defmodule Tightbeam.Wire.Router do
             verb: verb,
             origin: origin,
             principal: principal,
+            # Core fix (A): the authentication class is derived here, from the
+            # credential this request carried, and never from its body.
+            auth_class: auth_class(auth),
+            auth_device_id: auth_device_id(auth),
             # Retain the authenticated transport separately from the selected origin.
             transport_session_key: authenticated_session_key(auth),
             session_key: artifact_caller_session(verb, session_key, principal),
@@ -902,6 +906,8 @@ defmodule Tightbeam.Wire.Router do
             verb: verb,
             origin: "user:#{device.user_id}",
             principal: {:user, device.user_id},
+            auth_class: "device",
+            auth_device_id: device.device_id,
             session_key: key,
             params: params
           }
@@ -2292,7 +2298,9 @@ defmodule Tightbeam.Wire.Router do
           Macro.underscore(key) in ["user_id", "owner_user_id"],
           do: value
 
-    if read_verb?(verb) or verb == "remove-user" do
+    # A protected act (core fix (A) C2) refuses a non-device caller before any
+    # other check, and checks removed users inside its own transaction.
+    if read_verb?(verb) or Tightbeam.GrantAuth.protected_verb?(verb) do
       :ok
     else
       case Enum.find(named, &UserAdmin.removed?(db(conn), &1)) do
@@ -3664,6 +3672,10 @@ defmodule Tightbeam.Wire.Router do
 
   defp allowed_agent_verb(verb, {:device, _device}) when verb in @read_marker_verbs, do: :ok
 
+  # Core fix (A) C12: a device token may rule its own user's operator requests on
+  # dispatch, and call nothing else beyond the read markers.
+  defp allowed_agent_verb("operator-rule", {:device, _device}), do: :ok
+
   defp allowed_agent_verb(_verb, {:device, _device}),
     do: {:error, 401, "auth_failed", nil}
 
@@ -3755,6 +3767,13 @@ defmodule Tightbeam.Wire.Router do
          "as, asUser, or asProcess required on an organization credential"}
     end
   end
+
+  defp auth_class({:device, _device}), do: "device"
+  defp auth_class({:session, _session}), do: "session"
+  defp auth_class(:org), do: "org"
+
+  defp auth_device_id({:device, device}), do: device.device_id
+  defp auth_device_id(_auth), do: nil
 
   defp authenticated_session_key({:session, session}), do: session.session_key
   defp authenticated_session_key({:device, _device}), do: nil
@@ -4218,7 +4237,10 @@ defmodule Tightbeam.Wire.Router do
               "not_authorized",
               "process_denied",
               "principal_required",
-              "user_removed"
+              "user_removed",
+              "user_authentication_required",
+              "self_ruling_forbidden",
+              "delegation_rationale_required"
             ],
        do: 403
 
