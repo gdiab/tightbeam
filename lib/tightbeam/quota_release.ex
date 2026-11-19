@@ -86,7 +86,8 @@ defmodule Tightbeam.QuotaRelease do
            SELECT t.seq,t.sessionKey,t.assignmentId,t.messageId,t.requestRef,
                   (SELECT o.incidentId FROM harness_health_observations o
                    WHERE o.correlationId='harness-turn:' || t.seq || ':rate-limit-dead'
-                     AND o.evidenceKind='terminal-failure' LIMIT 1)
+                     AND o.evidenceKind IN ('terminal-failure','authoritative-provider')
+                   LIMIT 1)
            FROM turns t WHERE t.seq=?1
            """,
            [turn_seq]
