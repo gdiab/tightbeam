@@ -464,6 +464,8 @@ defmodule Tightbeam.EscalationTest do
              handlers["rule"].(%{
                origin: "user:flynn",
                principal: {:user, "flynn"},
+               auth_class: "device",
+               auth_device_id: "admin-device",
                params: %{request_id: id, decision: "later"}
              })
 
@@ -509,7 +511,13 @@ defmodule Tightbeam.EscalationTest do
     waiver =
       Escalation.waive(
         ctx.db,
-        %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{request_id: first}},
+        %{
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          auth_class: "device",
+          auth_device_id: "admin-device",
+          params: %{request_id: first}
+        },
         authorized: true,
         scheduler: ctx.scheduler
       )
@@ -536,6 +544,8 @@ defmodule Tightbeam.EscalationTest do
                %{
                  origin: "user:flynn",
                  principal: {:user, "flynn"},
+                 auth_class: "device",
+                 auth_device_id: "admin-device",
                  params: %{waiver_id: waiver.id}
                },
                authorized: true
@@ -555,7 +565,13 @@ defmodule Tightbeam.EscalationTest do
 
     Escalation.waive(
       ctx.db,
-      %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{request_id: id}},
+      %{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        auth_class: "device",
+        auth_device_id: "admin-device",
+        params: %{request_id: id}
+      },
       authorized: true
     )
 
@@ -581,6 +597,8 @@ defmodule Tightbeam.EscalationTest do
              Escalation.withdraw(ctx.db, %{
                origin: "user:flynn",
                principal: {:user, "flynn"},
+               auth_class: "device",
+               auth_device_id: "admin-device",
                params: %{request_id: id, reason: "no"}
              })
 
@@ -592,6 +610,8 @@ defmodule Tightbeam.EscalationTest do
         %{
           origin: "user:flynn",
           principal: {:user, "flynn"},
+          auth_class: "device",
+          auth_device_id: "admin-device",
           params: %{session_key: ctx.raiser.session_key, statute_name: "review"}
         },
         authorized: true
@@ -757,6 +777,8 @@ defmodule Tightbeam.EscalationTest do
       verb: "attest",
       origin: "user:flynn",
       principal: {:user, "flynn"},
+      auth_class: "device",
+      auth_device_id: "admin-device",
       session_key: nil,
       params: %{assignment_id: "a-origin", kind: "completion"}
     }
@@ -922,6 +944,8 @@ defmodule Tightbeam.EscalationTest do
              Escalation.operator_ask(ctx.db, %{
                origin: "user:flynn",
                principal: {:user, "flynn"},
+               auth_class: "device",
+               auth_device_id: "admin-device",
                params: %{question: "not session-filed"}
              })
 
@@ -1513,7 +1537,13 @@ defmodule Tightbeam.EscalationTest do
                [request.id]
              )
 
-    owner_call = %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
+    owner_call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      auth_class: "device",
+      auth_device_id: "admin-device",
+      params: %{}
+    }
 
     assert %{code: "decision_request_integrity_invalid"} =
              Escalation.get(ctx.db, owner_call, request.id)
@@ -1542,6 +1572,8 @@ defmodule Tightbeam.EscalationTest do
     owner_call = %{
       origin: "user:flynn",
       principal: {:user, "flynn"},
+      auth_class: "device",
+      auth_device_id: "admin-device",
       params: %{}
     }
 
@@ -2063,6 +2095,8 @@ defmodule Tightbeam.EscalationTest do
     owner_withdraw = %{
       origin: "user:flynn",
       principal: {:user, "flynn"},
+      auth_class: "device",
+      auth_device_id: "admin-device",
       params: %{request: owner_request.id, reason: "moot"}
     }
 
@@ -2096,6 +2130,8 @@ defmodule Tightbeam.EscalationTest do
     owner_call = %{
       origin: "user:flynn",
       principal: {:user, "flynn"},
+      auth_class: "device",
+      auth_device_id: "admin-device",
       params: %{}
     }
 
@@ -2822,6 +2858,8 @@ defmodule Tightbeam.EscalationTest do
                verb: "ask",
                origin: "user:flynn",
                principal: {:user, "flynn"},
+               auth_class: "device",
+               auth_device_id: "admin-device",
                session_key: asked.session_key,
                params: %{question: "user ask"}
              })
@@ -2904,6 +2942,8 @@ defmodule Tightbeam.EscalationTest do
                verb: "answer",
                origin: "user:flynn",
                principal: {:user, "flynn"},
+               auth_class: "device",
+               auth_device_id: "admin-device",
                params: %{request: request.id, answer: "asker owner is not the expecter"}
              })
 
@@ -3212,6 +3252,8 @@ defmodule Tightbeam.EscalationTest do
       %{
         origin: "user:flynn",
         principal: {:user, "flynn"},
+        auth_class: "device",
+        auth_device_id: "admin-device",
         params: %{request: request_id, reason: "race withdrawal"}
       },
       opts
@@ -3569,6 +3611,8 @@ defmodule Tightbeam.EscalationTest do
     %{
       origin: "user:flynn",
       principal: {:user, "flynn"},
+      auth_class: "device",
+      auth_device_id: "admin-device",
       params: %{request_id: id, decision: decision}
     }
   end
@@ -3617,6 +3661,8 @@ defmodule Tightbeam.EscalationTest do
       verb: "operator-rule",
       origin: "user:flynn",
       principal: {:user, "flynn"},
+      auth_class: "device",
+      auth_device_id: "admin-device",
       transport_session_key: nil,
       params: Map.put(params, :request, id)
     }
