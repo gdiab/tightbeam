@@ -22,6 +22,9 @@ defmodule Tightbeam.UnknownEffect do
   @doc "The turn error an unknown-effect terminal carries."
   def error, do: @error
 
+  @doc "The causes an unknown-effect terminal records."
+  def causes, do: @causes
+
   @doc "Whether `seq`'s prompt was written to the adapter transport."
   @spec dispatched_in_txn?(Txn.t(), pos_integer()) :: boolean()
   def dispatched_in_txn?(%Txn{} = txn, seq) when is_integer(seq) do
