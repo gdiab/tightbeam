@@ -210,13 +210,21 @@ jobs:
         working-directory: cli
         run: cargo test
 
+      # Memory limits v1.4 T10: the session launch step with real processes
+      # (Linux only: /proc and oom_score_adj). These steps run even when an
+      # earlier step failed, so a pre-existing suite failure cannot hide them.
+      - name: cargo test (memory guard launch step)
+        if: ${{ !cancelled() && env.FULL_SUITE == 'true' && matrix.name == 'linux' }}
+        working-directory: cli
+        run: cargo test --test memory_guard_step
+
       # Memory limits v1.4 §8 T1/T2/T15: a real runaway process, contained by
       # Tightbeam's own limits. Each run sits in a cgroup with a finite memory
       # limit of its own (6G, no swap), so a failure of Tightbeam's limits can
       # only end that environment; the tests refuse to start without it.
       # watched: a root-owned scope, so nothing is delegated to the gateway.
       - name: memory containment (watched)
-        if: env.FULL_SUITE == 'true' && matrix.name == 'linux'
+        if: ${{ !cancelled() && env.FULL_SUITE == 'true' && matrix.name == 'linux' }}
         run: |
           sudo systemd-run --scope --quiet -p MemoryMax=6G -p MemorySwapMax=0 -- \
             sudo -u "$(id -un)" env PATH="$PATH" HOME="$HOME" MIX_ENV=test \
@@ -227,7 +235,7 @@ jobs:
       # Delegate= with DelegateSubgroup=gateway does (proposal P1): the user owns
       # the root of the subtree, and the gateway runs in its `gateway` child.
       - name: memory containment (enforced)
-        if: env.FULL_SUITE == 'true' && matrix.name == 'linux'
+        if: ${{ !cancelled() && env.FULL_SUITE == 'true' && matrix.name == 'linux' }}
         run: |
           CG=/sys/fs/cgroup/tb-containment
           echo "+memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
