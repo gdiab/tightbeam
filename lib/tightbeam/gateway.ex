@@ -337,6 +337,7 @@ defmodule Tightbeam.Gateway do
           delivery_opts: delivery_config,
           internal_consumers: %{
             "rate_limit_reset" => &Tightbeam.RateLimitReset.release(db, &1),
+            "park_stranding" => &Tightbeam.ParkStranding.notify(db, &1),
             # These internal consumers remain only to drain wakes persisted by
             # pre-removal releases. They intentionally neither read generations
             # nor send effort-check-in decisions/notices.

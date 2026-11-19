@@ -24,6 +24,7 @@ defmodule Tightbeam.HarnessHealth do
     Id,
     Ledger,
     Org,
+    ParkStranding,
     Wire.Payloads,
     Projection,
     Wakes
@@ -2284,6 +2285,13 @@ defmodule Tightbeam.HarnessHealth do
 
     snapshot_affected_work(txn, incident_id, input)
 
+    # Contract v3 R11: the park this incident began has one durable
+    # six-hour stranding check. It runs after the member snapshot, which
+    # supplies its anchor when the observation names no session.
+    if input.failure_class == "rate-limit-dead" do
+      ParkStranding.schedule_in_txn(txn, incident_id, input)
+    end
+
     if input.failure_class == @other_failure_class do
       create_other_review_in_txn(txn, incident_id, input, recipient)
     end
@@ -3759,6 +3767,13 @@ defmodule Tightbeam.HarnessHealth do
         end
     end
   end
+
+  @doc false
+  # The repair sentence the incident read carries for a class, for a notice
+  # that must repeat today's guidance verbatim (contract v3 R11).
+  @spec repair_message(String.t()) :: String.t()
+  def repair_message(failure_class) when failure_class in @failure_classes,
+    do: repair_guidance(failure_class).message
 
   defp with_repair_guidance(incident),
     do: Map.put(incident, :repair, repair_guidance(incident.failureClass))
