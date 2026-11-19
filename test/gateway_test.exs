@@ -246,6 +246,24 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # Like the real AdapterCoordinator, a successful close removes the key's
+  # park fence itself (do_close_adapter's complete_park).
+  defmodule UnparkingCoordinatorStub do
+    use GenServer
+
+    def start_link({parent, db}), do: GenServer.start_link(__MODULE__, {parent, db})
+    def init(state), do: {:ok, state}
+
+    def handle_call({:close_adapter, key, _cleanup_scope}, from, state),
+      do: handle_call({:close_adapter, key}, from, state)
+
+    def handle_call({:close_adapter, key}, _from, {parent, db} = state) do
+      send(parent, {:repair_close_adapter, key})
+      :ok = Tightbeam.HarnessProcess.complete_park(db, key)
+      {:reply, :ok, state}
+    end
+  end
+
   defmodule CancelCoordinatorStub do
     use GenServer
 
@@ -4058,6 +4076,108 @@ defmodule Tightbeam.GatewayTest do
       assert turn_count(ctx.db, id) == 1
     end
 
+    test "B2/(a): a restart of a quota-parked key releases the park, so it has resume's narrower rule",
+         ctx do
+      Devices.add_user(ctx.db, "zoe", false)
+      ensure_main_session(ctx.db, "zoe")
+
+      for key <- ["zr-holder", "zr-sibling"] do
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          owner_user_id: "zoe",
+          origin: "user:zoe",
+          archetype: "default",
+          host: "testhost",
+          harness: "claude",
+          provider: "anthropic",
+          model: Model.new("fable")
+        })
+      end
+
+      # The key is quota-parked, and a newer adapter incident covers the
+      # assignment the restart repairs.
+      %{assignment_id: id, incident: quota} =
+        covered_assignment!(ctx, "asg_zoe_restart", "zr-holder", opened_by_user: "zoe")
+
+      assert {:opened, _adapter} =
+               HarnessHealth.observe(ctx.db, %{
+                 correlation_id: "route-asg_zoe_restart-adapter",
+                 harness: "claude",
+                 host: "testhost",
+                 failure_class: "adapter_unavailable",
+                 evidence_kind: "authoritative-provider",
+                 session_key: "zr-holder",
+                 assignment_id: id,
+                 observed_at: 120,
+                 cause: "adapter_unavailable",
+                 principal: "process:tightbeam"
+               })
+
+      handler = resume_handler(ctx, :ok)
+      key = {:claude, "shared", "testhost"}
+
+      # A session owned by the opening user may restart an unparked key, but
+      # not one whose restart would release a quota park.
+      assert %{ok: false, code: "not_authorized"} =
+               handler.(resume_call({:session, "zr-sibling"}, id, "sibling", ctx.lane, "restart"))
+
+      assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
+      refute_receive {:repair_close_adapter, _}, 50
+
+      assert %{ok: true, action: "restart", park: "released"} =
+               handler.(resume_call({:user, "zoe"}, id, "opener", ctx.lane, "restart"))
+
+      refute Tightbeam.HarnessProcess.parked?(ctx.db, key)
+
+      assert [%{"cause" => "explicit_restart", "actor" => "user:zoe"}] =
+               hold_releases(ctx.db, quota.id)
+    end
+
+    test "B1: a rerun consumes its turn's pending redelivery row, so the turn runs at most once",
+         ctx do
+      repair = failed_repair_route!(ctx, "asg_pending_row", "adapter_unavailable", 85)
+
+      {:ok, :ok} =
+        DB.transaction(ctx.db, fn txn ->
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            repair.source_seq,
+            "adapter_unavailable"
+          )
+        end)
+
+      handler = resume_handler(ctx, :ok)
+
+      assert %{
+               ok: true,
+               park: "not_parked",
+               rerun: %{"state" => "queued", "attemptTurnSeq" => attempt}
+             } =
+               handler.(
+                 resume_call({:user, "flynn"}, repair.assignment_id, "rr", ctx.lane, "restart")
+               )
+
+      assert {:ok, [[^attempt, ^attempt]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT restorationTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts WHERE sourceTurnSeq=?1",
+                 [repair.source_seq]
+               )
+
+      # A later restoration finds nothing left to redeliver.
+      assert {:ok, 0} =
+               DB.transaction(ctx.db, fn txn ->
+                 Wakes.redeliver_pending_health_intents_in_txn(
+                   txn,
+                   %{harness: :claude, host: "testhost", session_key: "k1"},
+                   %{seq: attempt}
+                 )
+               end)
+
+      assert turn_count(ctx.db, repair.assignment_id) == 2
+    end
+
     test "R9(c): only the opener, an admin, the holder's delivery owner or Main may resume",
          ctx do
       Devices.add_user(ctx.db, "zoe", false)
@@ -4118,7 +4238,11 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp resume_handler(ctx, close_result) do
-    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), close_result})
+    {:ok, coordinator} =
+      case close_result do
+        :ok -> UnparkingCoordinatorStub.start_link({self(), ctx.db})
+        failure -> RepairCoordinatorStub.start_link({self(), failure})
+      end
 
     ctx.catalog_base
     |> gateway_config(ctx.db, 0)
@@ -4127,7 +4251,7 @@ defmodule Tightbeam.GatewayTest do
     |> Map.fetch!("repair-assignment")
   end
 
-  defp resume_call(principal, assignment_id, key, lane) do
+  defp resume_call(principal, assignment_id, key, lane, action \\ "resume") do
     origin =
       case principal do
         {:user, user} -> "user:" <> user
@@ -4138,7 +4262,7 @@ defmodule Tightbeam.GatewayTest do
       origin: origin,
       principal: principal,
       lane_manager: lane,
-      params: %{assignment_id: assignment_id, action: "resume", idempotency_key: key}
+      params: %{assignment_id: assignment_id, action: action, idempotency_key: key}
     }
   end
 
@@ -4179,7 +4303,7 @@ defmodule Tightbeam.GatewayTest do
         [
           assignment_id,
           holder,
-          if(opts[:opened_by_session], do: nil, else: "flynn"),
+          if(opts[:opened_by_session], do: nil, else: opts[:opened_by_user] || "flynn"),
           opts[:opened_by_session],
           opts[:work_item_id],
           session.harness,

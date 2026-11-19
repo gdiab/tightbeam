@@ -1808,11 +1808,23 @@ defmodule Tightbeam.Gateway do
   defp repair_assignment(_db, _assignment_id),
     do: {:error, "invalid_request", "repair-assignment requires assignmentId"}
 
-  # A resume releases a quota park for every session on the shared key, so it
-  # is narrower than the other repairs: only the opener, an admin, the holder's
-  # delivery owner or Main (quota v3 R9(c)). A session owned by the opening
-  # user is not, on that ground alone, any of these.
-  defp repair_authorized(db, %{params: %{action: "resume"}} = call, assignment) do
+  # A resume, or a restart while the holder's key is quota-parked, releases
+  # the park for every session on the shared key (close_adapter removes the
+  # fence). That is narrower than the other repairs: only the opener, an
+  # admin, the holder's delivery owner or Main (quota v3 R9(c), acceptance
+  # (a)). A session owned by the opening user is not, on that ground alone,
+  # any of these.
+  defp repair_authorized(db, %{params: %{action: action}} = call, assignment)
+       when action in ["resume", "restart"] do
+    if action == "resume" or quota_parked_holder?(db, assignment),
+      do: park_release_authorized(db, call, assignment),
+      else: broad_repair_authorized(db, call, assignment)
+  end
+
+  defp repair_authorized(db, call, assignment),
+    do: broad_repair_authorized(db, call, assignment)
+
+  defp park_release_authorized(db, call, assignment) do
     allowed =
       case call.principal do
         {:user, user} ->
@@ -1836,7 +1848,7 @@ defmodule Tightbeam.Gateway do
          "assignment resume requires its opener, an admin, the holder's delivery owner or Main"}
   end
 
-  defp repair_authorized(db, call, assignment) do
+  defp broad_repair_authorized(db, call, assignment) do
     allowed =
       case call.principal do
         {:user, user} ->
@@ -1885,6 +1897,43 @@ defmodule Tightbeam.Gateway do
       end)
 
     offices
+  end
+
+  defp quota_parked_holder?(db, assignment) do
+    case Org.get(db, assignment.holder) do
+      %{harness: harness, host: host} when is_binary(host) ->
+        quota_park_incident(db, to_string(harness), host) != nil
+
+      _ ->
+        false
+    end
+  end
+
+  # The open rate-limit-dead incident whose park fence stands on the shared
+  # key, or nil.
+  defp quota_park_incident(db, harness, host) do
+    key = {Harness.parse!(harness).id(), "shared", host}
+
+    {:ok, incident} =
+      DB.transaction(db, fn txn ->
+        with true <- HarnessProcess.parked_in_txn?(txn, key),
+             [[incident_id]] <-
+               Txn.q(
+                 txn,
+                 """
+                 SELECT id FROM harness_health_incidents
+                 WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open'
+                 ORDER BY openedAt DESC,id DESC LIMIT 1
+                 """,
+                 [harness, host]
+               ) do
+          incident_id
+        else
+          _ -> nil
+        end
+      end)
+
+    incident
   end
 
   defp repair_holder(db, assignment) do
@@ -1974,11 +2023,15 @@ defmodule Tightbeam.Gateway do
 
     # Companion v1.1 A1: the result names every durable effect it committed,
     # whatever a later step does; `ok:false` only for a step that failed.
+    # A successful close removes the key's park fence itself, so a quota park
+    # standing now is released by this repair whatever incident it covers.
+    quota_incident = quota_park_incident(db, to_string(session.harness), session.host)
+
     case AdapterCoordinator.close_adapter(coordinator, key) do
       :ok ->
         park =
-          if incident.failure_class == "rate-limit-dead",
-            do: release_quota_park(db, call, session, key, incident),
+          if quota_incident,
+            do: release_quota_park(db, call, session, key, quota_incident),
             else: "not_parked"
 
         case guarded_rerun(db, call, assignment, incident) do
@@ -2108,39 +2161,36 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # Quota v3 R9(c): an explicit resume removes the park fence and records the
-  # release with its actor and time; the release then does what every release
-  # does (companion B5, v3 R12).
-  defp release_quota_park(db, call, session, key, incident) do
+  # Quota v3 R9(c): an explicit resume (or a restart of a quota-parked key)
+  # releases the park and records the release with its actor and time; the
+  # release then does what every reset or resume release does (companion B5,
+  # v3 R12). close_adapter has usually removed the fence already.
+  defp release_quota_park(db, call, session, key, incident_id) do
     {:ok, park} =
       DB.transaction(db, fn txn ->
-        if HarnessProcess.parked_in_txn?(txn, key) do
-          HarnessProcess.complete_park_in_txn(txn, key)
+        HarnessProcess.complete_park_in_txn(txn, key)
 
-          EventLog.lifecycle_in_txn(
-            txn,
-            "rate_limit_hold_released",
-            incident.id,
-            JSON.encode!(%{
-              cause: "explicit_resume",
-              actor: repair_principal(call.principal),
-              releasedAt: System.system_time(:millisecond),
-              assignmentId: call.params[:assignment_id]
-            })
-          )
+        EventLog.lifecycle_in_txn(
+          txn,
+          "rate_limit_hold_released",
+          incident_id,
+          JSON.encode!(%{
+            cause: "explicit_#{call.params[:action]}",
+            actor: repair_principal(call.principal),
+            releasedAt: System.system_time(:millisecond),
+            assignmentId: call.params[:assignment_id]
+          })
+        )
 
-          Tightbeam.QuotaRelease.released_in_txn(
-            txn,
-            incident.id,
-            to_string(session.harness),
-            session.host,
-            readmit: true
-          )
+        Tightbeam.QuotaRelease.released_in_txn(
+          txn,
+          incident_id,
+          to_string(session.harness),
+          session.host,
+          readmit: true
+        )
 
-          "released"
-        else
-          "not_parked"
-        end
+        "released"
       end)
 
     park
@@ -2151,34 +2201,64 @@ defmodule Tightbeam.Gateway do
   # covers, its outcome is not unknown, and nothing later superseded it.
   # Otherwise nothing is enqueued and the reason is reported.
   defp guarded_rerun(db, call, assignment, incident) do
-    {:ok, eligibility} =
-      DB.transaction(db, fn txn -> rerun_eligibility_in_txn(txn, call, assignment, incident) end)
+    principal = repair_principal(call.principal)
+    repair_key = call.params[:idempotency_key]
 
-    case eligibility do
+    # The judgment, the attempt and the consumption of a pending redelivery
+    # row of the same turn commit together, so the turn runs at most once.
+    outcome =
+      DB.transaction_then(
+        db,
+        fn txn ->
+          case rerun_eligibility_in_txn(txn, call, assignment, incident) do
+            {:none, reason} ->
+              {:none, reason}
+
+            {:eligible, source_seq} ->
+              case Ledger.repair_terminal_in_txn(
+                     txn,
+                     source_seq,
+                     assignment.id,
+                     repair_key,
+                     principal
+                   ) do
+                {:appended, attempt_seq, _attempt_id} ->
+                  Wakes.consume_health_redelivery_by_repair_in_txn(txn, source_seq, attempt_seq)
+                  {:rerun, "queued", source_seq, attempt_seq}
+
+                {:duplicate, attempt_seq, _attempt_id} ->
+                  {:rerun, "duplicate", source_seq, attempt_seq}
+
+                {:error, reason} ->
+                  {:error, reason}
+              end
+          end
+        end,
+        fn txn, result ->
+          Wakes.row_commit_in_txn(txn, [])
+          result
+        end
+      )
+
+    case outcome do
       # The nested result is string-keyed: a replay of the same --key returns
       # the persisted (JSON) result, and it must be identical (A1).
-      {:none, reason} ->
+      {:ok, {:none, reason}} ->
         {:ok, %{"state" => "none", "reason" => reason}}
 
-      {:eligible, source_seq} ->
-        principal = repair_principal(call.principal)
-        repair_key = call.params[:idempotency_key]
+      {:ok, {:rerun, state, source_seq, attempt_seq}} ->
+        LaneManager.ensure_lane(
+          Map.get(call, :lane_manager, Tightbeam.LaneManager),
+          assignment.holder
+        )
 
-        case Ledger.repair_terminal(db, source_seq, assignment.id, repair_key, principal) do
-          {:ok, {status, attempt_seq, _attempt_id}} ->
-            LaneManager.ensure_lane(
-              Map.get(call, :lane_manager, Tightbeam.LaneManager),
-              assignment.holder
-            )
+        {:ok, %{"state" => state, "sourceTurnSeq" => source_seq, "attemptTurnSeq" => attempt_seq}}
 
-            state = if status == :duplicate, do: "duplicate", else: "queued"
+      {:ok, {:error, reason}} ->
+        {:error, repair_failed(reason, operation: "repair_terminal", phase: "repair_rerun")}
 
-            {:ok,
-             %{"state" => state, "sourceTurnSeq" => source_seq, "attemptTurnSeq" => attempt_seq}}
-
-          {:error, reason} ->
-            {:error, repair_failed(reason, operation: "repair_terminal", phase: "repair_rerun")}
-        end
+      {:error, reason} ->
+        {:error, repair_failed(reason, operation: "repair_terminal", phase: "repair_rerun")}
     end
   end
 

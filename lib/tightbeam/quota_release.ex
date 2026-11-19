@@ -13,7 +13,9 @@ defmodule Tightbeam.QuotaRelease do
     (`:unknown_effect`) turn is never replayed: the vehicles are not written for
     it (`Wakes`), a retry attempt still pending is settled, the disposition is
     recorded with cause `provider_quota`, and one item goes to the holder and
-    the delivery owner (v3 R16).
+    the delivery owner (v3 R16). That happens where its vehicles are withheld
+    (`surface_not_replayed_in_txn/2`), so it holds even when no incident ever
+    opens; a release only catches a turn recorded before this existed.
   - Companion B5 (spec writer's ruling, asg_a4d1e7d6): a release by the
     declared reset or an explicit resume re-admits the key's pending
     pre-activity message turns itself, once each in seq order (`readmit: true`).
@@ -68,6 +70,39 @@ defmodule Tightbeam.QuotaRelease do
       when is_integer(turn_seq) and turn_seq > 0 do
     quota_failure?(txn, turn_seq) and
       LimitFallback.Outcome.classify_in_txn(txn, turn_seq) == :unknown_effect
+  end
+
+  @doc """
+  Record and surface one post-activity quota-failed turn as not replayed, at
+  the point its replay vehicles are withheld (companion v1.1 B5, v3 R16). Its
+  incident may not exist yet; a later release finds the item and adds nothing.
+  """
+  @spec surface_not_replayed_in_txn(Txn.t(), pos_integer()) :: :ok
+  def surface_not_replayed_in_txn(%Txn{} = txn, turn_seq)
+      when is_integer(turn_seq) and turn_seq > 0 do
+    case Txn.q(
+           txn,
+           """
+           SELECT t.seq,t.sessionKey,t.assignmentId,t.messageId,t.requestRef,
+                  (SELECT o.incidentId FROM harness_health_observations o
+                   WHERE o.correlationId='harness-turn:' || t.seq || ':rate-limit-dead'
+                     AND o.evidenceKind='terminal-failure' LIMIT 1)
+           FROM turns t WHERE t.seq=?1
+           """,
+           [turn_seq]
+         ) do
+      [[seq, session_key, assignment_id, message_id, request_ref, incident_id]] ->
+        not_replayed_in_txn(txn, incident_id, %{
+          seq: seq,
+          session_key: session_key,
+          assignment_id: assignment_id,
+          message_id: message_id,
+          request_ref: request_ref
+        })
+
+      [] ->
+        :ok
+    end
   end
 
   defp quota_failure?(txn, turn_seq) do
