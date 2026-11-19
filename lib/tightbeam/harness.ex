@@ -131,11 +131,19 @@ defmodule Tightbeam.Harness do
   @doc "Whether a running turn accepts model tuning without replacing its conversation."
   @callback running_model_tuning_supported?() :: boolean()
 
+  @doc """
+  Whether a prompt's error response reports that the harness process serving
+  the session ended (stale-turn settlement v1.1 §1 "harness-exit error", R4).
+  A harness without one is covered by transport loss alone.
+  """
+  @callback harness_exit_error?(term()) :: boolean()
+
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       records_tool_calls?: 0,
                       running_model_tuning_supported?: 0,
+                      harness_exit_error?: 1,
                       submission_text_limit: 0,
                       session_load_meta: 2,
                       project_session_identity: 3,
