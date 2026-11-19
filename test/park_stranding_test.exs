@@ -293,7 +293,17 @@ defmodule Tightbeam.ParkStrandingTest do
     tmp_dir: tmp
   } do
     db = :"park_stranding_restart_#{System.unique_integer([:positive])}"
-    spec = Supervisor.child_spec({DB, path: Path.join(tmp, "state.db"), name: db}, id: :file_db)
+    # A persistent database is admitted against an assembled payload.
+    prepared = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "schema_shape_runtime.exs")
+
+    db_opts = [
+      path: Path.join(prepared.base, "state.db"),
+      name: db,
+      guard_inputs: [],
+      payload_root: prepared.payload
+    ]
+
+    spec = Supervisor.child_spec({DB, db_opts}, id: :file_db)
     start_supervised!(spec)
     :ok = Tightbeam.Schema.ensure_all(db)
     seed!(db)
@@ -359,6 +369,11 @@ defmodule Tightbeam.ParkStrandingTest do
   end
 
   defp seed!(db) do
+    # The owner is a real user: the delivery-owner rule resolves an
+    # assignment's owner through `users`.
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)", [@owner])
+
     ensure_main_session(db, @owner)
     create_session(db, @lead, "claude")
     for key <- ["c1", "c2"], do: create_session(db, key, "codex")
