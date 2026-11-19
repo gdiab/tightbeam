@@ -159,6 +159,10 @@ defmodule Tightbeam.HarnessProcess do
       if dedicated_cursor?, do: File.chmod!(Path.dirname(identity_path), 0o2770)
     end
 
+    # Memory limits v1.1 R2a: no session tree of an earlier launch of this
+    # key survives into this one.
+    :ok = Tightbeam.MemoryGuard.ensure_no_orphans(key)
+
     case DB.transaction(db, fn txn ->
            case DB.Txn.q(
                   txn,
@@ -227,9 +231,24 @@ defmodule Tightbeam.HarnessProcess do
         Keyword.get(opts, :cursor_rails_sha256)
       )
     )
+    |> Keyword.update(:env, [], &memory_guard_env(&1, key, launch_id, opts, db))
     |> Keyword.put(:harness_process_launch_id, launch_id)
     |> Keyword.put(:harness_process_direct_launcher, is_nil(ssh) and not dedicated_cursor?)
     |> Keyword.put(:harness_process_satellite_host, if(is_binary(ssh), do: elem(key, 2)))
+  end
+
+  # Memory limits v1.1 AS2, R12c: route the adapter's session processes through
+  # the launch step and, in enforced mode, place the adapter in its unit. The
+  # step's own variables replace any overlay of the same name.
+  defp memory_guard_env(env, key, launch_id, opts, db) do
+    case Tightbeam.MemoryGuard.launch_env(key, launch_id, opts, db) do
+      [] ->
+        env
+
+      extra ->
+        names = MapSet.new(extra, &elem(&1, 0))
+        Enum.reject(env, fn {name, _} -> MapSet.member?(names, name) end) ++ extra
+    end
   end
 
   @doc "Read and persist identity within an explicit finite deadline."
@@ -1844,6 +1863,53 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp key_name({harness, preset, host}), do: "#{harness}:#{preset}@#{host}"
+
+  @doc "The stored adapterKey name of an adapter key."
+  @spec adapter_key_name(tuple()) :: String.t()
+  def adapter_key_name(key), do: key_name(key)
+
+  @doc """
+  Memory limits v1.1 R1/R2 (watched mode): end a recorded adapter's whole
+  tree through the same `harness-group` kill recovery uses. The adapter's
+  exit then settles its row through the ordinary `:DOWN` path.
+  """
+  @spec kill_tree(row()) :: :ok | {:error, term()}
+  def kill_tree(%{process_group_id: pgid} = row) when is_integer(pgid) do
+    case run_group_command(row, command_timeout_ms()) do
+      {_output, 0} -> :ok
+      {:error, reason} -> {:error, reason}
+      {output, status} -> {:error, {:harness_group_failed, status, one_line(output)}}
+    end
+  end
+
+  def kill_tree(_row), do: {:error, :no_identity}
+
+  @doc """
+  Memory limits v1.1 R1, R2, R2a: end one session tree, identified by the
+  identity its launch step recorded (`tightbeam-session-exec`, the same
+  identity format as `harness-exec`), through `harness-group`, which also
+  finds the tree's detached process groups.
+  """
+  @spec kill_session_tree(String.t(), String.t()) :: :ok | {:error, term()}
+  def kill_session_tree(helper_path, identity_path) do
+    with {:ok, text} <- File.read(identity_path),
+         [pid, pgid, boot, launch] <- String.split(String.trim(text), "\t"),
+         true <- pid == pgid || {:error, :not_a_group_leader} do
+      case bounded_command(
+             helper_path,
+             ["harness-group", pgid, identity_path, boot, launch, @identity_authority_version],
+             command_timeout_ms()
+           ) do
+        {_output, 0} -> :ok
+        {:error, reason} -> {:error, reason}
+        {output, status} -> {:error, {:harness_group_failed, status, one_line(output)}}
+      end
+    else
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :identity_malformed}
+    end
+  end
 
   defp command_timeout_ms,
     do: Application.get_env(:tightbeam, :harness_process_command_timeout_ms, @command_timeout_ms)

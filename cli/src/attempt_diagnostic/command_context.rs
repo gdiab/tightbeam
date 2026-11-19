@@ -163,6 +163,8 @@ impl CommandContext {
             HostToolchainSet { .. } => ("cli.host_toolchain_set", DispatchPath),
             HarnessProcessSettle { .. } => ("cli.harness_process_settle", DispatchPath),
             HarnessProcesses { .. } => ("cli.harness_processes", DispatchPath),
+            HostMemory { .. } => ("cli.host_memory", DispatchPath),
+            HostMemorySet { .. } => ("cli.host_memory_set", DispatchPath),
             UpdateClients { .. } => ("cli.update_clients", DispatchPath),
             Assimilate(_) => ("cli.assimilate", CatalogAndDispatch),
         };
@@ -347,7 +349,12 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | Users { .. }
         | HostEnvList { .. }
         | HarnessProcesses { .. }
+        | HostMemory { .. }
         | UpdateClients { .. } => Read,
+
+        // A setting change is a last-writer-wins upsert of one value; a
+        // repeat writes the same row.
+        HostMemorySet { .. } => WriteWithoutIdempotency,
 
         // Settlement resolves the launch row, may remove its park fence and
         // records a lifecycle event. It carries no idempotency key; the

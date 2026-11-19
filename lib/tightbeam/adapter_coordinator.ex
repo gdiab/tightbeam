@@ -1107,6 +1107,10 @@ defmodule Tightbeam.AdapterCoordinator do
         if absorbed? do
           {:noreply, state}
         else
+          # Memory limits v1.1 R2a: no session process outlives its adapter,
+          # and none survives into the replacement scheduled below.
+          :ok = Tightbeam.MemoryGuard.adapter_ended(key, current_launch_id(state.db, key))
+
           case Tightbeam.HarnessProcess.settle_proven_dead(state.db, key) do
             :ok ->
               :ok
@@ -1453,6 +1457,17 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
+  defp current_launch_id(db, key) do
+    name = Tightbeam.HarnessProcess.adapter_key_name(key)
+
+    case Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.adapter_key == name)) do
+      %{launch_id: launch_id} -> launch_id
+      nil -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
   defp start_adapter_unfenced(key, entry, state, opts) do
     coordinator = self()
     generation = entry.generation
@@ -1461,6 +1476,7 @@ defmodule Tightbeam.AdapterCoordinator do
     opts =
       opts
       |> Keyword.put(:connection_generation, generation)
+      |> Keyword.put(:memory_guard_key, key)
       |> Keyword.put(:on_ready, fn ->
         send(coordinator, {:adapter_ready, key, self(), generation, token})
       end)

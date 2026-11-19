@@ -90,7 +90,12 @@ defmodule Tightbeam.Acp.Adapter do
     # Stale-turn v1.3 R7: harness sessions closed after an unanswered cancel,
     # and why this adapter is unresponsive (nil while it answers).
     fenced_sessions: MapSet.new(),
-    unresponsive: nil
+    unresponsive: nil,
+    # Memory limits v1.1: this adapter's key and launch, for residency reports
+    # (R3), and each session's observed unfinished background tasks (R4).
+    memory_guard_key: nil,
+    launch_id: nil,
+    background: %{}
   ]
 
   ## Client
@@ -573,7 +578,9 @@ defmodule Tightbeam.Acp.Adapter do
       on_cancel_unanswered: Keyword.get(opts, :on_cancel_unanswered),
       on_unresponsive: Keyword.get(opts, :on_unresponsive),
       settle_grace_ms: Keyword.get(opts, :settle_grace_ms, @cancel_grace_ms),
-      quiet_bound_ms: Keyword.get(opts, :quiet_bound_ms, TurnActivity.w_ms())
+      quiet_bound_ms: Keyword.get(opts, :quiet_bound_ms, TurnActivity.w_ms()),
+      memory_guard_key: Keyword.get(opts, :memory_guard_key),
+      launch_id: Keyword.get(opts, :harness_process_launch_id)
     }
 
     # A binary that cannot execute still opens the port (the spawn is `sh -c`),
@@ -670,20 +677,69 @@ defmodule Tightbeam.Acp.Adapter do
 
   @impl true
   def handle_call(message, from, state) do
-    cond do
-      refusal = fence_refusal(state, message) ->
-        {:reply, refusal, state}
+    result =
+      cond do
+        refusal = fence_refusal(state, message) ->
+          {:reply, refusal, state}
 
-      session_operation?(message) ->
-        enqueue_operation(state, message, from)
+        session_operation?(message) ->
+          enqueue_operation(state, message, from)
 
-      is_tuple(message) and elem(message, 0) in [:prompt, :forget_model_residency] and
-          pending_session_operation?(state, elem(message, 1)) ->
-        {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from}]}}
+        is_tuple(message) and elem(message, 0) in [:prompt, :forget_model_residency] and
+            pending_session_operation?(state, elem(message, 1)) ->
+          {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from}]}}
 
-      true ->
-        session_call(message, from, state)
+        true ->
+          session_call(message, from, state)
+      end
+
+    report_residency(state, result)
+  end
+
+  # Memory limits v1.1 R3: the guard counts resident session processes from
+  # each adapter's own residency, reported whenever it changes.
+  defp report_residency(before, result) do
+    after_state =
+      case result do
+        {:reply, _reply, next} -> next
+        {:noreply, next} -> next
+        _ -> nil
+      end
+
+    if after_state && after_state.memory_guard_key && after_state.known != before.known do
+      Tightbeam.MemoryGuard.residency(
+        self(),
+        after_state.memory_guard_key,
+        after_state.launch_id,
+        after_state.known
+      )
     end
+
+    result
+  end
+
+  @doc """
+  Memory limits v1.1 R4 (§1 idle): `:idle` when the session has no pending or
+  queued prompt, no session operation in flight and no observed unfinished
+  background task (a subagent the harness reported starting and not
+  stopping); otherwise `:busy`.
+  """
+  @spec idle_session?(adapter(), String.t()) :: :idle | :busy | {:error, term()}
+  def idle_session?(adapter, sid) do
+    GenServer.call(adapter, {:idle_session?, sid}, 10_000)
+  catch
+    :exit, reason -> {:error, {:adapter_unavailable, reason}}
+  end
+
+  @doc """
+  Memory limits v1.1 R11a: the session's process ended other than by a
+  Tightbeam close; forget its residency so its next turn starts a fresh one.
+  """
+  @spec forget_session_residency(adapter(), String.t()) :: :ok
+  def forget_session_residency(adapter, sid) do
+    GenServer.call(adapter, {:forget_session_residency, sid}, 10_000)
+  catch
+    :exit, _ -> :ok
   end
 
   defp enqueue_operation(state, message, from) do
@@ -1029,6 +1085,25 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp session_call({:knows_session?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
+
+  defp session_call({:idle_session?, sid}, _from, state) do
+    busy? =
+      Map.has_key?(state.prompts, sid) or
+        Enum.any?(state.queued_prompts, &(&1.sid == sid)) or
+        pending_session_operation?(state, sid) or
+        MapSet.size(Map.get(state.background, sid, MapSet.new())) > 0
+
+    {:reply, if(busy?, do: :busy, else: :idle), state}
+  end
+
+  defp session_call({:forget_session_residency, sid}, _from, state) do
+    if Map.has_key?(state.prompts, sid) do
+      # The pending prompt's own error clears it (finish_prompt).
+      {:reply, :ok, state}
+    else
+      {:reply, :ok, state |> drop_model_residency(sid) |> forget_background(sid)}
+    end
+  end
 
   defp session_call({:current_model, sid}, _from, state) do
     case Map.fetch(state.models, sid) do
@@ -1705,8 +1780,11 @@ defmodule Tightbeam.Acp.Adapter do
   @impl true
   def handle_info({:session_operation_done, key, pid, reply, updates}, state) do
     case state.operations[key] do
-      %{pid: ^pid} = operation -> finish_operation(state, key, operation, reply, updates)
-      _ -> {:noreply, state}
+      %{pid: ^pid} = operation ->
+        report_residency(state, finish_operation(state, key, operation, reply, updates))
+
+      _ ->
+        {:noreply, state}
     end
   end
 
@@ -1796,57 +1874,39 @@ defmodule Tightbeam.Acp.Adapter do
     do: {:noreply, state}
 
   def handle_info({:prompt_done, sid, from, result}, state) do
-    case state.prompts[sid] do
-      # Stale-turn v1.1 R6/R8: a prompt being settled after its cancel. A
-      # response with a stop reason other than cancelled decides the outcome
-      # (the harness answered); cancelled, or an error, is an unknown effect.
-      # A route that wrote its own terminal: the answer stands as it is.
-      %{from: ^from, settling: %{cause: nil}} ->
-        settle_prompt(state, sid, from, result)
-
-      %{from: ^from, settling: %{cause: cause, detail: detail}} ->
-        result =
-          case result do
-            {:ok, %{"stopReason" => stop}} when is_binary(stop) and stop != "cancelled" ->
-              result
-
-            _ ->
-              {:error, {:unknown_effect, cause, detail}}
-          end
-
-        settle_prompt(state, sid, from, result)
-
-      _ ->
-        settle_prompt(state, sid, from, result)
-    end
+    report_residency(state, prompt_done(state, sid, from, result))
   end
 
   # Stale-turn v1.1 R7: no response within G of the cancel. Stop waiting: the
   # worker's death leaves P in Conn only as an orphan (its late answer is
   # quiescence evidence, nothing more), and the turn ends as an unknown effect.
   def handle_info({:settle_grace_expired, sid, ref}, state) do
-    case state.prompts[sid] do
-      %{from: from, settling: %{ref: ^ref, cause: nil}} ->
-        emit_settle_unanswered(state, sid, "canceled")
+    # fence_session/2 forgets the sid's residency: report it (memory limits R3).
+    result =
+      case state.prompts[sid] do
+        %{from: from, settling: %{ref: ^ref, cause: nil}} ->
+          emit_settle_unanswered(state, sid, "canceled")
 
-        state
-        |> fence_session(sid)
-        |> settle_prompt(
-          sid,
-          from,
-          {:error, {:prompt_interrupted, {:cancel_unacknowledged, sid}}}
-        )
+          state
+          |> fence_session(sid)
+          |> settle_prompt(
+            sid,
+            from,
+            {:error, {:prompt_interrupted, {:cancel_unacknowledged, sid}}}
+          )
 
-      %{from: from, settling: %{ref: ^ref, cause: cause, detail: detail}} ->
-        emit_settle_unanswered(state, sid, cause)
+        %{from: from, settling: %{ref: ^ref, cause: cause, detail: detail}} ->
+          emit_settle_unanswered(state, sid, cause)
 
-        state
-        |> fence_session(sid)
-        |> settle_prompt(sid, from, {:error, {:unknown_effect, cause, detail}})
+          state
+          |> fence_session(sid)
+          |> settle_prompt(sid, from, {:error, {:unknown_effect, cause, detail}})
 
-      _ ->
-        {:noreply, state}
-    end
+        _ ->
+          {:noreply, state}
+      end
+
+    report_residency(state, result)
   end
 
   # Stale-turn v1.1 R6: the harness reported its turn's end but never
@@ -1954,6 +2014,20 @@ defmodule Tightbeam.Acp.Adapter do
         chunks: Map.delete(state.chunks, sid),
         turn_activity: Map.delete(state.turn_activity, sid)
     }
+
+    # Memory limits v1.1 R11a: the session's harness process ended under this
+    # prompt. Its residency goes now, so the next turn loads a fresh process
+    # instead of failing once more on the dead one (C6).
+    state =
+      case result do
+        {:error, reason} ->
+          if harness_exit_error?(state, reason),
+            do: state |> drop_model_residency(sid) |> forget_background(sid),
+            else: state
+
+        _ ->
+          state
+      end
 
     state
     |> next_prompt(sid)
@@ -2278,6 +2352,33 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp prompt_done(state, sid, from, result) do
+    case state.prompts[sid] do
+      # Stale-turn v1.1 R6/R8: a prompt being settled after its cancel. A
+      # response with a stop reason other than cancelled decides the outcome
+      # (the harness answered); cancelled, or an error, is an unknown effect.
+      # A route that wrote its own terminal: the answer stands as it is.
+      %{from: ^from, settling: %{cause: nil}} ->
+        settle_prompt(state, sid, from, result)
+
+      %{from: ^from, settling: %{cause: cause, detail: detail}} ->
+        result =
+          case result do
+            {:ok, %{"stopReason" => stop}} when is_binary(stop) and stop != "cancelled" ->
+              result
+
+            _ ->
+              {:error, {:unknown_effect, cause, detail}}
+          end
+
+        settle_prompt(state, sid, from, result)
+
+      _ ->
+        settle_prompt(state, sid, from, result)
+    end
+  end
+
   # ACP's public `messageId` is the only boundary authority. Claude and Codex
   # stamp every chunk from one assistant message with the same stable id. A
   # changed id starts a new message record; an absent id preserves the legacy
@@ -2387,11 +2488,27 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Harness.module!(state.harness).classify_subagent_event(update) do
       {:subagent_start, %{subagent_ref: child_sid}} when is_binary(child_sid) ->
-        {root_sid, put_in(state.subagent_roots[child_sid], root_sid)}
+        state = put_in(state.subagent_roots[child_sid], root_sid)
+        {root_sid, update_background(state, root_sid, &MapSet.put(&1, child_sid))}
+
+      {:subagent_stop, %{subagent_ref: child_sid}} when is_binary(child_sid) ->
+        {root_sid, update_background(state, root_sid, &MapSet.delete(&1, child_sid))}
 
       _other ->
         {root_sid, state}
     end
+  end
+
+  defp update_background(state, sid, fun) do
+    %{state | background: Map.update(state.background, sid, fun.(MapSet.new()), fun)}
+  end
+
+  defp forget_background(state, sid), do: %{state | background: Map.delete(state.background, sid)}
+
+  defp harness_exit_error?(state, reason) do
+    module = Harness.module!(state.harness)
+    Code.ensure_loaded(module)
+    function_exported?(module, :harness_exit_error?, 1) and module.harness_exit_error?(reason)
   end
 
   defp drop_subagent_root(roots, sid) do

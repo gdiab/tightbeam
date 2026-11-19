@@ -46,6 +46,69 @@ defmodule Tightbeam.Harness.Claude do
 
   def harness_exit_error?(_reason), do: false
 
+  # Memory limits v1.1 §1, C2, AS2: claude-agent-acp runs one `claude` process
+  # per resident session, started through `process.env.CLAUDE_CODE_EXECUTABLE ??
+  # claudeCliPath()` (dist/acp-agent.js:6208). Without the variable it resolves
+  # the SDK's native binary, a platform package next to the adapter in
+  # node_modules (claudeCliPath, :377-413): glibc first, musl second, the other
+  # way round on a musl system.
+  @impl true
+  def session_process_executable(cmd, env) do
+    case List.keyfind(env, "CLAUDE_CODE_EXECUTABLE", 0) do
+      {_, path} when is_binary(path) and path != "" ->
+        {:ok, %{env_name: "CLAUDE_CODE_EXECUTABLE", executable: path}}
+
+      _ ->
+        with [binary | _] <- cmd,
+             node_modules = binary |> Path.dirname() |> Path.dirname(),
+             {:ok, path} <- sdk_binary(node_modules) do
+          {:ok, %{env_name: "CLAUDE_CODE_EXECUTABLE", executable: path}}
+        else
+          _ -> {:error, "the Claude session binary was not found next to the adapter"}
+        end
+    end
+  end
+
+  defp sdk_binary(node_modules) do
+    {platform, arch} = platform_arch()
+    base = Path.join([node_modules, "@anthropic-ai", "claude-agent-sdk-#{platform}-#{arch}"])
+
+    candidates =
+      cond do
+        platform != "linux" -> [base]
+        musl?() -> [base <> "-musl", base]
+        true -> [base, base <> "-musl"]
+      end
+
+    case Enum.find(candidates, &File.regular?(Path.join(&1, "claude"))) do
+      nil -> :error
+      dir -> {:ok, Path.join(dir, "claude")}
+    end
+  end
+
+  defp platform_arch do
+    architecture = List.to_string(:erlang.system_info(:system_architecture))
+
+    arch =
+      cond do
+        String.starts_with?(architecture, "x86_64") -> "x64"
+        String.starts_with?(architecture, "aarch64") -> "arm64"
+        String.starts_with?(architecture, "arm64") -> "arm64"
+        true -> architecture |> String.split("-") |> hd()
+      end
+
+    platform =
+      case :os.type() do
+        {:unix, :darwin} -> "darwin"
+        {:unix, :linux} -> "linux"
+        {_, other} -> Atom.to_string(other)
+      end
+
+    {platform, arch}
+  end
+
+  defp musl?, do: Path.wildcard("/lib/ld-musl-*.so.1") != []
+
   # claude-agent-acp 0.81.0 sends one usage_update per SDK result, and only
   # that one carries `cost` (dist/acp-agent.js:3621-3640, with
   # `_meta["_claude/origin"]` for an autonomous result). Its other

@@ -20,6 +20,8 @@ config :tightbeam,
        Path.join(suite_tmp, "app")
 
 config :tightbeam, :autostart, false
+# The memory guard samples the real host; its tests start it with fakes.
+config :tightbeam, :memory_guard, false
 config :tightbeam, :local_host_name, "testhost"
 config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp

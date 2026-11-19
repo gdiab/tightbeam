@@ -718,6 +718,16 @@ pub enum Command {
         launch_id: String,
         adapter_key: String,
     },
+    HostMemory {
+        identity: Identity,
+        host: Option<String>,
+    },
+    HostMemorySet {
+        identity: Identity,
+        host: String,
+        name: String,
+        value: String,
+    },
     HarnessProcesses {
         identity: Identity,
     },
@@ -1281,6 +1291,13 @@ COMMANDS:
   harness-process list
   harness-process settle <launch-id> --adapter-key <key>
       List the durable harness launch ledger, newest launch first.
+  host-memory [--host <host>]
+      Show a host's memory-limit mode, what it lacks, its settings, the memory
+      Tightbeam's agents hold, the resident count and held turns (counts only).
+  host-memory set --host <host> NAME VALUE
+      Set one memory-limit setting (admin): mode auto|off, budget and
+      sessionLimit (50% or 16G), residentCap, floorHold, floorRelease,
+      sessionOomScoreAdj. Applies without a restart.
 
   session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
@@ -2074,6 +2091,7 @@ fn parse_with_optional_catalog(
             })
         }
         "harness-process" => parse_harness_process(&parsed, flags),
+        "host-memory" => parse_host_memory(&parsed, flags),
         "wake" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -3946,7 +3964,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, users, remove-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, users, remove-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process, host-memory"
         )),
     }
 }
@@ -4213,6 +4231,29 @@ fn has_packed_effort(model: &str) -> bool {
         .rsplit_once('[')
         .and_then(|(_, suffix)| suffix.strip_suffix(']'))
         .is_some_and(|suffix| matches!(suffix, "low" | "medium" | "high" | "xhigh" | "max"))
+}
+
+fn parse_host_memory(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    const USAGE: &str =
+        "usage: tightbeam host-memory [--host <host>] | host-memory set --host <host> NAME VALUE";
+    match (
+        parsed.positional.get(1).map(String::as_str),
+        parsed.positional.get(2),
+        parsed.positional.get(3),
+        parsed.positional.get(4),
+    ) {
+        (None, None, None, None) => Ok(Command::HostMemory {
+            identity: identity(flags)?,
+            host: nonempty(flags, "host"),
+        }),
+        (Some("set"), Some(name), Some(value), None) => Ok(Command::HostMemorySet {
+            identity: identity(flags)?,
+            host: nonempty(flags, "host").ok_or_else(|| USAGE.to_owned())?,
+            name: name.clone(),
+            value: value.clone(),
+        }),
+        _ => Err(USAGE.to_owned()),
+    }
 }
 
 fn parse_harness_process(
@@ -6535,6 +6576,7 @@ mod tests {
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",
+                "host-memory",
                 "host-toolchain-set",
                 "identity",
                 "kungfu",
@@ -6619,6 +6661,8 @@ mod tests {
             "host-env-unset --host <host> --harness <harness> NAME",
             "host-toolchain-set --host <host> --dirs '<json-array>'",
             "harness-process list",
+            "host-memory [--host <host>]",
+            "host-memory set --host <host> NAME VALUE",
             "kungfu list",
             "kungfu setup <bundle>",
             "sentinel list",
@@ -7618,7 +7662,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, users, remove-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, fact-demand, fact-producer-claim, fact-producers, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-handoff, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, users, remove-user, artifact-record, artifact-content-fetch, artifacts, memento-set, mementos, harklight-send, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process, host-memory".to_owned()),
         );
     }
 
