@@ -183,14 +183,16 @@ defmodule Tightbeam.Wire.SocketTest do
     {:push, [{:text, _sync}], live} = Socket.handle_info(:finish_replay, replaying)
     assert Org.list_for_user(ctx.db, device.user_id, false) == []
 
-    Devices.add_user(ctx.db, "remover", true)
+    remover = Tightbeam.TestDevices.paired!(ctx.db, "remover", admin: true)
 
     assert %{user: %{"state" => "removed"}} =
-             Tightbeam.UserAdmin.remove(ctx.db, %{
-               principal: {:user, "remover"},
-               origin: "user:remover",
-               params: %{user_id: device.user_id}
-             })
+             Tightbeam.UserAdmin.remove(
+               ctx.db,
+               Tightbeam.TestDevices.device_call(remover, %{
+                 verb: "remove-user",
+                 params: %{user_id: device.user_id}
+               })
+             )
 
     # The next inbound frame closes the connection instead of being handled.
     typing = JSON.encode!(%{"type" => "typing"})
@@ -1015,16 +1017,18 @@ defmodule Tightbeam.Wire.SocketTest do
         model: nil
       })
 
-    Devices.add_user(ctx.db, "remover", true)
+    remover = Tightbeam.TestDevices.paired!(ctx.db, "remover", admin: true)
     db = ctx.db
 
     remove = fn ->
       %{user: %{"state" => "removed"}} =
-        Tightbeam.UserAdmin.remove(db, %{
-          principal: {:user, "remover"},
-          origin: "user:remover",
-          params: %{user_id: device.user_id}
-        })
+        Tightbeam.UserAdmin.remove(
+          db,
+          Tightbeam.TestDevices.device_call(remover, %{
+            verb: "remove-user",
+            params: %{user_id: device.user_id}
+          })
+        )
     end
 
     proxy = :"remove_after_lookup_db_#{System.unique_integer([:positive])}"

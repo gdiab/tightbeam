@@ -1306,13 +1306,15 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
   # A synthetic active admin removes the user through the real removal path.
   defp remove_user!(db, user_id) do
-    Devices.add_user(db, "remover", true)
+    remover = Tightbeam.TestDevices.paired!(db, "remover", admin: true)
 
     assert %{user: %{"state" => "removed"}} =
-             Tightbeam.UserAdmin.remove(db, %{
-               principal: {:user, "remover"},
-               origin: "user:remover",
-               params: %{user_id: user_id}
-             })
+             Tightbeam.UserAdmin.remove(
+               db,
+               Tightbeam.TestDevices.device_call(remover, %{
+                 verb: "remove-user",
+                 params: %{user_id: user_id}
+               })
+             )
   end
 end

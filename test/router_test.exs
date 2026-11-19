@@ -1265,11 +1265,11 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert dr_id in ids
 
-    # Rule as the owner over the org transport. This path has no presenting session.
+    # Core fix (A) C12: rule as the owner from the owner's own paired device. This
+    # path has no presenting session.
     ruled =
-      dispatch_cli(ctx, "tbc_test", %{
+      dispatch_cli(ctx, ctx.device.token, %{
         verb: "operator-rule",
-        asUser: owner,
         params: %{request: dr_id, decision: "ship"}
       })
 
@@ -1428,8 +1428,9 @@ defmodule Tightbeam.Wire.RouterTest do
              }
            }
 
-    # Any authenticated session may record the ruling, with its actual session
-    # retained in the terminal row.
+    # Core fix (A) C13 (K14; this replaces the former any-session ruling here): the
+    # raiser session cannot rule its own request, whatever it selects, and the
+    # organization credential cannot rule it either (C15). The request stays open.
     ask3 =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
@@ -1438,63 +1439,49 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert is_binary(dr3 = JSON.decode!(ask3.resp_body)["result"]["id"])
 
-    ruled_by_session =
-      dispatch_cli(ctx, raiser.cli_token, %{
+    for {token, selector, code} <- [
+          {raiser.cli_token, %{}, "self_ruling_forbidden"},
+          {raiser.cli_token, %{asUser: owner}, "self_ruling_forbidden"},
+          {raiser.cli_token, %{asProcess: "automation"}, "self_ruling_forbidden"},
+          {"tbc_test", %{asUser: owner}, "user_authentication_required"},
+          {"tbc_test", %{asProcess: "automation"}, "user_authentication_required"}
+        ] do
+      refused =
+        dispatch_cli(
+          ctx,
+          token,
+          Map.merge(%{verb: "operator-rule", params: %{request: dr3, decision: "a"}}, selector)
+        )
+
+      assert refused.status == 403, refused.resp_body
+      assert JSON.decode!(refused.resp_body)["error"]["code"] == code
+    end
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT status,ruledBy FROM decision_requests WHERE id=?1", [dr3])
+
+    # The owner's paired device rules it: recorded as the owner, with the device route.
+    ruled_by_device =
+      dispatch_cli(ctx, ctx.device.token, %{
         verb: "operator-rule",
         params: %{request: dr3, decision: "a"}
       })
 
-    assert ruled_by_session.status == 200
-    session_ruled = JSON.decode!(ruled_by_session.resp_body)["result"]
-    assert session_ruled["status"] == "ruled"
-    assert session_ruled["ruledViaSessionKey"] == raiser.session_key
-    assert session_ruled["ruledBy"] == "session:" <> raiser.session_key
-    assert session_ruled["ownerUserId"] == owner
+    assert ruled_by_device.status == 200, ruled_by_device.resp_body
+    actor = "user:" <> owner
 
-    assert {:ok, [[actor, ^owner]]} =
-             DB.query(ctx.db, "SELECT ruledBy,ownerUserId FROM decision_requests WHERE id=?1", [
-               dr3
-             ])
+    assert {:ok, [[^actor, nil, ^owner]]} =
+             DB.query(
+               ctx.db,
+               "SELECT ruledBy,ruledViaSessionKey,ownerUserId FROM decision_requests WHERE id=?1",
+               [dr3]
+             )
 
-    for {token, selector, expected_actor, expected_session} <- [
-          {raiser.cli_token, %{asUser: owner}, "session:" <> raiser.session_key,
-           raiser.session_key},
-          {raiser.cli_token, %{asProcess: "automation"}, "session:" <> raiser.session_key,
-           raiser.session_key},
-          {"tbc_test", %{asProcess: "automation"}, "process:automation", nil}
-        ] do
-      asked =
-        dispatch_cli(ctx, raiser.cli_token, %{
-          verb: "operator-ask",
-          params: %{
-            question: "Actor #{expected_actor} #{inspect(selector)}",
-            options: [%{label: "a"}]
-          }
-        })
+    device_id = ctx.device.device_id
 
-      request_id = JSON.decode!(asked.resp_body)["result"]["id"]
+    assert %{route: "device", auth_class: "device", auth_device_id: ^device_id} =
+             Tightbeam.GrantAuth.ruling_route(ctx.db, dr3)
 
-      response =
-        dispatch_cli(
-          ctx,
-          token,
-          Map.merge(
-            %{verb: "operator-rule", params: %{request: request_id, decision: "a"}},
-            selector
-          )
-        )
-
-      assert response.status == 200, response.resp_body
-
-      assert {:ok, [[^expected_actor, ^expected_actor, ^expected_session, ^owner]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT ruledBy,ruledViaPrincipal,ruledViaSessionKey,ownerUserId FROM decision_requests WHERE id=?1",
-                 [request_id]
-               )
-    end
-
-    assert actor == "session:" <> raiser.session_key
     assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
 
     assert {:ok, [[^actor, ^owner]]} =
@@ -1542,7 +1529,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_binary(ruled_id = JSON.decode!(ruled_ask.resp_body)["result"]["id"])
 
     ruled =
-      dispatch_cli(ctx, raiser.cli_token, %{
+      dispatch_cli(ctx, ctx.device.token, %{
         verb: "operator-rule",
         params: %{request: ruled_id, decision: "a"}
       })
@@ -1761,10 +1748,11 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert response.status == 403
 
-    assert JSON.decode!(response.resp_body) == %{
-             "error" => %{"code" => "forbidden", "message" => "admin required"}
-           }
+    # Core fix (A) C2/C5: the organization credential is refused in every state.
+    assert %{"error" => %{"code" => "user_authentication_required", "message" => message}} =
+             JSON.decode!(response.resp_body)
 
+    assert message =~ "`/tightbeam add-user first --admin`"
     assert Devices.user(db, "first") == nil
   end
 
@@ -4248,7 +4236,12 @@ defmodule Tightbeam.Wire.RouterTest do
       assert updated["bodyUpdate"]["updatedBySession"] == key
       assert updated["bodyUpdate"]["updatedByUser"] == nil
 
-      dispatch.(%{verb: "add-user", params: %{userId: "guest-#{role_count}-#{process}"}})
+      # An admin row the session may still write (core fix (A) moved add-user to
+      # the owner's paired device only).
+      dispatch.(%{
+        verb: "config",
+        params: %{action: "set", setting: "default-priority", value: rem(role_count, 8)}
+      })
 
       expected_origin =
         if process && process != "as-user", do: "process:#{process}", else: "agent:#{key}"
@@ -4374,9 +4367,13 @@ defmodule Tightbeam.Wire.RouterTest do
         }
       })
 
-    assert admin.status == 200, admin.resp_body
+    # Core fix (A) C2/K3: a session cannot register a host, whatever it selects;
+    # nothing is written and no credential child is started.
+    assert admin.status == 403, admin.resp_body
+    assert JSON.decode!(admin.resp_body)["error"]["code"] == "user_authentication_required"
+    assert {:ok, []} = DB.query(ctx.db, "SELECT name FROM hosts WHERE name = 'worker'")
 
-    assert Enum.any?(Supervisor.which_children(credential_supervisor), fn
+    refute Enum.any?(Supervisor.which_children(credential_supervisor), fn
              {{Credentials, "worker"}, _pid, :worker, [Credentials]} -> true
              _child -> false
            end)
