@@ -1080,8 +1080,74 @@ defmodule Tightbeam.OwnerAlerts do
   @cleared_fact "host-memory-pressure-cleared"
   @gib_kib 1_048_576
   @gib_bytes 1_073_741_824
-  @memory_closing "Tightbeam is only watching. It has not stopped or changed anything. " <>
-                    "If free memory keeps falling, the machine may stop responding."
+  @memory_watching "Tightbeam is only watching. It has not stopped or changed anything."
+  @memory_warning "If free memory keeps falling, the machine may stop responding."
+
+  # Memory limits v1.4 R16 (the amendment to M9's closing line): once the
+  # memory guard has, since the episode's run began, held a launch, closed an
+  # idle agent process or ended a tree on this host, the closing line says so
+  # instead. G1 itself still acts on nothing (V5); this only reads the guard's
+  # own lifecycle records.
+  defp memory_closing(run_or_open) do
+    case Map.get(run_or_open, :guard_actions) do
+      %{held: held, closed: closed, ended: ended} when held or closed > 0 or ended > 0 ->
+        Enum.join([guard_actions_text(held, closed, ended), @memory_warning], " ")
+
+      _ ->
+        @memory_watching <> " " <> @memory_warning
+    end
+  end
+
+  defp guard_actions_text(held, closed, ended) do
+    first =
+      case {held, closed} do
+        {true, 0} -> ["Tightbeam has paused starting new agent processes."]
+        {true, n} -> ["Tightbeam has paused starting new agent processes and closed #{idle(n)}."]
+        {false, 0} -> []
+        {false, n} -> ["Tightbeam has closed #{idle(n)}."]
+      end
+
+    second =
+      case ended do
+        0 -> []
+        1 -> ["It has stopped 1 agent that went over its own memory limit."]
+        n -> ["It has stopped #{n} agents that went over their own memory limits."]
+      end
+
+    Enum.join(first ++ second, " ")
+  end
+
+  defp idle(1), do: "1 idle one"
+  defp idle(n), do: "#{n} idle ones"
+
+  @doc false
+  # Counts of the memory guard's actions on `host` since `since` (ms), from
+  # its lifecycle rows: held launches, closed idle processes, ended trees.
+  def memory_guard_actions_in_txn(_txn, _host, since) when not is_integer(since),
+    do: %{held: false, closed: 0, ended: 0}
+
+  def memory_guard_actions_in_txn(%Txn{} = txn, host, since) do
+    count = fn kinds, where ->
+      [[n]] =
+        Txn.q(
+          txn,
+          "SELECT COUNT(*) FROM lifecycle_events WHERE kind IN (#{kinds}) AND ts>=?1 AND (#{where})",
+          [since, host]
+        )
+
+      n
+    end
+
+    %{
+      held:
+        count.(
+          "'memory_guard_host_hold','memory_guard_hold'",
+          "subject=?2 OR json_extract(detail,'$.host')=?2"
+        ) > 0,
+      closed: count.("'memory_guard_idle_closed'", "json_extract(detail,'$.host')=?2"),
+      ended: count.("'memory_tree_ended'", "json_extract(detail,'$.host')=?2")
+    }
+  end
 
   @doc """
   M4: record one memory-pressure episode's open in one transaction: its
@@ -1110,7 +1176,14 @@ defmodule Tightbeam.OwnerAlerts do
               dedupe_key: memory_dedupe_key(host, opened_at),
               owner: owner,
               title: memory_title(host),
-              body: memory_body(open),
+              body:
+                memory_body(
+                  Map.put(
+                    open,
+                    :guard_actions,
+                    memory_guard_actions_in_txn(txn, host, open.run_started_at)
+                  )
+                ),
               lifecycle: %{
                 host: host,
                 episodeOpenedAt: opened_at,
@@ -1188,11 +1261,17 @@ defmodule Tightbeam.OwnerAlerts do
             owner: owner,
             title: memory_restart_title(run.host),
             body:
-              memory_restart_body(%{
-                run
-                | episode_opened_at: opened_at,
-                  first_alert: first_alert_status(episode, opened_at)
-              }),
+              memory_restart_body(
+                Map.put(
+                  %{
+                    run
+                    | episode_opened_at: opened_at,
+                      first_alert: first_alert_status(episode, opened_at)
+                  },
+                  :guard_actions,
+                  memory_guard_actions_in_txn(txn, run.host, run.run_started_at)
+                )
+              ),
             lifecycle: %{
               host: run.host,
               runStartedAt: run.run_started_at,
@@ -1367,7 +1446,7 @@ defmodule Tightbeam.OwnerAlerts do
         "Since #{format_local(open.episode_opened_at)}, #{open.host} has had " <>
           "#{memory_text(open.sample)}.",
         stalled_text(open.sample)
-      ] ++ population_text(open.populations) ++ [@memory_closing],
+      ] ++ population_text(open.populations) ++ [memory_closing(open)],
       " "
     )
   end
@@ -1379,7 +1458,7 @@ defmodule Tightbeam.OwnerAlerts do
         "Tightbeam restarted on #{run.host} while memory pressure was ongoing.",
         "Its record of this pressure could not be read, so when it began and how severe " <>
           "it was are unknown.",
-        @memory_closing
+        memory_closing(run)
       ],
       " "
     )
@@ -1394,7 +1473,7 @@ defmodule Tightbeam.OwnerAlerts do
         "Tightbeam restarted on #{run.host} shortly after a brief memory-pressure spike that " <>
           "began at #{format_local(run.run_started_at)} and ended at " <>
           "#{format_local(ended_at)}, before an alert was due."
-      ] ++ last_sample_text(run) ++ [@memory_closing],
+      ] ++ last_sample_text(run) ++ [memory_closing(run)],
       " "
     )
   end
@@ -1428,7 +1507,7 @@ defmodule Tightbeam.OwnerAlerts do
         "Tightbeam restarted on #{run.host} while memory pressure was ongoing.",
         "The pressure began at #{format_local(run.run_started_at)}.",
         opened
-      ] ++ last_sample_text(run) ++ first ++ [@memory_closing],
+      ] ++ last_sample_text(run) ++ first ++ [memory_closing(run)],
       " "
     )
   end
