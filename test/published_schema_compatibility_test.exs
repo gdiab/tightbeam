@@ -32,14 +32,19 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
     assert {:ok, [["limit-fallback-v1-016"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
-    assert actor_schema(db) == before
+    # Item 6 c1 (contract v3.1 R7) adds byProcess and its one process
+    # progress alternative to attests, checked by c1's exact-text validation;
+    # every other actor table is unchanged.
+    migrated = actor_schema(db)
+    assert Map.delete(migrated, "attests") == Map.delete(before, "attests")
+    assert {:ok, :ok} = DB.transaction(db, &Tightbeam.LimitFallback.validate_in_txn!/1)
 
     assert {:ok, [["Published fixture", "user", "fixture-owner"]]} =
              DB.query(db, "SELECT title,createdActorKind,createdActorRef FROM toplines")
 
     assert_check_failure(db, "UPDATE toplines SET createdActorKind='unknown'")
     assert :ok = Schema.ensure_all(db)
-    assert actor_schema(db) == before
+    assert actor_schema(db) == migrated
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
     assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
     assert_attest_actors(db)
@@ -134,7 +139,7 @@ defmodule Tightbeam.PublishedSchemaCompatibilityTest do
       ORDER BY name
       """)
 
-    rows
+    Map.new(rows, fn [name, sql] -> {name, sql} end)
   end
 
   defp assert_check_failure(db, sql) do

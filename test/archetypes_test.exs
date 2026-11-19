@@ -858,9 +858,16 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert Archetypes.limit_fallback("coderish") == %{model: opus, harness: nil}
 
+    # On 0.1.16 a preference entry carries its own harness, so a fallback
+    # naming a harness must equal an entry naming the same one (contract c
+    # §12): the routed-harness check is made when the manifest loads.
     File.write!(
       path,
-      preferences <>
+      String.replace(
+        preferences,
+        ~s(model = "claude-opus-5-5"\neffort = "high"\n),
+        ~s(model = "claude-opus-5-5"\neffort = "high"\nharness = "claude"\n)
+      ) <>
         """
 
         [limit_fallback]
@@ -887,7 +894,9 @@ defmodule Tightbeam.ArchetypesTest do
           {~s(model = "claude-opus-5-5"\neffort = "high"\nprovider = "anthropic"),
            ~r/unknown limit_fallback keys in .*: provider/},
           {~s(model = "claude-opus-5-5"\neffort = "high"\nharness = "nonesuch"),
-           ~r/unknown harness "nonesuch"/}
+           ~r/unknown harness "nonesuch"/},
+          {~s(model = "claude-opus-5-5"\neffort = "high"\nharness = "claude"),
+           ~r/claude-opus-5-5 \(effort high\) on harness claude is not one of its model_preferences/}
         ] do
       File.write!(path, preferences <> "\n[limit_fallback]\n" <> table <> "\n")
 
