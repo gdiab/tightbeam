@@ -734,6 +734,32 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  describe "stale-turn v1.1 R4 harness killed" do
+    test "SIGKILL of the harness mid-turn ends the dispatched prompt at once with transport loss" do
+      {adapter, _capture} = start_adapter(gate_mode: "stall-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      monitor = Process.monitor(adapter)
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "agent_message_chunk", %{"content" => %{"text" => "working"}})}
+      )
+
+      {:os_pid, os_pid} = Port.info(:sys.get_state(Adapter.conn(adapter)).port, :os_pid)
+      killed_at = System.monotonic_time(:millisecond)
+      {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(os_pid)])
+
+      # Both are the transport-loss forms the gateway settles as harness_exited.
+      assert {:error, reason} = Task.await(caller, 30_000)
+      assert reason == :closed or match?({:adapter_unavailable, _}, reason), inspect(reason)
+      assert System.monotonic_time(:millisecond) - killed_at < 30_000
+      assert {:acp_exit, _status} = assert_down(adapter, monitor)
+    end
+  end
+
   describe "stale-turn v1.1 R2 folded prompt" do
     test "activity and a turn-end report, then end_turn: delivered, and the next prompt starts" do
       {adapter, capture} = start_adapter(gate_mode: "folded-turn", probe: false)
