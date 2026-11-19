@@ -140,6 +140,36 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Core fix (A) K4a: on an empty local database the shortcut creates the first
+    /// user and nothing else: no device row and no token, frozen pairing or not.
+    #[test]
+    fn local_first_user_shortcut_issues_no_device_token() {
+        let (root, path) = database();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                r#"CREATE TABLE devices (
+                     deviceId TEXT PRIMARY KEY,
+                     userId TEXT NOT NULL,
+                     token TEXT
+                   );"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            create_first_in(&path, "george", true, 7),
+            Ok(FirstUser::Created { .. })
+        ));
+        let connection = Connection::open(&path).unwrap();
+        let users: i64 = connection
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .unwrap();
+        let devices: i64 = connection
+            .query_row("SELECT COUNT(*) FROM devices", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((users, devices), (1, 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn absent_or_nonempty_local_database_dispatches() {
         let (root, path) = database();
