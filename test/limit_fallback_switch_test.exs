@@ -1408,6 +1408,313 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     end
   end
 
+  ## Memory limits v1.1 (art_4009cd68) R8-R11, R15, T7-T9 through the real
+  ## turn runner. The guard runs with a fake /proc under the scratch base; its
+  ## kill is injected (no process is signalled here). What is under test is
+  ## the gateway's own handling on our side of the ACP seam: attribution from
+  ## the guard's record before any error-text classification, the settlement,
+  ## the notice, and that nothing replays.
+
+  describe "memory limits v1.1 settlement" do
+    @gib 1024 * 1024 * 1024
+    @mib 1024 * 1024
+    @memory_exit_429 %{
+      "code" => -32_603,
+      "message" =>
+        "Internal error: usage limit reached (429). The Claude Agent process exited unexpectedly. Please start a new session."
+    }
+
+    test "T7/R9: a dispatched turn whose session tree is memory killed settles unknown_effect/memory_limit, is never a quota event and never replayed" do
+      with_gateway(fn ctx ->
+        host_root = memory_host!(ctx, 16 * @gib, 12 * @gib)
+        memory_guard!(ctx, host_root)
+        key = "mg-dispatched"
+        s1_session!(ctx, key, :claude)
+        lane!(ctx, key)
+
+        :ok =
+          GenServer.call(
+            ctx.claude,
+            {:set, :prompt,
+             fn
+               1, _text, opts ->
+                 Keyword.fetch!(opts, :trace_dispatch).(101)
+                 # The session tree outgrows its limit; the guard ends it.
+                 memory_tree!(ctx, host_root, "sl-m1", "claude-session-1", 600, 700 * @mib)
+                 :ok = Tightbeam.MemoryGuard.tick()
+                 {:error, @memory_exit_429}
+
+               n, _text, _opts ->
+                 ok_reply(n)
+             end}
+          )
+
+        seq = deliver!(ctx, key, "mg-runaway")
+        await_turns_settled!(ctx.db, key)
+
+        assert turn_status(ctx.db, seq) == "failed_unknown"
+        assert turn_error(ctx.db, seq) == "unknown_effect"
+        assert terminal_cause(ctx.db, seq) == "memory_limit"
+
+        assert %{"cause" => "memory_limit", "limit" => "session", "scope" => "session"} =
+                 unknown_effect_detail(ctx.db, seq)
+
+        # R8: no harness-health class, evidence or incident, no park, no reset.
+        assert count(ctx.db, "SELECT COUNT(*) FROM harness_health_observations") == 0
+        assert count(ctx.db, "SELECT COUNT(*) FROM harness_health_incidents") == 0
+        assert count(ctx.db, "SELECT COUNT(*) FROM harness_park_fences") == 0
+
+        assert count(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId LIKE 'rate-limit-reset:%'") ==
+                 0
+
+        refute LimitFallback.held?(ctx.db, key)
+
+        # R11: one item each to holder and owner, in plain words.
+        assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
+
+        for text <- unknown_effect_texts(ctx.db) do
+          assert text =~ "stopped because the agent's processes used more memory than"
+          assert text =~ "the memory limit for one agent"
+          assert text =~ "What the turn had already done is unknown"
+          assert text =~ "will NOT be retried automatically"
+        end
+
+        # R10/R11: the read shows the terminal and its cause.
+        assert %{turnSeq: ^seq, cause: "memory_limit"} =
+                 Tightbeam.TurnSettlementView.settlement(
+                   Tightbeam.TurnSettlementView.latest_turn(ctx.db, key)
+                 )
+
+        # R11: a later delivered turn (today's redelivery trigger) re-sends nothing.
+        assert redelivery_rows(ctx.db, seq) == 0
+        next = deliver!(ctx, key, "mg-next")
+        await_turns_settled!(ctx.db, key)
+        assert turn_status(ctx.db, next) == "delivered"
+        assert same_message_turns(ctx.db, seq) == [seq]
+        assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
+      end)
+    end
+
+    test "T8: a session whose load alone exceeds its limit is re-admitted once, then fails and is not re-admitted" do
+      with_gateway(fn ctx ->
+        host_root = memory_host!(ctx, 16 * @gib, 12 * @gib)
+        memory_guard!(ctx, host_root)
+        key = "mg-load-loop"
+        s1_session!(ctx, key, :claude)
+        lane!(ctx, key)
+
+        # Each attempt's session process is killed before the prompt is sent.
+        :ok =
+          GenServer.call(
+            ctx.claude,
+            {:set, :prompt,
+             fn n, _text, _opts ->
+               memory_tree!(
+                 ctx,
+                 host_root,
+                 "sl-load-#{n}",
+                 "claude-session-1",
+                 610 + n,
+                 700 * @mib
+               )
+
+               :ok = Tightbeam.MemoryGuard.tick()
+               {:error, @memory_exit_429}
+             end}
+          )
+
+        seq = deliver!(ctx, key, "mg-load")
+        await_turns_settled!(ctx.db, key)
+
+        assert [^seq, readmitted] = same_message_turns(ctx.db, seq)
+        assert turn_status(ctx.db, seq) == "failed"
+        assert terminal_cause(ctx.db, seq) == "memory_limit"
+        assert turn_error(ctx.db, seq) =~ "memory_limit:"
+        assert turn_status(ctx.db, readmitted) == "failed"
+        assert terminal_cause(ctx.db, readmitted) == "memory_limit"
+
+        assert count(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM lifecycle_events WHERE kind='memory_readmission_done'"
+               ) == 1
+
+        assert unknown_effect_notices(ctx.db) == []
+        assert count(ctx.db, "SELECT COUNT(*) FROM harness_health_observations") == 0
+      end)
+    end
+
+    test "T9/R15: an outside kill of the adapter while the host is low on memory is harness_exited with the signal, never memory_limit, and the relaunch is held" do
+      with_gateway(fn ctx ->
+        # 5% available: below the floor.
+        host_root = memory_host!(ctx, 16 * @gib, div(16 * @gib, 20))
+        memory_guard!(ctx, host_root)
+        :ok = Tightbeam.MemoryGuard.tick()
+        launch_id = adapter_row!(ctx.db, "claude")
+        key = "mg-outside-kill"
+        s1_session!(ctx, key, :claude)
+        lane!(ctx, key)
+
+        :ok =
+          GenServer.call(
+            ctx.claude,
+            {:set, :prompt,
+             fn
+               1, _text, opts ->
+                 Keyword.fetch!(opts, :trace_dispatch).(101)
+                 # The helper reports 128 + SIGTERM before the transport fails.
+                 Tightbeam.MemoryGuard.note_adapter_exit(launch_id, 143)
+                 {:error, {:adapter_unavailable, "acp exited with status 143"}}
+
+               n, _text, _opts ->
+                 ok_reply(n)
+             end}
+          )
+
+        # The floor holds launches; this session is not resident, so its first
+        # turn is held until memory frees.
+        seq = deliver!(ctx, key, "mg-floor-held")
+
+        assert %{reasonClass: "host_capacity", reasons: [%{detail: "memory_floor"} = reason]} =
+                 await_held!(ctx.db, key)
+
+        assert reason.condition =~ "starts when testhost has 15% of memory free; now 5.0%"
+        assert turn_status(ctx.db, seq) == "queued"
+
+        # R7: the session status read carries the held state and never reads idle.
+        status = Gateway.session_status(key, ctx.db)
+        assert status.run.state == "running"
+        assert %{reasonClass: "host_capacity"} = status.run.held
+
+        # Memory frees; the turn runs and the adapter is killed from outside.
+        memory_host!(ctx, 16 * @gib, div(16 * @gib, 2))
+        :ok = Tightbeam.MemoryGuard.tick()
+        await_turns_settled!(ctx.db, key)
+
+        assert turn_status(ctx.db, seq) == "failed_unknown"
+        assert terminal_cause(ctx.db, seq) == "harness_exited"
+
+        assert count(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM turn_lifecycle_events WHERE turnSeq=#{seq} AND kind='terminal_committed'"
+               ) == 1
+
+        assert %{"cause" => "harness_exited", "exitSignal" => 15, "hostLowOnMemory" => true} =
+                 unknown_effect_detail(ctx.db, seq)
+      end)
+    end
+  end
+
+  defp memory_host!(ctx, total, available) do
+    root = Path.join(ctx.base, "fake-host")
+    File.mkdir_p!(Path.join(root, "proc"))
+
+    File.write!(
+      Path.join(root, "proc/meminfo"),
+      "MemTotal: #{div(total, 1024)} kB\nMemAvailable: #{div(available, 1024)} kB\n"
+    )
+
+    root
+  end
+
+  defp memory_guard!(ctx, root) do
+    start_supervised!(
+      {Tightbeam.MemoryGuard,
+       db: ctx.db,
+       base_dir: ctx.base,
+       local_host: "testhost",
+       root: root,
+       probe: fn -> %{mode: :watched, reason: "test", mem_total: 16 * @gib, cgroup: nil} end,
+       sample_ms: :manual,
+       closer: fn _adapter, _sid, _reason -> :ok end,
+       killer: fn _target, _host_state -> :ok end,
+       nudge: &SessionLane.nudge/1}
+    )
+  end
+
+  # A session process of `sid` holding `bytes`, with the launch record the step
+  # writes, under a 512 MiB limit.
+  defp memory_tree!(ctx, root, launch, sid, pid, bytes) do
+    dir = Path.join([root, "proc", Integer.to_string(pid)])
+    File.mkdir_p!(dir)
+    zeros = Enum.map_join(1..17, " ", fn _ -> "0" end)
+    File.write!(Path.join(dir, "stat"), "#{pid} (claude) S 1 #{zeros} #{pid} 0 0\n")
+    File.write!(Path.join(dir, "status"), "VmRSS:\t#{div(bytes, 1024)} kB\nVmSwap:\t0 kB\n")
+    sessions = Path.join(Tightbeam.MemoryGuard.Records.dir(ctx.base), "sessions")
+    File.mkdir_p!(sessions)
+
+    File.write!(
+      Path.join(sessions, launch <> ".json"),
+      JSON.encode!(%{
+        v: 1,
+        launchId: launch,
+        sessionId: sid,
+        pid: pid,
+        start: pid,
+        adapterLaunchId: "none",
+        placement: "watched",
+        identity: Path.join(sessions, launch <> ".identity"),
+        sessionLimit: 512 * @mib
+      })
+    )
+  end
+
+  defp adapter_row!(db, harness) do
+    launch_id = "mg-launch-#{System.unique_integer([:positive])}"
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          """
+          INSERT INTO harness_processes
+            (launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+             launchSequence, state, createdAt)
+          VALUES (?1, ?2, ?3, 'shared', 'testhost', NULL, '/bin/false', '/nonexistent',
+                  (SELECT COALESCE(MAX(launchSequence),0)+1 FROM harness_processes), 'running', 1)
+          """,
+          [launch_id, "#{harness}:shared@testhost", harness]
+        )
+      end)
+
+    launch_id
+  end
+
+  defp await_held!(db, key, attempts \\ 300) do
+    case Tightbeam.MemoryGuard.HeldState.read(db, Org.get(db, key)) do
+      %{} = held ->
+        held
+
+      nil when attempts > 0 ->
+        Process.sleep(20)
+        await_held!(db, key, attempts - 1)
+
+      nil ->
+        flunk("#{key} never read held")
+    end
+  end
+
+  defp count(db, sql) do
+    {:ok, [[count]]} = DB.query(db, sql)
+    count
+  end
+
+  defp unknown_effect_detail(db, seq) do
+    {:ok, rows} =
+      DB.query(db, "SELECT detail FROM lifecycle_events WHERE kind='turn_unknown_effect'")
+
+    Enum.find_value(rows, fn [detail] ->
+      decoded = JSON.decode!(detail)
+      if decoded["turnSeq"] == seq, do: decoded
+    end)
+  end
+
+  defp unknown_effect_texts(db) do
+    {:ok, rows} =
+      DB.query(db, "SELECT prompt FROM wakes WHERE wakeId LIKE 'w_turn_unknown_effect_%'")
+
+    Enum.map(rows, &hd/1)
+  end
+
   defp s1_session!(ctx, key, :codex), do: session!(ctx, key)
 
   defp s1_session!(ctx, key, :claude) do
