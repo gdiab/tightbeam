@@ -4221,6 +4221,35 @@ defmodule Tightbeam.RulesTest do
                hash
              )
 
+    report_review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET workItemId=?2 WHERE id=?1", [
+        report_review.id,
+        "wi_revision_binding"
+      ])
+
+    report =
+      record_revision_artifact(
+        ctx,
+        reviewer.session_key,
+        report_review.id,
+        "wi_revision_binding",
+        hash
+      )
+
+    assert %{attest: %{artifactId: report_id, verdictKind: "changes-requested"}} =
+             revision_verdict(
+               ctx,
+               reviewer.session_key,
+               report_review.id,
+               report.artifact_id,
+               hash,
+               "changes-requested"
+             )
+
+    assert report_id == report.artifact_id
+
     valid =
       revision_verdict(
         ctx,
