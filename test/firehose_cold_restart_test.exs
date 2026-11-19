@@ -6,7 +6,11 @@ defmodule Tightbeam.FirehoseColdRestartTest do
   @tag timeout: 120_000
   @tag :preauth_restart
   test "external client reconnects after a real guarded gateway process restart", %{tmp_dir: tmp} do
-    plan = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "firehose_cold_restart.exs")
+    plan =
+      tmp
+      |> Tightbeam.GuardRuntimeFixture.prepare!("firehose_cold_restart.exs")
+      |> paired_devices("restart-firehose=synthetic-restart")
+
     manifest = File.read!(Path.join(plan.payload, "build-manifest.json"))
     first = launch(plan, "first")
 
@@ -17,11 +21,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
       assert old["base"] == plan.base
       assert old["payload"] == plan.payload
 
-      {:ok, device} =
-        SimClient.pair("127.0.0.1", old["port"],
-          device_id: "restart-firehose",
-          claimed_name: "Synthetic restart"
-        )
+      device = paired_device(old, "restart-firehose")
 
       ws = subscribe!(old["port"], device.token)
 
@@ -104,12 +104,14 @@ defmodule Tightbeam.FirehoseColdRestartTest do
         Path.join(tmp, "survivor"),
         "firehose_cold_restart.exs"
       )
+      |> paired_devices("survivor=synthetic")
 
     doomed_plan =
       Tightbeam.GuardRuntimeFixture.prepare!(
         Path.join(tmp, "doomed"),
         "firehose_cold_restart.exs"
       )
+      |> paired_devices("doomed=synthetic")
 
     survivor = launch(survivor_plan, "first")
 
@@ -123,17 +125,9 @@ defmodule Tightbeam.FirehoseColdRestartTest do
         assert live["port"] != other["port"]
         assert live["base"] != other["base"]
 
-        {:ok, user} =
-          SimClient.pair("127.0.0.1", live["port"],
-            device_id: "survivor",
-            claimed_name: "Synthetic"
-          )
+        user = paired_device(live, "survivor")
 
-        {:ok, other_user} =
-          SimClient.pair("127.0.0.1", other["port"],
-            device_id: "doomed",
-            claimed_name: "Synthetic"
-          )
+        other_user = paired_device(other, "doomed")
 
         ws = subscribe!(live["port"], user.token)
         other_ws = subscribe!(other["port"], other_user.token)
@@ -496,17 +490,17 @@ defmodule Tightbeam.FirehoseColdRestartTest do
   test "full canonical snapshot recovers writes committed while the client is disconnected", %{
     tmp_dir: tmp
   } do
-    plan = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "firehose_cold_restart.exs")
+    plan =
+      tmp
+      |> Tightbeam.GuardRuntimeFixture.prepare!("firehose_cold_restart.exs")
+      |> paired_devices("disconnected-inventory=synthetic-inventory")
+
     child = launch(plan, "first")
 
     try do
       boot = receipt!(child, plan, "first")
 
-      {:ok, device} =
-        SimClient.pair("127.0.0.1", boot["port"],
-          device_id: "disconnected-inventory",
-          claimed_name: "Synthetic inventory"
-        )
+      device = paired_device(boot, "disconnected-inventory")
 
       ws = subscribe!(boot["port"], device.token)
 
@@ -625,7 +619,8 @@ defmodule Tightbeam.FirehoseColdRestartTest do
       plan.env ++
         [
           {"FIREHOSE_RESTART_PHASE", phase},
-          {"FIREHOSE_REOPEN_PROOF", if(reopen, do: "1", else: "0")}
+          {"FIREHOSE_REOPEN_PROOF", if(reopen, do: "1", else: "0")},
+          {"FIREHOSE_PAIRED_DEVICES", Map.get(plan, :paired_devices)}
         ]
 
     Port.open({:spawn_executable, String.to_charlist(plan.executable)}, [
@@ -638,6 +633,15 @@ defmodule Tightbeam.FirehoseColdRestartTest do
           {String.to_charlist(key), if(is_nil(value), do: false, else: String.to_charlist(value))}
         end)
     ])
+  end
+
+  # Core fix (A): pairing issues no token; the child gateway pairs these devices by
+  # fixture and returns their tokens in its ready receipt.
+  defp paired_devices(plan, spec), do: Map.put(plan, :paired_devices, spec)
+
+  defp paired_device(receipt, device_id) do
+    %{"token" => token, "userId" => user_id} = Map.fetch!(receipt["devices"], device_id)
+    %{token: token, user_id: user_id}
   end
 
   defp receipt!(port, plan, phase, deadline \\ nil) do

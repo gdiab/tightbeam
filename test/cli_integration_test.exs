@@ -3118,13 +3118,17 @@ defmodule Tightbeam.CliIntegrationTest do
         }
       })
 
+    # Core fix (A) C12: the owner rules from a paired device.
+    owner_device = Tightbeam.TestDevices.paired!(ctx.db, "flynn", device_id: "cli-flynn-phone")
+
     ruled =
-      Escalation.operator_rule(ctx.db, %{
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        transport_session_key: ctx.session.session_key,
-        params: %{request: request.id, decision: "ship"}
-      })
+      Escalation.operator_rule(
+        ctx.db,
+        Tightbeam.TestDevices.device_call(owner_device, %{
+          transport_session_key: ctx.session.session_key,
+          params: %{request: request.id, decision: "ship"}
+        })
+      )
 
     {detail_bytes, 0} =
       System.cmd(ctx.binary, ["decision-request", "--request", request.id],

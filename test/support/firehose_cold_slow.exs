@@ -125,11 +125,8 @@ opts =
 {:ok, {_, slow_port}} = ThousandIsland.listener_info(server)
 
 try do
-  {:ok, device} =
-    Tightbeam.ClientE2E.SimClient.pair("127.0.0.1", slow_port,
-      device_id: "slow-cold",
-      claimed_name: "Synthetic"
-    )
+  # Core fix (A): pairing issues no token; the device is paired by fixture.
+  device = Tightbeam.TestDevices.paired!(DB, "synthetic", admin: true, device_id: "slow-cold")
 
   connect = fn ->
     {:ok, ws} = WS.connect("127.0.0.1", slow_port, "/ws/changes?protocolVersion=2")

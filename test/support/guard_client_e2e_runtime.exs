@@ -25,9 +25,60 @@ defmodule GuardClientWire do
     pid
   end
 
+  # Core fix (A) K8: end to end with the hatch lifted. Pairing is frozen, the cold
+  # start included, so George's admin device exists first. A new device pairs only
+  # while the unfreeze file is valid, George approves it from his paired device by
+  # user command, the device collects its token and connects; once the file is
+  # removed, a new pair_request is refused again.
   defp run_case(0, ctx) do
+    george =
+      Tightbeam.TestDevices.paired!(ctx.db, "george", admin: true, device_id: "george-phone")
+
+    absent = "/nonexistent/tightbeam-test/pairing-unfreeze"
+    Application.put_env(:tightbeam, :pairing_unfreeze_path, absent)
+
+    assert {:error, "pairing_frozen"} =
+             SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
+
+    valid =
+      Enum.find(
+        ["/usr/bin/env", "/bin/sh", "/usr/bin/true"],
+        &Tightbeam.PairingFreeze.read(&1).lifted
+      )
+
+    Application.put_env(:tightbeam, :pairing_unfreeze_path, valid)
+
+    assert {:error, "pair_pending"} =
+             SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
+
+    {:ok, admin} =
+      SimClient.connect("127.0.0.1", ctx.port, george.token, device_id: george.device_id)
+
+    watermark = SimClient.mark(admin)
+
+    {:ok, admin, _id} =
+      SimClient.post(
+        admin,
+        Org.personal_session_key("george"),
+        "/tightbeam approve-device sim-j0"
+      )
+
+    assert {:ok, outcome, admin} =
+             SimClient.await(
+               admin,
+               watermark,
+               &(&1["type"] == "message" and &1["role"] == "assistant"),
+               5_000
+             )
+
+    assert outcome["content"] =~ "Done: approve-device"
+    SimClient.disconnect(admin)
+
     {:ok, %{token: token}} =
       SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
+
+    assert {:error, "already_paired"} =
+             SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
 
     {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-j0")
 
@@ -38,6 +89,11 @@ defmodule GuardClientWire do
            "J0 rows: #{inspect(Enum.map(rows, &{&1.step, &1.status, &1.note}))}"
 
     assert journey_ctx.main_key =~ "main"
+
+    Application.put_env(:tightbeam, :pairing_unfreeze_path, absent)
+
+    assert {:error, "pairing_frozen"} =
+             SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-late", claimed_name: "Late")
   end
 
   defp run_case(1, ctx) do
@@ -46,8 +102,8 @@ defmodule GuardClientWire do
   end
 
   defp run_case(2, ctx) do
-    {:ok, %{token: token}} =
-      SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "Flynn")
+    # Pairing is frozen (core fix (A)); the device is paired by fixture.
+    %{token: token} = Tightbeam.TestDevices.paired!(ctx.db, "flynn", device_id: "sim-bad-id")
 
     {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-bad-id")
     watermark = SimClient.mark(client)
