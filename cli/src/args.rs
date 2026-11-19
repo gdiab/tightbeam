@@ -706,6 +706,24 @@ pub enum Command {
         identity: Identity,
         user_id: String,
     },
+    ApproveDevice {
+        identity: Identity,
+        device_id: String,
+        user_id: Option<String>,
+    },
+    DenyDevice {
+        identity: Identity,
+        device_id: String,
+    },
+    RevokeDevice {
+        identity: Identity,
+        device_id: String,
+    },
+    PromoteUser {
+        identity: Identity,
+        user_id: String,
+        admin: bool,
+    },
     ConfigGet {
         identity: Identity,
         setting: String,
@@ -1331,16 +1349,30 @@ COMMANDS:
       repository. This never asks an agent for a PAT.
 
   add-user <userId> [--admin]
-      Add a user, optionally as an admin. An existing admin may run this over
-      the ordinary gateway path. On an empty local org, the first user is
-      created directly and becomes admin by the existing cold-start rule.
+      Operator only: from an agent session or the organization credential the
+      gateway refuses it; George sends `/tightbeam add-user` from Clawline.
+      Add a user, optionally as an admin. On an empty local org, the first user
+      is created directly and becomes admin by the existing cold-start rule.
   users
       List every user, active and removed, with admin standing, creation
       provenance, device and activity counts, and owned-row counts. Admin only.
   remove-user <userId>
+      Operator only: from an agent session or the organization credential the
+      gateway refuses it; George sends `/tightbeam remove-user` from Clawline.
       Remove one exact user. Removal is deactivation: history is kept, and the
       user can no longer authenticate, be selected or act. Refuses self, the
-      last admin and any user who owns rows; nothing is reassigned. Admin only.
+      last admin and any user who owns rows; nothing is reassigned.
+  approve-device <deviceId> [--user <userId>]
+      Operator only: only an admin's paired device app may approve a device;
+      George sends `/tightbeam approve-device` from Clawline. Pairing is frozen
+      while the device-credential fix is installed.
+  deny-device <deviceId>
+      Operator only: George sends `/tightbeam deny-device` from Clawline.
+  revoke-device <deviceId>
+      Operator only: George sends `/tightbeam revoke-device` from Clawline.
+  promote-user <userId> [--demote]
+      Operator only: George sends `/tightbeam promote-user` (or demote-user)
+      from Clawline.
   config get default-archetype|default-priority  read an organization default
   config set default-archetype <name>            set the default spawn archetype
   config set default-priority <0..8>              set the default card priority
@@ -1474,6 +1506,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "clear-delivery-owner",
     "clear",
     "daemon-credential",
+    "demote",
     "dry-run",
     "help",
     "history",
@@ -4128,6 +4161,49 @@ fn parse_with_optional_catalog(
             Ok(Command::RemoveUser {
                 identity: identity(flags)?,
                 user_id: parsed.positional[1].clone(),
+            })
+        }
+        // Core fix (A) C8: operator-only verbs. They reach the gateway like any
+        // other, which refuses every caller but an admin's paired device (C5).
+        "approve-device" => {
+            if parsed.positional.len() != 2 {
+                return Err(
+                    "usage: tightbeam approve-device <deviceId> [--user <userId>]".to_owned(),
+                );
+            }
+            Ok(Command::ApproveDevice {
+                identity: identity(flags)?,
+                device_id: parsed.positional[1].clone(),
+                user_id: nonempty(flags, "user"),
+            })
+        }
+        "deny-device" | "revoke-device" => {
+            let verb = parsed.positional[0].as_str();
+            if parsed.positional.len() != 2 {
+                return Err(format!("usage: tightbeam {verb} <deviceId>"));
+            }
+            let identity = identity(flags)?;
+            let device_id = parsed.positional[1].clone();
+            Ok(if verb == "deny-device" {
+                Command::DenyDevice {
+                    identity,
+                    device_id,
+                }
+            } else {
+                Command::RevokeDevice {
+                    identity,
+                    device_id,
+                }
+            })
+        }
+        "promote-user" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam promote-user <userId> [--demote]".to_owned());
+            }
+            Ok(Command::PromoteUser {
+                identity: identity(flags)?,
+                user_id: parsed.positional[1].clone(),
+                admin: !flags.contains_key("demote"),
             })
         }
         "config" => parse_config(&parsed, flags),
@@ -8360,6 +8436,83 @@ mod tests {
         }
     }
 
+    /// Core fix (A) K10 / C8: the operator-only device and user verbs parse and go
+    /// through dispatch, where the gateway refuses every caller but an admin's
+    /// paired device; their help says operator only.
+    #[test]
+    fn operator_only_device_and_user_verbs_parse_to_their_requests() {
+        assert_eq!(
+            parse(strings(&["approve-device", "dev_X"])),
+            Ok(Command::ApproveDevice {
+                identity: Identity::Session,
+                device_id: "dev_X".to_owned(),
+                user_id: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["approve-device", "dev_X", "--user", "george"])),
+            Ok(Command::ApproveDevice {
+                identity: Identity::Session,
+                device_id: "dev_X".to_owned(),
+                user_id: Some("george".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["deny-device", "dev_X"])),
+            Ok(Command::DenyDevice {
+                identity: Identity::Session,
+                device_id: "dev_X".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["revoke-device", "dev_X"])),
+            Ok(Command::RevokeDevice {
+                identity: Identity::Session,
+                device_id: "dev_X".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["promote-user", "guest"])),
+            Ok(Command::PromoteUser {
+                identity: Identity::Session,
+                user_id: "guest".to_owned(),
+                admin: true,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["promote-user", "guest", "--demote"])),
+            Ok(Command::PromoteUser {
+                identity: Identity::Session,
+                user_id: "guest".to_owned(),
+                admin: false,
+            })
+        );
+        for args in [
+            &["approve-device"][..],
+            &["approve-device", "a", "b"],
+            &["deny-device"],
+            &["revoke-device", "a", "b"],
+            &["promote-user"],
+        ] {
+            assert!(
+                parse(strings(args))
+                    .unwrap_err()
+                    .starts_with("usage: tightbeam ")
+            );
+        }
+        for verb in [
+            "approve-device",
+            "deny-device",
+            "revoke-device",
+            "promote-user",
+            "add-user",
+            "remove-user",
+        ] {
+            let entry = render_command_help(None, verb).unwrap();
+            assert!(entry.contains("Operator only"), "{verb}: {entry}");
+        }
+    }
+
     #[test]
     fn commands_outside_cli_surface_v1_are_not_exposed() {
         for command in [
@@ -8379,10 +8532,6 @@ mod tests {
             "setup",
             "role",
             "kungfu-scaffold",
-            "approve-device",
-            "deny-device",
-            "revoke-device",
-            "promote-user",
         ] {
             assert!(
                 parse(strings(&[command]))

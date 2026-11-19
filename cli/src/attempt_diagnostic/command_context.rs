@@ -164,6 +164,10 @@ impl CommandContext {
             AddUser { .. } => ("cli.add_user", DispatchPath),
             Users { .. } => ("cli.users", DispatchPath),
             RemoveUser { .. } => ("cli.remove_user", DispatchPath),
+            ApproveDevice { .. } => ("cli.approve_device", DispatchPath),
+            DenyDevice { .. } => ("cli.deny_device", DispatchPath),
+            RevokeDevice { .. } => ("cli.revoke_device", DispatchPath),
+            PromoteUser { .. } => ("cli.promote_user", DispatchPath),
             ConfigGet { .. } => ("cli.config_get", DispatchPath),
             ConfigSet { .. } => ("cli.config_set", DispatchPath),
             HostEnvSet { .. } => ("cli.host_env_set", DispatchPath),
@@ -494,6 +498,10 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | Onboard { .. }
         | AddUser { .. }
         | RemoveUser { .. }
+        | ApproveDevice { .. }
+        | DenyDevice { .. }
+        | RevokeDevice { .. }
+        | PromoteUser { .. }
         | ConfigSet { .. }
         | HostEnvSet { .. }
         | HostEnvUnset { .. }

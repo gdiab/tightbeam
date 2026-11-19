@@ -1937,6 +1937,48 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("userId", user_id)],
         )),
+        Command::ApproveDevice {
+            identity,
+            device_id,
+            user_id,
+        } => {
+            let mut params = vec![string_field("deviceId", device_id)];
+            if let Some(user_id) = user_id {
+                params.push(string_field("userId", user_id));
+            }
+            Ok(request(identity, "approve-device", vec![], params))
+        }
+        Command::DenyDevice {
+            identity,
+            device_id,
+        } => Ok(request(
+            identity,
+            "deny-device",
+            vec![],
+            vec![string_field("deviceId", device_id)],
+        )),
+        Command::RevokeDevice {
+            identity,
+            device_id,
+        } => Ok(request(
+            identity,
+            "revoke-device",
+            vec![],
+            vec![string_field("deviceId", device_id)],
+        )),
+        Command::PromoteUser {
+            identity,
+            user_id,
+            admin,
+        } => Ok(request(
+            identity,
+            "promote-user",
+            vec![],
+            vec![
+                string_field("userId", user_id),
+                format!("\"isAdmin\":{admin}"),
+            ],
+        )),
         Command::ConfigGet { identity, setting } => Ok(request(
             identity,
             "config",
@@ -4168,6 +4210,10 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::AddUser { identity, .. }
         | Command::Users { identity }
         | Command::RemoveUser { identity, .. }
+        | Command::ApproveDevice { identity, .. }
+        | Command::DenyDevice { identity, .. }
+        | Command::RevokeDevice { identity, .. }
+        | Command::PromoteUser { identity, .. }
         | Command::ConfigGet { identity, .. }
         | Command::ConfigSet { identity, .. }
         | Command::HostEnvSet { identity, .. }
