@@ -1979,21 +1979,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   test "AC11 captures real committed raw frames and compares payload bytes to HTTP item bytes",
        ctx do
-    # Core fix (A): approve-device needs the pairing freeze lifted.
-    Application.put_env(
-      :tightbeam,
-      :pairing_unfreeze_path,
-      Tightbeam.TestDevices.valid_unfreeze_file!()
-    )
-
-    on_exit(fn ->
-      Application.put_env(
-        :tightbeam,
-        :pairing_unfreeze_path,
-        "/nonexistent/tightbeam-test/pairing-unfreeze"
-      )
-    end)
-
     {:ok, queued_turn} =
       Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "raw-a6-fixture-drain")
 
@@ -4069,14 +4054,20 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         model: "fixture"
       })
 
-    # Core fix (A): approve-device runs only from an admin's paired device.
-    device_call =
-      Tightbeam.TestDevices.device_call(
-        ctx.admin_device,
-        firehose_call("approve-device", nil, %{device_id: "raw-a6-device"})
-      )
+    # Stage 1: approval is one-time-code pairing. The admin's paired device issues a
+    # code for flynn and the pending device redeems it; that redemption commits the
+    # device.approved frame (it also sets platform/model to the pairing request's).
+    {code, _record} = Tightbeam.TestDevices.issue_code!(ctx.db, ctx.admin_device, "flynn")
+    admission = :"raw_a6_admission_#{System.unique_integer([:positive])}"
 
-    device = Devices.approve_with_firehose(ctx.db, "raw-a6-device", "flynn", device_call)
+    start_supervised!(%{
+      id: admission,
+      start: {Tightbeam.PairingAdmission, :start_link, [[name: admission]]}
+    })
+
+    {:paired, device} =
+      Tightbeam.TestDevices.coded_pair(ctx.db, "raw-a6-device", "Raw A6 device", code, admission)
+
     {device_raw, ws} = receive_raw_change(ws, "device.approved")
 
     device_frame =

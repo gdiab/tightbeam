@@ -877,26 +877,20 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     })
 
     # Core fix (A): the device acts run only from a paired device (the admin's acts,
-    # a non-admin's is refused `forbidden`), and approve-device only with the pairing
-    # freeze lifted.
+    # a non-admin's is refused `forbidden`).
     owner_device = Tightbeam.TestDevices.paired!(db, "synthetic-owner")
     outsider_device = Tightbeam.TestDevices.paired!(db, "outsider")
 
-    Application.put_env(
-      :tightbeam,
-      :pairing_unfreeze_path,
-      Tightbeam.TestDevices.valid_unfreeze_file!()
-    )
+    # Stage 1: approve-device issues a one-time code and changes no device row; the
+    # committed device.approved comes from the coded pairing that redeems it, which
+    # publishes on the named Hub, so the test observes that Hub.
+    hub = start_supervised!({Hub, name: Hub})
+    admission = :"escalation_admission_#{System.unique_integer([:positive])}"
 
-    on_exit(fn ->
-      Application.put_env(
-        :tightbeam,
-        :pairing_unfreeze_path,
-        "/nonexistent/tightbeam-test/pairing-unfreeze"
-      )
-    end)
-
-    hub = start_supervised!({Hub, name: nil})
+    start_supervised!(%{
+      id: admission,
+      start: {Tightbeam.PairingAdmission, :start_link, [[name: admission]]}
+    })
 
     :ok =
       Hub.register(hub, self(), %{mode: :all, db: db, user_id: "synthetic-owner", is_admin: true})
@@ -935,6 +929,19 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       assert {:ok, _} = Dispatch.dispatch(db, handlers, allowed)
       assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
       Hub.delivered(hub, self())
+
+      if verb == "approve-device" do
+        # Stage 1: the accepted approval only issued a code; the pending row is
+        # unchanged and no device.approved is published until the code is redeemed.
+        assert StateResources.query_device(db, id) == before
+        refute_receive {:firehose_notice, %{"class" => ^class}}
+        assert_receive {:tightbeam_ephemeral, text}
+        [code] = Regex.run(~r/TB-[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}/, text)
+
+        assert {:paired, %{device_id: ^id, user_id: "synthetic-owner"}} =
+                 Tightbeam.TestDevices.coded_pair(db, id, "synthetic", code, admission)
+      end
+
       assert_receive {:firehose_notice, %{"class" => ^class, "payload" => payload}}
       assert payload["deviceId"] == id
       refute Map.has_key?(payload, "token")

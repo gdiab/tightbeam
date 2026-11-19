@@ -286,6 +286,10 @@ defmodule Tightbeam.DeviceLifecycle do
             JSON.encode!(%{codeId: id, userId: target, expiresAt: expires_at, recovery: false})
           )
 
+          # A transactional verb publishes its acceptance in its own transaction; the
+          # notice names the verb only, never the code.
+          Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
           {:issued, %{code_id: id, user_id: target, expires_at: expires_at}}
         end
       end)
