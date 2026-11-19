@@ -66,14 +66,16 @@ defmodule Tightbeam.QuotaRelease do
 
     case standing_reasons_in_txn(txn, incident_id, harness, host, cause) do
       [] ->
-        HarnessProcess.complete_park_in_txn(txn, key)
-
+        # Recorded before the fence goes, so fence_cleared_in_txn/2 does not
+        # count this release as one a standing reason still held.
         EventLog.lifecycle_in_txn(
           txn,
           "rate_limit_admission_resumed",
           incident_id,
           JSON.encode!(%{harness: harness, host: host, cause: cause, resumedAt: at})
         )
+
+        HarnessProcess.complete_park_in_txn(txn, key)
 
         released_in_txn(txn, incident_id, harness, host,
           readmit: Keyword.get(opts, :readmit, false)
@@ -96,6 +98,74 @@ defmodule Tightbeam.QuotaRelease do
   end
 
   @readmitting_causes ["declared_reset", "explicit_resume", "explicit_restart", "recovery_probe"]
+
+  @doc """
+  A park fence was removed (`HarnessProcess`'s park completion or orphan-fence
+  sweep). On 0.1.16 a held release's only standing reason is a harness process
+  (one rate-limit incident can be open per key), and that process's own
+  settlement removes the fence. For each quota release on the key that a
+  standing reason held and that has not yet seen admission resume, this
+  records `rate_limit_admission_resumed` (cause `standing_reason_cleared`) and
+  re-admits its pending pre-activity turns once (companion v1.6 C1).
+  """
+  @spec fence_cleared_in_txn(Txn.t(), String.t()) :: :ok
+  def fence_cleared_in_txn(%Txn{} = txn, adapter_key) when is_binary(adapter_key) do
+    case {String.split(adapter_key, ":shared@", parts: 2), quota_schema?(txn)} do
+      {[harness, host], true} ->
+        at = System.system_time(:millisecond)
+
+        Txn.q(
+          txn,
+          """
+          SELECT i.id,
+                 (SELECT json_extract(r.detail, '$.cause') FROM lifecycle_events r
+                  WHERE r.kind='rate_limit_hold_released' AND r.subject=i.id
+                  ORDER BY r.id DESC LIMIT 1)
+          FROM harness_health_incidents i
+          WHERE i.harness=?1 AND i.host=?2 AND i.failureClass='rate-limit-dead'
+            AND EXISTS (
+              SELECT 1 FROM lifecycle_events h
+              WHERE h.kind='rate_limit_hold_remains' AND h.subject=i.id
+                AND NOT EXISTS (
+                  SELECT 1 FROM lifecycle_events a
+                  WHERE a.kind='rate_limit_admission_resumed' AND a.subject=i.id AND a.id > h.id
+                )
+            )
+          ORDER BY i.id
+          """,
+          [harness, host]
+        )
+        |> Enum.each(fn [incident_id, cause] ->
+          EventLog.lifecycle_in_txn(
+            txn,
+            "rate_limit_admission_resumed",
+            incident_id,
+            JSON.encode!(%{
+              harness: harness,
+              host: host,
+              cause: "standing_reason_cleared",
+              releaseCause: cause,
+              resumedAt: at
+            })
+          )
+
+          released_in_txn(txn, incident_id, harness, host, readmit: cause in @readmitting_causes)
+        end)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  # A process-only database (some harness-process tests) has no health tables.
+  defp quota_schema?(txn) do
+    Txn.q(
+      txn,
+      "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('harness_health_incidents','lifecycle_events')"
+    ) == [[2]]
+  end
 
   defp standing_reasons_in_txn(txn, incident_id, harness, host, cause) do
     adapter_key = Atom.to_string(Harness.parse!(harness).id()) <> ":shared@" <> host

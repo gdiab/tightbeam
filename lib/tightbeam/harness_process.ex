@@ -388,6 +388,11 @@ defmodule Tightbeam.HarnessProcess do
   def complete_park_in_txn(%DB.Txn{} = txn, key) do
     DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
 
+    # A quota release that a standing reason held resumes admission here
+    # (companion v1.6 C1).
+    if DB.Txn.changes(txn) == 1,
+      do: Tightbeam.QuotaRelease.fence_cleared_in_txn(txn, key_name(key))
+
     :ok
   end
 
@@ -1734,7 +1739,14 @@ defmodule Tightbeam.HarnessProcess do
         """
       )
 
-    Enum.map(released, fn [adapter_key] -> adapter_key end)
+    # A quota release that a standing reason held resumes admission when its
+    # fence goes (companion v1.6 C1).
+    Enum.map(released, fn [adapter_key] ->
+      {:ok, :ok} =
+        DB.transaction(db, &Tightbeam.QuotaRelease.fence_cleared_in_txn(&1, adapter_key))
+
+      adapter_key
+    end)
   end
 
   defp rate_limit_incident_guard(db) do
