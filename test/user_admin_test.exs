@@ -138,8 +138,18 @@ defmodule Tightbeam.UserAdminTest do
 
     test "no device of the removed user authenticates or obtains a token", ctx do
       assert Devices.by_token(ctx.db, ctx.guest_device.token) == nil
-      assert {:refused, "user_removed"} = pair(ctx.db, "guest-dev", "guest")
-      assert {:refused, "user_removed"} = pair(ctx.db, "guest-new-dev", "guest")
+      # Core fix (A) C6: pairing is frozen, so no pair_request obtains a token;
+      # while the freeze is lifted, a removed user's device still gets none.
+      assert {:refused, "pairing_frozen"} = real_pair(ctx.db, "guest-dev", "guest")
+      assert {:refused, "pairing_frozen"} = real_pair(ctx.db, "guest-new-dev", "guest")
+      assert Devices.by_id(ctx.db, "guest-new-dev") == nil
+
+      lifted = Enum.find(["/usr/bin/env", "/bin/sh"], &Tightbeam.PairingFreeze.read(&1).lifted)
+      frozen = Application.get_env(:tightbeam, :pairing_unfreeze_path)
+      Application.put_env(:tightbeam, :pairing_unfreeze_path, lifted)
+      on_exit(fn -> Application.put_env(:tightbeam, :pairing_unfreeze_path, frozen) end)
+      assert {:refused, "user_removed"} = real_pair(ctx.db, "guest-dev", "guest")
+      assert {:refused, "user_removed"} = real_pair(ctx.db, "guest-new-dev", "guest")
       assert Devices.by_id(ctx.db, "guest-new-dev") == nil
       assert Devices.by_id(ctx.db, "guest-dev").user_removed
     end
@@ -150,14 +160,17 @@ defmodule Tightbeam.UserAdminTest do
 
       for {verb, params} <- [
             {"add-user", %{user_id: "guest", is_admin: false}},
-            {"promote-user", %{user_id: "guest", is_admin: true}},
-            {"approve-device", %{device_id: "other-dev", user_id: "guest"}}
+            {"promote-user", %{user_id: "guest", is_admin: true}}
           ] do
         assert {:error, %{code: "user_removed", message: message}} =
                  run(ctx, verb, "admin", params)
 
         assert message =~ "guest"
       end
+
+      # Core fix (A) C6: while frozen, approval is refused before any user check.
+      assert {:error, %{code: "pairing_frozen"}} =
+               run(ctx, "approve-device", "admin", %{device_id: "other-dev", user_id: "guest"})
 
       assert users_table(ctx.db) == before
       assert Devices.by_id(ctx.db, "other-dev").status == "pending"
@@ -245,11 +258,13 @@ defmodule Tightbeam.UserAdminTest do
           Map.update!(ctx.handlers, verb, fn writer ->
             fn call ->
               assert %{user: %{"state" => "removed"}} =
-                       UserAdmin.remove(ctx.db, %{
-                         principal: {:user, "admin"},
-                         origin: "user:admin",
-                         params: %{user_id: user}
-                       })
+                       UserAdmin.remove(
+                         ctx.db,
+                         Tightbeam.TestDevices.device_call(ctx.admin_device, %{
+                           verb: "remove-user",
+                           params: %{user_id: user}
+                         })
+                       )
 
               writer.(call)
             end
@@ -358,7 +373,8 @@ defmodule Tightbeam.UserAdminTest do
 
       before = users_table(ctx.db)
 
-      assert {:error, %{code: "forbidden"}} =
+      # Core fix (A) C2/C5: a process is not an admin-paired device.
+      assert {:error, %{code: "user_authentication_required"}} =
                Dispatch.dispatch(ctx.db, ctx.handlers, process_call)
 
       assert {:error, %{code: "user_not_found"}} =
@@ -485,13 +501,26 @@ defmodule Tightbeam.UserAdminTest do
     end
   end
 
+  # Core fix (A): user administration comes from the acting user's own paired
+  # device, so a synthetic actor with a device acts through it.
   defp run(ctx, verb, actor, params) do
-    Dispatch.dispatch(ctx.db, ctx.handlers, %{
-      verb: verb,
-      origin: "user:#{actor}",
-      session_key: nil,
-      principal: {:user, actor},
-      params: params
+    call = %{verb: verb, origin: "user:#{actor}", session_key: nil, params: params}
+
+    call =
+      case Map.get(%{"admin" => ctx[:admin_device], "guest" => ctx[:guest_device]}, actor) do
+        nil -> Map.put(call, :principal, {:user, actor})
+        device -> Tightbeam.TestDevices.device_call(device, call)
+      end
+
+    Dispatch.dispatch(ctx.db, ctx.handlers, call)
+  end
+
+  defp real_pair(db, device_id, claimed_name) do
+    Devices.pair(db, %{
+      device_id: device_id,
+      claimed_name: claimed_name,
+      platform: nil,
+      model: nil
     })
   end
 
