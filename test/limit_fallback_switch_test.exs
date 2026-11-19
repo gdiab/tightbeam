@@ -1384,6 +1384,11 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     case :persistent_term.get({__MODULE__, :window}, nil) do
       {^provider, hook} ->
         :persistent_term.erase({__MODULE__, :window})
+
+        IO.puts(
+          "SCRATCHDIAG window pid=#{inspect(self())} stack=#{inspect(Process.info(self(), :current_stacktrace), limit: :infinity, printable_limit: :infinity)}"
+        )
+
         hook.()
 
       _ ->
