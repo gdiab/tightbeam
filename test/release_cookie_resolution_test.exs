@@ -169,4 +169,33 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     File.rm!(ctx.mode_path)
     assert_refused(ctx, "releases/COOKIE_MODE is missing", ctx.baked)
   end
+
+  test "the production release carries and loads the native helpers", ctx do
+    # Stage 1: the Argon2id and base-lock NIF ships in the release's priv and loads
+    # there. The vector is the CLI's (cli/src/device_recovery_vector.txt).
+    vector =
+      Path.expand("../cli/src/device_recovery_vector.txt", __DIR__)
+      |> File.read!()
+      |> String.trim()
+
+    lock = Path.join(System.tmp_dir!(), "tb-release-nif-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm(lock) end)
+
+    expr = """
+    verifier = Tightbeam.Native.argon2id("TB-7K3M-Q9ZD-2WH8", :binary.copy(<<7>>, 16))
+    IO.puts("ARGON2=" <> Base.encode16(verifier, case: :lower))
+    held = Tightbeam.Native.base_lock(#{inspect(lock)})
+    IO.puts("LOCK=" <> to_string(is_reference(held)))
+    """
+
+    {out, status} =
+      System.cmd(ctx.launcher, ["eval", expr],
+        env: [{"RELEASE_COOKIE", nil}],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, out
+    assert [^vector] = Regex.run(~r/^ARGON2=(.*)$/m, out, capture: :all_but_first)
+    assert ["true"] = Regex.run(~r/^LOCK=(.*)$/m, out, capture: :all_but_first)
+  end
 end
