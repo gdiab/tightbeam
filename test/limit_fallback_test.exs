@@ -392,7 +392,84 @@ defmodule Tightbeam.LimitFallbackTest do
     )
   end
 
-  defp assign!(ctx) do
+  describe "listings (cross-line contract v3.1 R9(ii))" do
+    test "every listing surfaces a process attest's byProcess; a session attest is unchanged",
+         ctx do
+      item =
+        Tightbeam.WorkItems.__handle__(ctx.db, "work-item-create", %{
+          verb: "work-item-create",
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          session_key: nil,
+          params: %{title: "R9 listings"}
+        })
+
+      assignment = assign!(ctx, item.id)
+      assert %{attest: %{id: session_attest}} = session_progress!(ctx, assignment.id, "halfway")
+
+      {:ok, %{id: process_attest}} =
+        DB.transaction(ctx.db, fn txn ->
+          Assignments.record_model_fallback_attest_in_txn(txn, assignment.id, @note)
+        end)
+
+      by_id = fn rows, key -> Map.new(rows, &{Map.fetch!(&1, key), &1}) end
+
+      # REST collections and their wire items.
+      {:ok, page} =
+        DB.transaction(ctx.db, fn txn ->
+          Assignments.list_attests(txn, %{
+            assignment_id: assignment.id,
+            filters: %{},
+            boundary: :earliest,
+            limit: 10
+          })
+        end)
+
+      rows = by_id.(page.rows, :id)
+      assert rows[process_attest].by_process == "process:tightbeam"
+      refute Map.has_key?(rows[session_attest], :by_process)
+
+      process_item = Tightbeam.StateResources.attest(rows[process_attest])
+      session_item = Tightbeam.StateResources.attest(rows[session_attest])
+      assert process_item["byProcess"] == "process:tightbeam"
+      assert %{"bySession" => nil, "byUser" => nil} = process_item
+      refute Map.has_key?(session_item, "byProcess")
+      assert session_item["bySession"] == "holder"
+
+      # The single record.
+      assert Tightbeam.StateResources.query_attest(ctx.db, process_attest).by_process ==
+               "process:tightbeam"
+
+      refute Map.has_key?(
+               Tightbeam.StateResources.query_attest(ctx.db, session_attest),
+               :by_process
+             )
+
+      # The work-state detail (/api/work/:id).
+      attests = by_id.(Tightbeam.WorkState.detail(ctx.db, assignment.id).attests, :id)
+      assert attests[process_attest].byProcess == "process:tightbeam"
+      refute Map.has_key?(attests[session_attest], :byProcess)
+
+      # work-item-trace.
+      entries =
+        ctx.db
+        |> Tightbeam.JobTrace.build(%{
+          id: item.id,
+          ownerUserId: "flynn",
+          state: "open",
+          failReason: nil,
+          title: "R9 listings"
+        })
+        |> Map.fetch!(:timeline)
+        |> Enum.filter(&(&1.type == "attest"))
+        |> by_id.(:id)
+
+      assert entries[process_attest].byProcess == "process:tightbeam"
+      refute Map.has_key?(entries[session_attest], :byProcess)
+    end
+  end
+
+  defp assign!(ctx, work_item_id \\ nil) do
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
       origin: "user:flynn",
@@ -401,7 +478,7 @@ defmodule Tightbeam.LimitFallbackTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: "work", idempotency_key: nil, work_item_id: nil}
+      params: %{subject: "work", idempotency_key: nil, work_item_id: work_item_id}
     })
   end
 
