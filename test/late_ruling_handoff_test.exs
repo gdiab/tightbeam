@@ -79,6 +79,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
     Ledger,
     Model,
     Org,
+    TestDevices,
     Wakes,
     WorkItems
   }
@@ -104,6 +105,8 @@ defmodule Tightbeam.LateRulingHandoffTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     insert_user!(db, "flynn")
+    # Core fix (A): operator-rule on flynn's requests comes from flynn's paired device.
+    flynn_device = TestDevices.paired!(db, "flynn")
 
     ensure_main_session(db, "flynn")
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
@@ -145,7 +148,8 @@ defmodule Tightbeam.LateRulingHandoffTest do
       scheduler: scheduler,
       opener: opener,
       raiser: raiser,
-      replacement_holder: replacement_holder
+      replacement_holder: replacement_holder,
+      flynn_device: flynn_device
     }
   end
 
@@ -216,13 +220,11 @@ defmodule Tightbeam.LateRulingHandoffTest do
     assert %{id: @incident_request_id, status: "ruled"} =
              Escalation.operator_rule(
                ctx.db,
-               %{
+               TestDevices.device_call(ctx.flynn_device, %{
                  verb: "operator-rule",
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
                  transport_session_key: ctx.raiser.session_key,
                  params: %{request: @incident_request_id, decision: "accept"}
-               },
+               }),
                scheduler: ctx.scheduler
              )
 
@@ -487,13 +489,14 @@ defmodule Tightbeam.LateRulingHandoffTest do
     before_ruling = mutation_counts(ctx.db)
 
     assert %{code: "late_ruling_recipient_unavailable"} =
-             Escalation.operator_rule(ctx.db, %{
-               verb: "operator-rule",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               transport_session_key: ctx.raiser.session_key,
-               params: %{request: request.id, decision: "accept"}
-             })
+             Escalation.operator_rule(
+               ctx.db,
+               TestDevices.device_call(ctx.flynn_device, %{
+                 verb: "operator-rule",
+                 transport_session_key: ctx.raiser.session_key,
+                 params: %{request: request.id, decision: "accept"}
+               })
+             )
 
     assert mutation_counts(ctx.db) == before_ruling
     assert hd(request_row(ctx.db, request.id)) == "open"
@@ -533,13 +536,11 @@ defmodule Tightbeam.LateRulingHandoffTest do
     assert %{status: "ruled"} =
              Escalation.operator_rule(
                ctx.db,
-               %{
+               TestDevices.device_call(ctx.flynn_device, %{
                  verb: "operator-rule",
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
                  transport_session_key: ctx.raiser.session_key,
                  params: %{request: request.id, decision: "accept"}
-               },
+               }),
                scheduler: ctx.scheduler
              )
 

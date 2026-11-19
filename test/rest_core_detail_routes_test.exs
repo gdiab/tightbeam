@@ -1979,6 +1979,17 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   test "AC11 captures real committed raw frames and compares payload bytes to HTTP item bytes",
        ctx do
+    # Core fix (A): approve-device needs the pairing freeze lifted.
+    Application.put_env(:tightbeam, :pairing_unfreeze_path, "/usr/bin/env")
+
+    on_exit(fn ->
+      Application.put_env(
+        :tightbeam,
+        :pairing_unfreeze_path,
+        "/nonexistent/tightbeam-test/pairing-unfreeze"
+      )
+    end)
+
     {:ok, queued_turn} =
       Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "raw-a6-fixture-drain")
 
@@ -4054,7 +4065,13 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         model: "fixture"
       })
 
-    device_call = firehose_call("approve-device", nil, %{device_id: "raw-a6-device"})
+    # Core fix (A): approve-device runs only from an admin's paired device.
+    device_call =
+      Tightbeam.TestDevices.device_call(
+        ctx.admin_device,
+        firehose_call("approve-device", nil, %{device_id: "raw-a6-device"})
+      )
+
     device = Devices.approve_with_firehose(ctx.db, "raw-a6-device", "flynn", device_call)
     {device_raw, ws} = receive_raw_change(ws, "device.approved")
 

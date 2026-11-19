@@ -3589,6 +3589,8 @@ defmodule Tightbeam.RulesTest do
   test "AC6a routes unassigned agent stretches to the item coordinator once and excludes human starts",
        ctx do
     assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
+    # Core fix (A): flynn rules the stretch request from flynn's paired device.
+    flynn_device = Tightbeam.TestDevices.paired!(ctx.db, "flynn")
     agent = session(ctx.db, "ac6a-unassigned-agent", "flynn", archetype: "coder")
     foreign_sender = session(ctx.db, "ac6a-foreign-agent", "flynn", archetype: "coder")
     human_started = session(ctx.db, "ac6a-human-started", "flynn", archetype: "coder")
@@ -3838,13 +3840,14 @@ defmodule Tightbeam.RulesTest do
              Ledger.finish(ctx.db, replay_seq, "delivered", nil, owner_lease: replay_lease)
 
     assert %{id: ^request_id, status: "ruled"} =
-             Escalation.operator_rule(ctx.db, %{
-               verb: "operator-rule",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               transport_session_key: no_context.session_key,
-               params: %{request: request_id, decision: "accept"}
-             })
+             Escalation.operator_rule(
+               ctx.db,
+               Tightbeam.TestDevices.device_call(flynn_device, %{
+                 verb: "operator-rule",
+                 transport_session_key: no_context.session_key,
+                 params: %{request: request_id, decision: "accept"}
+               })
+             )
 
     assert {:ok, _} =
              Ledger.enqueue(ctx.db, %{

@@ -9,6 +9,7 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     Model,
     Org,
     Schema,
+    TestDevices,
     Wakes,
     WorkItems
   }
@@ -230,6 +231,8 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     assert :ok = Schema.ensure_all(db)
     assert :done = Schema.backfill_wake_delivery(db)
     :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',0,1)")
+    # Core fix (A): flynn rules the late request from flynn's paired device.
+    flynn_device = TestDevices.paired!(db, "flynn")
     ensure_main_session(db, "flynn")
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
@@ -292,13 +295,12 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     assert :ok = Escalation.recover_retired(db)
     before_version = version_of(db, request.id)
 
-    call = %{
-      verb: "operator-rule",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      transport_session_key: raiser.session_key,
-      params: %{request: request.id, decision: "accept"}
-    }
+    call =
+      TestDevices.device_call(flynn_device, %{
+        verb: "operator-rule",
+        transport_session_key: raiser.session_key,
+        params: %{request: request.id, decision: "accept"}
+      })
 
     assert %{status: "ruled"} = Escalation.operator_rule(db, call, scheduler: scheduler)
     assert version_of(db, request.id) == before_version + 1

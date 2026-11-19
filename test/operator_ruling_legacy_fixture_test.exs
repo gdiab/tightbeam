@@ -1,7 +1,7 @@
 defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Escalation, Model, Org, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Escalation, Model, Org, TestDevices, Wakes}
 
   # Historical schema rows use synthetic identifiers and a synthetic test principal.
   @fixture_path "test/fixtures/operator_ruling_legacy_synthetic.json"
@@ -44,7 +44,8 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
 
     fixture = @fixture_path |> File.read!() |> JSON.decode!()
     import_fixture!(db, fixture)
-    %{db: db, fixture: fixture}
+    # Core fix (A): the owner's replayed operator-rule comes from tester's paired device.
+    %{db: db, fixture: fixture, device: TestDevices.paired!(db, "tester")}
   end
 
   test "0.1.8 deadline-relative pending and fired rulings remain readable and replayable", ctx do
@@ -58,7 +59,7 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
     assert pending["dueAt"] == pending["ruledAt"] + pending["duration"]
     assert fired["dueAt"] == fired["ruledAt"] + fired["duration"]
 
-    call = owner_operator_rule(pending["requestId"], %{decision: "accept"})
+    call = owner_operator_rule(ctx.device, pending["requestId"], %{decision: "accept"})
 
     assert MapSet.new(
              Enum.map(Escalation.list(ctx.db, call, "ruled", owner_user_id: "tester"), & &1.id)
@@ -66,7 +67,7 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
              MapSet.new([pending["requestId"], fired["requestId"]])
 
     for legacy <- [pending, fired] do
-      replay_call = owner_operator_rule(legacy["requestId"], %{decision: "accept"})
+      replay_call = owner_operator_rule(ctx.device, legacy["requestId"], %{decision: "accept"})
 
       assert %{id: request_id, status: "ruled", decision: "accept"} =
                Escalation.get(ctx.db, replay_call, legacy["requestId"], owner_user_id: "tester")
@@ -176,14 +177,12 @@ defmodule Tightbeam.OperatorRulingLegacyFixtureTest do
     end)
   end
 
-  defp owner_operator_rule(id, params) do
-    %{
+  defp owner_operator_rule(device, id, params) do
+    TestDevices.device_call(device, %{
       verb: "operator-rule",
-      origin: "user:tester",
-      principal: {:user, "tester"},
       transport_session_key: nil,
       params: Map.put(params, :request, id)
-    }
+    })
   end
 
   defp wake_state_and_turn_count(db, wake_id) do
