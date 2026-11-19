@@ -19,7 +19,11 @@ defmodule Tightbeam.RowReactionPolicyTest do
     assert settings["reschedule"] == "move_the_single_pending_cycle_in_place"
     assert settings["release"] == "resolve_only_after_all_constituent_routes_succeed"
     assert english =~ "Owning bundle: substrate base seed."
-    assert english =~ "one hour by default"
+    # Companion v1.6 PR3: two minutes, doubling to an hour, 24 a day.
+    assert settings["first_interval_ms"] == 120_000
+    assert settings["daily_probe_cap"] == 24
+    assert english =~ "first_interval_ms (two minutes) after opening"
+    assert english =~ "capped at interval_ms (one hour)"
     assert provenance["source"] == "rules/harness-health-recovery.toml"
   end
 

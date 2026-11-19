@@ -2075,7 +2075,9 @@ defmodule Tightbeam.HarnessHealthTest do
         failed.session,
         message_id,
         prompt,
-        @captured_claude_rate_limit_no_reset, assignment_id: failed.assignment)
+        @captured_claude_rate_limit_no_reset,
+        assignment_id: failed.assignment
+      )
 
     assert {:opened, initial_incident} =
              HarnessHealth.observe(
@@ -3603,7 +3605,10 @@ defmodule Tightbeam.HarnessHealthTest do
     assert second_resumed_turn.prompt == second_failure_prompt
   end
 
-  test "recovery cycle records each route and releases only after all current routes succeed",
+  # Companion v1.6 PR2: each cycle probes one route per key, the model of the
+  # incident's first failure (route_two here); a result for another route is
+  # recorded and neither releases nor blocks the hold.
+  test "recovery cycle records its checks and releases when the key's one probe route succeeds",
        ctx do
     [first | _] = ctx.sessions
 
@@ -3763,7 +3768,8 @@ defmodule Tightbeam.HarnessHealthTest do
                [incident.id]
              )
 
-    assert next_due_at == started_one + 3_600_000
+    # Companion v1.6 PR3: after one started cycle the interval is 4 minutes.
+    assert next_due_at == started_one + 240_000
     assert next_due_at < started_one + 3_600_100
 
     assert {:ok, [[cycle_two]]} =
@@ -4079,7 +4085,8 @@ defmodule Tightbeam.HarnessHealthTest do
                     "SELECT COUNT(*),MIN(outcome),MAX(outcome) FROM harness_health_recovery_checks WHERE holdId=?1",
                     [opened.id]
                   ) do
-               {:ok, [[2, "uncheckable", "uncheckable"]]} ->
+               # Companion v1.6 PR2: one check per key per cycle.
+               {:ok, [[1, "uncheckable", "uncheckable"]]} ->
                  case DB.query(
                         ctx.db,
                         "SELECT status,dueAt,previousStartedAt FROM harness_health_recovery_schedules WHERE holdId=?1",
@@ -4359,10 +4366,13 @@ defmodule Tightbeam.HarnessHealthTest do
       assert pending_probes(ctx.db, hold_id) == 0
     end
 
-    test "C1: a probe release keeps the fence while another quota incident stands; admission resumes when it clears",
+    # On 0.1.16 one rate-limit incident can be open per key
+    # (harness_health_one_open_class), so the standing reason that can keep a
+    # released key fenced is a harness process still being parked.
+    test "C1: a probe release keeps the fence while a process is being parked; admission resumes, recorded, when it settles",
          ctx do
       %{hold: hold_id} = codex_hold!(ctx)
-      other = second_open_codex_incident!(ctx.db, ctx.main_session)
+      launch = parking_codex_process!(ctx.db)
 
       {_started, release} = probe_cycle!(ctx.db, hold_id, "succeeded")
 
@@ -4373,27 +4383,25 @@ defmodule Tightbeam.HarnessHealthTest do
       assert [%{"cause" => "recovery_probe"}] =
                lifecycle_details(ctx.db, "rate_limit_hold_released", hold_id)
 
-      assert [%{"reasons" => ["open_incident:" <> ^other]}] =
+      assert [%{"reasons" => ["harness_process:" <> ^launch]}] =
                lifecycle_details(ctx.db, "rate_limit_hold_remains", hold_id)
 
       assert lifecycle_details(ctx.db, "rate_limit_admission_resumed", hold_id) == []
 
-      # The remaining incident clears: admission resumes, recorded on its own.
-      assert {:resolved, _} =
-               HarnessHealth.resolve(ctx.db, %{
-                 harness: "codex",
-                 host: "testhost",
-                 failure_class: "rate-limit-dead",
-                 observed_at: System.system_time(:millisecond),
-                 correlation_id: "c1-second-clears",
-                 cause: "normal turn delivered",
-                 principal: "process:tightbeam"
-               })
+      # The process settles and its park completes: admission resumes, as its
+      # own record, once.
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE harness_processes SET state='closed_gracefully',resolvedAt=?2 WHERE launchId=?1",
+          [launch, System.system_time(:millisecond)]
+        )
 
+      :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, {:codex, "shared", "testhost"})
       refute Tightbeam.HarnessProcess.parked?(ctx.db, {:codex, "shared", "testhost"})
 
-      assert [%{"cause" => "later_success"}] =
-               lifecycle_details(ctx.db, "rate_limit_admission_resumed", other)
+      assert [%{"cause" => "standing_reason_cleared", "releaseCause" => "recovery_probe"}] =
+               lifecycle_details(ctx.db, "rate_limit_admission_resumed", hold_id)
     end
 
     test "C2: after a probe release a pre-activity turn is redelivered once; a started turn never is",
@@ -4507,30 +4515,20 @@ defmodule Tightbeam.HarnessHealthTest do
     })
   end
 
-  # A second open rate-limit-dead incident on the same Codex key, as one
-  # stated fixture (two incidents can stand on a key; upstream's standing-
-  # reasons guard counts them).
-  defp second_open_codex_incident!(db, session_key) do
+  # A Codex adapter process on the key, being parked: a standing reason that
+  # keeps the fence (one stated fixture row).
+  defp parking_codex_process!(db) do
+    launch = "launch_c1_#{System.unique_integer([:positive])}"
     at = System.system_time(:millisecond)
-    incident = "hhi_c1_second_#{System.unique_integer([:positive])}"
-    observation = "hho_c1_second_#{System.unique_integer([:positive])}"
 
     {:ok, _} =
-      DB.transaction(db, fn txn ->
-        Tightbeam.DB.Txn.q(
-          txn,
-          "INSERT INTO harness_health_observations(id,correlationId,harness,host,failureClass,evidenceKind,sessionKey,observedAt,cause,principal,incidentId) VALUES(?1,?2,'codex','testhost','rate-limit-dead','terminal-failure',?5,?3,'fixture','process:test',?4)",
-          [observation, "c1-second-#{observation}", at, incident, session_key]
-        )
+      DB.query(
+        db,
+        "INSERT INTO harness_processes(launchId,adapterKey,harness,preset,host,helperPath,identityPath,launchSequence,state,createdAt,parkRequestedAt) VALUES(?1,'codex:shared@testhost','codex','default','testhost','/nonexistent/helper','/nonexistent/identity',1,'park_requested',?2,?2)",
+        [launch, at]
+      )
 
-        Tightbeam.DB.Txn.q(
-          txn,
-          "INSERT INTO harness_health_incidents(id,harness,host,failureClass,state,openedAt,openObservationId) VALUES(?1,'codex','testhost','rate-limit-dead','open',?2,?3)",
-          [incident, at, observation]
-        )
-      end)
-
-    incident
+    launch
   end
 
   defp started_work!(db, key, seq) do
