@@ -3991,7 +3991,8 @@ defmodule Tightbeam.GatewayTest do
                  evidence_kind: "authoritative-provider",
                  session_key: "k1",
                  assignment_id: "asg_sole_turn",
-                 observed_at: 95,
+                 # Within the attach window of the turn's own observation.
+                 observed_at: System.system_time(:millisecond),
                  cause: "rate-limit-dead",
                  principal: "process:tightbeam"
                })
