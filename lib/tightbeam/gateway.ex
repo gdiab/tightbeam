@@ -70,6 +70,7 @@ defmodule Tightbeam.Gateway do
     Assignments,
     ConditionFacts,
     FactProducers,
+    GrantAuth,
     CriticalLeases,
     Placement,
     DB,
@@ -183,6 +184,8 @@ defmodule Tightbeam.Gateway do
     :ok = Schema.ensure_all(db)
     :ok = AdminProjection.bootstrap_served(db, config.base_dir)
     :ok = TerminalCredentialFailure.reconcile_all(db)
+    # Core fix (A) C6a: boot reads the unfreeze file only to record and alert.
+    :ok = Tightbeam.PairingFreeze.observe_at_boot(db)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
@@ -1110,7 +1113,7 @@ defmodule Tightbeam.Gateway do
         end
       end,
       {"approve-device", ["device.approved"]} =>
-        admin_call_handler(db, fn call ->
+        protected_handler(db, fn call ->
           p = call.params
 
           case Devices.approve_with_firehose(db, p.device_id, p[:user_id], call) do
@@ -1118,20 +1121,29 @@ defmodule Tightbeam.Gateway do
               refusal
 
             d ->
-              %{approved: %{device_id: d.device_id, user_id: d.user_id, is_admin: d.is_admin}}
+              %{
+                approved: %{device_id: d.device_id, user_id: d.user_id, is_admin: d.is_admin},
+                pairing_freeze: "lifted"
+              }
           end
         end),
       {"deny-device", ["device.denied"]} =>
-        admin_call_handler(db, fn call ->
+        protected_handler(db, fn call ->
           p = call.params
-          Devices.deny_with_firehose(db, p.device_id, call)
-          %{denied: p.device_id}
+
+          case Devices.deny_with_firehose(db, p.device_id, call) do
+            :ok -> %{denied: p.device_id}
+            refusal -> refusal
+          end
         end),
       {"revoke-device", ["device.revoked"]} =>
-        admin_call_handler(db, fn call ->
+        protected_handler(db, fn call ->
           p = call.params
-          Devices.revoke_with_firehose(db, p.device_id, call)
-          %{revoked: p.device_id}
+
+          case Devices.revoke_with_firehose(db, p.device_id, call) do
+            :ok -> %{revoked: p.device_id}
+            refusal -> refusal
+          end
         end),
       {"host-env-set", ["host_env.updated"]} =>
         admin_call_handler(db, fn call ->
@@ -1349,15 +1361,16 @@ defmodule Tightbeam.Gateway do
           end
         end),
       {"register-host", ["host.registered"]} =>
-        admin_call_handler(db, fn call ->
+        protected_handler(db, fn call ->
           p = call.params
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
           # prepared the machine; this records the fact. The topology is the
-          # operator's to declare.
+          # operator's to declare: only an admin-paired device registers a host,
+          # and any other caller is refused before a row, proposal or push.
           previous_entry = Placement.hosts(config.base_dir, db)[p.name]
 
-          {:ok, registration} =
-            Placement.register_host_with_firehose(
+          with {:ok, registration} <-
+                 Placement.register_host_with_firehose(
               db,
               p.name,
               %{
@@ -1366,30 +1379,11 @@ defmodule Tightbeam.Gateway do
                 cli_bin: p[:cli_bin],
                 adapter_bin_dir: p[:adapter_bin_dir]
               },
-              call
-            )
-
-          entry = registration.entry
-
-          :ok = start_credential_child(config, db, p.name, previous_entry, entry)
-
-          # The operator who just assimilated this machine will run `onboard` ON
-          # it, and that shell has no session token. Provisioning is the gateway's
-          # because only the gateway knows its advertised url and the org token.
-          case Placement.provision_endpoint(
-                 config.base_dir,
-                 p.name,
-                 entry,
-                 provision_opts(config)
-               ) do
-            :ok ->
-              %{
-                host: StateResources.host(registration.projection),
-                changed: registration.changed
-              }
-
-            {:error, reason} ->
-              %{code: to_string(reason), message: endpoint_failure_message(reason, p.name)}
+                   call
+                 ) do
+            register_host_effects(config, db, p, previous_entry, registration)
+          else
+            {:refused, refusal} -> refusal
           end
         end),
       {"update-clients", []} =>
@@ -1448,7 +1442,7 @@ defmodule Tightbeam.Gateway do
         end),
       {"onboard", []} => admin_call_handler(db, fn call -> onboard_result(config, call) end),
       {"promote-user", ["user.promoted", "user.demoted"]} =>
-        admin_call_handler(db, fn call ->
+        protected_handler(db, fn call ->
           p = call.params
 
           result =
@@ -1460,7 +1454,7 @@ defmodule Tightbeam.Gateway do
           end
         end),
       {"add-user", ["user.added"]} =>
-        admin_call_handler(db, fn call ->
+        protected_handler(db, fn call ->
           p = call.params
 
           user = Devices.add_user_with_firehose(db, p.user_id, Map.get(p, :is_admin, false), call)
@@ -1471,7 +1465,7 @@ defmodule Tightbeam.Gateway do
           end
         end),
       {"users", []} => admin_call_handler(db, fn _call -> %{users: UserAdmin.list(db)} end),
-      {"remove-user", []} => fn call -> UserAdmin.remove(db, call) end,
+      {"remove-user", []} => protected_handler(db, fn call -> UserAdmin.remove(db, call) end),
       {"read-marker-set", ["read_marker.updated"]} => fn call ->
         read_marker_result(db, call, :set)
       end,
@@ -7232,6 +7226,43 @@ defmodule Tightbeam.Gateway do
       if admin_caller?(db, call),
         do: fun.(call.params),
         else: %{code: "forbidden", message: "admin required"}
+    end
+  end
+
+  # Core fix (A) C2: a protected act runs only for an admin-paired device. This
+  # refuses every other caller before the act; each act repeats the check inside
+  # its own transaction, so the check and the act are one transaction.
+  defp register_host_effects(config, db, p, previous_entry, registration) do
+    entry = registration.entry
+
+    :ok = start_credential_child(config, db, p.name, previous_entry, entry)
+
+    # The operator who just assimilated this machine will run `onboard` ON
+    # it, and that shell has no session token. Provisioning is the gateway's
+    # because only the gateway knows its advertised url and the org token.
+    case Placement.provision_endpoint(
+           config.base_dir,
+           p.name,
+           entry,
+           provision_opts(config)
+         ) do
+      :ok ->
+        %{
+          host: StateResources.host(registration.projection),
+          changed: registration.changed
+        }
+
+      {:error, reason} ->
+        %{code: to_string(reason), message: endpoint_failure_message(reason, p.name)}
+    end
+  end
+
+  defp protected_handler(db, fun) do
+    fn call ->
+      case GrantAuth.authorize(db, call) do
+        :ok -> fun.(call)
+        refusal -> refusal
+      end
     end
   end
 

@@ -12,7 +12,16 @@ defmodule Tightbeam.Devices do
   gateway-owned; prefix `tbt_`).
   """
 
-  alias Tightbeam.{AdminProjection, DB, StateResources, TerminalCredentialFailure, UserAdmin}
+  alias Tightbeam.{
+    AdminProjection,
+    DB,
+    GrantAuth,
+    PairingFreeze,
+    StateResources,
+    TerminalCredentialFailure,
+    UserAdmin
+  }
+
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -87,14 +96,21 @@ defmodule Tightbeam.Devices do
   end
 
   @doc """
-  Pair a device. Semantics (devices.ts `pair`) — all in ONE transaction:
-  - Known denied device → :denied. Known pending → {:pending, device}.
-  - Known allowlisted → rotate its token, {:paired, device}.
-  - Unknown device: user_id is slugged from claimed_name
-    (lowercase, non-alphanumerics → "-", trimmed; empty → "user"). If NO users
-    exist yet, the user bootstraps as admin and the device is allowlisted with
-    a fresh token ({:paired, _}); otherwise the device is pending with a nil
-    token ({:pending, _}) — including new devices claiming an EXISTING user.
+  Pair a device (core-v8 C6, C6a). The unfreeze file is read in this handling step
+  and the observation is recorded in the pairing transaction.
+
+  While FROZEN every request is refused `pairing_frozen` and nothing is created or
+  changed: no user, no device row, no token, no status change.
+
+  While LIFTED only new devices pair:
+  - an unknown device goes pending (its claimed user is created non-admin), and a
+    pending device stays pending;
+  - an approved device collects its uncollected token once; the token is marked
+    collected in the same transaction;
+  - a device whose token is collected gets `already_paired`, and nothing changes;
+  - a revoked device (allowlisted, no token) is set pending again;
+  - a denied device stays denied, and a removed user's device gets `user_removed`;
+  - the cold start (no user at all) is refused `pairing_frozen`, lifted or not.
   """
   @spec pair(db(), %{
           device_id: String.t(),
@@ -103,67 +119,95 @@ defmodule Tightbeam.Devices do
           model: String.t() | nil
         }) :: pair_outcome()
   def pair(db \\ Tightbeam.DB, input) do
+    freeze = PairingFreeze.read()
+
     transaction!(db, fn txn ->
       device_id = Map.fetch!(input, :device_id)
+      :ok = PairingFreeze.observe_in_txn(txn, freeze)
 
-      case select_device(txn, "d.deviceId = ?1", [device_id]) do
-        [row] ->
-          case to_device(row) do
-            # A removed user's device obtains no token, whatever its status.
-            %{user_removed: true} ->
-              {:refused, "user_removed"}
-
-            %{status: "denied"} ->
-              :denied
-
-            %{status: "pending"} = device ->
-              {:pending, device}
-
-            %{status: "allowlisted"} ->
-              updated_at = now()
-
-              Txn.q(txn, "UPDATE devices SET token = ?2 WHERE deviceId = ?1", [
-                device_id,
-                mint_token()
-              ])
-
-              stamp_device_in_txn(txn, device_id, updated_at)
-
-              {:paired, must_get(txn, device_id)}
-          end
-
-        [] ->
-          claimed_name = Map.fetch!(input, :claimed_name)
-          user_id = slug_user_id(claimed_name)
-
-          if UserAdmin.removed_in_txn?(txn, user_id) do
-            {:refused, "user_removed"}
-          else
-            pair_new_device(txn, input, device_id, claimed_name, user_id)
-          end
+      if freeze.lifted do
+        outcome = pair_lifted_in_txn(txn, input, device_id)
+        PairingFreeze.record_use_in_txn(txn, freeze, "pair_request", device_id, label(outcome))
+        outcome
+      else
+        {:refused, "pairing_frozen"}
       end
     end)
   end
 
+  defp pair_lifted_in_txn(txn, input, device_id) do
+    case select_device(txn, "d.deviceId = ?1", [device_id]) do
+      [row] ->
+        case to_device(row) do
+          # A removed user's device obtains no token, whatever its status.
+          %{user_removed: true} ->
+            {:refused, "user_removed"}
+
+          %{status: "denied"} ->
+            :denied
+
+          %{status: "pending"} = device ->
+            {:pending, device}
+
+          # Revoked: no token is re-minted; it returns only through a fresh approval.
+          %{status: "allowlisted", token: nil} ->
+            Txn.q(txn, "UPDATE devices SET status = 'pending' WHERE deviceId = ?1", [device_id])
+            stamp_device_in_txn(txn, device_id, now())
+            {:pending, must_get(txn, device_id)}
+
+          %{status: "allowlisted"} ->
+            case Txn.q(txn, "SELECT tokenCollected FROM devices WHERE deviceId = ?1", [device_id]) do
+              [[0]] ->
+                Txn.q(txn, "UPDATE devices SET tokenCollected = 1 WHERE deviceId = ?1", [
+                  device_id
+                ])
+
+                stamp_device_in_txn(txn, device_id, now())
+                {:paired, must_get(txn, device_id)}
+
+              [[1]] ->
+                {:refused, "already_paired"}
+            end
+        end
+
+      [] ->
+        claimed_name = Map.fetch!(input, :claimed_name)
+        user_id = slug_user_id(claimed_name)
+
+        cond do
+          # The cold start is never lifted: whoever can create the file could
+          # otherwise mint the first admin device with no approval.
+          Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]] ->
+            {:refused, "pairing_frozen"}
+
+          UserAdmin.removed_in_txn?(txn, user_id) ->
+            {:refused, "user_removed"}
+
+          true ->
+            pair_new_device(txn, input, device_id, claimed_name, user_id)
+        end
+    end
+  end
+
+  defp label({:paired, _}), do: "paired"
+  defp label({:pending, _}), do: "pending"
+  defp label(:denied), do: "denied"
+  defp label({:refused, reason}), do: reason
+
   defp pair_new_device(txn, input, device_id, claimed_name, user_id) do
-    first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
     ensure_user(txn, user_id)
-    status = if first_ever?, do: "allowlisted", else: "pending"
-    token = if first_ever?, do: mint_token(), else: nil
 
     Txn.q(
       txn,
       """
         INSERT INTO devices
           (deviceId, userId, claimedName, status, token, platform, model, createdAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?5, ?6)
       """,
       [
         device_id,
         user_id,
         claimed_name,
-        status,
-        token,
         Map.fetch!(input, :platform),
         Map.fetch!(input, :model),
         now()
@@ -172,7 +216,7 @@ defmodule Tightbeam.Devices do
 
     device = must_get(txn, device_id)
     stamp_device_in_txn(txn, device_id, device.created_at)
-    if first_ever?, do: {:paired, device}, else: {:pending, device}
+    {:pending, device}
   end
 
   @doc """
@@ -232,28 +276,51 @@ defmodule Tightbeam.Devices do
   end
 
   @doc false
-  # Returns the approved device, or the `user_removed` refusal map when the
-  # device's user (or the override user) was removed; a refusal writes nothing.
+  # C2 then C6/C6a, in the approval's own transaction: only an admin-paired device
+  # approves, only while the freeze is lifted, and only a pending device. The token
+  # is minted uncollected; the device collects it on its next pair_request. A
+  # refusal changes no device or user.
   def approve_with_firehose(db, device_id, user_id, call) do
+    freeze = PairingFreeze.read()
+
     transaction!(db, fn txn ->
-      device = must_get(txn, device_id)
-      target = user_id || device.user_id
+      with :ok <- GrantAuth.authorize_in_txn(txn, call),
+           :ok <- PairingFreeze.observe_in_txn(txn, freeze),
+           :ok <- if(freeze.lifted, do: :ok, else: PairingFreeze.frozen_refusal()) do
+        device = must_get(txn, device_id)
+        target = user_id || device.user_id
 
-      if UserAdmin.removed_in_txn?(txn, target) do
-        UserAdmin.removed_refusal(target)
-      else
-        if user_id, do: ensure_user(txn, user_id)
+        outcome =
+          cond do
+            UserAdmin.removed_in_txn?(txn, target) ->
+              UserAdmin.removed_refusal(target)
 
-        Txn.q(
-          txn,
-          "UPDATE devices SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3 WHERE deviceId = ?1",
-          [device_id, user_id, mint_token()]
-        )
+            device.status != "pending" ->
+              %{
+                code: "device_not_pending",
+                message:
+                  "#{device_id} is #{device.status}; only a pending device can be approved. " <>
+                    "A revoked device returns to pending when it next asks to pair."
+              }
 
-        stamp_device_in_txn(txn, device_id, now())
-        device = firehose_device_in_txn(txn, device_id)
-        Publisher.maybe_accepted_in_txn(txn, call, %{device: device})
-        device
+            true ->
+              if user_id, do: ensure_user(txn, user_id)
+
+              Txn.q(
+                txn,
+                "UPDATE devices SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3, tokenCollected = 0 WHERE deviceId = ?1",
+                [device_id, user_id, mint_token()]
+              )
+
+              stamp_device_in_txn(txn, device_id, now())
+              device = firehose_device_in_txn(txn, device_id)
+              Publisher.maybe_accepted_in_txn(txn, call, %{device: device})
+              device
+          end
+
+        result = if match?(%{code: _}, outcome), do: outcome.code, else: "approved"
+        PairingFreeze.record_use_in_txn(txn, freeze, "approve-device", device_id, result)
+        outcome
       end
     end)
   end
@@ -277,18 +344,24 @@ defmodule Tightbeam.Devices do
   @doc false
   def deny_with_firehose(db, device_id, call) do
     transaction!(db, fn txn ->
-      must_get(txn, device_id)
-
-      Txn.q(txn, "UPDATE devices SET status = 'denied', token = NULL WHERE deviceId = ?1", [
-        device_id
-      ])
-
-      stamp_device_in_txn(txn, device_id, now())
-
-      Publisher.maybe_accepted_in_txn(txn, call, %{device: firehose_device_in_txn(txn, device_id)})
-
-      :ok
+      with :ok <- GrantAuth.authorize_in_txn(txn, call) do
+        deny_in_txn(txn, device_id, call)
+      end
     end)
+  end
+
+  defp deny_in_txn(txn, device_id, call) do
+    must_get(txn, device_id)
+
+    Txn.q(txn, "UPDATE devices SET status = 'denied', token = NULL WHERE deviceId = ?1", [
+      device_id
+    ])
+
+    stamp_device_in_txn(txn, device_id, now())
+
+    Publisher.maybe_accepted_in_txn(txn, call, %{device: firehose_device_in_txn(txn, device_id)})
+
+    :ok
   end
 
   @doc "Revoke a device's token (status unchanged — it re-pairs). Raises on unknown device."
@@ -305,13 +378,17 @@ defmodule Tightbeam.Devices do
   @doc false
   def revoke_with_firehose(db, device_id, call) do
     transaction!(db, fn txn ->
-      must_get(txn, device_id)
-      Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
-      stamp_device_in_txn(txn, device_id, now())
+      with :ok <- GrantAuth.authorize_in_txn(txn, call) do
+        must_get(txn, device_id)
+        Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
+        stamp_device_in_txn(txn, device_id, now())
 
-      Publisher.maybe_accepted_in_txn(txn, call, %{device: firehose_device_in_txn(txn, device_id)})
+        Publisher.maybe_accepted_in_txn(txn, call, %{
+          device: firehose_device_in_txn(txn, device_id)
+        })
 
-      :ok
+        :ok
+      end
     end)
   end
 
@@ -352,14 +429,21 @@ defmodule Tightbeam.Devices do
   # refusal map and writes nothing.
   def add_user_with_firehose(db, user_id, is_admin, call) do
     transaction!(db, fn txn ->
-      if UserAdmin.removed_in_txn?(txn, user_id) do
-        UserAdmin.removed_refusal(user_id)
-      else
-        insert_user(txn, user_id, is_admin)
-        user = StateResources.query_user(txn, user_id)
-        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-        Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
-        user
+      authorized = GrantAuth.authorize_in_txn(txn, call)
+
+      cond do
+        authorized != :ok ->
+          authorized
+
+        UserAdmin.removed_in_txn?(txn, user_id) ->
+          UserAdmin.removed_refusal(user_id)
+
+        true ->
+          insert_user(txn, user_id, is_admin)
+          user = StateResources.query_user(txn, user_id)
+          :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+          Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
+          user
       end
     end)
   end
@@ -373,34 +457,40 @@ defmodule Tightbeam.Devices do
   # `user_removed` refusal map and writes nothing.
   def promote_user_with_firehose(db, user_id, is_admin, call) do
     transaction!(db, fn txn ->
-      user = must_get_user(txn, user_id)
-      desired = !!is_admin
-
-      cond do
-        not is_nil(user.removed_at) ->
-          UserAdmin.removed_refusal(user_id)
-
-        user.stored_admin == desired ->
-          :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-          Publisher.maybe_observed_accepted_in_txn(txn, call)
-          %{user: StateResources.query_user(txn, user_id), changed: false}
-
-        true ->
-          Txn.q(txn, "UPDATE users SET isAdmin = ?2 WHERE userId = ?1", [
-            user_id,
-            if(desired, do: 1, else: 0)
-          ])
-
-          updated_at = System.system_time(:millisecond)
-          AdminProjection.allocate_in_txn(txn, "users", user_id, updated_at)
-          projection = StateResources.query_user(txn, user_id)
-          :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-          Publisher.maybe_observed_accepted_in_txn(txn, call)
-          class = if desired, do: "user.promoted", else: "user.demoted"
-          Publisher.committed_in_txn(txn, class, projection, %{"userId" => user_id})
-          %{user: projection, changed: true}
+      with :ok <- GrantAuth.authorize_in_txn(txn, call) do
+        promote_in_txn(txn, user_id, is_admin, call)
       end
     end)
+  end
+
+  defp promote_in_txn(txn, user_id, is_admin, call) do
+    user = must_get_user(txn, user_id)
+    desired = !!is_admin
+
+    cond do
+      not is_nil(user.removed_at) ->
+        UserAdmin.removed_refusal(user_id)
+
+      user.stored_admin == desired ->
+        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+        Publisher.maybe_observed_accepted_in_txn(txn, call)
+        %{user: StateResources.query_user(txn, user_id), changed: false}
+
+      true ->
+        Txn.q(txn, "UPDATE users SET isAdmin = ?2 WHERE userId = ?1", [
+          user_id,
+          if(desired, do: 1, else: 0)
+        ])
+
+        updated_at = System.system_time(:millisecond)
+        AdminProjection.allocate_in_txn(txn, "users", user_id, updated_at)
+        projection = StateResources.query_user(txn, user_id)
+        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+        Publisher.maybe_observed_accepted_in_txn(txn, call)
+        class = if desired, do: "user.promoted", else: "user.demoted"
+        Publisher.committed_in_txn(txn, class, projection, %{"userId" => user_id})
+        %{user: projection, changed: true}
+    end
   end
 
   @doc "Set a user's admin bit (the promote-user verb's write). Raises on unknown user."

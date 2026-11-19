@@ -71,7 +71,8 @@ defmodule Tightbeam.UserAdmin do
 
     {:ok, result} =
       DB.transaction(db, fn txn ->
-        with {:ok, actor} <- acting_admin(txn, principal),
+        with :ok <- Tightbeam.GrantAuth.authorize_in_txn(txn, call),
+             {:ok, actor} <- acting_admin(txn, principal),
              {:ok, user} <- target_in_txn(txn, target),
              :ok <- not_self(actor, target),
              :ok <- not_last_admin(txn, user),

@@ -24,3 +24,10 @@ config :tightbeam, :local_host_name, "testhost"
 config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp
 config :tightbeam, :port, 0
+
+# Core fix (A) C6a: tests point the unfreeze-file reader at fixtures. Only this
+# environment compiles the override; by default the hatch reads a path that does
+# not exist, so every test starts frozen and never reads the host's /etc.
+config :tightbeam,
+  pairing_unfreeze_path_override: true,
+  pairing_unfreeze_path: "/nonexistent/tightbeam-test/pairing-unfreeze"
