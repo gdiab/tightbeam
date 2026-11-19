@@ -3548,20 +3548,37 @@ defmodule Tightbeam.Wakes do
         0
 
       Ledger.enqueueable_in_txn?(txn, session_key) ->
-        enqueue_health_redelivery_in_txn(
-          txn,
-          idempotency_key,
-          session_key,
-          message_id,
-          origin,
-          prompt,
-          role_ref,
-          role_fallback,
-          assignment_id,
-          job_ref,
-          request_ref,
-          restoration_turn_seq
-        )
+        case Ledger.enqueue_in_txn(txn, %{
+               session_key: session_key,
+               message_id: message_id,
+               origin: origin,
+               prompt: prompt,
+               role_ref: role_ref,
+               role_fallback: role_fallback == 1,
+               assignment_id: assignment_id,
+               job_ref: job_ref,
+               request_ref: request_ref
+             }) do
+          {:ok, redelivery_turn_seq} ->
+            Txn.q(
+              txn,
+              """
+              UPDATE health_redelivery_attempts
+              SET restorationTurnSeq=?2,redeliveryTurnSeq=?3
+              WHERE idempotencyKey=?1 AND redeliveryTurnSeq IS NULL
+              """,
+              [idempotency_key, restoration_turn_seq, redelivery_turn_seq]
+            )
+
+            if Txn.changes(txn) != 1,
+              do: raise("health redelivery attempt lost its enqueue")
+
+            Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
+            1
+
+          {:error, :no_session} ->
+            0
+        end
 
       true ->
         0
@@ -3574,53 +3591,6 @@ defmodule Tightbeam.Wakes do
       "SELECT 1 FROM health_redelivery_attempts WHERE idempotencyKey=?1 AND failureClass='rate-limit-dead'",
       [idempotency_key]
     ) == [[1]]
-  end
-
-  defp enqueue_health_redelivery_in_txn(
-         txn,
-         idempotency_key,
-         session_key,
-         message_id,
-         origin,
-         prompt,
-         role_ref,
-         role_fallback,
-         assignment_id,
-         job_ref,
-         request_ref,
-         restoration_turn_seq
-       ) do
-    case Ledger.enqueue_in_txn(txn, %{
-           session_key: session_key,
-           message_id: message_id,
-           origin: origin,
-           prompt: prompt,
-           role_ref: role_ref,
-           role_fallback: role_fallback == 1,
-           assignment_id: assignment_id,
-           job_ref: job_ref,
-           request_ref: request_ref
-         }) do
-      {:ok, redelivery_turn_seq} ->
-        Txn.q(
-          txn,
-          """
-          UPDATE health_redelivery_attempts
-          SET restorationTurnSeq=?2,redeliveryTurnSeq=?3
-          WHERE idempotencyKey=?1 AND redeliveryTurnSeq IS NULL
-          """,
-          [idempotency_key, restoration_turn_seq, redelivery_turn_seq]
-        )
-
-        if Txn.changes(txn) != 1,
-          do: raise("health redelivery attempt lost its enqueue")
-
-        Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
-        1
-
-      {:error, :no_session} ->
-        0
-    end
   end
 
   defp health_redelivery_key(session_key, source_turn_seq) do
