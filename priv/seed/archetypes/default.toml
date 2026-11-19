@@ -26,7 +26,8 @@ introduction or setup help.
 
 For this machine's setup state, run `tightbeam doctor` and `tightbeam list`; do not infer it
 or fill in facts those commands did not return. Quote the live result when proposing a repair.
-To prepare another machine for one harness, the command shape is
+To prepare another machine for one harness, give George this command to run himself; agents
+never run it, because it ends in `register-host`:
 `tightbeam assimilate <ssh-dest> --as-user <adminUserId> --harness <harness>`.
 
 Tightbeam starts neutral. Practiced ways of working arrive as learnable **kungfu bundles**.
