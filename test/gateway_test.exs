@@ -3982,6 +3982,84 @@ defmodule Tightbeam.GatewayTest do
       assert turn_count(ctx.db, repair.assignment_id) == 2
     end
 
+    test "B5: an explicit resume itself re-admits a sole pre-activity message turn exactly once",
+         ctx do
+      session = Org.get(ctx.db, "k1")
+
+      {:ok, []} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO assignments
+            (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+          VALUES ('asg_sole_turn','held work','k1','flynn',1,'open',?1,?2)
+          """,
+          [session.harness, session.provider]
+        )
+
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: "k1",
+          message_id: "m-sole-turn",
+          origin: "agent:k1",
+          prompt: "held work",
+          assignment_id: "asg_sole_turn"
+        })
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "sole-turn")
+
+      limit = %{
+        "code" => -32_603,
+        "data" => %{"errorKind" => "rate_limit"},
+        "message" => "Rate limit"
+      }
+
+      {:ok, _} =
+        DB.transaction(ctx.db, fn txn ->
+          assert Ledger.finish_in_txn(txn, seq, "failed", "Rate limit",
+                   owner_lease: turn.owner_lease
+                 )
+
+          HarnessHealth.observe_turn_failure_in_txn(
+            txn,
+            session,
+            Map.put(turn, :session_key, "k1"),
+            :prompt,
+            limit
+          )
+        end)
+
+      assert {:opened, _incident} =
+               HarnessHealth.observe(ctx.db, %{
+                 correlation_id: "route-sole-turn",
+                 harness: session.harness,
+                 host: session.host,
+                 failure_class: "rate-limit-dead",
+                 evidence_kind: "authoritative-provider",
+                 session_key: "k1",
+                 assignment_id: "asg_sole_turn",
+                 observed_at: 95,
+                 cause: "rate-limit-dead",
+                 principal: "process:tightbeam"
+               })
+
+      handler = resume_handler(ctx, :ok)
+
+      # The resume's release re-admits the turn; its own rerun then finds it
+      # already redelivered, so the turn is queued exactly once.
+      assert %{ok: true, park: "released", rerun: %{"state" => "none", "reason" => "superseded"}} =
+               handler.(resume_call({:user, "flynn"}, "asg_sole_turn", "sole-turn", ctx.lane))
+
+      assert {:ok, [["queued"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status FROM turns WHERE messageId='m-sole-turn' AND seq>?1",
+                 [seq]
+               )
+
+      assert turn_count(ctx.db, "asg_sole_turn") == 2
+    end
+
     test "A1: a covered assignment with no eligible turn still reports the release, with ok:true",
          ctx do
       %{assignment_id: id, incident: incident} = covered_assignment!(ctx, "asg_no_turn", "k1")

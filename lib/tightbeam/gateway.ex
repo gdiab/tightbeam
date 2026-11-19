@@ -2286,7 +2286,8 @@ defmodule Tightbeam.Gateway do
             txn,
             incident.id,
             to_string(session.harness),
-            session.host
+            session.host,
+            readmit: true
           )
 
           "released"
