@@ -22,7 +22,7 @@ defmodule Tightbeam.Acp.Adapter do
   use GenServer
   require Logger
   alias Tightbeam.{ErrorDiagnostic, Harness, Model}
-  alias Tightbeam.Acp.{Conn, ContextUsage}
+  alias Tightbeam.Acp.{Conn, ContextUsage, TurnActivity}
 
   # Boot may spend 60s initializing ACP before the separate 120s gate
   # deadline starts. Residency calls queue behind handle_continue, so their
@@ -32,6 +32,7 @@ defmodule Tightbeam.Acp.Adapter do
   # explicit `:timeout` gets an absolute deadline; only the owning connection
   # may escalate after that cancellation fails.
   @prompt_timeout :infinity
+  @cancel_grace_ms 60_000
   @prompt_cancel_grace 5_000
   @prompt_reply_margin 2_000
   @gate_marker "[gate: tightbeam-probe]"
@@ -63,6 +64,9 @@ defmodule Tightbeam.Acp.Adapter do
     :on_guidance,
     :on_guidance_verified,
     :on_subagent_event,
+    :on_cancel_unanswered,
+    settle_grace_ms: 60_000,
+    quiet_bound_ms: 300_000,
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
@@ -79,7 +83,9 @@ defmodule Tightbeam.Acp.Adapter do
     operation_queue: [],
     context_usage: %{},
     tool_turns: %{},
-    pending_tool_calls: %{}
+    pending_tool_calls: %{},
+    # Stale-turn v1.1: per-session turn liveness of the pending prompt (R3).
+    turn_activity: %{}
   ]
 
   ## Client
@@ -414,6 +420,28 @@ defmodule Tightbeam.Acp.Adapter do
   @spec conn(adapter()) :: pid()
   def conn(adapter), do: GenServer.call(adapter, :conn)
 
+  @doc "Cancel grace G (stale-turn v1.1 §1): how long a sent cancel waits for P's response."
+  def cancel_grace_ms, do: @cancel_grace_ms
+
+  @doc """
+  Turn liveness of `sid`'s pending prompt `request_id` (stale-turn v1.1 R3):
+  `{:ok, %{live: boolean, settling: boolean, open_tool_calls, quiet_ms,
+  turn_end_reported}}`, or `{:error, :not_pending}` when that prompt is not
+  pending here. A lane task or a pending Conn entry is never liveness.
+  """
+  def prompt_liveness(adapter, sid, request_id),
+    do: call(adapter, {:prompt_liveness, sid, request_id}, 5_000)
+
+  @doc """
+  Settle `sid`'s pending prompt `request_id` (stale-turn v1.1 R6/R8): send the
+  supported `session/cancel`, then wait G. A response with a stop reason other
+  than `cancelled` settles the turn normally; `cancelled`, an error, or no
+  response within G ends it as `{:unknown_effect, cause, detail}`.
+  Idempotent while the settle runs.
+  """
+  def settle_prompt_unknown(adapter, sid, request_id, cause, detail \\ %{}),
+    do: call(adapter, {:settle_prompt_unknown, sid, request_id, cause, detail}, 5_000)
+
   ## Server
 
   @impl true
@@ -512,7 +540,10 @@ defmodule Tightbeam.Acp.Adapter do
       on_auth_event: Keyword.get(opts, :on_auth_event),
       on_guidance: Keyword.get(opts, :on_guidance),
       on_guidance_verified: Keyword.get(opts, :on_guidance_verified),
-      on_subagent_event: Keyword.get(opts, :on_subagent_event)
+      on_subagent_event: Keyword.get(opts, :on_subagent_event),
+      on_cancel_unanswered: Keyword.get(opts, :on_cancel_unanswered),
+      settle_grace_ms: Keyword.get(opts, :settle_grace_ms, @cancel_grace_ms),
+      quiet_bound_ms: Keyword.get(opts, :quiet_bound_ms, TurnActivity.w_ms())
     }
 
     # A binary that cannot execute still opens the port (the spawn is `sh -c`),
@@ -768,6 +799,40 @@ defmodule Tightbeam.Acp.Adapter do
 
       {:noreply, next} ->
         drain_operations(next)
+    end
+  end
+
+  defp session_call({:prompt_liveness, sid, request_id}, _from, state) do
+    case {state.prompts[sid], state.turn_activity[sid]} do
+      {%{request_id: ^request_id} = prompt, %{} = activity} ->
+        now = now_ms()
+        open = open_tool_calls(state, sid)
+
+        {:reply,
+         {:ok,
+          %{
+            live: TurnActivity.live?(activity, now, open, state.quiet_bound_ms),
+            settling: Map.has_key?(prompt, :settling),
+            open_tool_calls: open,
+            quiet_ms: now - TurnActivity.last_advance(activity),
+            turn_end_reported: not is_nil(activity.turn_end_at)
+          }}, state}
+
+      _ ->
+        {:reply, {:error, :not_pending}, state}
+    end
+  end
+
+  defp session_call({:settle_prompt_unknown, sid, request_id, cause, detail}, _from, state) do
+    case state.prompts[sid] do
+      %{request_id: ^request_id, settling: _} ->
+        {:reply, {:ok, :settling}, state}
+
+      %{request_id: ^request_id} when not is_nil(request_id) ->
+        {:reply, {:ok, :settling}, begin_settle(state, sid, cause, detail)}
+
+      _ ->
+        {:reply, {:error, :not_pending}, state}
     end
   end
 
@@ -1490,6 +1555,7 @@ defmodule Tightbeam.Acp.Adapter do
         # A local capacity refusal has not changed the receiver history.
         state = %{state | context_usage: Map.delete(state.context_usage, sid)}
         state = put_in(state.prompts[sid].request_id, request_id)
+        state = put_in(state.turn_activity[sid], TurnActivity.new(now_ms()))
 
         case trace_dispatch(opts, request_id) do
           :ok ->
@@ -1580,6 +1646,7 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_info({:acp_notification, "session/update", params}, state) do
     sid = params["sessionId"]
     update = params["update"] || %{}
+    state = observe_turn_activity(state, sid, update)
     maybe_emit_account_update(state, update)
     state = maybe_emit_subagent_event(state, sid, update)
     state = emit_progress(state, sid, update)
@@ -1652,7 +1719,39 @@ defmodule Tightbeam.Acp.Adapter do
     do: {:noreply, state}
 
   def handle_info({:prompt_done, sid, from, result}, state) do
-    settle_prompt(state, sid, from, result)
+    case state.prompts[sid] do
+      # Stale-turn v1.1 R6/R8: a prompt being settled after its cancel. A
+      # response with a stop reason other than cancelled decides the outcome
+      # (the harness answered); cancelled, or an error, is an unknown effect.
+      %{from: ^from, settling: %{cause: cause, detail: detail}} ->
+        result =
+          case result do
+            {:ok, %{"stopReason" => stop}} when is_binary(stop) and stop != "cancelled" ->
+              result
+
+            _ ->
+              {:error, {:unknown_effect, cause, detail}}
+          end
+
+        settle_prompt(state, sid, from, result)
+
+      _ ->
+        settle_prompt(state, sid, from, result)
+    end
+  end
+
+  # Stale-turn v1.1 R7: no response within G of the cancel. Stop waiting: the
+  # worker's death leaves P in Conn only as an orphan (its late answer is
+  # quiescence evidence, nothing more), and the turn ends as an unknown effect.
+  def handle_info({:settle_grace_expired, sid, ref}, state) do
+    case state.prompts[sid] do
+      %{from: from, settling: %{ref: ^ref, cause: cause, detail: detail}} ->
+        emit_settle_unanswered(state, sid, cause)
+        settle_prompt(state, sid, from, {:error, {:unknown_effect, cause, detail}})
+
+      _ ->
+        {:noreply, state}
+    end
   end
 
   defp settle_prompt(state, sid, from, result) do
@@ -1691,7 +1790,8 @@ defmodule Tightbeam.Acp.Adapter do
     state = %{
       state
       | prompts: Map.delete(state.prompts, sid),
-        chunks: Map.delete(state.chunks, sid)
+        chunks: Map.delete(state.chunks, sid),
+        turn_activity: Map.delete(state.turn_activity, sid)
     }
 
     next_prompt(state, sid)
@@ -1727,6 +1827,54 @@ defmodule Tightbeam.Acp.Adapter do
 
     Process.demonitor(ref, [:flush])
   end
+
+  # The supported cancel, sent only for P's session; the Conn entry is left
+  # as it is, so a normal answer still decides the outcome (R6).
+  defp begin_settle(state, sid, cause, detail) do
+    Conn.notify(state.conn, "session/cancel", %{sessionId: sid})
+    ref = make_ref()
+    Process.send_after(self(), {:settle_grace_expired, sid, ref}, state.settle_grace_ms)
+    put_in(state.prompts[sid][:settling], %{ref: ref, cause: cause, detail: detail})
+  end
+
+  defp emit_settle_unanswered(state, sid, cause) do
+    Logger.warning("acp cancel unanswered within grace session=#{sid} cause=#{cause}")
+
+    if is_function(state.on_cancel_unanswered, 2),
+      do: state.on_cancel_unanswered.(sid, cause)
+
+    :ok
+  end
+
+  defp observe_turn_activity(state, sid, update) when is_binary(sid) and is_map(update) do
+    root = Map.get(state.subagent_roots, sid, sid)
+
+    case state.turn_activity[root] do
+      %{} = activity ->
+        module = Harness.module!(state.harness)
+        turn_end? = &turn_end_report?(module, &1)
+
+        put_in(
+          state.turn_activity[root],
+          TurnActivity.observe(activity, update, now_ms(), turn_end?)
+        )
+
+      nil ->
+        state
+    end
+  end
+
+  defp observe_turn_activity(state, _sid, _update), do: state
+
+  defp turn_end_report?(module, update) do
+    Code.ensure_loaded(module)
+    function_exported?(module, :turn_end_report?, 1) and module.turn_end_report?(update)
+  end
+
+  defp open_tool_calls(state, sid),
+    do: Enum.count(state.pending_tool_calls, fn {{root, _id}, _pending} -> root == sid end)
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
 
   defp teardown_prompt_connection(state, cause_sid, cause) do
     # A PID is a generation identity. Never resolve a name here: a late

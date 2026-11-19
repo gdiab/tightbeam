@@ -121,9 +121,41 @@ defmodule Tightbeam.StaleTurnSettlement do
                    1_000
                  ) do
             case probe do
-              {:live, _request_id} -> error("turn_live", "the provider request is live")
-              :absent -> commit(db, request, correlation, valid?)
-              {:unknown, _reason} -> ambiguous()
+              # Stale-turn v1.1 R8: a pending Conn entry is not liveness. With no
+              # lane task to wait on it, a turn that is not live (R3) is
+              # cancelled at its harness and committed as an unknown effect here.
+              {:live, _request_id} ->
+                sid = correlation.harness_session_id
+                request_id = correlation.acp_request_id
+
+                case Adapter.prompt_liveness(adapter, sid, request_id) do
+                  {:ok, %{live: true}} ->
+                    error(
+                      "turn_live",
+                      "the turn's harness is live: turn activity within the last 5 minutes or a tool call open"
+                    )
+
+                  _ ->
+                    _ =
+                      Adapter.settle_prompt_unknown(
+                        adapter,
+                        sid,
+                        request_id,
+                        "operator_settle",
+                        %{
+                          principal: request.principal,
+                          reason: request.reason
+                        }
+                      )
+
+                    commit(db, request, correlation, valid?, :unknown_effect)
+                end
+
+              :absent ->
+                commit(db, request, correlation, valid?)
+
+              {:unknown, _reason} ->
+                ambiguous()
             end
           else
             {:error, %{code: _} = refusal} -> {:error, refusal}
@@ -153,6 +185,98 @@ defmodule Tightbeam.StaleTurnSettlement do
       other ->
         other
     end
+  end
+
+  @doc """
+  Stale-turn v1.1 R8: settle-turn for the lane's current turn while its lane
+  task holds it. A lane task or a pending Conn entry is not liveness; only R3
+  is. IF P's harness turn is live, refuse `turn_live`. Otherwise settle it
+  through the adapter: one `session/cancel`, then G. The terminal (an unknown
+  effect, cause `operator_settle`, with the requesting principal and reason)
+  is committed by the lane when the adapter ends the prompt, so this answers
+  `status: "settling"`. If P is no longer pending on its adapter, its
+  transport is gone and the turn is already settling by itself (R4).
+  """
+  @spec settle_held(DB.server(), request()) :: {:ok, map()} | {:error, map()}
+  def settle_held(db, request) do
+    case preliminary(db, request) do
+      {:ok, %{adapter_gen: adapter_gen, harness: harness, host: host}} ->
+        key = {Harness.parse!(harness).id(), "shared", host}
+
+        callback = fn adapter, _connection_generation, coordinator_fence_valid? ->
+          with :ok <- require_fence(coordinator_fence_valid?),
+               {:ok, correlation} <- correlation(db, request, adapter_gen) do
+            sid = correlation.harness_session_id
+            request_id = correlation.acp_request_id
+
+            case Tightbeam.Acp.Adapter.prompt_liveness(adapter, sid, request_id) do
+              {:ok, %{live: true}} ->
+                error(
+                  "turn_live",
+                  "the turn's harness is live: turn activity within the last 5 minutes or a tool call open"
+                )
+
+              {:ok, %{live: false}} ->
+                detail = %{principal: request.principal, reason: request.reason}
+
+                case Tightbeam.Acp.Adapter.settle_prompt_unknown(
+                       adapter,
+                       sid,
+                       request_id,
+                       "operator_settle",
+                       detail
+                     ) do
+                  {:ok, :settling} -> {:ok, settling(request, "operator_settle")}
+                  {:error, :not_pending} -> {:ok, settling(request, "harness_exited")}
+                  _ -> ambiguous()
+                end
+
+              {:error, :not_pending} ->
+                {:ok, settling(request, "harness_exited")}
+
+              _ ->
+                ambiguous()
+            end
+          else
+            {:error, %{code: _} = refusal} -> {:error, refusal}
+            _ -> ambiguous()
+          end
+        end
+
+        owner_scope = %{lane_pid: self(), gateway_pid: request.gateway_pid, callback: callback}
+
+        case AdapterCoordinator.with_generation_fence(
+               Tightbeam.AdapterCoordinator,
+               key,
+               adapter_gen,
+               owner_scope
+             ) do
+          {:ok, result} -> result
+          # The turn's adapter generation is gone: its transport is lost and
+          # the lane task's prompt ends by itself as harness_exited (R4).
+          {:error, _reason} -> {:ok, settling(request, "harness_exited")}
+        end
+
+      {:terminal, result} ->
+        {:ok, result}
+
+      other ->
+        other
+    end
+  end
+
+  defp settling(request, cause) do
+    %{
+      session_key: request.session_key,
+      turn_seq: request.turn_seq,
+      status: "settling",
+      cause: cause,
+      grace_ms: Tightbeam.Acp.Adapter.cancel_grace_ms(),
+      won: false,
+      replayed: false,
+      message_id: nil,
+      stored_error: nil
+    }
   end
 
   defp preliminary(db, request) do
@@ -227,10 +351,10 @@ defmodule Tightbeam.StaleTurnSettlement do
     end
   end
 
-  defp commit(db, request, correlation, valid?) do
+  defp commit(db, request, correlation, valid?, terminal \\ :operator) do
     case DB.transaction_then(
            db,
-           fn txn -> commit_in_txn(txn, request, correlation, valid?) end,
+           fn txn -> commit_in_txn(txn, request, correlation, valid?, terminal) end,
            fn txn, result ->
              Tightbeam.Wakes.row_commit_in_txn(txn, [])
              result
@@ -252,7 +376,7 @@ defmodule Tightbeam.StaleTurnSettlement do
     end
   end
 
-  defp commit_in_txn(txn, request, correlation, valid?) do
+  defp commit_in_txn(txn, request, correlation, valid?, terminal) do
     require_fence!(valid?)
 
     case Idempotency.settlement_in_txn(txn, request.principal, request.idempotency_key) do
@@ -264,11 +388,11 @@ defmodule Tightbeam.StaleTurnSettlement do
         end
 
       nil ->
-        do_commit_in_txn(txn, request, correlation, valid?)
+        do_commit_in_txn(txn, request, correlation, valid?, terminal)
     end
   end
 
-  defp do_commit_in_txn(txn, request, correlation, valid?) do
+  defp do_commit_in_txn(txn, request, correlation, valid?, terminal) do
     with :ok <- active_in_txn(txn, request.session_key),
          {:ok, turn} <- turn_in_txn(txn, request.session_key, request.turn_seq),
          :ok <- running(turn),
@@ -282,8 +406,17 @@ defmodule Tightbeam.StaleTurnSettlement do
              harness_session_id == correlation.harness_session_id and
              turn.adapter_gen == correlation.adapter_gen do
       now = System.system_time(:millisecond)
-      status = if request.outcome == "cancel", do: "canceled", else: "failed"
-      stored_error = if status == "failed", do: request.reason, else: nil
+
+      {status, stored_error, cause} =
+        case terminal do
+          # Stale-turn v1.1 R8: a dispatched prompt settled by the operator.
+          :unknown_effect ->
+            {"failed_unknown", Tightbeam.UnknownEffect.error(), "operator_settle"}
+
+          :operator ->
+            status = if request.outcome == "cancel", do: "canceled", else: "failed"
+            {status, if(status == "failed", do: request.reason), "operator:stale-running-turn"}
+        end
 
       transition =
         Ledger.turn_terminal_transition_in_txn(txn, request.turn_seq, "running", status)
@@ -327,11 +460,14 @@ defmodule Tightbeam.StaleTurnSettlement do
           producer_event_id: "settle-turn:#{fingerprint(request)}",
           kind: "terminal_committed",
           outcome: status,
-          cause: "operator:stale-running-turn",
+          cause: cause,
           principal: request.principal,
           detail: %{v: 1, status: status},
           at: now
         })
+
+        if terminal == :unknown_effect,
+          do: :ok = Tightbeam.UnknownEffect.record_in_txn(txn, request.turn_seq, cause)
 
         Tightbeam.Ephemeral.retire_turn_in_txn(txn, request.turn_seq)
         Publisher.turn_in_txn(txn, "turn.ended", request.turn_seq)

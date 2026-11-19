@@ -2342,6 +2342,11 @@ defmodule Tightbeam.Gateway do
   # or a shared-connection teardown) or by the harness's own process-exit
   # error (`Harness.harness_exit_error?/1`). A prompt never dispatched keeps
   # its not-started semantics.
+  # A prompt the adapter settled (R6, R7, R8) carries its own cause.
+  defp harness_exit_cause(_db, _session, seq, {:unknown_effect, cause, _detail})
+       when is_integer(seq) and cause in ["response_missing", "operator_settle", "harness_exited"],
+       do: cause
+
   defp harness_exit_cause(db, session, seq, raw_reason) when is_integer(seq) do
     if transport_lost?(raw_reason) or harness_exit_error?(session, raw_reason) do
       case DB.query(
@@ -2356,6 +2361,13 @@ defmodule Tightbeam.Gateway do
   end
 
   defp harness_exit_cause(_db, _session, _seq, _raw_reason), do: nil
+
+  # R8: an operator settle records its requesting principal on the terminal.
+  defp settle_principal({:unknown_effect, "operator_settle", %{principal: principal}})
+       when is_binary(principal),
+       do: principal
+
+  defp settle_principal(_raw_reason), do: nil
 
   defp transport_lost?({:adapter_unavailable, _}), do: true
   defp transport_lost?(:closed), do: true
@@ -4145,6 +4157,7 @@ defmodule Tightbeam.Gateway do
                    else: "failed"
                  ),
                terminal_cause: unknown_cause,
+               terminal_principal: settle_principal(raw_reason),
                terminal_publish: failure_publish,
                record_in_txn: record_in_txn,
                prewrite_evidence: prewrite_evidence

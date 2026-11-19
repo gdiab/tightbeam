@@ -137,12 +137,21 @@ defmodule Tightbeam.Harness do
   """
   @callback harness_exit_error?(term()) :: boolean()
 
+  @doc """
+  Whether a `session/update` is this harness's turn-end report: one
+  notification per ended harness turn, independent of any prompt response
+  (stale-turn settlement v1.1 §1). A harness without one is not subject to
+  the missing-response rule (R6); v3 R15 bounds it.
+  """
+  @callback turn_end_report?(map()) :: boolean()
+
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       materialize_legacy_credential_link: 2,
                       local_client_model_authority?: 1,
                       records_tool_calls?: 0,
                       harness_exit_error?: 1,
+                      turn_end_report?: 1,
                       accepts_inline_images?: 0,
                       submission_text_limit: 0,
                       project_session_identity: 3,
