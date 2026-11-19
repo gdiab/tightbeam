@@ -30,7 +30,7 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     :ok = Schema.ensure_all(db)
 
     {:paired, device} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "public-wire-device",
         claimed_name: "Public wire",
         platform: nil,

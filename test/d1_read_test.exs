@@ -124,10 +124,15 @@ defmodule Tightbeam.D1ReadRouteTest do
     :ok = Schema.ensure_all(db)
 
     {:paired, admin} =
-      Devices.pair(db, %{device_id: "d1-admin", claimed_name: "admin", platform: nil, model: nil})
+      Tightbeam.TestDevices.pair(db, %{
+        device_id: "d1-admin",
+        claimed_name: "admin",
+        platform: nil,
+        model: nil
+      })
 
     {:pending, _} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "d1-operator",
         claimed_name: "operator",
         platform: nil,

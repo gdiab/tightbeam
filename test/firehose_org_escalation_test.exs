@@ -855,7 +855,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     alias Tightbeam.Firehose.Hub
     Devices.add_user(db, "synthetic-owner", true)
 
-    Devices.pair(db, %{
+    Tightbeam.TestDevices.pair(db, %{
       device_id: "first-admin",
       claimed_name: "synthetic",
       platform: nil,
@@ -875,7 +875,14 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
           {"revoke-device", "device.revoked"}
         ] do
       id = "synthetic-" <> verb
-      Devices.pair(db, %{device_id: id, claimed_name: "synthetic", platform: nil, model: nil})
+
+      Tightbeam.TestDevices.pair(db, %{
+        device_id: id,
+        claimed_name: "synthetic",
+        platform: nil,
+        model: nil
+      })
+
       before = StateResources.query_device(db, id)
 
       call = %{

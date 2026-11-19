@@ -24,7 +24,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     Archetypes.load!(System.tmp_dir!())
 
     {:paired, admin} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "admin-device",
         claimed_name: "Admin",
         platform: nil,
@@ -32,7 +32,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
       })
 
     {:pending, owner} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "owner-device",
         claimed_name: "Owner",
         platform: nil,
@@ -42,7 +42,7 @@ defmodule Tightbeam.Wire.OperatorHistoryTest do
     owner = Devices.approve(db, owner.device_id, "owner")
 
     {:pending, other} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "other-device",
         claimed_name: "Other",
         platform: nil,

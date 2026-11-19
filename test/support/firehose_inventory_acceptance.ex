@@ -175,7 +175,7 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
         notices,
         fn {class, verb, device_id, mutation}, notices ->
           assert {:pending, _device} =
-                   Devices.pair(fixture.db, %{
+                   Tightbeam.TestDevices.pair(fixture.db, %{
                      device_id: device_id,
                      claimed_name: device_id,
                      platform: nil,

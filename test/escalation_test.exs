@@ -41,7 +41,7 @@ defmodule Tightbeam.EscalationTest do
     raiser = session(db, "raiser", "flynn")
 
     _admin_device =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "admin-device",
         claimed_name: "flynn",
         platform: nil,

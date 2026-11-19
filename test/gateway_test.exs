@@ -670,7 +670,7 @@ defmodule Tightbeam.GatewayTest do
     end)
 
     {:paired, device} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "flynn-device",
         claimed_name: "Flynn",
         platform: nil,
@@ -6230,7 +6230,7 @@ defmodule Tightbeam.GatewayTest do
     host = Placement.local_host_name()
 
     {:pending, _operator_device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "operator-device",
         claimed_name: "Operator",
         platform: nil,
@@ -6347,7 +6347,7 @@ defmodule Tightbeam.GatewayTest do
     host = Placement.local_host_name()
 
     {:pending, _operator_device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "toolchain-operator-device",
         claimed_name: "Toolchain operator",
         platform: nil,
@@ -6381,7 +6381,7 @@ defmodule Tightbeam.GatewayTest do
     # non-admin were wrongly authorized. Pair a second user (the cold-start rule
     # gives admin only to the first) and refuse THAT principal.
     {:pending, _guest_device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "guest-device",
         claimed_name: "Guest",
         platform: nil,
@@ -8828,7 +8828,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "role verbs record mutations from session, user and process callers", ctx do
     {:pending, _} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "other-device",
         claimed_name: "Other",
         platform: nil,

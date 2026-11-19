@@ -10,7 +10,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     :ok = Tightbeam.DB.assert_base_admitted!(db, base)
 
     {:paired, device} =
-      Tightbeam.Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "a4-inventory",
         claimed_name: "Flynn",
         platform: nil,

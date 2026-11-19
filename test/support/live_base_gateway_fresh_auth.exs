@@ -3,7 +3,7 @@ alias Tightbeam.{Devices, Gateway, Harness, Model, ModelCatalog, Org}
 
 Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
   {:paired, _} =
-    Devices.pair(db, %{
+    Tightbeam.TestDevices.pair(db, %{
       device_id: "first-fixture",
       claimed_name: "First",
       platform: nil,
@@ -25,7 +25,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
   {Tightbeam.Wire.Router, socket_deps} = Keyword.fetch!(bandit_opts, :plug)
 
   {:pending, pending} =
-    Devices.pair(db, %{
+    Tightbeam.TestDevices.pair(db, %{
       device_id: "fresh-empty",
       claimed_name: "Fresh Empty",
       platform: nil,

@@ -68,6 +68,7 @@ defmodule Tightbeam.GrantAuth do
   @columns [
     {"events", "authClass", "TEXT", "authClass TEXT"},
     {"events", "authDeviceId", "TEXT", "authDeviceId TEXT"},
+    {"events", "pairingFreeze", "TEXT", "pairingFreeze TEXT"},
     {"devices", "tokenCollected", "INTEGER", "tokenCollected INTEGER NOT NULL DEFAULT 0"}
   ]
 
@@ -98,9 +99,22 @@ defmodule Tightbeam.GrantAuth do
     end
   end
 
-  @doc "The event-row authentication fields of a call (C4)."
-  @spec audit(map()) :: %{class: auth_class(), device_id: String.t() | nil}
-  def audit(call), do: %{class: auth_class(call), device_id: auth_device_id(call)}
+  @doc """
+  The event-row authentication fields of a call (C4): its class, its device, and
+  for a protected act the pairing freeze state at the call.
+  """
+  @spec audit(map()) :: %{
+          class: auth_class(),
+          device_id: String.t() | nil,
+          pairing_freeze: String.t() | nil
+        }
+  def audit(call) do
+    freeze =
+      if protected_verb?(Map.get(call, :verb) || ""),
+        do: if(Tightbeam.PairingFreeze.read().lifted, do: "lifted", else: "frozen")
+
+    %{class: auth_class(call), device_id: auth_device_id(call), pairing_freeze: freeze}
+  end
 
   @doc """
   The acting user of a device-authenticated call whose device still holds a token

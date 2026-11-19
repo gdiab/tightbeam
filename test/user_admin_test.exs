@@ -496,7 +496,7 @@ defmodule Tightbeam.UserAdminTest do
   end
 
   defp pair(db, device_id, claimed_name) do
-    Devices.pair(db, %{
+    Tightbeam.TestDevices.pair(db, %{
       device_id: device_id,
       claimed_name: claimed_name,
       platform: nil,

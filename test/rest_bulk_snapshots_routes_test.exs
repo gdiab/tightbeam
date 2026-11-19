@@ -227,7 +227,12 @@ defmodule Tightbeam.RestBulkSnapshotsRoutesTest do
 
   defp approved_device(db, device_id, name, user_id) do
     {:pending, _device} =
-      Devices.pair(db, %{device_id: device_id, claimed_name: name, platform: nil, model: nil})
+      Tightbeam.TestDevices.pair(db, %{
+        device_id: device_id,
+        claimed_name: name,
+        platform: nil,
+        model: nil
+      })
 
     Devices.approve(db, device_id, user_id)
   end
