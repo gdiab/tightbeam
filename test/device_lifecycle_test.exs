@@ -618,6 +618,34 @@ defmodule Tightbeam.DeviceLifecycleTest do
     assert is_reference(Native.base_lock(path))
   end
 
+  test "S1.2: the gateway refuses to start while the base-directory lock is held" do
+    dir = Path.join(System.tmp_dir!(), "baselock-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    path = Path.join(dir, "gateway.lock")
+    parent = self()
+
+    ceremony =
+      spawn(fn ->
+        lock = Native.base_lock(path)
+        send(parent, :held)
+
+        receive do
+          :release -> lock
+        end
+      end)
+
+    assert_receive :held
+    Process.flag(:trap_exit, true)
+    assert {:error, {:base_dir_locked, ^path}} = Tightbeam.BaseLock.start_link(path: path)
+    send(ceremony, :release)
+    Process.sleep(100)
+
+    assert {:ok, pid} = Tightbeam.BaseLock.start_link(path: path)
+    assert_raise ErlangError, fn -> Native.base_lock(path) end
+    GenServer.stop(pid)
+  end
+
   test "the gateway's and the CLI's verifiers are byte-identical" do
     # The same input, salt and parameters as cli/src/device_recovery.rs's test vector.
     assert Native.argon2id("TB-7K3M-Q9ZD-2WH8", :binary.copy(<<7>>, 16)) ==
