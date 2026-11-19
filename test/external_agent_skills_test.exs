@@ -4,7 +4,7 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
   @cli_name "tightbeam-cli"
   @cli_description "Work an assigned Tightbeam card through the tightbeam CLI. Use when an external agent holds a Tightbeam session credential in its worktree and must read its assignment, record results, ask its owner for decisions, or contact Main without a served Tightbeam identity."
   @operator_name "tightbeam-operator"
-  @operator_description "Operate a Tightbeam organization from outside it on behalf of a named user. Use when an agent that is not a Tightbeam session must inspect work, present or rule on decision requests, file and route work to a delivery owner, or wake sessions through the tightbeam CLI."
+  @operator_description "Operate a Tightbeam organization from outside it on behalf of a named user. Use when an agent that is not a Tightbeam session must inspect work, present decision requests and relay rulings, file and route work to a delivery owner, or wake sessions through the tightbeam CLI."
 
   @cli_commands [
     {"--help", ["--help"]},
@@ -67,7 +67,9 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     end
 
     assert operator =~ "Pass `--as-user <userId>` on every command"
-    assert operator =~ "tightbeam operator-rule <decisionRequestId> --decision"
+    assert operator =~ "/tightbeam rule <decisionRequestId> <exact label>"
+    assert operator =~ "Never run `operator-rule` on an operator request yourself."
+    refute operator =~ "tightbeam operator-rule"
     assert operator =~ "tightbeam work-item-handoff --title"
     refute operator =~ "INSERT INTO"
     refute operator =~ "UPDATE work_items"
@@ -80,7 +82,8 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
       bytes = skill_bytes(name)
 
       commands =
-        Regex.scan(~r/\btightbeam ([a-z][a-z-]*)/, bytes, capture: :all_but_first)
+        # `/tightbeam …` lines are Clawline user commands, not CLI commands.
+        Regex.scan(~r/(?<![\w\/])tightbeam ([a-z][a-z-]*)/, bytes, capture: :all_but_first)
         |> List.flatten()
         |> Enum.uniq()
 
