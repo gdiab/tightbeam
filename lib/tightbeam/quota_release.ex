@@ -29,10 +29,12 @@ defmodule Tightbeam.QuotaRelease do
   @process "process:tightbeam"
 
   @doc """
-  The one recorded release step of a quota park (companion v1.6 §7 C1). Every
+  The one recorded release step of a quota park (companion v1.7 §7 C1). Every
   cause goes through it: `declared_reset` (B1), `later_success` (v3 R9(b)),
-  `explicit_resume` / `explicit_restart` (v3 R9(c)) and `recovery_probe`
-  (PR3). It records the release with its cause, actor and time, which ends
+  `explicit_resume` (v3 R9(c)), `credential_replacement` (v1.2 B6) and
+  `recovery_probe` (PR3). These are the only releases of a quota park: every
+  other fence completion keeps it (v1.2 B2,
+  `HarnessProcess.complete_park_in_txn/2`). It records the release with its cause, actor and time, which ends
   this quota cause of the hold. The fence is removed, and admission resumes,
   only when no other standing reason still needs it:
 
@@ -75,7 +77,7 @@ defmodule Tightbeam.QuotaRelease do
           JSON.encode!(%{harness: harness, host: host, cause: cause, resumedAt: at})
         )
 
-        HarnessProcess.complete_park_in_txn(txn, key)
+        HarnessProcess.release_quota_park_in_txn(txn, key)
 
         released_in_txn(txn, incident_id, harness, host,
           readmit: Keyword.get(opts, :readmit, false)
@@ -97,7 +99,55 @@ defmodule Tightbeam.QuotaRelease do
     end
   end
 
-  @readmitting_causes ["declared_reset", "explicit_resume", "explicit_restart", "recovery_probe"]
+  @readmitting_causes [
+    "declared_reset",
+    "explicit_resume",
+    "credential_replacement",
+    "recovery_probe"
+  ]
+
+  @doc """
+  Companion v1.2 B6: a credential for a provider was activated on `host`. The
+  quota park of each of `harnesses` (that provider's harnesses) on that host
+  is released through the one release step, cause `credential_replacement`,
+  with re-admission. A key that is not parked, or has no open quota incident,
+  is untouched.
+  """
+  @spec credential_activated_in_txn(Txn.t(), [String.t()], String.t(), String.t()) :: [
+          {String.t(), :released | :held | :not_parked}
+        ]
+  def credential_activated_in_txn(%Txn{} = txn, harnesses, host, actor)
+      when is_list(harnesses) and is_binary(host) do
+    for harness <- harnesses do
+      key = {Harness.parse!(harness).id(), "shared", host}
+
+      incident =
+        Txn.q(
+          txn,
+          """
+          SELECT id FROM harness_health_incidents
+          WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open'
+          ORDER BY openedAt DESC,id DESC LIMIT 1
+          """,
+          [harness, host]
+        )
+
+      case {incident, HarnessProcess.parked_in_txn?(txn, key)} do
+        {[[incident_id]], true} ->
+          result =
+            release_in_txn(txn, incident_id, harness, host,
+              cause: "credential_replacement",
+              actor: actor,
+              readmit: true
+            )
+
+          {harness, if(result == :admission_resumed, do: :released, else: :held)}
+
+        _ ->
+          {harness, :not_parked}
+      end
+    end
+  end
 
   @doc """
   A park fence was removed (`HarnessProcess`'s park completion or orphan-fence

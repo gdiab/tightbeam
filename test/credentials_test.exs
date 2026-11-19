@@ -180,6 +180,87 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == :onboarded
   end
 
+  test "B6: on_activated runs once, after the activation commits and before credential_present",
+       ctx do
+    owner = self()
+
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "lab1",
+        onboarders: %{openai: fn _ -> {:ok, %{bytes: "candidate", expires_at: nil}} end},
+        start: fn _, _ -> :ok end,
+        on_activated: fn provider ->
+          metadata =
+            Path.join([
+              Tightbeam.Homes.home_path(ctx.base, "lab1", :codex),
+              ".tightbeam",
+              "credential.json"
+            ])
+            |> File.read!()
+            |> JSON.decode!()
+
+          send(owner, {:activated, provider, metadata["onboarded"]})
+          :ok
+        end,
+        on_credential_present: fn _ ->
+          send(owner, :credential_present)
+          :ok
+        end
+      )
+
+    assert :ok = Credentials.onboard(:openai, server)
+    assert_receive {:activated, :openai, true}
+    assert_receive :credential_present
+    refute_receive {:activated, _, _}
+  end
+
+  test "B6: a failed onboarding or start never calls on_activated", ctx do
+    owner = self()
+    activated = fn provider -> send(owner, {:activated, provider}) end
+
+    {:ok, refused} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "lab1",
+        onboarders: %{openai: fn _ -> {:error, :human_unavailable} end},
+        on_activated: activated
+      )
+
+    assert {:error, :human_unavailable} = Credentials.onboard(:openai, refused)
+    GenServer.stop(refused)
+
+    {:ok, failing} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "lab1",
+        onboarders: %{openai: fn _ -> {:ok, %{bytes: "candidate", expires_at: nil}} end},
+        start: fn :openai, :subscription -> {:error, :runtime_start_failed} end,
+        on_activated: activated
+      )
+
+    assert {:error, :runtime_start_failed} = Credentials.onboard(:openai, failing)
+    refute_receive {:activated, _}, 100
+  end
+
+  test "B6: an on_activated failure never fails the committed activation", ctx do
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "lab1",
+        onboarders: %{openai: fn _ -> {:ok, %{bytes: "candidate", expires_at: nil}} end},
+        start: fn _, _ -> :ok end,
+        on_activated: fn _ -> raise "release step failed" end
+      )
+
+    assert :ok = Credentials.onboard(:openai, server)
+    assert Credentials.status(:openai, server) == :onboarded
+  end
+
   test "failed onboarding stays stopped and never starts the revoked runtime", ctx do
     owner = self()
 
