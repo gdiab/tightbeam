@@ -535,14 +535,17 @@ defmodule Tightbeam.SessionLane do
     {:reply, ambiguous(), state}
   end
 
+  # Stale-turn v1.1 R8: a lane task is not liveness. Settle-turn on the turn
+  # this lane's task holds asks the turn's harness (R3); the lane task then
+  # ends by the adapter's answer and the lane commits the terminal.
   def handle_call(
-        {:settle_stale, reservation_token, %{turn_seq: turn_seq}},
+        {:settle_stale, reservation_token, %{turn_seq: turn_seq} = request},
         _from,
         %{task_ref: ref, current_seq: turn_seq} = state
       )
       when not is_nil(ref) do
     state = release_reservation(state, reservation_token)
-    {:reply, {:error, %{code: "turn_live", message: "the session lane is running a turn"}}, state}
+    {:reply, StaleTurnSettlement.settle_held(state.db, request), state}
   end
 
   def handle_call({:settle_stale, reservation_token, _request}, _from, %{task_ref: ref} = state)
@@ -777,8 +780,16 @@ defmodule Tightbeam.SessionLane do
     # terminal lifecycle row (harness_exited, response_missing, operator_settle).
     terminal_opts =
       case outcome do
-        {:error, %{terminal_cause: cause}} when is_binary(cause) ->
-          Keyword.put(terminal_opts, :cause, cause)
+        {:error, %{terminal_cause: cause} = failure} when is_binary(cause) ->
+          terminal_opts = Keyword.put(terminal_opts, :cause, cause)
+
+          case Map.get(failure, :terminal_principal) do
+            principal when is_binary(principal) ->
+              Keyword.put(terminal_opts, :principal, principal)
+
+            _ ->
+              terminal_opts
+          end
 
         _ ->
           terminal_opts
