@@ -1,9 +1,11 @@
 defmodule Tightbeam.QuotaRelease do
   @moduledoc """
-  What every release of a quota park does, whichever trigger released it: the
-  declared reset (quota v3 R9(a)), a later success (R9(b)) or an explicit
-  resume (R9(c)). Each caller removes the fence and records its own cause
-  first; this then runs in the same transaction.
+  What every release of a quota park does, whichever named trigger released it
+  (companion v1.2 B2): the declared reset (quota v3 R9(a)), a later success
+  (R9(b)), an explicit resume (R9(c)) or a credential activation (B6). Only
+  these lift a quota park's fence: `release_named_in_txn/5` for the reset,
+  resume and activation, and the success's own resolution. Every other fence
+  completion keeps a quota park (`HarnessProcess.complete_park_in_txn/2`).
 
   - Companion v1.1 B5: each quota-failed turn of the incident is classified by
     contract (c) R9a (`LimitFallback.Outcome.classify_in_txn/2`). A
@@ -23,10 +25,81 @@ defmodule Tightbeam.QuotaRelease do
     ensured, so the queue drains in its original order.
   """
 
-  alias Tightbeam.{EventLog, LimitFallback, Org, Wakes}
+  alias Tightbeam.{EventLog, Harness, HarnessProcess, LimitFallback, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @process "process:tightbeam"
+
+  @doc """
+  A named release of a quota park (companion v1.2 B2): the declared reset,
+  an explicit resume or a credential activation. A later success lifts the
+  fence in its own resolution. If the key is parked, this lifts the fence,
+  records `rate_limit_hold_released` with `detail` (its `cause`, `actor` and
+  any trigger facts) and `releasedAt`, then runs `released_in_txn/5` with
+  re-admission. Returns `:released` or `:not_parked`.
+  """
+  @spec release_named_in_txn(Txn.t(), String.t(), String.t(), String.t(), map()) ::
+          :released | :not_parked
+  def release_named_in_txn(
+        %Txn{} = txn,
+        incident_id,
+        harness,
+        host,
+        %{cause: _, actor: _} = detail
+      )
+      when is_binary(incident_id) and is_binary(harness) and is_binary(host) do
+    key = {Harness.parse!(harness).id(), "shared", host}
+
+    if HarnessProcess.parked_in_txn?(txn, key) do
+      HarnessProcess.release_quota_park_in_txn(txn, key)
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        "rate_limit_hold_released",
+        incident_id,
+        JSON.encode!(Map.put(detail, :releasedAt, System.system_time(:millisecond)))
+      )
+
+      released_in_txn(txn, incident_id, harness, host, readmit: true)
+      :released
+    else
+      :not_parked
+    end
+  end
+
+  @doc """
+  B6: a credential for `provider` was activated on `host`. Release the quota
+  park of each of `harnesses` (that provider's harnesses) on that host, as a
+  recorded release with cause `credential_replacement`. A key with no open
+  quota incident is untouched.
+  """
+  @spec credential_activated_in_txn(Txn.t(), [String.t()], String.t(), String.t()) :: [
+          {String.t(), :released | :not_parked}
+        ]
+  def credential_activated_in_txn(%Txn{} = txn, harnesses, host, actor)
+      when is_list(harnesses) and is_binary(host) do
+    for harness <- harnesses do
+      case Txn.q(
+             txn,
+             """
+             SELECT id FROM harness_health_incidents
+             WHERE harness=?1 AND host=?2 AND failureClass='rate-limit-dead' AND state='open'
+             ORDER BY openedAt DESC,id DESC LIMIT 1
+             """,
+             [harness, host]
+           ) do
+        [[incident_id]] ->
+          {harness,
+           release_named_in_txn(txn, incident_id, harness, host, %{
+             cause: "credential_replacement",
+             actor: actor
+           })}
+
+        [] ->
+          {harness, :not_parked}
+      end
+    end
+  end
 
   @spec released_in_txn(Txn.t(), String.t(), String.t(), String.t(), keyword()) :: :ok
   def released_in_txn(%Txn{} = txn, incident_id, harness, host, opts \\ [])

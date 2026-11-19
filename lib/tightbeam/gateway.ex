@@ -434,6 +434,7 @@ defmodule Tightbeam.Gateway do
           publish_credential_sessions(db, captured, transition)
         end,
         on_credential_present: credential_present_hook(db, machine),
+        on_activated: credential_activation_hook(db, machine),
         onboarding_lease_ms: config.onboarding_lease_ms,
         log_event: fn kind, subject, detail ->
           Tightbeam.EventLog.lifecycle(db, kind, subject, detail)
@@ -461,6 +462,32 @@ defmodule Tightbeam.Gateway do
   the fact is best-effort (a dropped edge self-heals via the catalog's TTL
   sweep), so a filing error is logged, not raised into the commit.
   """
+  @doc """
+  Quota companion v1.2 B6: a committed credential activation for `provider`
+  on `machine` is a recorded release (cause `credential_replacement`) of the
+  quota park of each of that provider's harness keys on that machine. The
+  credential command carries no principal, so the actor is the credentials
+  process.
+  """
+  @spec credential_activation_hook(DB.server(), String.t()) :: (atom() -> :ok)
+  def credential_activation_hook(db, machine) do
+    fn provider ->
+      harnesses = Enum.map(harnesses_for_provider(provider), &to_string(&1.id()))
+
+      {:ok, _released} =
+        DB.transaction(db, fn txn ->
+          Tightbeam.QuotaRelease.credential_activated_in_txn(
+            txn,
+            harnesses,
+            machine,
+            "process:credentials"
+          )
+        end)
+
+      :ok
+    end
+  end
+
   @spec credential_present_hook(DB.server(), String.t(), GenServer.server()) :: (atom() -> :ok)
   def credential_present_hook(db, machine, catalog \\ ModelCatalog) do
     fn provider ->
@@ -1808,18 +1835,13 @@ defmodule Tightbeam.Gateway do
   defp repair_assignment(_db, _assignment_id),
     do: {:error, "invalid_request", "repair-assignment requires assignmentId"}
 
-  # A resume, or a restart while the holder's key is quota-parked, releases
-  # the park for every session on the shared key (close_adapter removes the
-  # fence). That is narrower than the other repairs: only the opener, an
-  # admin, the holder's delivery owner or Main (quota v3 R9(c), acceptance
-  # (a)). A session owned by the opening user is not, on that ground alone,
-  # any of these.
-  defp repair_authorized(db, %{params: %{action: action}} = call, assignment)
-       when action in ["resume", "restart"] do
-    if action == "resume" or quota_parked_holder?(db, assignment),
-      do: park_release_authorized(db, call, assignment),
-      else: broad_repair_authorized(db, call, assignment)
-  end
+  # A resume releases a quota park for every session on the shared key, so it
+  # is narrower than the other repairs: only the opener, an admin, the holder's
+  # delivery owner or Main (quota v3 R9(c), acceptance (a)). A session owned by
+  # the opening user is not, on that ground alone, any of these. No other
+  # repair releases a quota park (companion v1.2 B2).
+  defp repair_authorized(db, %{params: %{action: "resume"}} = call, assignment),
+    do: park_release_authorized(db, call, assignment)
 
   defp repair_authorized(db, call, assignment),
     do: broad_repair_authorized(db, call, assignment)
@@ -1897,16 +1919,6 @@ defmodule Tightbeam.Gateway do
       end)
 
     offices
-  end
-
-  defp quota_parked_holder?(db, assignment) do
-    case Org.get(db, assignment.holder) do
-      %{harness: harness, host: host} when is_binary(host) ->
-        quota_park_incident(db, to_string(harness), host) != nil
-
-      _ ->
-        false
-    end
   end
 
   # The open rate-limit-dead incident whose park fence stands on the shared
@@ -2023,16 +2035,18 @@ defmodule Tightbeam.Gateway do
 
     # Companion v1.1 A1: the result names every durable effect it committed,
     # whatever a later step does; `ok:false` only for a step that failed.
-    # A successful close removes the key's park fence itself, so a quota park
-    # standing now is released by this repair whatever incident it covers.
+    # A close keeps a quota park (companion v1.2 B2); only the resume itself
+    # releases it, as a named, recorded release (v3 R9(c)).
     quota_incident = quota_park_incident(db, to_string(session.harness), session.host)
 
     case AdapterCoordinator.close_adapter(coordinator, key) do
       :ok ->
         park =
-          if quota_incident,
-            do: release_quota_park(db, call, session, key, quota_incident),
-            else: "not_parked"
+          cond do
+            is_nil(quota_incident) -> "not_parked"
+            action == "resume" -> release_quota_park(db, call, session, quota_incident)
+            true -> "unchanged"
+          end
 
         case guarded_rerun(db, call, assignment, incident) do
           {:ok, rerun} ->
@@ -2161,39 +2175,26 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # Quota v3 R9(c): an explicit resume (or a restart of a quota-parked key)
-  # releases the park and records the release with its actor and time; the
-  # release then does what every reset or resume release does (companion B5,
-  # v3 R12). close_adapter has usually removed the fence already.
-  defp release_quota_park(db, call, session, key, incident_id) do
+  # Quota v3 R9(c): an explicit resume is a named release, recorded with its
+  # actor and time, that does what every reset or resume release does
+  # (companion B5, v3 R12).
+  defp release_quota_park(db, call, session, incident_id) do
     {:ok, park} =
       DB.transaction(db, fn txn ->
-        HarnessProcess.complete_park_in_txn(txn, key)
-
-        EventLog.lifecycle_in_txn(
-          txn,
-          "rate_limit_hold_released",
-          incident_id,
-          JSON.encode!(%{
-            cause: "explicit_#{call.params[:action]}",
-            actor: repair_principal(call.principal),
-            releasedAt: System.system_time(:millisecond),
-            assignmentId: call.params[:assignment_id]
-          })
-        )
-
-        Tightbeam.QuotaRelease.released_in_txn(
+        Tightbeam.QuotaRelease.release_named_in_txn(
           txn,
           incident_id,
           to_string(session.harness),
           session.host,
-          readmit: true
+          %{
+            cause: "explicit_resume",
+            actor: repair_principal(call.principal),
+            assignmentId: call.params[:assignment_id]
+          }
         )
-
-        "released"
       end)
 
-    park
+    Atom.to_string(park)
   end
 
   # Companion v1.1 A2: a resume or restart reruns a turn only when it is the

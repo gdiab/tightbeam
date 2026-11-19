@@ -246,8 +246,9 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  # Like the real AdapterCoordinator, a successful close removes the key's
-  # park fence itself (do_close_adapter's complete_park).
+  # Like the real AdapterCoordinator, a successful close completes the key's
+  # park (do_close_adapter's complete_park), which keeps a quota park
+  # (companion v1.2 B2).
   defmodule UnparkingCoordinatorStub do
     use GenServer
 
@@ -4077,7 +4078,7 @@ defmodule Tightbeam.GatewayTest do
       assert turn_count(ctx.db, id) == 1
     end
 
-    test "B2/(a): a restart of a quota-parked key releases the park, so it has resume's narrower rule",
+    test "B2 (v1.2): a restart of a quota-parked key keeps the park, with no release record",
          ctx do
       Devices.add_user(ctx.db, "zoe", false)
       ensure_main_session(ctx.db, "zoe")
@@ -4118,21 +4119,15 @@ defmodule Tightbeam.GatewayTest do
       handler = resume_handler(ctx, :ok)
       key = {:claude, "shared", "testhost"}
 
-      # A session owned by the opening user may restart an unparked key, but
-      # not one whose restart would release a quota park.
-      assert %{ok: false, code: "not_authorized"} =
+      # A restart releases nothing, so it keeps the general rule: the opening
+      # user's other session may run it.
+      assert %{ok: true, action: "restart", park: "unchanged"} =
                handler.(resume_call({:session, "zr-sibling"}, id, "sibling", ctx.lane, "restart"))
 
+      assert_receive {:repair_close_adapter, ^key}
       assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
-      refute_receive {:repair_close_adapter, _}, 50
-
-      assert %{ok: true, action: "restart", park: "released"} =
-               handler.(resume_call({:user, "zoe"}, id, "opener", ctx.lane, "restart"))
-
-      refute Tightbeam.HarnessProcess.parked?(ctx.db, key)
-
-      assert [%{"cause" => "explicit_restart", "actor" => "user:zoe"}] =
-               hold_releases(ctx.db, quota.id)
+      assert HarnessHealth.get(ctx.db, quota.id).state == "open"
+      assert hold_releases(ctx.db, quota.id) == []
     end
 
     test "B1: a rerun consumes its turn's pending redelivery row, so the turn runs at most once",

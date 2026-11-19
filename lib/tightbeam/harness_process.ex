@@ -375,7 +375,15 @@ defmodule Tightbeam.HarnessProcess do
     count > 0
   end
 
-  @doc "Release the per-key fence after the park has reached a terminal state."
+  @doc """
+  Release the per-key fence after the park has reached a terminal state.
+
+  A quota park (an open `rate-limit-dead` incident on the key) is kept: only
+  the named releases lift it, through `release_quota_park_in_txn/2` (quota
+  companion v1.2 B2). That covers every adapter close, process-park
+  completion, launch reconciliation and proven-dead settlement, as the boot
+  and orphan sweeps already do.
+  """
   @spec complete_park(DB.server(), tuple()) :: :ok
   def complete_park(db, key) do
     {:ok, :ok} = DB.transaction(db, &complete_park_in_txn(&1, key))
@@ -383,12 +391,48 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  @doc "Release the park fence as part of a caller-owned recovery transaction."
+  @doc "Release the park fence as part of a caller-owned recovery transaction; a quota park is kept."
   @spec complete_park_in_txn(DB.Txn.t(), tuple()) :: :ok
   def complete_park_in_txn(%DB.Txn{} = txn, key) do
+    DB.Txn.q(
+      txn,
+      "DELETE FROM harness_park_fences WHERE adapterKey = ?1 " <> quota_hold_guard_in_txn(txn),
+      [key_name(key)]
+    )
+
+    :ok
+  end
+
+  @doc """
+  Lift a quota park's fence. Only the named releases call this, through
+  `Tightbeam.QuotaRelease.release_named_in_txn/5`: the declared reset, a later
+  success, an explicit resume and a credential activation (companion v1.2 B2,
+  B6).
+  """
+  @spec release_quota_park_in_txn(DB.Txn.t(), tuple()) :: :ok
+  def release_quota_park_in_txn(%DB.Txn{} = txn, key) do
     DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
 
     :ok
+  end
+
+  defp quota_hold_guard_in_txn(txn) do
+    if DB.Txn.q(
+         txn,
+         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
+       ) == [[1]] do
+      """
+      AND NOT EXISTS (
+        SELECT 1
+          FROM harness_health_incidents
+         WHERE state = 'open'
+           AND failureClass = 'rate-limit-dead'
+           AND harness || ':shared@' || host = harness_park_fences.adapterKey
+      )
+      """
+    else
+      ""
+    end
   end
 
   @doc "Deliver SIGKILL to a parked process group."
