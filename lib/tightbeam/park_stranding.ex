@@ -148,7 +148,7 @@ defmodule Tightbeam.ParkStranding do
            ) do
         [[incident_id, due_at]] when due_at <= at ->
           Wakes.consume_internal_in_txn(txn, wake_id)
-          decide_in_txn(txn, incident_id, wake_id, episode(wake_id, incident_id), at)
+          decide_in_txn(txn, incident_id, wake_id, episode(wake_id, incident_id), due_at, at)
 
         [[_, _]] ->
           {:deferred, :before_deadline}
@@ -168,7 +168,7 @@ defmodule Tightbeam.ParkStranding do
       do: binary_part(wake_id, byte_size(prefix), byte_size(wake_id) - byte_size(prefix))
   end
 
-  defp decide_in_txn(txn, incident_id, wake_id, generation, at) do
+  defp decide_in_txn(txn, incident_id, wake_id, generation, due_at, at) do
     case Txn.q(
            txn,
            "SELECT harness,host,state,openedAt FROM harness_health_incidents WHERE id=?1 AND failureClass=?2",
@@ -178,9 +178,13 @@ defmodule Tightbeam.ParkStranding do
         facts = %{
           incident_id: incident_id,
           wake_id: wake_id,
+          generation: generation,
           harness: harness,
           host: host,
           opened_at: opened_at,
+          # When this park episode began: the incident's opening, or a later
+          # B4 re-park. Its wake is due six hours after it.
+          parked_since: due_at - @after_ms,
           at: at
         }
 
@@ -222,7 +226,7 @@ defmodule Tightbeam.ParkStranding do
 
         notices =
           Enum.map(recipients, fn recipient ->
-            notice_wake_id = notice_wake_id(facts.incident_id, recipient)
+            notice_wake_id = notice_wake_id(facts.incident_id, facts.generation, recipient)
 
             # The consumed stranding wake already makes this once; the
             # per-recipient id keeps a replayed transaction from doubling it.
@@ -379,19 +383,23 @@ defmodule Tightbeam.ParkStranding do
       harness: facts.harness,
       host: facts.host,
       openedAt: facts.opened_at,
+      parkGeneration: facts.generation,
+      parkedSince: facts.parked_since,
       checkedAt: facts.at,
       principal: @process,
       cause: "no release within 6 hours and no known reset"
     }
   end
 
-  defp notice_wake_id(incident_id, recipient) do
+  # One notice per recipient per park episode: a later episode of the same
+  # incident has its own generation, so its notices are new rows.
+  defp notice_wake_id(incident_id, generation, recipient) do
     digest =
       :crypto.hash(:sha256, recipient)
       |> Base.encode16(case: :lower)
       |> binary_part(0, 32)
 
-    @notice_prefix <> incident_id <> ":" <> digest
+    @notice_prefix <> incident_id <> ":" <> generation <> ":" <> digest
   end
 
   @doc false
@@ -400,7 +408,7 @@ defmodule Tightbeam.ParkStranding do
     """
     [rate-limit park unreleased after 6 hours]
 
-    The #{facts.harness} harness on #{facts.host} has been parked by rate-limit incident #{facts.incident_id} since #{iso(facts.opened_at)}. No reset time is known for it, and nothing released it within 6 hours: no declared reset, no later successful turn, no explicit resume.
+    The #{facts.harness} harness on #{facts.host} has been parked by rate-limit incident #{facts.incident_id} since #{iso(facts.parked_since)}. No reset time is known for it, and nothing released it within 6 hours: no declared reset, no later successful turn, no explicit resume.
 
     #{held_lines(held)}
 
