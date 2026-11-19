@@ -712,6 +712,14 @@ mod tests {
         ));
     }
 
+    /// The shared test vector: the gateway's NIF must produce the same bytes
+    /// (test/device_lifecycle_test.exs reads the same file).
+    #[test]
+    fn verifier_matches_the_shared_gateway_vector() {
+        let expected = include_str!("device_recovery_vector.txt").trim();
+        assert_eq!(hex(&argon2id("TB-7K3M-Q9ZD-2WH8", &[7u8; 16]).unwrap()), expected);
+    }
+
     #[test]
     fn a_session_credential_above_the_directory_is_found() {
         let root = std::env::temp_dir().join(format!("tb-recover-guard-{}", std::process::id()));
