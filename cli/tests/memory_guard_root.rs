@@ -31,8 +31,24 @@ fn base(name: &str, episode: serde_json::Value) -> Base {
     Base(dir)
 }
 
+fn base_named(name: &str, episode: serde_json::Value) -> Base {
+    base(name, episode)
+}
+
 fn run(base: &Path, command: &str, id: &str, root: bool, stdin: &str) -> std::process::Output {
+    run_with(base, command, id, root, stdin, &[])
+}
+
+fn run_with(
+    base: &Path,
+    command: &str,
+    id: &str,
+    root: bool,
+    stdin: &str,
+    env: &[(&str, &Path)],
+) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tightbeam"));
+    cmd.envs(env.iter().map(|(name, value)| (*name, *value)));
     cmd.args([command, "--base", base.to_str().unwrap(), id])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -227,4 +243,203 @@ fn n6_unreadable_a_statement_that_cannot_be_printed_writes_nothing() {
         "it does not proceed without its statement"
     );
     assert!(records(&base.0).is_empty(), "nothing is written");
+}
+
+fn setsid_sleep() -> std::process::Child {
+    unsafe {
+        Command::new("sleep")
+            .arg("300")
+            .pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            })
+            .spawn()
+            .unwrap()
+    }
+}
+
+#[test]
+fn t31_2_unit_recovery_writes_cgroup_kill_and_records_the_kill_time() {
+    let unit = "/tightbeam.slice/harness/session-sl-u";
+    let base = base(
+        "unitkill",
+        custody(
+            "ep_8",
+            serde_json::json!([{"launchId": "sl-u", "pid": 999_999, "start": 1, "unit": unit}]),
+            serde_json::Value::Null,
+        ),
+    );
+    // A stand-in cgroup tree: the unit's cgroup.kill is a file root can write.
+    let cgroup = base.0.join("cgroup");
+    let unit_dir = cgroup.join(unit.trim_start_matches('/'));
+    fs::create_dir_all(&unit_dir).unwrap();
+    fs::write(unit_dir.join("cgroup.kill"), "").unwrap();
+
+    let output = run_with(
+        &base.0,
+        "memory-guard-recover",
+        "ep_8",
+        true,
+        "",
+        &[("TIGHTBEAM_TEST_CGROUP_FS", &cgroup)],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(unit_dir.join("cgroup.kill")).unwrap(),
+        "1"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 through their cgroup"));
+    let [record] = records(&base.0).try_into().unwrap();
+    assert!(record["killedAt"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn t31_2_a_unit_whose_cgroup_kill_cannot_be_written_falls_back_to_root_signals() {
+    let mut leader = setsid_sleep();
+    let unit = "/tightbeam.slice/harness/session-sl-f";
+    let base = base(
+        "unitfallback",
+        custody(
+            "ep_9",
+            serde_json::json!([{
+                "launchId": "sl-f", "pid": leader.id(), "start": start_of(leader.id()), "unit": unit
+            }]),
+            serde_json::Value::Null,
+        ),
+    );
+    // The unit is gone from the cgroup tree: cgroup.kill cannot be written.
+    let cgroup = base.0.join("cgroup");
+    fs::create_dir_all(&cgroup).unwrap();
+
+    let output = run_with(
+        &base.0,
+        "memory-guard-recover",
+        "ep_9",
+        true,
+        "",
+        &[("TIGHTBEAM_TEST_CGROUP_FS", &cgroup)],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&leader.wait().unwrap()),
+        Some(9),
+        "the identity-checked signal path ended the tree"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 process(es) by signal"));
+    let [record] = records(&base.0).try_into().unwrap();
+    assert!(record["killedAt"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn t31_2_when_no_kill_can_be_sent_nothing_is_recorded_and_it_says_so() {
+    let unit = "/tightbeam.slice/harness/session-sl-n";
+    let base = base(
+        "nokill",
+        custody(
+            "ep_10",
+            serde_json::json!([{"launchId": "sl-n", "pid": 4242, "start": 7, "unit": unit}]),
+            serde_json::Value::Null,
+        ),
+    );
+    // cgroup.kill cannot be written, and the process table cannot be read.
+    let cgroup = base.0.join("cgroup");
+    fs::create_dir_all(&cgroup).unwrap();
+    let no_proc = base.0.join("no-proc");
+
+    let output = run_with(
+        &base.0,
+        "memory-guard-recover",
+        "ep_10",
+        true,
+        "",
+        &[
+            ("TIGHTBEAM_TEST_CGROUP_FS", &cgroup),
+            ("TIGHTBEAM_TEST_PROC", &no_proc),
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("could not be sent"), "{stderr}");
+    assert!(stderr.contains("nothing was recorded"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Sent SIGKILL"));
+    assert!(records(&base.0).is_empty(), "no kill time without a kill");
+
+    // A tree with neither a writable unit nor a recorded process: the same.
+    let base = base_named(
+        "nokill-nopid",
+        custody(
+            "ep_11",
+            serde_json::json!([{"launchId": "sl-m", "pid": null, "start": null, "unit": unit}]),
+            serde_json::Value::Null,
+        ),
+    );
+    let cgroup = base.0.join("cgroup");
+    fs::create_dir_all(&cgroup).unwrap();
+    let output = run_with(
+        &base.0,
+        "memory-guard-recover",
+        "ep_11",
+        true,
+        "",
+        &[("TIGHTBEAM_TEST_CGROUP_FS", &cgroup)],
+    );
+    assert!(!output.status.success());
+    assert!(records(&base.0).is_empty());
+}
+
+#[test]
+fn b6_an_episode_whose_trees_are_unknown_is_not_recovered_and_nothing_is_recorded() {
+    let base = base(
+        "unknowntrees",
+        custody("ep_12", serde_json::Value::Null, serde_json::Value::Null),
+    );
+    let output = run(&base.0, "memory-guard-recover", "ep_12", true, "");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nothing was recorded"));
+    assert!(records(&base.0).is_empty());
+}
+
+#[test]
+fn b7_a_root_command_moves_the_records_the_gateway_judged_aside() {
+    let mut leader = setsid_sleep();
+    let trees = serde_json::json!([
+        {"launchId": "sl-a", "pid": leader.id(), "start": start_of(leader.id()), "unit": null}
+    ]);
+    let base = base("archive", custody("ep_13", trees, serde_json::Value::Null));
+    let root = base.0.join("run/memory-guard/root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("recovery-ep_1-1.json"), "{}").unwrap();
+    fs::write(root.join("recovery-ep_1-2.json"), "{}").unwrap();
+    let list = base.0.join("run/memory-guard/root-judged.json");
+    fs::write(
+        &list,
+        serde_json::json!({"judged": ["recovery-ep_1-1.json", "../escape.json"]}).to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&list, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let output = run(&base.0, "memory-guard-recover", "ep_13", true, "");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = leader.wait();
+    assert!(
+        root.join("judged/recovery-ep_1-1.json").exists(),
+        "judged: moved aside"
+    );
+    assert!(
+        root.join("recovery-ep_1-2.json").exists(),
+        "not judged: stays"
+    );
+    assert!(!root.join("recovery-ep_1-1.json").exists());
 }

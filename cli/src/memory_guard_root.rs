@@ -150,19 +150,51 @@ fn load_episode(parsed: &Parsed) -> Result<(serde_json::Value, u32), String> {
 
 fn recover(parsed: &Parsed) -> Result<(), String> {
     let (episode, gateway_uid) = load_episode(parsed)?;
+    archive_judged(&parsed.base, gateway_uid);
     let kind = episode["kind"].as_str().unwrap_or("");
     let mut record = base_record(parsed, &episode);
     if kind == "custody" {
-        let trees = episode["trees"].as_array().cloned().unwrap_or_default();
-        for tree in &trees {
-            kill_tree(tree, gateway_uid);
+        let Some(trees) = episode["trees"]
+            .as_array()
+            .filter(|trees| !trees.is_empty())
+        else {
+            return Err(format!(
+                "episode {} names no process tree Tightbeam could list, so there is nothing to \
+                 kill; nothing was recorded",
+                parsed.episode
+            ));
+        };
+        // Every named tree is killed, or nothing is recorded: a kill time is
+        // the time root sent SIGKILL to all of them (FS9 Step 1).
+        let mut signalled = 0;
+        let mut units = 0;
+        let mut empty = 0;
+        let mut failures = Vec::new();
+        for tree in trees {
+            match kill_tree(tree, gateway_uid) {
+                Ok(Killed::Unit) => units += 1,
+                Ok(Killed::Signalled(count)) => signalled += count,
+                Ok(Killed::NoneLeft) => empty += 1,
+                Err(error) => failures.push(format!(
+                    "launch record {}: {error}",
+                    tree["launchId"].as_str().unwrap_or("unknown")
+                )),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(format!(
+                "SIGKILL could not be sent to every named tree ({}); nothing was recorded, so \
+                 Tightbeam does not judge this recovery. Run the command again.",
+                failures.join("; ")
+            ));
         }
         record.insert("killedAt", serde_json::json!(now_ms()));
         write_record(parsed, &record)?;
         println!(
-            "Sent SIGKILL to the {} agent process tree(s) of episode {}. Tightbeam now checks: the \
-             episode is cleared once every one is gone, or the recovery is recorded as failed if \
-             any is still there 60 seconds from now.",
+            "Sent SIGKILL to the {} named agent process tree(s) of episode {}: {units} through \
+             their cgroup, {signalled} process(es) by signal, {empty} with no process left. \
+             Tightbeam now checks: the episode is cleared once every one is gone, or the \
+             recovery is recorded as failed if any is still there 60 seconds from now.",
             trees.len(),
             parsed.episode
         );
@@ -178,54 +210,168 @@ fn recover(parsed: &Parsed) -> Result<(), String> {
     Ok(())
 }
 
-fn kill_tree(tree: &serde_json::Value, gateway_uid: u32) {
+/// What a tree's kill did.
+#[derive(Debug, PartialEq)]
+enum Killed {
+    /// `cgroup.kill` on its unit was written: the kernel kills every member.
+    Unit,
+    /// This many of its processes were sent SIGKILL.
+    Signalled(usize),
+    /// No process of the tree is left to signal.
+    NoneLeft,
+}
+
+/// SIGKILL to one named tree: by `cgroup.kill` on its unit, or, when that
+/// cannot be written, by signals to the recorded leader (if it is still the
+/// same process) and every process of its process group or session (the
+/// step `setsid`s), owned by the gateway's user and started no earlier. An
+/// error means no kill could be sent.
+fn kill_tree(tree: &serde_json::Value, gateway_uid: u32) -> Result<Killed, String> {
+    let mut unit_error = None;
     if let Some(unit) = tree["unit"].as_str() {
         if unit.contains("/harness/session-") && !unit.contains("..") {
             let path = cgroup_fs()
                 .join(unit.trim_start_matches('/'))
                 .join("cgroup.kill");
-            let _ = fs::write(path, "1");
+            match fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(b"1"))
+            {
+                Ok(()) => return Ok(Killed::Unit),
+                Err(error) => unit_error = Some(format!("cgroup.kill of {unit}: {error}")),
+            }
+        } else {
+            unit_error = Some(format!("{unit} is not a session unit"));
         }
-        return;
     }
     let (Some(pid), start) = (tree["pid"].as_i64(), tree["start"].as_u64()) else {
-        return;
+        return Err(unit_error.unwrap_or_else(|| "no recorded process to signal".into()));
     };
-    // The recorded leader, if it is still the same process, and every process
-    // of its process group or session (the step `setsid`s), owned by the
-    // gateway's user and started no earlier.
-    for (member, member_start, uid, pgrp, sid) in processes() {
+    let processes = processes().map_err(|error| match &unit_error {
+        Some(unit) => format!("{unit}; and the process table cannot be read: {error}"),
+        None => format!("the process table cannot be read: {error}"),
+    })?;
+    let mut sent = 0;
+    let mut failures = Vec::new();
+    for (member, member_start, uid, pgrp, sid) in processes {
         let ours = uid == gateway_uid
             && (member == pid || pgrp == pid || sid == pid)
             && start.map_or(true, |start| member_start >= start)
             && (member != pid || Some(member_start) == start);
         if ours {
-            unsafe {
-                libc::kill(member as libc::pid_t, libc::SIGKILL);
+            if unsafe { libc::kill(member as libc::pid_t, libc::SIGKILL) } == 0 {
+                sent += 1;
+            } else {
+                let error = std::io::Error::last_os_error();
+                // A process that ended since the table was read needs no kill.
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    failures.push(format!("process {member}: {error}"));
+                }
             }
         }
     }
+    match (sent, failures.is_empty()) {
+        (0, true) => Ok(Killed::NoneLeft),
+        (sent, true) => Ok(Killed::Signalled(sent)),
+        (_, false) => Err(failures.join("; ")),
+    }
 }
 
-/// Every readable process: (pid, start, uid, pgrp, session).
-fn processes() -> Vec<(i64, u64, u32, i64, i64)> {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
+/// Every process: (pid, start, uid, pgrp, session). A process that ends
+/// while it is read is not listed; an entry that cannot be read or parsed for
+/// any other reason, or a table that cannot be read, is an error, never a
+/// smaller table.
+fn processes() -> Result<Vec<(i64, u64, u32, i64, i64)>, String> {
+    let gone = |error: &std::io::Error| {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
     };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: i64 = entry.file_name().to_str()?.parse().ok()?;
-            let uid = entry.metadata().ok()?.uid();
-            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
-            let rest = &stat[stat.rfind(')')? + 1..];
-            let fields: Vec<&str> = rest.split_whitespace().collect();
-            let pgrp = fields.get(2)?.parse().ok()?;
-            let sid = fields.get(3)?.parse().ok()?;
-            let start = fields.get(19)?.parse().ok()?;
-            Some((pid, start, uid, pgrp, sid))
-        })
-        .collect()
+    let mut table = Vec::new();
+    for entry in fs::read_dir(proc_fs()).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let read = entry.metadata().and_then(|meta| {
+            fs::read_to_string(entry.path().join("stat")).map(|stat| (meta, stat))
+        });
+        let (meta, stat) = match read {
+            Ok(read) => read,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(format!("process {pid} cannot be read: {error}")),
+        };
+        let parsed = stat.rfind(')').and_then(|close| {
+            let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+            Some((
+                fields.get(19)?.parse().ok()?,
+                fields.get(2)?.parse().ok()?,
+                fields.get(3)?.parse().ok()?,
+            ))
+        });
+        let Some((start, pgrp, sid)) = parsed else {
+            return Err(format!("process {pid}'s stat cannot be parsed"));
+        };
+        table.push((pid, start, meta.uid(), pgrp, sid));
+    }
+    Ok(table)
+}
+
+fn proc_fs() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var("TIGHTBEAM_TEST_PROC") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from("/proc")
+}
+
+/// Move the records the gateway has judged (it lists them in
+/// `root-judged.json`, its own file) to `root/judged/`, so the directory it
+/// reads holds only what is new. Only this user's own regular files are
+/// moved; what cannot be moved stays and is said so.
+fn archive_judged(base: &Path, gateway_uid: u32) {
+    let list = guard_dir(base).join("root-judged.json");
+    let Ok(meta) = fs::metadata(&list) else {
+        return;
+    };
+    if meta.uid() != gateway_uid || meta.permissions().mode() & 0o022 != 0 {
+        eprintln!(
+            "tightbeam: {} is not the gateway's own record; no record was moved",
+            list.display()
+        );
+        return;
+    }
+    let names: Vec<String> = fs::read_to_string(&list)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value["judged"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| name.as_str().map(str::to_string))
+        .collect();
+    let dir = guard_dir(base).join("root");
+    let judged = dir.join("judged");
+    let me = unsafe { libc::geteuid() };
+    for name in names {
+        if name.contains('/') || name.starts_with('.') || !name.ends_with(".json") {
+            continue;
+        }
+        let path = dir.join(&name);
+        let ours = fs::symlink_metadata(&path)
+            .is_ok_and(|meta| meta.file_type().is_file() && meta.uid() == me);
+        if !ours {
+            continue;
+        }
+        let moved = fs::create_dir_all(&judged)
+            .and_then(|_| fs::set_permissions(&judged, fs::Permissions::from_mode(0o755)))
+            .and_then(|_| fs::rename(&path, judged.join(&name)));
+        if let Err(error) = moved {
+            eprintln!("tightbeam: judged record {name} could not be moved aside: {error}");
+        }
+    }
 }
 
 fn cgroup_fs() -> PathBuf {
@@ -238,6 +384,7 @@ fn cgroup_fs() -> PathBuf {
 
 fn override_episode(parsed: &Parsed, input: &mut dyn BufRead) -> Result<(), String> {
     let (episode, gateway_uid) = load_episode(parsed)?;
+    archive_judged(&parsed.base, gateway_uid);
     if episode["recovery"]["outcome"].as_str() != Some("failed") {
         return Err(format!(
             "an override needs a failed recovery of episode {} first; nothing was written",
@@ -260,51 +407,8 @@ fn override_episode(parsed: &Parsed, input: &mut dyn BufRead) -> Result<(), Stri
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let held = if episode["kind"] == "guard" {
-        "new agent launches".to_string()
-    } else {
-        format!(
-            "the replacement of the {} adapter",
-            episode["key"].as_str().unwrap_or("?")
-        )
-    };
-    let risk = if episode["kind"] == "guard" {
-        "Admitting the held launches means they run without the memory guard: no cap, floor or \
-         per-agent limit is checked until it answers."
-            .to_string()
-    } else {
-        format!(
-            "{} agent processes could not be stopped, even by root. Launching a replacement means \
-             they may keep using memory outside every limit until they end or the machine reboots.",
-            survivors.len()
-        )
-    };
-
-    let mut statement_text = format!(
-        "Episode {} on {}: Tightbeam holds {} because {}.\n",
-        parsed.episode,
-        episode["host"].as_str().unwrap_or("?"),
-        held,
-        episode["why"].as_str().unwrap_or("?")
-    );
-    for tree in &survivors {
-        statement_text.push_str(&format!(
-            "  - launch record {}, process {} started at {}, unit {}, state {}\n",
-            tree["launchId"].as_str().unwrap_or("unknown"),
-            tree["pid"],
-            tree["start"],
-            tree["unit"].as_str().unwrap_or("none"),
-            tree["state"].as_str().unwrap_or("unknown")
-        ));
-    }
-    statement_text.push_str(&format!("Risk accepted: {risk}\n"));
-    statement_text.push_str(&format!(
-        "Recorded as: root, invoked by {} (uid {}).\n",
-        operator["sudoUser"].as_str().unwrap_or("unknown"),
-        operator["sudoUid"].as_str().unwrap_or("unknown")
-    ));
-    statement_text.push_str(&sentence);
-    statement_text.push('\n');
+    let statement_text =
+        override_statement(&parsed.episode, &episode, &survivors, &operator, &sentence);
 
     print!("{statement_text}");
     print!(
@@ -329,6 +433,64 @@ fn override_episode(parsed: &Parsed, input: &mut dyn BufRead) -> Result<(), Stri
         parsed.episode
     );
     Ok(())
+}
+
+/// The statement the override prints before it acts, and records exactly as
+/// printed (FS9 Step 2). The gateway rebuilds the same text from its own
+/// state and refuses a record whose statement differs.
+fn override_statement(
+    episode_id: &str,
+    episode: &serde_json::Value,
+    survivors: &[serde_json::Value],
+    operator: &serde_json::Value,
+    sentence: &str,
+) -> String {
+    let held = if episode["kind"] == "guard" {
+        "new agent launches".to_string()
+    } else {
+        format!(
+            "the replacement of the {} adapter",
+            episode["key"].as_str().unwrap_or("?")
+        )
+    };
+    let risk = if episode["kind"] == "guard" {
+        "Admitting the held launches means they run without the memory guard: no cap, floor or \
+         per-agent limit is checked until it answers."
+            .to_string()
+    } else {
+        format!(
+            "{} agent processes could not be stopped, even by root. Launching a replacement means \
+             they may keep using memory outside every limit until they end or the machine reboots.",
+            survivors.len()
+        )
+    };
+
+    let mut text = format!(
+        "Episode {} on {}: Tightbeam holds {} because {}.\n",
+        episode_id,
+        episode["host"].as_str().unwrap_or("?"),
+        held,
+        episode["why"].as_str().unwrap_or("?")
+    );
+    for tree in survivors {
+        text.push_str(&format!(
+            "  - launch record {}, process {} started at {}, unit {}, state {}\n",
+            tree["launchId"].as_str().unwrap_or("unknown"),
+            tree["pid"],
+            tree["start"],
+            tree["unit"].as_str().unwrap_or("none"),
+            tree["state"].as_str().unwrap_or("unknown")
+        ));
+    }
+    text.push_str(&format!("Risk accepted: {risk}\n"));
+    text.push_str(&format!(
+        "Recorded as: root, invoked by {} (uid {}).\n",
+        operator["sudoUser"].as_str().unwrap_or("unknown"),
+        operator["sudoUid"].as_str().unwrap_or("unknown")
+    ));
+    text.push_str(sentence);
+    text.push('\n');
+    text
 }
 
 fn base_record(
@@ -534,6 +696,40 @@ mod tests {
         assert!(parse(&args(&["memory-guard-override", "--base", "/x", "../ep"])).is_err());
         assert!(parse(&args(&["memory-guard-recover", "ep_ab12"])).is_err());
         assert!(parse(&args(&["memory-guard-recover", "--base", "/x", "ep_ab12"])).is_ok());
+    }
+
+    #[test]
+    fn n5_golden_the_printed_statement_is_the_one_the_gateway_rebuilds() {
+        // The same fixture and text as the gateway's "N5 golden" test.
+        let episode = serde_json::json!({
+            "episodeId": "ep_golden", "host": "sirius", "kind": "custody",
+            "key": "claude:shared@sirius",
+            "why": "1 agent processes could not be confirmed stopped"
+        });
+        let survivors = vec![serde_json::json!({
+            "launchId": "sl-9", "pid": 4242, "start": 7,
+            "unit": "/tightbeam.slice/harness/session-sl-9", "state": "D"
+        })];
+        let operator = serde_json::json!({"user": "root", "sudoUser": "george", "sudoUid": "1000"});
+        let finding = serde_json::json!({
+            "groups": {"result": "present", "detail": ["docker", "lxd"]},
+            "sudo": {"result": "unknown", "detail": "no tty"},
+            "sockets": {"result": "absent", "detail": []}
+        });
+        let sentence = statement(&finding, finding_kind(&finding));
+        assert_eq!(
+            override_statement("ep_golden", &episode, &survivors, &operator, &sentence),
+            "Episode ep_golden on sirius: Tightbeam holds the replacement of the \
+             claude:shared@sirius adapter because 1 agent processes could not be \
+             confirmed stopped.\n  - launch record sl-9, process 4242 started at 7, unit \
+             /tightbeam.slice/harness/session-sl-9, state D\nRisk accepted: 1 agent processes \
+             could not be stopped, even by root. Launching a replacement means they may keep \
+             using memory outside every limit until they end or the machine reboots.\n\
+             Recorded as: root, invoked by george (uid 1000).\nThis machine's agents run as \
+             a user that can gain root, here through groups (docker, lxd); a path that could \
+             not be checked (sudo). So a process with that access, including an agent breaking \
+             its rules, could also run this override.\n"
+        );
     }
 
     #[test]
