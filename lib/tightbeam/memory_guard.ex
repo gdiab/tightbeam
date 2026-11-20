@@ -2938,7 +2938,9 @@ defmodule Tightbeam.MemoryGuard do
           # not ended.
           table ->
             not alive?(table, record) and
-              not (is_integer(record["pid"]) and ProcTree.unreadable?(state.root, record["pid"]))
+              not (is_integer(record["pid"]) and ProcTree.unreadable?(state.root, record["pid"])) and
+              (not is_integer(record["pid"]) or
+                 ProcTree.group_survivors(table, record["pid"], record["start"]) == [])
 
           # Trees that could not be read are not trees that ended (FS4).
           not trees_read? ->
@@ -3296,7 +3298,29 @@ defmodule Tightbeam.MemoryGuard do
         nil -> true
       end
 
-    root_gone? and members_gone? and unit_empty?
+    # B2.stale / D1.absent / E2.absent: a session leader that has gone is not
+    # its tree; without a unit to show it empty, no process of its group or
+    # session may remain (read-only; nothing found this way is signalled).
+    group_gone? =
+      case {Map.get(target, :unit), target} do
+        {unit, _} when is_binary(unit) ->
+          true
+
+        {_, %{scope: "session", pid: pid, start: start}} when is_integer(pid) ->
+          group_gone?(state, pid, start)
+
+        _ ->
+          true
+      end
+
+    root_gone? and members_gone? and unit_empty? and group_gone?
+  end
+
+  defp group_gone?(state, pid, start) do
+    case ProcTree.snapshot(state.root) do
+      {:ok, table} -> ProcTree.group_survivors(table, pid, start) == []
+      :error -> false
+    end
   end
 
   # Running, or there but unreadable: either way not shown gone.

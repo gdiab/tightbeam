@@ -86,16 +86,25 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
   @spec read(String.t(), pos_integer()) :: {:ok, proc()} | :error
   def read(proc, pid) do
     with {:ok, stat} <- File.read(Path.join([proc, Integer.to_string(pid), "stat"])),
-         {:ok, state, ppid, start} <- parse_stat(stat),
+         {:ok, state, ppid, pgrp, sid, start} <- parse_stat(stat),
          {:ok, status} <- File.read(Path.join([proc, Integer.to_string(pid), "status"])) do
-      {:ok, %{pid: pid, ppid: ppid, start: start, state: state, bytes: status_bytes(status)}}
+      {:ok,
+       %{
+         pid: pid,
+         ppid: ppid,
+         pgrp: pgrp,
+         sid: sid,
+         start: start,
+         state: state,
+         bytes: status_bytes(status)
+       }}
     else
       _ -> :error
     end
   end
 
   # `comm` may contain spaces and parentheses; the fields after the last ")"
-  # are fixed: state(3) ppid(4) ... starttime(22).
+  # are fixed: state(3) ppid(4) pgrp(5) session(6) ... starttime(22).
   defp parse_stat(stat) do
     case :binary.matches(stat, ")") do
       [] ->
@@ -108,8 +117,10 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
         case String.split(rest) do
           [state, ppid | fields] when length(fields) >= 18 ->
             with {ppid, ""} <- Integer.parse(ppid),
+                 {pgrp, ""} <- Integer.parse(Enum.at(fields, 0)),
+                 {sid, ""} <- Integer.parse(Enum.at(fields, 1)),
                  {start, ""} <- Integer.parse(Enum.at(fields, 17)) do
-              {:ok, state, ppid, start}
+              {:ok, state, ppid, pgrp, sid, start}
             else
               _ -> :error
             end
@@ -129,6 +140,24 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
         reduce: 0 do
       sum -> sum + number * 1024
     end
+  end
+
+  @doc """
+  The processes still in the process group or session the launch step's
+  leader `leader` started (the step `setsid`s, so both carry its pid), other
+  than the leader, started no earlier than it, and not zombies. After the
+  leader has gone its descendants are found this way, without a parent chain
+  (v1.13 R2a, M-V7; matrix B2.stale, D1.absent, E2.absent): a read-only
+  proof, never a reason to signal them.
+  """
+  @spec group_survivors(table(), pos_integer(), non_neg_integer() | nil) :: [pos_integer()]
+  def group_survivors(table, leader, leader_start) do
+    for {pid, process} <- table,
+        pid != leader,
+        process.state != "Z",
+        Map.get(process, :pgrp) == leader or Map.get(process, :sid) == leader,
+        is_nil(leader_start) or process.start >= leader_start,
+        do: pid
   end
 
   @doc "The pids of the tree rooted at `pid` (the root included), by parent chain."
