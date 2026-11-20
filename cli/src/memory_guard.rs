@@ -5,9 +5,8 @@
 //! `enforced`, the gateway points that variable at a link to this binary named
 //! `tightbeam-session-exec`. Before the harness runs any code, the step:
 //!
-//! 1. raises its own `oom_score_adj` by the host's configured amount (+100 by
-//!    default) above the value it inherited, which every descendant inherits
-//!    (R14);
+//! 1. raises its own `oom_score_adj` by +100 above the value it inherited
+//!    (capped at 1000), which every descendant inherits (R14);
 //! 2. leads its own session and process group, so the tree can be ended whole
 //!    by the existing `harness-group` kill, which also finds detached groups;
 //! 3. in `enforced` mode, joins a fresh `harness/session-<id>` cgroup with the
@@ -105,7 +104,6 @@ pub struct LaunchConfig {
     pub fs: Option<String>,
     pub harness: Option<String>,
     pub session_limit: Option<u64>,
-    pub oom_score_adj: Option<i64>,
 }
 
 pub fn read_config(dir: &Path) -> Result<LaunchConfig, String> {
@@ -128,7 +126,6 @@ pub fn read_config(dir: &Path) -> Result<LaunchConfig, String> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
         session_limit: value.get("sessionLimit").and_then(|v| v.as_u64()),
-        oom_score_adj: value.get("oomScoreAdj").and_then(|v| v.as_i64()),
     })
 }
 
@@ -153,9 +150,9 @@ fn prepare(dir: &Path, sid: &str, adapter_launch: &str) {
     }
 
     // R14: the session tree runs at the value inherited from the adapter (the
-    // gateway's, 0 on Sirius) plus the host's raise (+100 by default), capped
+    // gateway's, 0 on Sirius) plus 100, capped
     // at 1000. Raising one's own value needs no privilege.
-    let raise = config.oom_score_adj.unwrap_or(100);
+    let raise = 100;
     let inherited = fs::read_to_string("/proc/self/oom_score_adj")
         .ok()
         .and_then(|text| text.trim().parse::<i64>().ok())
@@ -363,7 +360,7 @@ mod tests {
         assert!(read_config(&dir).is_err());
         fs::write(
             dir.join("launch.json"),
-            r#"{"v":1,"mode":"enforced","fs":"/sys/fs/cgroup","harness":"/a/harness","sessionLimit":536870912,"oomScoreAdj":100}"#,
+            r#"{"v":1,"mode":"enforced","fs":"/sys/fs/cgroup","harness":"/a/harness","sessionLimit":536870912}"#,
         )
         .unwrap();
         assert_eq!(
@@ -373,7 +370,6 @@ mod tests {
                 fs: Some("/sys/fs/cgroup".into()),
                 harness: Some("/a/harness".into()),
                 session_limit: Some(536870912),
-                oom_score_adj: Some(100),
             }
         );
         fs::remove_dir_all(&dir).unwrap();

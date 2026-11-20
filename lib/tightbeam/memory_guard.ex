@@ -86,7 +86,12 @@ defmodule Tightbeam.MemoryGuard do
   when no record exists yet (AS1).
   """
   @spec memory_kill(map()) :: map() | nil
-  def memory_kill(%{host: host} = match) do
+  def memory_kill(match), do: memory_kill(match, System.monotonic_time(:millisecond) + 15_000)
+
+  # Only a kill confirmed to have ended its tree counts (R10). A kill still
+  # being carried out when a turn settles is waited for, briefly: settlement
+  # stays well inside R9's 30 s, and a kill that fails is never a memory kill.
+  defp memory_kill(%{host: host} = match, deadline) do
     since = Map.get(match, :since, 0)
 
     recorded =
@@ -97,9 +102,20 @@ defmodule Tightbeam.MemoryGuard do
             (kill.scope == "adapter" and kill.key == Map.get(match, :adapter_key)),
           do: kill
 
-    case Enum.sort_by(recorded, & &1.at) do
-      [kill | _] -> Map.take(kill, [:limit, :scope, :bytes, :limit_bytes, :mode])
-      [] -> enforced_counters(match)
+    {confirmed, pending} = Enum.split_with(recorded, &Map.get(&1, :confirmed, true))
+
+    case {Enum.sort_by(confirmed, & &1.at), pending} do
+      {[kill | _], _} ->
+        Map.take(kill, [:limit, :scope, :bytes, :limit_bytes, :mode])
+
+      {[], [_ | _]} ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(100)
+          memory_kill(match, deadline)
+        end
+
+      {[], []} ->
+        enforced_counters(match)
     end
   rescue
     ArgumentError -> nil
@@ -118,6 +134,24 @@ defmodule Tightbeam.MemoryGuard do
       [{_, exit}] -> exit
       _ -> nil
     end
+  end
+
+  @doc """
+  A re-admission hook was deferred (R6a): the sampler retries deferred hooks
+  each second until none is pending, so a hook runs once the last standing
+  reason of any kind clears (a memory release, a park release, a fallback
+  outcome).
+  """
+  @spec note_deferred() :: :ok
+  def note_deferred do
+    :ets.insert(table(), {:deferred_pending, true})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp deferred_pending? do
+    match?([{:deferred_pending, true}], lookup(:deferred_pending))
   end
 
   @doc false
@@ -251,22 +285,31 @@ defmodule Tightbeam.MemoryGuard do
   started is ended before this returns, so no replacement adapter starts while
   one lives.
   """
-  @spec adapter_ended(tuple(), String.t() | nil) :: :ok
+  @spec adapter_ended(tuple(), String.t() | nil) :: :ok | {:error, term()}
   def adapter_ended(key, launch_id) do
-    if running?(), do: GenServer.call(__MODULE__, {:adapter_ended, key, launch_id}, 60_000)
-    :ok
+    if running?(),
+      do: GenServer.call(__MODULE__, {:adapter_ended, key, launch_id}, call_timeout()),
+      else: :ok
   catch
-    :exit, _ -> :ok
+    :exit, reason -> {:error, {:memory_guard_unavailable, reason}}
   end
 
-  @doc "R2a backstop before a launch of `key`: no session tree of an earlier launch survives."
-  @spec ensure_no_orphans(tuple()) :: :ok
+  @doc """
+  R2a backstop before a launch of `key`: no session tree of an earlier launch
+  survives. `{:error, _}` refuses the launch: a tree could not be shown to have
+  ended, or the guard could not answer. Without a guard (not configured) there
+  is nothing it launched.
+  """
+  @spec ensure_no_orphans(tuple()) :: :ok | {:error, term()}
   def ensure_no_orphans(key) do
-    if running?(), do: GenServer.call(__MODULE__, {:ensure_no_orphans, key}, 60_000)
-    :ok
+    if running?(),
+      do: GenServer.call(__MODULE__, {:ensure_no_orphans, key}, call_timeout()),
+      else: :ok
   catch
-    :exit, _ -> :ok
+    :exit, reason -> {:error, {:memory_guard_unavailable, reason}}
   end
+
+  defp call_timeout, do: Application.get_env(:tightbeam, :memory_guard_call_timeout_ms, 60_000)
 
   @doc "A host's settings changed (R17): re-determine its mode and apply them."
   @spec settings_changed(String.t()) :: :ok
@@ -321,6 +364,8 @@ defmodule Tightbeam.MemoryGuard do
       closer: Keyword.get(opts, :closer, &default_close/3),
       idle_check: Keyword.get(opts, :idle_check, &default_idle_check/2),
       killer: Keyword.get(opts, :killer, &default_kill/2),
+      # SIGKILL for the parent-chain fallback; tests with a fake /proc inject one.
+      signaller: Keyword.get(opts, :signaller, &default_signal/1),
       nudge: Keyword.get(opts, :nudge, &default_nudge/1),
       conn_registry: Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry),
       hosts: %{},
@@ -338,6 +383,8 @@ defmodule Tightbeam.MemoryGuard do
     }
 
     state = state |> determine_all() |> publish_all()
+    # Deferrals recorded before a restart are picked up by the first samples.
+    note_deferred()
 
     if state.sample_ms != :manual, do: Process.send_after(self(), :tick, state.sample_ms)
     {:ok, state}
@@ -363,13 +410,13 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   def handle_call({:adapter_ended, key, launch_id}, _from, state) do
-    state = end_adapter_sessions(state, key, launch_id)
-    {:reply, :ok, publish_all(state)}
+    {reply, state} = end_adapter_sessions(state, key, launch_id)
+    {:reply, reply, publish_all(state)}
   end
 
   def handle_call({:ensure_no_orphans, key}, _from, state) do
-    state = end_adapter_sessions(state, key, :any_previous)
-    {:reply, :ok, state}
+    {reply, state} = end_adapter_sessions(state, key, :any_previous)
+    {:reply, reply, state}
   end
 
   def handle_call({:settings_changed, host}, _from, state) do
@@ -459,8 +506,42 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
-  def handle_info({:killed, id, _result}, state) do
-    {:noreply, %{state | killing: Map.delete(state.killing, id)}}
+  # R1/R2 in watched mode: the kill is published as an ended tree, and counts
+  # for settlement, only once the tree is shown gone. A failed kill is
+  # recorded and retried by the next sample, which still sees it over its limit.
+  def handle_info({:killed, id, result}, state) do
+    {kill, killing} = Map.pop(state.killing, id)
+    state = %{state | killing: killing}
+
+    case {kill, result} do
+      {nil, _} ->
+        {:noreply, state}
+
+      {kill, :ok} ->
+        :ets.insert(table(), {{:kill, id}, Map.put(kill, :confirmed, true)})
+        record_ended(state, kill.host, kill)
+        {:noreply, publish_all(state)}
+
+      {kill, {:error, reason}} ->
+        :ets.delete(table(), {:kill, id})
+
+        EventLog.lifecycle(
+          state.db,
+          "memory_kill_failed",
+          kill.host,
+          JSON.encode!(%{
+            host: kill.host,
+            unit: id,
+            scope: kill.scope,
+            limit: kill.limit,
+            sessionId: kill.sid,
+            launchId: kill.launch_id,
+            error: inspect(reason)
+          })
+        )
+
+        {:noreply, state}
+    end
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -551,7 +632,7 @@ defmodule Tightbeam.MemoryGuard do
           fs: layout && layout.fs,
           harness: layout && layout.harness,
           sessionLimit: settings.session_limit,
-          oomScoreAdj: settings.session_oom_score_adj
+          oomRaise: 100
         })
     end
 
@@ -602,7 +683,6 @@ defmodule Tightbeam.MemoryGuard do
       residentCap: settings.resident_cap,
       floorHold: settings.floor_hold,
       floorRelease: settings.floor_release,
-      sessionOomScoreAdj: settings.session_oom_score_adj,
       memTotal: settings.mem_total
     }
   end
@@ -1289,7 +1369,9 @@ defmodule Tightbeam.MemoryGuard do
         state = put_in(state.hosts[host].available, available)
         state = watched_limits(state, host, measured, settings)
         state = observe_ended(state, host, measured)
-        state |> shed(host) |> trim_to_cap(host)
+        state = state |> shed(host) |> trim_to_cap(host)
+        if host_level_reasons(state.hosts[host]) == [], do: run_deferred(state, host)
+        state
 
       :error ->
         if host_state.sampling_failed do
@@ -1561,7 +1643,7 @@ defmodule Tightbeam.MemoryGuard do
     held_keys = for {key, held} <- state.held, held.host == host, do: key
 
     for session_key <- held_keys do
-      other = Tightbeam.MemoryGuard.Admission.other_reasons(state.db, session_key)
+      other = Admission.other_reasons(state.db, session_key)
       remaining = remaining_host ++ other
 
       if remaining != [] do
@@ -1574,11 +1656,22 @@ defmodule Tightbeam.MemoryGuard do
       end
     end
 
-    if remaining_host == [] do
-      :ok = Tightbeam.MemoryGuard.Admission.run_deferred(state.db, host)
-    end
+    if remaining_host == [], do: run_deferred(state, host)
 
     release_check(state, host)
+  end
+
+  # Deferred hooks run once nothing stands; the flag keeps the per-second
+  # sampler from querying when nothing was ever deferred.
+  defp run_deferred(state, host) do
+    if deferred_pending?() do
+      case Admission.run_deferred(state.db, host) do
+        :ok -> :ets.insert(table(), {:deferred_pending, false})
+        :pending -> :ok
+      end
+    end
+
+    :ok
   end
 
   # R1 and R2 in watched mode (and for unplaced trees on an enforced host).
@@ -1630,9 +1723,12 @@ defmodule Tightbeam.MemoryGuard do
       limit_bytes:
         if(limit == "session", do: unit.limit_bytes, else: state.hosts[host].settings.budget),
       mode: mode,
-      at: now
+      at: now,
+      confirmed: false
     }
 
+    # R10a: the intent is recorded before the first signal; it becomes a
+    # memory kill only once the tree is shown gone (handle_info :killed).
     :ets.insert(table(), {{:kill, unit.id}, kill})
 
     EventLog.lifecycle(
@@ -1652,16 +1748,11 @@ defmodule Tightbeam.MemoryGuard do
       })
     )
 
-    record_ended(state, host, kill)
-
     guard = self()
-    killer = state.killer
     target = kill_target(state, unit)
+    host_state = state.hosts[host]
 
-    Task.start(fn ->
-      result = killer.(target, state.hosts[host])
-      send(guard, {:killed, unit.id, result})
-    end)
+    Task.start(fn -> send(guard, {:killed, unit.id, end_tree(state, host_state, target)}) end)
 
     %{state | killing: Map.put(state.killing, unit.id, kill)}
   end
@@ -1671,6 +1762,7 @@ defmodule Tightbeam.MemoryGuard do
       scope: "session",
       helper: helper(state),
       pid: record["pid"],
+      start: record["start"],
       identity: record["identity"],
       launch_id: record["launchId"],
       unit: Map.get(unit, :unit)
@@ -1909,29 +2001,145 @@ defmodule Tightbeam.MemoryGuard do
           launch_id == :any_previous or record["adapterLaunchId"] == launch_id,
           do: record
 
-    for record <- victims do
-      target = %{
-        scope: "session",
-        helper: helper(state),
-        pid: record["pid"],
-        identity: record["identity"],
-        launch_id: record["launchId"],
-        unit: if(record["placement"] == "enforced", do: record["unit"])
-      }
+    results =
+      for record <- victims do
+        target = %{
+          scope: "session",
+          helper: helper(state),
+          pid: record["pid"],
+          start: record["start"],
+          identity: record["identity"],
+          launch_id: record["launchId"],
+          unit: if(record["placement"] == "enforced", do: record["unit"])
+        }
 
-      _ = state.killer.(target, host_state)
+        {record, end_tree(state, host_state, target)}
+      end
+
+    # Custody is kept for every tree not shown gone: its record stays, so the
+    # next attempt (the pre-launch backstop) can end it.
+    state =
+      Enum.reduce(results, state, fn
+        {record, :ok}, acc ->
+          forget_residency(acc, host, record["sessionId"])
+
+          if host_state && host_state.layout && record["unit"],
+            do: Cgroup.remove(host_state.layout.fs, record["unit"])
+
+          Records.remove(acc.base_dir, record["launchId"])
+          %{acc | launches: Map.delete(acc.launches, record["launchId"])}
+
+        {_record, {:error, _}}, acc ->
+          acc
+      end)
+
+    case for({record, {:error, reason}} <- results, do: {record["launchId"], reason}) do
+      [] ->
+        {:ok, remove_adapter_unit(state, host_state, launch_id)}
+
+      survivors ->
+        EventLog.lifecycle(
+          state.db,
+          "memory_guard_orphans",
+          host,
+          JSON.encode!(%{
+            host: host,
+            adapterLaunchId: if(is_binary(launch_id), do: launch_id),
+            survivors:
+              Enum.map(survivors, fn {launch, reason} ->
+                %{launchId: launch, error: inspect(reason)}
+              end)
+          })
+        )
+
+        {{:error, {:session_trees_survive, Enum.map(survivors, &elem(&1, 0))}}, state}
+    end
+  end
+
+  # End one tree and show it gone (R1, R2, R2a, M-V7): the killer's own
+  # verdict is not enough. A session tree is gone when its recorded process
+  # (same start time) is no longer running and, in enforced mode, its unit holds
+  # nothing. If the identity kill could not run (for example its identity file
+  # is missing) the recorded process tree is ended by its parent chain instead.
+  @doc false
+  def end_tree(state, host_state, target) do
+    first = state.killer.(target, host_state)
+
+    case await_gone(state, host_state, target, 5_000) do
+      :ok ->
+        :ok
+
+      :alive ->
+        _ = walk_kill(state, target)
+
+        case await_gone(state, host_state, target, 5_000) do
+          :ok -> :ok
+          :alive -> {:error, {:tree_survives, first}}
+        end
+    end
+  end
+
+  defp await_gone(state, host_state, target, ms) do
+    deadline = System.monotonic_time(:millisecond) + ms
+
+    Stream.repeatedly(fn -> gone?(state, host_state, target) end)
+    |> Enum.reduce_while(:alive, fn
+      true, _ ->
+        {:halt, :ok}
+
+      false, _ ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:halt, :alive}
+        else
+          Process.sleep(50)
+          {:cont, :alive}
+        end
+    end)
+  end
+
+  defp gone?(state, host_state, %{scope: "session", pid: pid, start: start} = target) do
+    unit_empty? =
+      case {Map.get(target, :unit), host_state && host_state.layout} do
+        {unit, %{fs: fs}} when is_binary(unit) -> Cgroup.populated?(fs, unit) != true
+        _ -> true
+      end
+
+    not running?(state.root, pid, start) and unit_empty?
+  end
+
+  defp gone?(state, _host_state, %{scope: "adapter", row: row}),
+    do: not running?(state.root, row.os_pid, nil)
+
+  defp gone?(_state, _host_state, _target), do: true
+
+  # A process is running when /proc has it, it is not a zombie, and (when
+  # known) its start time is the recorded one: a reused pid is not ours.
+  defp running?(root, pid, start) when is_integer(pid) do
+    case ProcTree.read(Path.join(root, "proc"), pid) do
+      {:ok, %{state: "Z"}} -> false
+      {:ok, %{start: ^start}} -> true
+      {:ok, _} -> is_nil(start)
+      :error -> false
+    end
+  end
+
+  defp running?(_root, _pid, _start), do: false
+
+  defp walk_kill(state, %{scope: "session", pid: pid, start: start}) when is_integer(pid) do
+    with true <- running?(state.root, pid, start),
+         {:ok, table} <- ProcTree.snapshot(state.root) do
+      pids = table |> ProcTree.tree(pid) |> MapSet.to_list()
+      if pids != [], do: state.signaller.(pids)
     end
 
-    Enum.reduce(victims, state, fn record, acc ->
-      forget_residency(acc, host, record["sessionId"])
+    :ok
+  end
 
-      if host_state && host_state.layout && record["unit"],
-        do: Cgroup.remove(host_state.layout.fs, record["unit"])
+  defp walk_kill(_state, _target), do: :ok
 
-      Records.remove(acc.base_dir, record["launchId"])
-      %{acc | launches: Map.delete(acc.launches, record["launchId"])}
-    end)
-    |> remove_adapter_unit(host_state, launch_id)
+  defp default_signal(pids) do
+    System.cmd("kill", ["-KILL" | Enum.map(pids, &Integer.to_string/1)], stderr_to_stdout: true)
+    :ok
   end
 
   # The ended launch, or (`:any_previous`, before a new launch) every launch of
@@ -2116,7 +2324,7 @@ defmodule Tightbeam.MemoryGuard do
 
     %{
       gatewayAndAdapters: gateway,
-      sessionProcesses: gateway && min(gateway + host_state.settings.session_oom_score_adj, 1000)
+      sessionProcesses: gateway && min(gateway + 100, 1000)
     }
   end
 

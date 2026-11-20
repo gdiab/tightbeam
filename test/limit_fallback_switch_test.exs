@@ -1636,6 +1636,8 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     root
   end
 
+  # Ending a tree on the fake host removes its fake process; nothing real is
+  # signalled.
   defp memory_guard!(ctx, root) do
     start_supervised!(
       {Tightbeam.MemoryGuard,
@@ -1646,7 +1648,15 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
        probe: fn -> %{mode: :watched, reason: "test", mem_total: 16 * @gib, cgroup: nil} end,
        sample_ms: :manual,
        closer: fn _adapter, _sid, _reason -> :ok end,
-       killer: fn _target, _host_state -> :ok end,
+       killer: fn
+         %{pid: pid}, _host_state when is_integer(pid) ->
+           File.rm_rf!(Path.join([root, "proc", Integer.to_string(pid)]))
+           :ok
+
+         _target, _host_state ->
+           :ok
+       end,
+       signaller: fn _pids -> :ok end,
        nudge: &SessionLane.nudge/1}
     )
   end

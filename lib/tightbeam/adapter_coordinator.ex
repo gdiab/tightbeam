@@ -1109,7 +1109,17 @@ defmodule Tightbeam.AdapterCoordinator do
         else
           # Memory limits v1.1 R2a: no session process outlives its adapter,
           # and none survives into the replacement scheduled below.
-          :ok = Tightbeam.MemoryGuard.adapter_ended(key, current_launch_id(state.db, key))
+          # If a tree cannot be shown gone, its record stays and the
+          # pre-launch backstop refuses the replacement until it is.
+          case Tightbeam.MemoryGuard.adapter_ended(key, current_launch_id(state.db, key)) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              Logger.error(
+                "session processes of #{key_name(key)} could not be ended: #{inspect(reason)}"
+              )
+          end
 
           case Tightbeam.HarnessProcess.settle_proven_dead(state.db, key) do
             :ok ->

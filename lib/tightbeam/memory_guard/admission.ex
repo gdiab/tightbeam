@@ -44,6 +44,36 @@ defmodule Tightbeam.MemoryGuard.Admission do
   end
 
   @doc """
+  The same reasons as `other_reasons/2`, inside a transaction, so a hook and
+  the check that gates it see one state (R6a).
+  """
+  @spec other_reasons_in_txn(Txn.t(), String.t()) :: [String.t()]
+  def other_reasons_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[harness, host]] ->
+        key = {Harness.parse!(harness).id(), "shared", host}
+
+        fallback? =
+          Txn.q(
+            txn,
+            "SELECT 1 FROM limit_fallback_evaluations WHERE sessionKey=?1 AND outcome IS NULL LIMIT 1",
+            [session_key]
+          ) != []
+
+        Enum.filter(
+          [
+            HarnessProcess.parked_in_txn?(txn, key) && "quota_park",
+            fallback? && "limit_fallback"
+          ],
+          & &1
+        )
+
+      _ ->
+        []
+    end
+  end
+
+  @doc """
   At a quota-park release (companion B5): when a memory reason still stands
   on the key's host, record the remaining hold and defer the re-admission.
   Returns `:deferred`, or `:resume` when nothing else stands and the caller
@@ -75,6 +105,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
           JSON.encode!(%{host: host, harness: harness, incidentId: incident_id})
         )
 
+        Tightbeam.MemoryGuard.note_deferred()
         :deferred
     end
   end
@@ -94,8 +125,9 @@ defmodule Tightbeam.MemoryGuard.Admission do
   R9's not-started rule: a turn whose session tree was memory killed before
   its prompt was dispatched is re-admitted exactly once. A turn that is itself
   such a re-admission is not re-admitted again (the load-and-kill loop stop).
-  Returns `:readmitted`, `:deferred` (a memory reason stands; it runs when the
-  last one clears) or `:exhausted`.
+  Returns `:readmitted`, `:deferred` (a standing reason, of this contract or
+  another, still holds the session; it runs once the last one clears, R6a) or
+  `:exhausted`.
   """
   @spec not_started_in_txn(Txn.t(), pos_integer(), String.t()) ::
           :readmitted | :deferred | :exhausted
@@ -104,7 +136,8 @@ defmodule Tightbeam.MemoryGuard.Admission do
       readmission?(txn, seq) ->
         :exhausted
 
-      Tightbeam.MemoryGuard.host_reasons(host) != [] ->
+      Tightbeam.MemoryGuard.host_reasons(host) != [] or
+          other_reasons_in_txn(txn, session_of(txn, seq)) != [] ->
         EventLog.lifecycle_in_txn(
           txn,
           "memory_readmission_pending",
@@ -112,6 +145,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
           JSON.encode!(%{host: host, sourceSeq: seq})
         )
 
+        Tightbeam.MemoryGuard.note_deferred()
         :deferred
 
       true ->
@@ -205,39 +239,46 @@ defmodule Tightbeam.MemoryGuard.Admission do
   A deferred quota re-admission whose key is parked again is left for that
   park's own release.
   """
-  @spec run_deferred(DB.server(), String.t()) :: :ok
+  @spec run_deferred(DB.server(), String.t()) :: :ok | :pending
   def run_deferred(db, host) do
-    {:ok, _} =
-      DB.transaction(db, fn txn ->
-        for [subject, detail] <-
-              pending_in_txn(txn, "quota_readmission_deferred", "quota_readmission_resumed", host) do
-          %{"harness" => harness} = JSON.decode!(detail)
-          key = {Harness.parse!(harness).id(), "shared", host}
+    DB.transaction(db, fn txn ->
+      for [subject, detail] <-
+            pending_in_txn(txn, "quota_readmission_deferred", "quota_readmission_resumed", host) do
+        %{"harness" => harness} = JSON.decode!(detail)
+        key = {Harness.parse!(harness).id(), "shared", host}
 
-          unless HarnessProcess.parked_in_txn?(txn, key) do
-            Wakes.readmit_released_quota_intents_in_txn(txn, subject)
+        unless HarnessProcess.parked_in_txn?(txn, key) do
+          Wakes.readmit_released_quota_intents_in_txn(txn, subject)
 
-            EventLog.lifecycle_in_txn(
-              txn,
-              "quota_readmission_resumed",
-              subject,
-              JSON.encode!(%{host: host, harness: harness})
-            )
+          EventLog.lifecycle_in_txn(
+            txn,
+            "quota_readmission_resumed",
+            subject,
+            JSON.encode!(%{host: host, harness: harness})
+          )
 
-            resumed_in_txn(txn, subject, host, "memory")
-          end
+          resumed_in_txn(txn, subject, host, "memory")
         end
+      end
 
-        for [_subject, detail] <-
-              pending_in_txn(txn, "memory_readmission_pending", "memory_readmission_done", host) do
-          %{"sourceSeq" => seq} = JSON.decode!(detail)
-          readmit_in_txn(txn, seq, host)
-        end
+      # A not-started re-admission runs only when no reason of any kind
+      # still holds its session (R6a); otherwise it stays pending.
+      for [session_key, detail] <-
+            pending_in_txn(txn, "memory_readmission_pending", "memory_readmission_done", host),
+          other_reasons_in_txn(txn, session_key) == [] do
+        %{"sourceSeq" => seq} = JSON.decode!(detail)
+        readmit_in_txn(txn, seq, host)
+      end
 
-        :ok
-      end)
-
-    :ok
+      pending_in_txn(txn, "quota_readmission_deferred", "quota_readmission_resumed", host) !=
+        [] or
+        pending_in_txn(txn, "memory_readmission_pending", "memory_readmission_done", host) !=
+          []
+    end)
+    |> case do
+      {:ok, true} -> :pending
+      {:ok, false} -> :ok
+    end
   end
 
   # Rows of `pending_kind` on `host` with no matching `done_kind` row (matched

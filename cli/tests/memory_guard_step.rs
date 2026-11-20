@@ -76,7 +76,7 @@ fn start(name: &str, raise: i64, mode: &str) -> Fixture {
     fs::create_dir_all(guard_dir.join("bin")).unwrap();
     fs::write(
         guard_dir.join("launch.json"),
-        format!(r#"{{"v":1,"mode":"{mode}","sessionLimit":536870912,"oomScoreAdj":100}}"#),
+        format!(r#"{{"v":1,"mode":"{mode}","sessionLimit":536870912}}"#),
     )
     .unwrap();
 

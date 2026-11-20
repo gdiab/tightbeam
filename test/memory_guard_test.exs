@@ -76,6 +76,19 @@ defmodule Tightbeam.MemoryGuardTest do
 
   defp gone!(root, pid), do: File.rm_rf!(Path.join([root, "proc", Integer.to_string(pid)]))
 
+  defp target_pids(%{scope: "session", pid: pid}) when is_integer(pid), do: [pid]
+  defp target_pids(%{scope: "adapter", row: %{os_pid: pid}}) when is_integer(pid), do: [pid]
+  defp target_pids(_target), do: []
+
+  # The guard has handled every kill it started.
+  defp settle_kills!(attempts \\ 1500) do
+    cond do
+      :sys.get_state(MemoryGuard).killing == %{} -> :ok
+      attempts == 0 -> flunk("a kill never finished")
+      true -> Process.sleep(10) && settle_kills!(attempts - 1)
+    end
+  end
+
   # A launch record as the step writes it.
   defp launch!(base, launch, sid, pid, start, limit, adapter_launch \\ "adapter-launch-1") do
     dir = Path.join(Records.dir(base), "sessions")
@@ -116,25 +129,40 @@ defmodule Tightbeam.MemoryGuardTest do
         cgroup: nil
       })
 
-    start_supervised!(
-      {MemoryGuard,
-       db: ctx.db,
-       base_dir: ctx.base,
-       local_host: @host,
-       root: ctx.root,
-       cgroup_fs: Keyword.get(opts, :cgroup_fs, Path.join(ctx.root, "sys/fs/cgroup")),
-       probe: fn -> probe end,
-       sample_ms: :manual,
-       closer: fn _adapter, sid, reason ->
-         send(test, {:closed, sid, reason})
-         Keyword.get(opts, :close_result, :ok)
-       end,
-       killer: fn target, _host_state ->
-         send(test, {:killed, target})
-         :ok
-       end,
-       nudge: fn key -> send(test, {:nudged, key}) end}
-    )
+    start_supervised!({
+      MemoryGuard,
+      # A kill on the fake host removes the fake processes it ends (unless
+      # the test says the kill fails); nothing real is ever signalled.
+      db: ctx.db,
+      base_dir: ctx.base,
+      local_host: @host,
+      root: ctx.root,
+      cgroup_fs: Keyword.get(opts, :cgroup_fs, Path.join(ctx.root, "sys/fs/cgroup")),
+      probe: fn -> probe end,
+      sample_ms: :manual,
+      closer: fn _adapter, sid, reason ->
+        send(test, {:closed, sid, reason})
+        Keyword.get(opts, :close_result, :ok)
+      end,
+      killer: fn target, _host_state ->
+        send(test, {:killed, target})
+
+        case Keyword.get(opts, :kill_result, :ok) do
+          :ok ->
+            for pid <- target_pids(target), do: gone!(ctx.root, pid)
+            :ok
+
+          failure ->
+            failure
+        end
+      end,
+      signaller: fn pids ->
+        send(test, {:signalled, Enum.sort(pids)})
+        if Keyword.get(opts, :signal_works, true), do: for(pid <- pids, do: gone!(ctx.root, pid))
+        :ok
+      end,
+      nudge: fn key -> send(test, {:nudged, key}) end
+    })
   end
 
   defp session!(ctx, key, sid \\ nil) do
@@ -202,8 +230,9 @@ defmodule Tightbeam.MemoryGuardTest do
       assert settings.resident_cap == 15
       assert settings.floor_hold == 12
       assert settings.floor_release == 15
-      # NB-3: +100 by default, a setting.
-      assert settings.session_oom_score_adj == 100
+      # R14/NB-3: the +100 is fixed, not a setting; R17 has exactly six settings.
+      refute Map.has_key?(settings, :session_oom_score_adj)
+      assert Settings.names() == ~w(mode budget sessionLimit residentCap floorHold floorRelease)
     end
 
     test "ranges and cross-field rules refuse a bad value and keep the stored one", ctx do
@@ -234,8 +263,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert {:error, %{code: "invalid_setting"}} = set.("floorHold", "2")
       assert {:error, %{code: "invalid_setting"}} = set.("floorRelease", "12")
       assert {:ok, %{value: "20"}} = set.("floorRelease", "20%")
-      assert {:error, %{code: "invalid_setting"}} = set.("sessionOomScoreAdj", "1001")
-      assert {:ok, %{value: "0"}} = set.("sessionOomScoreAdj", "0")
+      assert {:error, %{code: "invalid_setting"}} = set.("sessionOomScoreAdj", "0")
       assert {:error, %{code: "invalid_setting"}} = set.("mode", "enforced")
       assert {:error, %{code: "invalid_setting"}} = set.("nonsense", "1")
 
@@ -244,7 +272,6 @@ defmodule Tightbeam.MemoryGuardTest do
       assert effective.budget == 8 * @gib
       assert effective.session_limit == 512 * @mib
       assert effective.floor_release == 20
-      assert effective.session_oom_score_adj == 0
 
       assert {:ok, [["user:owner", set_at]]} =
                DB.query(
@@ -1042,6 +1069,36 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  defp free!(ctx), do: meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 16, 100))
+
+  defp hold_other!(ctx, :park, _seq, true) do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO harness_park_fences (adapterKey, requestedAt, generation) VALUES ('claude:shared@testhost', 1, 1)"
+      )
+  end
+
+  defp hold_other!(ctx, :park, _seq, false),
+    do: {:ok, _} = DB.query(ctx.db, "DELETE FROM harness_park_fences")
+
+  defp hold_other!(ctx, :fallback, seq, true) do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO limit_fallback_evaluations (sessionKey, turnSeq, heldAt, createdAt) VALUES ('agent:load', ?1, 1, 1)",
+        [seq]
+      )
+  end
+
+  defp hold_other!(ctx, :fallback, _seq, false),
+    do:
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE limit_fallback_evaluations SET outcome='withheld', reason='test', decidedAt=2"
+        )
+
   defp oldest!(ctx, key) do
     {:ok, [[seq]]} =
       DB.query(
@@ -1177,6 +1234,7 @@ defmodule Tightbeam.MemoryGuardTest do
 
       assert identity =~ "sl-a.identity"
       refute_received {:killed, _}
+      settle_kills!()
 
       assert [{@host, intent}] = events(ctx.db, "memory_kill_intent")
       assert %{"limit" => "session", "scope" => "session", "sessionId" => "sid-a"} = intent
@@ -1188,6 +1246,35 @@ defmodule Tightbeam.MemoryGuardTest do
 
       assert bytes == 710 * @mib
       assert MemoryGuard.memory_kill(%{host: @host, harness_session_id: "sid-b", since: 0}) == nil
+    end
+
+    test "review B3: a kill that does not end its tree is no memory kill and is recorded as failed",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      proc!(ctx.root, 640, 1, 41, 900 * @mib)
+      launch!(ctx.base, "sl-f", "sid-f", 640, 41, 512 * @mib)
+      guard!(ctx, kill_result: {:error, :harness_group_failed}, signal_works: false)
+      session!(ctx, "agent:f", "sid-f")
+
+      :ok = MemoryGuard.tick()
+      assert_receive {:killed, %{pid: 640}}
+      # The intent is recorded before the signal (R10a) ...
+      assert [{@host, %{"sessionId" => "sid-f"}}] = events(ctx.db, "memory_kill_intent")
+      settle_kills!()
+
+      # ... but nothing claims the tree ended, and settlement finds no memory kill.
+      assert events(ctx.db, "memory_tree_ended") == []
+
+      assert [{@host, %{"sessionId" => "sid-f", "error" => error}}] =
+               events(ctx.db, "memory_kill_failed")
+
+      assert error =~ "tree_survives"
+      assert MemoryGuard.memory_kill(%{host: @host, harness_session_id: "sid-f", since: 0}) == nil
+
+      # It is still over its limit, so the next sample tries again.
+      :ok = MemoryGuard.tick()
+      assert_receive {:killed, %{pid: 640}}
+      settle_kills!()
     end
 
     test "T3: at 90% of the budget launches hold and an idle process closes; past the budget exactly one growing tree ends; below 85% holds release",
@@ -1352,6 +1439,63 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  describe "adapter end failures (R2a, review B1)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      proc!(ctx.root, 951, 950, 951, 10 * @mib)
+      launch!(ctx.base, "sl-a", "sid-a", 951, 951, 512 * @mib)
+      :ok
+    end
+
+    test "a failed group kill keeps the record, says the tree survives and refuses the replacement",
+         ctx do
+      guard!(ctx, kill_result: {:error, :harness_group_failed}, signal_works: false)
+
+      assert {:error, {:session_trees_survive, ["sl-a"]}} =
+               MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
+
+      assert Map.keys(Records.read_all(ctx.base)) == ["sl-a"]
+
+      assert [{@host, %{"survivors" => [%{"launchId" => "sl-a"}]}}] =
+               events(ctx.db, "memory_guard_orphans")
+
+      # The pre-launch backstop refuses while the tree lives ...
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+      assert {:error, _} = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+
+      # ... and allows the launch once it has ended.
+      gone!(ctx.root, 951)
+      assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      assert Records.read_all(ctx.base) == %{}
+    end
+
+    test "a missing identity with the recorded process alive is ended through its parent chain",
+         ctx do
+      File.rm!(Path.join([Records.dir(ctx.base), "sessions", "sl-a.identity"]))
+      proc!(ctx.root, 952, 951, 952, 10 * @mib)
+      guard!(ctx, kill_result: {:error, :identity_missing})
+
+      assert :ok = MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
+      assert_received {:signalled, [951, 952]}
+      assert Records.read_all(ctx.base) == %{}
+    end
+
+    test "a guard that cannot answer refuses the launch rather than allowing it", ctx do
+      guard!(ctx)
+      Application.put_env(:tightbeam, :memory_guard_call_timeout_ms, 500)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_call_timeout_ms) end)
+      :sys.suspend(MemoryGuard)
+
+      try do
+        task = Task.async(fn -> MemoryGuard.ensure_no_orphans({:claude, "shared", @host}) end)
+        assert {:error, {:memory_guard_unavailable, _}} = Task.await(task, 5_000)
+      after
+        :sys.resume(MemoryGuard)
+      end
+    end
+  end
+
   ## R6a / T14 (admission composition)
 
   describe "standing reasons (R6a, T14)" do
@@ -1416,6 +1560,44 @@ defmodule Tightbeam.MemoryGuardTest do
                HeldState.read(ctx.db, Org.get(ctx.db, "agent:s")).reasons
 
       assert events(ctx.db, "admission_resumed") == []
+    end
+
+    # Review B6: the R9 hook itself waits for every standing reason, in both
+    # release orders, with a quota park and with a limit-fallback hold.
+    for {other, label} <- [{:park, "quota park"}, {:fallback, "limit-fallback hold"}],
+        order <- [:memory_first, :other_first] do
+      @tag other: other, order: order
+      test "R9 not-started with a #{label}, #{order}: re-admitted once, only after both clear",
+           ctx do
+        total = 16 * @gib
+        meminfo!(ctx.root, total, div(total * 10, 100))
+        guard!(ctx)
+        :ok = MemoryGuard.tick()
+        session!(ctx, "agent:load")
+        seq = queue!(ctx, "agent:load", "load me")
+        hold_other!(ctx, ctx.other, seq, true)
+
+        assert {:ok, :deferred} =
+                 DB.transaction(ctx.db, &Admission.not_started_in_txn(&1, seq, @host))
+
+        {first, second} =
+          if ctx.order == :memory_first,
+            do: {fn -> free!(ctx) end, fn -> hold_other!(ctx, ctx.other, seq, false) end},
+            else: {fn -> hold_other!(ctx, ctx.other, seq, false) end, fn -> free!(ctx) end}
+
+        first.()
+        :ok = MemoryGuard.tick()
+        assert events(ctx.db, "memory_readmission_done") == []
+
+        second.()
+        :ok = MemoryGuard.tick()
+
+        assert [{"agent:load", %{"sourceSeq" => ^seq}}] =
+                 events(ctx.db, "memory_readmission_done")
+
+        :ok = MemoryGuard.tick()
+        assert length(events(ctx.db, "memory_readmission_done")) == 1
+      end
     end
 
     test "R9 not-started: re-admitted exactly once, then exhausted", ctx do
