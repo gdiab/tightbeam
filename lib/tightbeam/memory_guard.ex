@@ -142,7 +142,13 @@ defmodule Tightbeam.MemoryGuard do
   when no record exists yet (AS1).
   """
   @spec memory_kill(map()) :: map() | nil
-  def memory_kill(match), do: memory_kill(match, System.monotonic_time(:millisecond) + 15_000)
+  def memory_kill(match),
+    do:
+      memory_kill(
+        match,
+        System.monotonic_time(:millisecond) +
+          Application.get_env(:tightbeam, :memory_guard_attribution_wait_ms, 15_000)
+      )
 
   # Only a kill confirmed to have ended its tree counts (R10). A kill still
   # being carried out when a turn settles is waited for, briefly: settlement
@@ -158,15 +164,28 @@ defmodule Tightbeam.MemoryGuard do
             (kill.scope == "adapter" and kill.key == Map.get(match, :adapter_key)),
           do: kill
 
-    {confirmed, pending} = Enum.split_with(recorded, &Map.get(&1, :confirmed, true))
+    # v1.13 FS6: `memory_limit` exactly when the intent is recorded (R10a)
+    # or the kernel attributes it (R10), and the kill was sent before the
+    # tree's end was observed. Whether the kill was confirmed is not part of
+    # the test. An intent not yet sent is waited for, inside R9's 30 s.
+    attributed =
+      recorded
+      |> Enum.filter(&(Map.get(&1, :confirmed, true) or Map.has_key?(&1, :sent_at)))
+      |> Enum.reject(&Map.get(&1, :ended_before_send, false))
 
-    case {Enum.sort_by(confirmed, & &1.at), pending} do
+    unsent =
+      Enum.filter(recorded, fn kill ->
+        not Map.get(kill, :confirmed, true) and not Map.has_key?(kill, :sent_at) and
+          not Map.get(kill, :ended_before_send, false)
+      end)
+
+    case {Enum.sort_by(attributed, & &1.at), unsent} do
       {[kill | _], _} ->
         Map.take(kill, [:limit, :scope, :bytes, :limit_bytes, :mode])
 
       {[], [_ | _]} ->
         if System.monotonic_time(:millisecond) < deadline do
-          Process.sleep(100)
+          Process.sleep(50)
           memory_kill(match, deadline)
         end
 
@@ -503,6 +522,8 @@ defmodule Tightbeam.MemoryGuard do
       # Test seam (matrix K7): runs between choosing a close candidate and the
       # conditional `closing` transaction.
       before_close_commit: Keyword.get(opts, :before_close_commit, fn _session_key -> :ok end),
+      # Test seam (matrix D4, A5): runs in the kill task before the send.
+      before_kill_send: Keyword.get(opts, :before_kill_send, fn _target -> :ok end),
       close_confirm_ms: Keyword.get(opts, :close_confirm_ms, 5_000)
     }
 
@@ -667,9 +688,14 @@ defmodule Tightbeam.MemoryGuard do
         record_ended(state, kill.host, kill)
         {:noreply, publish_all(state)}
 
-      {kill, {:error, reason}} ->
-        :ets.delete(table(), {:kill, id})
+      {_kill, {:error, :ended_before_send}} ->
+        # FS6: the tree ended before this guard's kill was sent: not a memory
+        # kill. The record stays, marked, so settlement says harness_exited.
+        {:noreply, state}
 
+      {kill, {:error, reason}} ->
+        # The kill was sent (FS6 attributes it), but the tree was not shown
+        # gone: recorded, and the next sample retries while it is over its limit.
         EventLog.lifecycle(
           state.db,
           "memory_kill_failed",
@@ -2592,7 +2618,24 @@ defmodule Tightbeam.MemoryGuard do
     target = kill_target(state, unit)
     host_state = state.hosts[host]
 
-    Task.start(fn -> send(guard, {:killed, unit.id, end_tree(state, host_state, target)}) end)
+    send_hook = state.before_kill_send
+
+    Task.start(fn ->
+      send_hook.(target)
+
+      # FS6: the kill counts only if it is sent before the tree's end is
+      # observed; a tree already gone is not killed by this guard.
+      result =
+        if root_present?(state, target) do
+          :ets.insert(table(), {{:kill, unit.id}, Map.put(kill, :sent_at, state.clock.())})
+          end_tree(state, host_state, target)
+        else
+          :ets.insert(table(), {{:kill, unit.id}, Map.put(kill, :ended_before_send, true)})
+          {:error, :ended_before_send}
+        end
+
+      send(guard, {:killed, unit.id, result})
+    end)
 
     %{state | killing: Map.put(state.killing, unit.id, kill)}
   end
@@ -2968,6 +3011,13 @@ defmodule Tightbeam.MemoryGuard do
     else
       :error -> :unknown
       _ -> []
+    end
+  end
+
+  defp root_present?(state, target) do
+    case root_of(target) do
+      {pid, start} -> present?(state.root, pid, start)
+      nil -> true
     end
   end
 
