@@ -313,47 +313,50 @@ defmodule Tightbeam.Wire.Socket do
   defp pair(msg, state) do
     device_id = string(msg["deviceId"])
 
-    cond do
-      not ConnRegistry.within_rate_limit(
-        conn_registry(state),
-        device_id,
-        :pair,
-        pair_limit(state),
-        60_000
-      ) ->
-        stop_with(Payloads.wire_error("rate_limited"), state)
+    if msg["protocolVersion"] != 1 do
+      stop_with(Payloads.wire_error("invalid_message", "protocolVersion must be 1"), state)
+    else
+      info = if is_map(msg["deviceInfo"]), do: msg["deviceInfo"], else: %{}
 
-      msg["protocolVersion"] != 1 ->
-        stop_with(Payloads.wire_error("invalid_message", "protocolVersion must be 1"), state)
+      # Stage 1 S2.2: the per-device limit is charged inside admission, after the
+      # shape and nothing-outstanding checks, so requests refused there never spend
+      # this device id's pairing budget.
+      device_rate = fn ->
+        ConnRegistry.within_rate_limit(
+          conn_registry(state),
+          device_id,
+          :pair,
+          pair_limit(state),
+          60_000
+        )
+      end
 
-      true ->
-        info = if is_map(msg["deviceInfo"]), do: msg["deviceInfo"], else: %{}
+      result =
+        Devices.pair(
+          db(state),
+          %{
+            device_id: device_id,
+            claimed_name: string(msg["claimedName"] || "device"),
+            platform: info["platform"],
+            model: info["model"]
+          },
+          admission: Map.get(state.deps, :pairing_admission, Tightbeam.PairingAdmission),
+          device_rate: device_rate
+        )
 
-        result =
-          Devices.pair(
-            db(state),
-            %{
-              device_id: device_id,
-              claimed_name: string(msg["claimedName"] || "device"),
-              platform: info["platform"],
-              model: info["model"]
-            },
-            admission: Map.get(state.deps, :pairing_admission, Tightbeam.PairingAdmission)
-          )
+      # Stage 1 S2.2: a token only for a valid one-time code; S2.3 confirms its
+      # delivery by the device's first sign-in, not by this send.
+      payload =
+        case result do
+          {:paired, device} ->
+            Tightbeam.DeliveryDeadlines.poke_if_running()
+            Payloads.pair_result({:ok, device.token, device.user_id})
 
-        # Stage 1 S2.2: a token only for a valid one-time code; S2.3 confirms its
-        # delivery by the device's first sign-in, not by this send.
-        payload =
-          case result do
-            {:paired, device} ->
-              Tightbeam.DeliveryDeadlines.poke_if_running()
-              Payloads.pair_result({:ok, device.token, device.user_id})
+          {:refused, reason, message} ->
+            Payloads.pair_result({:error, reason, message})
+        end
 
-            {:refused, reason, message} ->
-              Payloads.pair_result({:error, reason, message})
-          end
-
-        stop_with(payload, state)
+      stop_with(payload, state)
     end
   end
 

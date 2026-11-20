@@ -452,6 +452,12 @@ defmodule Tightbeam.DeviceLifecycle do
   @doc """
   Decide one `pair_request` (S2.2). Returns `{:paired, device}` or
   `{:refused, reason, message}`.
+
+  Admission runs in the order S2.2 requires, and no refusal computes a verifier:
+  shape, then nothing outstanding, then rate (the caller's per-device limit,
+  `opts[:device_rate]`, charged only here, then the gateway-wide limit), then
+  concurrency. So a malformed, uncoded or no-outstanding request never spends a
+  device's pairing budget.
   """
   @spec pair(DB.server(), map(), keyword()) ::
           {:paired, map()} | {:refused, String.t(), String.t()}
@@ -470,10 +476,18 @@ defmodule Tightbeam.DeviceLifecycle do
             # A database too busy for the cheap check refuses like the rate limit.
             :busy -> {:refused, "rate_limited", @rate_limited_message}
             [] -> {:refused, "pairing_code_invalid", @code_invalid_message}
-            _some -> admit_and_redeem(db, input, name, code, opts)
+            _some -> rate_then_admit(db, input, name, code, opts)
           end
         end
     end
+  end
+
+  defp rate_then_admit(db, input, name, code, opts) do
+    device_rate = Keyword.get(opts, :device_rate, fn -> true end)
+
+    if device_rate.(),
+      do: admit_and_redeem(db, input, name, code, opts),
+      else: {:refused, "rate_limited", @rate_limited_message}
   end
 
   defp admit_and_redeem(db, input, name, code, opts) do

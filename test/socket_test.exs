@@ -593,6 +593,57 @@ defmodule Tightbeam.Wire.SocketTest do
     refute_receive {:db_failure_reporting_callback_called, _db_pid}, 0
   end
 
+  test "S2.2/P8a: shape and nothing-outstanding refusals never spend a device's pairing budget",
+       ctx do
+    admission = :"socket_admission_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.PairingAdmission, name: admission})
+    deps = Map.merge(ctx.deps, %{pairing_admission: admission, pair_per_min: 5})
+
+    send_pair = fn device_id, claimed ->
+      {:ok, state} = Socket.init(deps)
+
+      frame = %{
+        "type" => "pair_request",
+        "protocolVersion" => 1,
+        "deviceId" => device_id,
+        "claimedName" => claimed
+      }
+
+      {:stop, :normal, 1000, {:text, reply}, _} =
+        Socket.handle_in({JSON.encode!(frame), opcode: :text}, state)
+
+      JSON.decode!(reply)
+    end
+
+    # Ten times the budget of uncoded, malformed and (no code issued yet) code-shaped
+    # requests from one device id: each refused by shape or nothing-outstanding.
+    for n <- 1..10 do
+      assert %{"reason" => "pairing_code_required"} = send_pair.("victim", "Phone #{n}")
+      assert %{"reason" => "pairing_code_required"} = send_pair.("victim", "Phone TB-0000-00")
+
+      assert %{"reason" => "pairing_code_invalid"} =
+               send_pair.("victim", "Phone TB-0000-0000-0000")
+    end
+
+    # A code is issued; the same device id still has its whole budget for it.
+    admin = Tightbeam.TestDevices.paired!(ctx.db, "george", admin: true, device_id: "iphone")
+    {code, _record} = Tightbeam.TestDevices.issue_code!(ctx.db, admin)
+
+    assert %{"success" => true, "userId" => "george"} = send_pair.("victim", "Phone #{code}")
+
+    # The limit itself still applies to coded requests that reach admission: five
+    # wrong-coded requests spend another device's budget, and the sixth is refused
+    # before any verification.
+    {_code, _record} = Tightbeam.TestDevices.issue_code!(ctx.db, admin)
+
+    for _ <- 1..5 do
+      assert %{"reason" => "pairing_code_invalid"} =
+               send_pair.("guesser", "Guess TB-0000-0000-0000")
+    end
+
+    assert %{"reason" => "rate_limited"} = send_pair.("guesser", "Guess TB-0000-0000-0000")
+  end
+
   test "pair and auth failures use the contract reasons", ctx do
     {:ok, state} = Socket.init(ctx.deps)
 
