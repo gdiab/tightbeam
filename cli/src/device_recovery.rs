@@ -19,7 +19,7 @@
 
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -311,21 +311,204 @@ impl Terminal {
     }
 
     fn read_hidden_line(&mut self) -> Result<String, String> {
-        let fd = self.file.as_raw_fd();
-        let mut original: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-            return Err("cannot read terminal settings; nothing changed".to_owned());
+        read_hidden(&TtyOps(&self.file))
+    }
+}
+
+/// The terminal operations a hidden read needs, behind a seam so a test can make any
+/// of them fail.
+trait TermOps {
+    fn fd(&self) -> i32;
+    fn get(&self) -> std::io::Result<libc::termios>;
+    fn set(&self, settings: &libc::termios) -> std::io::Result<()>;
+    fn read_line(&self) -> std::io::Result<String>;
+}
+
+struct TtyOps<'a>(&'a File);
+
+impl TermOps for TtyOps<'_> {
+    fn fd(&self) -> i32 {
+        self.0.as_raw_fd()
+    }
+
+    fn get(&self) -> std::io::Result<libc::termios> {
+        let mut settings: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(self.fd(), &mut settings) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        let mut hidden = original;
-        hidden.c_lflag &= !libc::ECHO;
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) };
-        let mut line = String::new();
-        let result = BufReader::new(self.file.try_clone().map_err(io_error)?)
-            .read_line(&mut line)
-            .map_err(io_error);
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
-        result?;
-        Ok(line.trim().to_owned())
+        Ok(settings)
+    }
+
+    fn set(&self, settings: &libc::termios) -> std::io::Result<()> {
+        if unsafe { libc::tcsetattr(self.fd(), libc::TCSANOW, settings) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// One line, read byte by byte from the terminal itself: no buffered reader or
+    /// cloned handle that could read past it or fail after echo is off.
+    fn read_line(&self) -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        let mut file = self.0;
+        loop {
+            match file.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => bytes.push(byte[0]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        String::from_utf8(bytes)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8"))
+    }
+}
+
+/// Reads one line with echo off (S1.2), and fails closed:
+/// - if echo cannot be turned off, or is still on afterwards, nothing is read;
+/// - the terminal's settings are restored on every way out: a normal return, an error,
+///   a panic (the guard's drop), and SIGINT, SIGTERM, SIGHUP or SIGQUIT (a handler that
+///   restores, then lets the signal act). Ctrl-Z is ignored while the secret is typed,
+///   so the prompt cannot be suspended and resumed with echo back on.
+/// - if restoration fails, the input is discarded and the refusal says so, without it.
+fn read_hidden<T: TermOps>(term: &T) -> Result<String, String> {
+    let original = term.get().map_err(|_| {
+        "refusing: cannot read the terminal's settings. Nothing changed.".to_owned()
+    })?;
+    let mut hidden = original;
+    hidden.c_lflag &= !libc::ECHO;
+
+    let guard = EchoRestore::arm(term, original);
+    let echo_off = term
+        .set(&hidden)
+        .and_then(|_| term.get())
+        .map(|now| now.c_lflag & libc::ECHO == 0);
+    if !matches!(echo_off, Ok(true)) {
+        return Err(
+            "refusing: cannot turn terminal echo off, so the secret is not read. Nothing \
+             changed."
+                .to_owned(),
+        );
+    }
+
+    let read = term.read_line();
+    if guard.restore().is_err() {
+        return Err(
+            "refusing: the terminal's settings could not be restored, so the input is \
+             discarded; echo may still be off (run `stty echo`). Nothing changed."
+                .to_owned(),
+        );
+    }
+    let line = read.map_err(|_| {
+        "refusing: cannot read the secret from the terminal. Nothing changed.".to_owned()
+    })?;
+    Ok(line.trim().to_owned())
+}
+
+/// Restores the terminal's original settings when it goes out of scope, and while it
+/// is armed, on the terminating signals too.
+struct EchoRestore<'a, T: TermOps> {
+    term: &'a T,
+    original: libc::termios,
+    signals: SignalRestore,
+    armed: bool,
+}
+
+impl<'a, T: TermOps> EchoRestore<'a, T> {
+    fn arm(term: &'a T, original: libc::termios) -> Self {
+        let signals = SignalRestore::install(term.fd(), original);
+        EchoRestore {
+            term,
+            original,
+            signals,
+            armed: true,
+        }
+    }
+
+    fn restore(mut self) -> std::io::Result<()> {
+        self.armed = false;
+        let restored = self.term.set(&self.original);
+        self.signals.uninstall();
+        restored
+    }
+}
+
+impl<T: TermOps> Drop for EchoRestore<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            if self.term.set(&self.original).is_err() {
+                eprintln!(
+                    "tightbeam: the terminal's settings could not be restored; echo may \
+                     still be off (run `stty echo`)."
+                );
+            }
+            self.signals.uninstall();
+        }
+    }
+}
+
+const RESTORE_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+static RESTORE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static mut RESTORE_SETTINGS: std::mem::MaybeUninit<libc::termios> = std::mem::MaybeUninit::uninit();
+
+/// Restores the terminal (tcsetattr is async-signal-safe), then lets the signal take
+/// its default action.
+extern "C" fn restore_and_reraise(signal: libc::c_int) {
+    let fd = RESTORE_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe {
+            let settings = std::ptr::addr_of!(RESTORE_SETTINGS) as *const libc::termios;
+            libc::tcsetattr(fd, libc::TCSANOW, settings);
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+}
+
+struct SignalRestore {
+    previous: Vec<(libc::c_int, libc::sighandler_t)>,
+    installed: bool,
+}
+
+impl SignalRestore {
+    fn install(fd: i32, original: libc::termios) -> Self {
+        // No terminal descriptor, nothing a signal could restore.
+        if fd < 0 {
+            return SignalRestore {
+                previous: Vec::new(),
+                installed: false,
+            };
+        }
+        unsafe {
+            (*std::ptr::addr_of_mut!(RESTORE_SETTINGS)).write(original);
+        }
+        RESTORE_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
+        let handler = restore_and_reraise as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        let mut previous: Vec<(libc::c_int, libc::sighandler_t)> = RESTORE_SIGNALS
+            .iter()
+            .map(|&signal| (signal, unsafe { libc::signal(signal, handler) }))
+            .collect();
+        previous.push((libc::SIGTSTP, unsafe {
+            libc::signal(libc::SIGTSTP, libc::SIG_IGN)
+        }));
+        SignalRestore {
+            previous,
+            installed: true,
+        }
+    }
+
+    fn uninstall(&mut self) {
+        if self.installed {
+            for &(signal, handler) in &self.previous {
+                unsafe { libc::signal(signal, handler) };
+            }
+            RESTORE_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+            self.installed = false;
+        }
     }
 }
 
@@ -717,7 +900,10 @@ mod tests {
     #[test]
     fn verifier_matches_the_shared_gateway_vector() {
         let expected = include_str!("device_recovery_vector.txt").trim();
-        assert_eq!(hex(&argon2id("TB-7K3M-Q9ZD-2WH8", &[7u8; 16]).unwrap()), expected);
+        assert_eq!(
+            hex(&argon2id("TB-7K3M-Q9ZD-2WH8", &[7u8; 16]).unwrap()),
+            expected
+        );
     }
 
     #[test]
@@ -732,5 +918,147 @@ mod tests {
             Some(root.join(".tightbeam-session"))
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A terminal whose every operation can be made to fail (B3 fault injection).
+    #[derive(Default)]
+    struct FakeTerm {
+        fail_get: bool,
+        disable_fails: bool,
+        disable_ignored: bool,
+        read_fails: bool,
+        read_panics: bool,
+        restore_fails: bool,
+        echo: std::cell::Cell<bool>,
+        reads: std::cell::Cell<u32>,
+        echo_at_read: std::cell::Cell<Option<bool>>,
+    }
+
+    impl FakeTerm {
+        fn new() -> Self {
+            let term = FakeTerm::default();
+            term.echo.set(true);
+            term
+        }
+    }
+
+    impl TermOps for FakeTerm {
+        fn fd(&self) -> i32 {
+            -1
+        }
+
+        fn get(&self) -> std::io::Result<libc::termios> {
+            if self.fail_get {
+                return Err(std::io::Error::other("tcgetattr"));
+            }
+            let mut settings: libc::termios = unsafe { std::mem::zeroed() };
+            if self.echo.get() {
+                settings.c_lflag |= libc::ECHO;
+            }
+            Ok(settings)
+        }
+
+        fn set(&self, settings: &libc::termios) -> std::io::Result<()> {
+            let wants_echo = settings.c_lflag & libc::ECHO != 0;
+            if !wants_echo && self.disable_fails || wants_echo && self.restore_fails {
+                return Err(std::io::Error::other("tcsetattr"));
+            }
+            if !(self.disable_ignored && !wants_echo) {
+                self.echo.set(wants_echo);
+            }
+            Ok(())
+        }
+
+        fn read_line(&self) -> std::io::Result<String> {
+            self.reads.set(self.reads.get() + 1);
+            self.echo_at_read.set(Some(self.echo.get()));
+            if self.read_panics {
+                panic!("read panicked");
+            }
+            if self.read_fails {
+                return Err(std::io::Error::other("read"));
+            }
+            Ok(" TBR-SECRET-INPUT \n".to_owned())
+        }
+    }
+
+    #[test]
+    fn a_hidden_read_reads_with_echo_off_and_restores_it() {
+        let term = FakeTerm::new();
+        assert_eq!(read_hidden(&term).unwrap(), "TBR-SECRET-INPUT");
+        assert_eq!(term.echo_at_read.get(), Some(false));
+        assert!(term.echo.get());
+    }
+
+    #[test]
+    fn a_hidden_read_refuses_without_reading_when_echo_cannot_be_turned_off() {
+        for term in [
+            FakeTerm {
+                disable_fails: true,
+                ..FakeTerm::new()
+            },
+            FakeTerm {
+                disable_ignored: true,
+                ..FakeTerm::new()
+            },
+        ] {
+            let refusal = read_hidden(&term).unwrap_err();
+            assert!(
+                refusal.contains("cannot turn terminal echo off"),
+                "{refusal}"
+            );
+            assert_eq!(term.reads.get(), 0);
+            assert!(term.echo.get());
+        }
+    }
+
+    #[test]
+    fn a_hidden_read_refuses_without_reading_when_settings_cannot_be_read() {
+        let term = FakeTerm {
+            fail_get: true,
+            ..FakeTerm::new()
+        };
+        assert!(
+            read_hidden(&term)
+                .unwrap_err()
+                .contains("terminal's settings")
+        );
+        assert_eq!(term.reads.get(), 0);
+    }
+
+    #[test]
+    fn a_failed_read_restores_echo() {
+        let term = FakeTerm {
+            read_fails: true,
+            ..FakeTerm::new()
+        };
+        assert!(
+            read_hidden(&term)
+                .unwrap_err()
+                .contains("cannot read the secret")
+        );
+        assert!(term.echo.get());
+    }
+
+    #[test]
+    fn a_panic_during_the_read_restores_echo() {
+        let term = FakeTerm {
+            read_panics: true,
+            ..FakeTerm::new()
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_hidden(&term)));
+        assert!(outcome.is_err());
+        assert!(term.echo.get());
+    }
+
+    #[test]
+    fn a_failed_restore_discards_the_input_and_says_so_without_it() {
+        let term = FakeTerm {
+            restore_fails: true,
+            ..FakeTerm::new()
+        };
+        let refusal = read_hidden(&term).unwrap_err();
+        assert!(refusal.contains("could not be restored"), "{refusal}");
+        assert!(!refusal.contains("TBR-SECRET-INPUT"));
     }
 }

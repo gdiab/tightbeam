@@ -1,24 +1,26 @@
 defmodule Tightbeam.BaseLock do
   @moduledoc """
   The base-directory lock (stage1-v8 S1.2 step 1): an exclusive, non-blocking OS
-  advisory lock on `<base_dir>/gateway.lock`, taken before the gateway's first write
-  and held for as long as it serves. While the recovery ceremony or a root-admin
-  command holds it, the gateway refuses to start; while the gateway holds it, they
-  refuse. The lock prevents accidents and honest-process races only (S1.4).
+  advisory lock on `<base_dir>/gateway.lock`.
+
+  The gateway's database owner (`Tightbeam.DB`) takes it after admission and before
+  it opens `state.db` for writing, and holds it in its own state, so the lock lives
+  exactly as long as the process that can write the base: it cannot be lost while
+  the database is open, and a refused start opens nothing. While the recovery
+  ceremony or a root-admin command holds it, the gateway refuses to start; while the
+  gateway holds it, they refuse. The lock prevents accidents and honest-process races
+  only (S1.4).
   """
 
-  use GenServer
   require Logger
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-  @impl true
-  def init(opts) do
-    path = Keyword.fetch!(opts, :path)
-    File.mkdir_p!(Path.dirname(path))
+  @doc "Take the lock for `base_dir`; the returned resource holds it until collected."
+  @spec acquire(Path.t()) :: {:ok, reference()} | {:error, {:base_dir_locked, Path.t()}}
+  def acquire(base_dir) do
+    path = Path.join(base_dir, "gateway.lock")
 
     try do
-      {:ok, %{path: path, lock: Tightbeam.Native.base_lock(path)}}
+      {:ok, Tightbeam.Native.base_lock(path)}
     rescue
       error in ErlangError ->
         Logger.error(
@@ -26,7 +28,7 @@ defmodule Tightbeam.BaseLock do
             "a recovery ceremony or root-admin command may be running"
         )
 
-        {:stop, {:base_dir_locked, path}}
+        {:error, {:base_dir_locked, path}}
     end
   end
 end

@@ -37,9 +37,16 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     File.mkdir_p!(base)
     db = :"recovery_db_#{System.unique_integer([:positive])}"
 
+    # The test's own connection seeds and reads the base while the CLI runs, so it does
+    # not take the gateway's base lock (a test-build-only option); the gateway starts
+    # raced below are real ones that do.
     start_supervised!(
       {DB,
-       path: Path.join(base, "state.db"), name: db, guard_inputs: [], payload_root: plan.payload}
+       path: Path.join(base, "state.db"),
+       name: db,
+       guard_inputs: [],
+       payload_root: plan.payload,
+       base_lock: false}
     )
 
     :ok = Schema.ensure_all(db)
@@ -71,7 +78,15 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     assert_received {:tightbeam_ephemeral, text}
     [secret] = Regex.run(~r/TBR-[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}/, text)
 
-    %{base: base, db: db, admission: admission, george: george, ipad: ipad, secret: secret}
+    %{
+      base: base,
+      payload: plan.payload,
+      db: db,
+      admission: admission,
+      george: george,
+      ipad: ipad,
+      secret: secret
+    }
   end
 
   ## running the CLI
@@ -362,33 +377,53 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
 
   ## P5: the lock decides between a gateway start and the ceremony
 
-  test "P5: across 200 races, exactly one of a gateway start and the ceremony proceeds", ctx do
-    lock_path = Path.join(ctx.base, "gateway.lock")
+  # A real gateway start on `base`: the production database owner, with admission and
+  # the base lock, unlinked so a refusal is a return value.
+  defp start_gateway_db(ctx, base \\ nil) do
+    GenServer.start(DB,
+      path: Path.join(base || ctx.base, "state.db"),
+      name: nil,
+      guard_inputs: [],
+      payload_root: ctx.payload
+    )
+  end
+
+  test "P5: across 200 races, exactly one of a real gateway start and the ceremony proceeds",
+       ctx do
+    ceremony = fn ->
+      on_tty(ctx, ["recover-admin", "--user", "george"], "TBR-AAAAA-BBBBB-CCCCC-DDDDD",
+        delay: "0.15",
+        linger: "0.4"
+      )
+    end
 
     outcomes =
       for n <- 1..200 do
-        task =
-          Task.async(fn ->
-            on_tty(ctx, ["recover-admin", "--user", "george"], "TBR-AAAAA-BBBBB-CCCCC-DDDDD",
-              delay: "0.15",
-              linger: "0.4"
-            )
-          end)
+        # The gateway's start is the production database owner, which admits the base
+        # and then takes the lock before it opens state.db for writing. Even rounds
+        # start the ceremony first, odd rounds the gateway, each at a varying offset.
+        {gateway, {output, _status}} =
+          if rem(n, 2) == 0 do
+            task = Task.async(ceremony)
+            Process.sleep(rem(n * 7, 40))
+            gateway = start_gateway_db(ctx)
+            {gateway, Task.await(task, 30_000)}
+          else
+            task = Task.async(fn -> start_gateway_db(ctx) end)
+            Process.sleep(rem(n * 13, 200))
+            result = ceremony.()
+            {Task.await(task, 30_000), result}
+          end
 
-        Process.sleep(rem(n * 7, 40))
-
-        # The gateway's start: the lock is held by a process, as the gateway holds it.
-        gateway = try_hold_lock(lock_path)
-        {output, _status} = Task.await(task, 30_000)
         ceremony = if output =~ "base-directory lock is held", do: :refused, else: :proceeded
 
         outcome =
           case gateway do
-            {:locked, holder} ->
-              release_lock(holder)
-              :locked
+            {:ok, pid} ->
+              GenServer.stop(pid)
+              :started
 
-            :refused ->
+            {:error, {:base_dir_locked, _}} ->
               :refused
           end
 
@@ -396,12 +431,101 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
       end
 
     for outcome <- outcomes do
-      assert outcome in [{:locked, :refused}, {:refused, :proceeded}],
-             inspect(outcome)
+      assert outcome in [{:started, :refused}, {:refused, :proceeded}], inspect(outcome)
     end
 
-    assert Enum.any?(outcomes, &match?({:locked, _}, &1))
+    assert Enum.any?(outcomes, &match?({:started, _}, &1))
     assert Enum.any?(outcomes, &match?({:refused, _}, &1))
+  end
+
+  test "S1.2: a real gateway start takes the lock before opening state.db, and a second instance refuses",
+       ctx do
+    # A fresh base: with a ceremony holding its lock, the start refuses before it
+    # creates or opens state.db at all.
+    fresh = Path.join(Path.dirname(ctx.base), "fresh-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(fresh)
+    holder = hold_lock(Path.join(fresh, "gateway.lock"))
+
+    assert {:error, {:base_dir_locked, _}} = start_gateway_db(ctx, fresh)
+    refute File.exists?(Path.join(fresh, "state.db"))
+    release_lock(holder)
+
+    # Released, the same base starts, and while it serves a second instance and the
+    # ceremony both refuse.
+    {:ok, first} = start_gateway_db(ctx, fresh)
+    assert File.exists?(Path.join(fresh, "state.db"))
+    # As the first gateway's boot does, so a second start's admission reads a stamp.
+    :ok = Schema.ensure_all(first)
+    assert {:error, {:base_dir_locked, _}} = start_gateway_db(ctx, fresh)
+
+    {output, _status} =
+      on_tty(%{ctx | base: fresh}, ["recover-admin", "--user", "george"], ctx.secret)
+
+    assert output =~ "base-directory lock is held"
+
+    # Stopping the owner releases the lock with it.
+    GenServer.stop(first)
+    {:ok, again} = start_gateway_db(ctx, fresh)
+    GenServer.stop(again)
+  end
+
+  ## B3: the secret prompt never leaves the terminal with echo off
+
+  # Run recover-admin on a pseudo-terminal, send `signal` to it while it waits at the
+  # secret prompt (echo off), then report the terminal's echo setting afterwards.
+  defp echo_after_signal(ctx, signal) do
+    pidfile = Path.join(ctx.base, "prompt-#{System.unique_integer([:positive])}.pid")
+
+    inner =
+      "echo $$ > #{shell_quote(pidfile)}; exec #{shell_quote(@cli)} recover-admin --user george"
+
+    outer = "sh -c #{shell_quote(inner)}; stty -a"
+
+    script =
+      case :os.type() do
+        {:unix, :darwin} -> "script -q /dev/null sh -c #{shell_quote(outer)}"
+        _ -> "script -qec #{shell_quote(outer)} /dev/null"
+      end
+
+    task =
+      Task.async(fn ->
+        System.cmd("sh", ["-c", "(sleep 5) | #{script}"],
+          cd: ctx.base,
+          env: env(ctx),
+          stderr_to_stdout: true
+        )
+      end)
+
+    pid = await_pidfile(pidfile, 50)
+    Process.sleep(1_000)
+    {_, 0} = System.cmd("kill", ["-#{signal}", pid])
+    {output, _status} = Task.await(task, 30_000)
+    assert output =~ "Recovery secret for george:", output
+
+    [sign] = Regex.run(~r/(?:^|\s)(-?)echo(?=\s|$)/m, output, capture: :all_but_first)
+    if sign == "-", do: :off, else: :on
+  end
+
+  defp await_pidfile(path, tries) do
+    case File.read(path) do
+      {:ok, pid} when pid != "" ->
+        String.trim(pid)
+
+      _ when tries > 0 ->
+        Process.sleep(100)
+        await_pidfile(path, tries - 1)
+
+      _ ->
+        flunk("the ceremony never started")
+    end
+  end
+
+  test "B3: an interrupt, a termination or a hangup at the secret prompt restores terminal echo",
+       ctx do
+    for signal <- ~w(INT TERM HUP), do: assert(echo_after_signal(ctx, signal) == :on, signal)
+
+    # Control: SIGKILL runs no handler, and the probe sees echo left off.
+    assert echo_after_signal(ctx, "KILL") == :off
   end
 
   ## P5c: the root-shell path (CI runners only, where passwordless sudo exists)

@@ -618,7 +618,7 @@ defmodule Tightbeam.DeviceLifecycleTest do
     assert is_reference(Native.base_lock(path))
   end
 
-  test "S1.2: the gateway refuses to start while the base-directory lock is held" do
+  test "S1.2: the base lock is refused while another holder has it, and free once released" do
     dir = Path.join(System.tmp_dir!(), "baselock-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
@@ -636,14 +636,14 @@ defmodule Tightbeam.DeviceLifecycleTest do
       end)
 
     assert_receive :held
-    Process.flag(:trap_exit, true)
-    assert {:error, {:base_dir_locked, ^path}} = Tightbeam.BaseLock.start_link(path: path)
+    assert {:error, {:base_dir_locked, ^path}} = Tightbeam.BaseLock.acquire(dir)
+    ref = Process.monitor(ceremony)
     send(ceremony, :release)
-    Process.sleep(100)
+    assert_receive {:DOWN, ^ref, :process, _, _}
 
-    assert {:ok, pid} = Tightbeam.BaseLock.start_link(path: path)
+    assert {:ok, lock} = Tightbeam.BaseLock.acquire(dir)
     assert_raise ErlangError, fn -> Native.base_lock(path) end
-    GenServer.stop(pid)
+    _ = lock
   end
 
   test "the gateway's and the CLI's verifiers are byte-identical" do
