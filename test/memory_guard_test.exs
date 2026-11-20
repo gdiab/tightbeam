@@ -11,6 +11,7 @@ defmodule Tightbeam.MemoryGuardTest do
   alias Tightbeam.{DB, Devices, EventLog, Gateway, Ledger, MemoryGuard, Org, Schema}
 
   alias Tightbeam.MemoryGuard.{
+    Journal,
     Unguarded,
     Admission,
     Cgroup,
@@ -224,6 +225,7 @@ defmodule Tightbeam.MemoryGuardTest do
       cgroup_fs: Keyword.get(opts, :cgroup_fs, Path.join(ctx.root, "sys/fs/cgroup")),
       probe: fn -> probe end,
       sample_ms: :manual,
+      clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
       closer:
         Keyword.get(opts, :closer, fn _adapter, sid, reason ->
           send(test, {:closed, sid, reason})
@@ -3064,11 +3066,14 @@ defmodule Tightbeam.MemoryGuardTest do
          ctx do
       test = self()
 
+      # The kill call returns: the send is proven (rev 3 D1). The tree is not
+      # yet shown gone (its confirmation lags).
       guard!(ctx,
         kill_result: fn _target ->
           send(test, :sent)
-          Process.sleep(:infinity)
-        end
+          :ok
+        end,
+        signal_works: false
       )
 
       :ok = MemoryGuard.tick()
@@ -3233,18 +3238,26 @@ defmodule Tightbeam.MemoryGuardTest do
          ctx do
       fail_kind!(ctx, "memory_guard_idle_closed_marker")
       floor_close!(ctx)
-      assert [{"agent:idle", _}] = events(ctx.db, "memory_guard_idle_closed")
+
+      # The close's event, its marker and the journal's `done` are one step
+      # (agreed design rev 5): while the marker cannot be written, neither is
+      # recorded, and the close stays an open, durable obligation.
+      assert events(ctx.db, "memory_guard_idle_closed") == []
       assert events(ctx.db, "memory_guard_idle_closed_marker") == []
-      assert [{"agent:idle", %{"marker" => _}}] = events(ctx.db, "memory_guard_marker_failed")
+
+      assert {:ok, [%{phase: "dispatched"}]} =
+               Journal.page(ctx.db, @host, "idle_close", nil, nil, 8)
 
       heal_kind!(ctx, "memory_guard_idle_closed_marker")
       :ok = MemoryGuard.tick()
       :ok = MemoryGuard.tick()
 
+      assert [{"agent:idle", _}] = events(ctx.db, "memory_guard_idle_closed")
+
       assert [{"agent:idle", %{"markerKey" => _}}] =
                events(ctx.db, "memory_guard_idle_closed_marker")
 
-      assert length(events(ctx.db, "memory_guard_marker_failed")) == 1
+      assert {:ok, []} = Journal.page(ctx.db, @host, "idle_close", nil, nil, 8)
     end
 
     test "I3.unreadable (T28 b): a close shown complete stands when its event cannot be written; the event is retried until written",
@@ -4334,51 +4347,6 @@ defmodule Tightbeam.MemoryGuardTest do
       assert [{^id, _}] = events(ctx.db, "memory_guard_override_applied")
     end
 
-    test "N9.unreadable / N9.stale (FS9 B4, R2, guard up): override_applied only after the held launch is admitted; a failed record is retried; a restart in the gap records it once",
-         ctx do
-      # The guard runs but its launch step is not in place: launches are held
-      # guard_unavailable, and a guard episode has an accepted override.
-      empty = Path.join(ctx.root, "no-cli")
-      File.mkdir_p!(empty)
-      {:opened, ep} = Episodes.open(ctx.db, %{host: @host, kind: "guard", since: 1, why: "t"})
-      id = ep["episodeId"]
-      base = %{"episodeId" => id, "host" => @host, "kind" => "guard", "key" => nil}
-      {:accepted, _} = Episodes.judge(ctx.db, Map.put(base, "action", "recovery"), "r-g", @host)
-      :ok = Episodes.record_outcome(ctx.db, Episodes.recovery(ctx.db, id), "failed", [])
-      {:accepted, _} = Episodes.judge(ctx.db, Map.put(base, "action", "override"), "o-g", @host)
-      guard!(ctx, cli_bin: empty)
-
-      # Accepted, nothing admitted yet: nothing applied.
-      :ok = MemoryGuard.tick()
-      assert %{"applied" => false} = Episodes.override(ctx.db, id)
-
-      {:ok, _} =
-        DB.query(ctx.db, """
-        CREATE TRIGGER fs9_applied_fails BEFORE UPDATE OF applied ON memory_guard_episodes
-        BEGIN SELECT RAISE(ABORT, 'injected'); END
-        """)
-
-      # The held launch is admitted; its record fails and is kept for retry.
-      session!(ctx, "agent:o1")
-      queue!(ctx, "agent:o1", "needs a launch")
-      assert :ok = MemoryGuard.admit("agent:o1")
-      assert %{"applied" => false} = Episodes.override(ctx.db, id)
-      assert MapSet.member?(:sys.get_state(MemoryGuard).pending_applied, id)
-
-      # The gap: a restart loses the retry. The override is still accepted,
-      # so the next admission carried out from it records it, once.
-      stop_supervised!(MemoryGuard)
-      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER fs9_applied_fails")
-      guard!(ctx, cli_bin: empty)
-      :ok = MemoryGuard.tick()
-      assert %{"applied" => false} = Episodes.override(ctx.db, id)
-      session!(ctx, "agent:o2")
-      queue!(ctx, "agent:o2", "needs a launch")
-      assert :ok = MemoryGuard.admit("agent:o2")
-      assert %{"applied" => true} = Episodes.override(ctx.db, id)
-      assert [{^id, _}] = events(ctx.db, "memory_guard_override_applied")
-    end
-
     test "N10.unreadable: an episode read that cannot be completed says unknown, never none",
          _ctx do
       assert %{unknown: _} = Episodes.read(:no_such_db, @host)
@@ -4987,7 +4955,8 @@ defmodule Tightbeam.MemoryGuardTest do
       fs = Path.join(ctx.root, "cg")
       host_state = %{layout: %{fs: fs}}
 
-      assert :ok =
+      # Nothing to kill, and no signal sent (rev 3 D1: not a proven send).
+      assert {:error, :unit_gone} =
                MemoryGuard.default_kill(%{scope: "session", unit: "/h/session-gone"}, host_state)
 
       dir = Cgroup.dir(fs, "/h/session-c")
@@ -5995,6 +5964,749 @@ defmodule Tightbeam.MemoryGuardTest do
         assert %{"result" => "unknown", "detail" => [^socket]} = finding["sockets"]
         assert RootPath.kind(finding) == "residual"
       end
+    end
+  end
+
+  ## The durable effect journal (agreed design: rev 2 art_10551253 as amended by
+  ## rev 3 art_e42f1681, rev 4 art_191d7337 and rev 5 art_84ba2766). Each test
+  ## drives one crash or failure point on the real path: the guard is stopped
+  ## (a crash) or a write is refused, then started again.
+
+  describe "durable effects: kills (O3/O4, rev 3 D1)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      proc!(ctx.root, 650, 1, 51, 900 * @mib)
+      launch!(ctx.base, "sl-k", "sid-k", 650, 51, 512 * @mib)
+      session!(ctx, "agent:k", "sid-k")
+      Application.put_env(:tightbeam, :memory_guard_attribution_wait_ms, 300)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_attribution_wait_ms) end)
+      %{match: %{host: @host, harness_session_id: "sid-k", since: 0}}
+    end
+
+    defp kill_effects(ctx) do
+      {:ok, rows} =
+        DB.query(
+          ctx.db,
+          "SELECT effectId, phase, outcome FROM memory_guard_effects WHERE kind='tree_kill'",
+          []
+        )
+
+      Enum.map(rows, fn [id, phase, outcome] -> {id, phase, outcome && JSON.decode!(outcome)} end)
+    end
+
+    defp await_phase(ctx, phase, attempts \\ 300) do
+      cond do
+        Enum.any?(kill_effects(ctx), &(elem(&1, 1) == phase)) -> :ok
+        attempts == 0 -> flunk("no kill reached #{phase}")
+        true -> Process.sleep(10) && await_phase(ctx, phase, attempts - 1)
+      end
+    end
+
+    # The tree is under its limit after the restart, so no new kill starts.
+    defp restart_quiet!(ctx, opts \\ []) do
+      stop_supervised!(MemoryGuard)
+      proc!(ctx.root, 650, 1, 51, 10 * @mib)
+      guard!(ctx, opts)
+    end
+
+    test "O3 (rev 3 crash 1): crash after the intent, before the signal, tree alive: not_sent, nothing attributed",
+         ctx do
+      guard!(ctx, before_kill_send: fn _ -> Process.sleep(:infinity) end)
+      :ok = MemoryGuard.tick()
+      assert [{_, "intended", nil}] = kill_effects(ctx)
+
+      restart_quiet!(ctx)
+      :ok = MemoryGuard.tick()
+      assert [{_, "done", %{"outcome" => "not_sent"}}] = kill_effects(ctx)
+      assert MemoryGuard.memory_kill(ctx.match) == nil
+      assert events(ctx.db, "memory_tree_ended") == []
+      assert events(ctx.db, "memory_kill_failed") == []
+    end
+
+    test "O3 (rev 3 crash 2/3): crash after the intent, the tree ending on its own in the gap: unattributed, settlement harness_exited",
+         ctx do
+      guard!(ctx, before_kill_send: fn _ -> Process.sleep(:infinity) end)
+      :ok = MemoryGuard.tick()
+      stop_supervised!(MemoryGuard)
+      gone!(ctx.root, 650)
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert [{_, "done", %{"outcome" => "unattributed_end"}}] = kill_effects(ctx)
+      assert MemoryGuard.memory_kill(ctx.match) == nil
+      assert events(ctx.db, "memory_tree_ended") == []
+    end
+
+    test "O3 (rev 3 crash 4): crash after the proven send, before the outcome, tree gone: memory_tree_ended once, and the killed turn still settles memory_limit",
+         ctx do
+      # The kill call returns (a proven send); the tree is not yet shown gone.
+      guard!(ctx, kill_result: fn _ -> :ok end, signal_works: false)
+      :ok = MemoryGuard.tick()
+      await_phase(ctx, "dispatched")
+
+      stop_supervised!(MemoryGuard)
+      gone!(ctx.root, 650)
+      guard!(ctx)
+      assert %{limit: "session"} = MemoryGuard.memory_kill(ctx.match)
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      assert [{_, "done", %{"outcome" => "ended"}}] = kill_effects(ctx)
+      assert [_] = events(ctx.db, "memory_tree_ended")
+    end
+
+    test "O4: a proven send whose tree is still there after the proof window, after a restart: memory_kill_failed",
+         ctx do
+      guard!(ctx, kill_result: fn _ -> :ok end, signal_works: false)
+      :ok = MemoryGuard.tick()
+      await_phase(ctx, "dispatched")
+      [{id, _, _}] = kill_effects(ctx)
+      restart_quiet!(ctx, kill_result: {:error, :harness_group_failed}, signal_works: false)
+      Process.sleep(700)
+      :ok = MemoryGuard.tick()
+      assert %{phase: "done", outcome: %{"outcome" => "failed"}} = Journal.get(ctx.db, id)
+      assert [_ | _] = events(ctx.db, "memory_kill_failed")
+    end
+
+    test "O3 (rev 3 crash 5): the outcome write fails: the row stays and is resolved once the write succeeds",
+         ctx do
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER o3_fail BEFORE INSERT ON lifecycle_events WHEN NEW.kind='memory_tree_ended'
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      settle_kills!()
+      assert [{_, "dispatched", nil}] = kill_effects(ctx)
+      assert events(ctx.db, "memory_tree_ended") == []
+
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER o3_fail")
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      assert [{_, "done", %{"outcome" => "ended"}}] = kill_effects(ctx)
+      assert [_] = events(ctx.db, "memory_tree_ended")
+    end
+
+    test "D1 (rev 3): the helper errors before any signal and the tree then ends on its own: not sent, not attributed",
+         ctx do
+      guard!(ctx,
+        kill_result: fn target ->
+          gone!(ctx.root, target.pid)
+          {:error, :harness_group_failed}
+        end,
+        signal_works: false
+      )
+
+      :ok = MemoryGuard.tick()
+      settle_kills!()
+      assert [{_, "done", %{"outcome" => "not_sent"}}] = kill_effects(ctx)
+      assert MemoryGuard.memory_kill(ctx.match) == nil
+      assert events(ctx.db, "memory_tree_ended") == []
+    end
+  end
+
+  describe "durable effects: idle closes (O2, rev 4/5)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE users SET createdAt=createdAt+1000 WHERE userId='guest'")
+
+      session!(ctx, "agent:c", "sid-c")
+      :ok
+    end
+
+    @conditional "Tightbeam had decided to close it to free memory and cannot confirm whether it did"
+
+    # A close the guard decided before a restart, left at `phase`.
+    defp close_left!(ctx, phase, sent_at \\ nil) do
+      now = System.system_time(:millisecond)
+
+      intent = %{
+        sid: "sid-c",
+        sessionKey: "agent:c",
+        reason: "resident_cap",
+        markerKey: "closed:agent:c:sid-c:x1",
+        target: %{pid: 961, start: 961, unit: nil}
+      }
+
+      {:ok, id} =
+        DB.transaction(
+          ctx.db,
+          &Journal.intend_in_txn(&1, "idle_close", "sid-c:x1", @host, "agent:c", intent, now)
+        )
+
+      if phase == "dispatched", do: :ok = Journal.dispatch(ctx.db, id, %{sentAt: sent_at || now})
+      id
+    end
+
+    defp markers_of(ctx, key) do
+      {:ok, rows} =
+        DB.query(ctx.db, "SELECT content FROM messages WHERE sessionKey=?1 ORDER BY seq", [key])
+
+      Enum.map(rows, &hd/1)
+    end
+
+    test "O2 (rev 5, 1): a closing mark that cannot be written: no close, no journal row",
+         ctx do
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER o2_mark BEFORE INSERT ON lifecycle_events WHEN NEW.kind='memory_guard_closing'
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      adapter = adapter!()
+      guard!(ctx)
+      resident!(adapter, ["sid-c"])
+      :ok = MemoryGuard.tick()
+      settle_closes!()
+      refute_received {:closed, "sid-c", _}
+      assert {:ok, []} = Journal.page(ctx.db, @host, "idle_close", nil, nil, 8)
+    end
+
+    test "O2 (rev 5, 2): intended, process alive after a restart: abandoned, nothing recorded as attempted",
+         ctx do
+      proc!(ctx.root, 961, 1, 961, 10 * @mib)
+      launch!(ctx.base, "sl-c", "sid-c", 961, 961, 512 * @mib)
+      id = close_left!(ctx, "intended")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert %{phase: "done", outcome: %{"outcome" => "abandoned"}} = Journal.get(ctx.db, id)
+      assert events(ctx.db, "memory_guard_close_failed") == []
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+      assert markers_of(ctx, "agent:c") == []
+    end
+
+    test "O2 (rev 5, 3 and 4; the spec author's test): intended, process gone after a restart: one close_unconfirmed, exactly one conditional marker, no idle_closed, a fresh next turn",
+         ctx do
+      # Covers both a crash before the close call and one after it returned
+      # but before `dispatched`: nothing that survives a restart separates them.
+      id = close_left!(ctx, "intended")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+
+      assert %{phase: "done", outcome: %{"outcome" => "unconfirmed"}} = Journal.get(ctx.db, id)
+
+      assert [{"agent:c", %{"sessionId" => "sid-c"}}] =
+               events(ctx.db, "memory_guard_close_unconfirmed")
+
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+      assert [marker] = markers_of(ctx, "agent:c")
+      assert marker =~ @conditional
+
+      # Residency is clear: the next turn needs, and gets, a fresh launch.
+      assert MemoryGuard.read(@host).residentCount == 0
+      queue!(ctx, "agent:c", "next")
+      assert :ok = MemoryGuard.admit("agent:c")
+    end
+
+    test "O2 (rev 5, 5): dispatched, process gone after a restart: idle_closed and one plain marker",
+         ctx do
+      id = close_left!(ctx, "dispatched")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert %{phase: "done", outcome: %{"outcome" => "confirmed"}} = Journal.get(ctx.db, id)
+
+      assert [{"agent:c", %{"certainty" => "confirmed"}}] =
+               events(ctx.db, "memory_guard_idle_closed")
+
+      assert [marker] = markers_of(ctx, "agent:c")
+      assert marker =~ "Tightbeam closed this session's process while it was idle"
+    end
+
+    test "O2 (rev 5, 6): dispatched, process alive past the confirm window after a restart: close_failed",
+         ctx do
+      proc!(ctx.root, 961, 1, 961, 10 * @mib)
+      launch!(ctx.base, "sl-c", "sid-c", 961, 961, 512 * @mib)
+      id = close_left!(ctx, "dispatched", System.system_time(:millisecond) - 60_000)
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert %{phase: "done", outcome: %{"outcome" => "failed"}} = Journal.get(ctx.db, id)
+      assert [{"agent:c", _}] = events(ctx.db, "memory_guard_close_failed")
+      assert markers_of(ctx, "agent:c") == []
+    end
+
+    test "O2 (rev 5, 7): the outcome write fails: retried; the marker is never sent twice",
+         ctx do
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER o2_out BEFORE INSERT ON lifecycle_events WHEN NEW.kind='memory_guard_close_unconfirmed'
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      id = close_left!(ctx, "intended")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert %{phase: "intended"} = Journal.get(ctx.db, id)
+      assert markers_of(ctx, "agent:c") == []
+
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER o2_out")
+
+      for _ <- 1..3, do: :ok = MemoryGuard.tick()
+      assert [_] = events(ctx.db, "memory_guard_close_unconfirmed")
+      assert [_] = markers_of(ctx, "agent:c")
+    end
+  end
+
+  describe "durable effects: override admission under a guard override (O1, D2)" do
+    alias Tightbeam.MemoryGuard.Episodes
+
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      empty = Path.join(ctx.root, "no-cli")
+      File.mkdir_p!(empty)
+      {:opened, ep} = Episodes.open(ctx.db, %{host: @host, kind: "guard", since: 1, why: "t"})
+      id = ep["episodeId"]
+      base = %{"episodeId" => id, "host" => @host, "kind" => "guard", "key" => nil}
+      {:accepted, _} = Episodes.judge(ctx.db, Map.put(base, "action", "recovery"), "r-g", @host)
+      :ok = Episodes.record_outcome(ctx.db, Episodes.recovery(ctx.db, id), "failed", [])
+      {:accepted, _} = Episodes.judge(ctx.db, Map.put(base, "action", "override"), "o-g", @host)
+      session!(ctx, "agent:o")
+      seq = queue!(ctx, "agent:o", "needs a launch")
+      %{episode: id, empty: empty, seq: seq}
+    end
+
+    defp claim!(ctx, seq),
+      do:
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE turns SET status='running', startedAt=?2 WHERE seq=?1", [
+            seq,
+            System.system_time(:millisecond) + 1
+          ])
+
+    test "O1 (crash 1): the admission's intent cannot be written: the launch is held, nothing applied",
+         ctx do
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER o1_intent BEFORE INSERT ON memory_guard_effects
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      guard!(ctx, cli_bin: ctx.empty)
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:o")
+      assert %{"applied" => false} = Episodes.override(ctx.db, ctx.episode)
+    end
+
+    test "O1 (crash 2): a restart before the claim: still only accepted; the claim then applies it once",
+         ctx do
+      guard!(ctx, cli_bin: ctx.empty)
+      assert :ok = MemoryGuard.admit("agent:o")
+      stop_supervised!(MemoryGuard)
+      guard!(ctx, cli_bin: ctx.empty)
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => false} = Episodes.override(ctx.db, ctx.episode)
+
+      claim!(ctx, ctx.seq)
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => true} = Episodes.override(ctx.db, ctx.episode)
+      assert [_] = events(ctx.db, "memory_guard_override_applied")
+    end
+
+    test "O1 (crash 3): a restart after the claim, before the outcome: applied once with no further admission",
+         ctx do
+      guard!(ctx, cli_bin: ctx.empty)
+      assert :ok = MemoryGuard.admit("agent:o")
+      claim!(ctx, ctx.seq)
+      stop_supervised!(MemoryGuard)
+      guard!(ctx, cli_bin: ctx.empty)
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => true} = Episodes.override(ctx.db, ctx.episode)
+      assert [_] = events(ctx.db, "memory_guard_override_applied")
+    end
+
+    test "O1 (crash 4): the outcome write fails: retried until written",
+         ctx do
+      guard!(ctx, cli_bin: ctx.empty)
+      assert :ok = MemoryGuard.admit("agent:o")
+      claim!(ctx, ctx.seq)
+
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER o1_out BEFORE UPDATE OF applied ON memory_guard_episodes
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => false} = Episodes.override(ctx.db, ctx.episode)
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER o1_out")
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => true} = Episodes.override(ctx.db, ctx.episode)
+    end
+
+    test "O1 (crash 5, D2): the turn is cancelled before its claim: not applied, and the override stays available",
+         ctx do
+      guard!(ctx, cli_bin: ctx.empty)
+      assert :ok = MemoryGuard.admit("agent:o")
+      {:ok, _} = DB.query(ctx.db, "UPDATE turns SET status='canceled' WHERE seq=?1", [ctx.seq])
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+
+      {:ok, [[outcome]]} =
+        DB.query(
+          ctx.db,
+          "SELECT outcome FROM memory_guard_effects WHERE kind='override_admission'",
+          []
+        )
+
+      assert %{"outcome" => "not_applied"} = JSON.decode!(outcome)
+      assert %{"applied" => false} = Episodes.override(ctx.db, ctx.episode)
+    end
+  end
+
+  describe "durable effects: units, publication, the inventory marker (O5/O16, O6-O8, D3)" do
+    alias Tightbeam.MemoryGuard.{Publish, Watcher}
+
+    test "O5 (crash 1/2): a unit that cannot be removed is journaled; after a restart the resolver removes it once it can",
+         ctx do
+      {harness, _unit, _set_mode} = enforced_with_unit!(ctx)
+      unit = Path.join(harness, "session-live")
+      File.write!(Path.join(unit, "cgroup.events"), "populated 0\nfrozen 0\n")
+      :ok = MemoryGuard.tick()
+
+      assert {:ok, [%{kind: "unit_remove"}]} =
+               Journal.page(ctx.db, @host, "unit_remove", nil, nil, 8)
+
+      stop_supervised!(MemoryGuard)
+      guard!(ctx, probe: enforced_probe(), cgroup_fs: Path.join(ctx.root, "sys/fs/cgroup"))
+      # Entering enforced writes the unit's limit files again: emptied now.
+      for file <- File.ls!(unit), do: File.rm!(Path.join(unit, file))
+      :ok = MemoryGuard.tick()
+      refute File.dir?(unit)
+      assert {:ok, []} = Journal.page(ctx.db, @host, "unit_remove", nil, nil, 8)
+    end
+
+    test "O16: at start, an empty unit no launch names (a removal lost to a restart) is removed",
+         ctx do
+      {harness, _unit, _set_mode} = enforced_with_unit!(ctx)
+      orphan = Path.join(harness, "adapter-orphan")
+      File.mkdir_p!(orphan)
+      File.write!(Path.join(orphan, "cgroup.events"), "populated 0\nfrozen 0\n")
+      stop_supervised!(MemoryGuard)
+      guard!(ctx, probe: enforced_probe(), cgroup_fs: Path.join(ctx.root, "sys/fs/cgroup"))
+      # Its files keep the stand-in directory from going: journaled, then
+      # removed by the resolver once it can be.
+      assert {:ok, [%{intent: %{"unit" => unit}}]} =
+               Journal.page(ctx.db, @host, "unit_remove", nil, nil, 8)
+
+      assert unit =~ "adapter-orphan"
+      for file <- File.ls!(orphan), do: File.rm!(Path.join(orphan, file))
+      :ok = MemoryGuard.tick()
+      refute File.dir?(orphan)
+    end
+
+    defp set_mode!(ctx, value) do
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "mode", value, "user:owner", 16 * @gib)
+        )
+
+      MemoryGuard.settings_changed(@host)
+    end
+
+    test "O6 (crash 2-4, D3): a mode whose step settings cannot be written is requested, not applied: held, said so, retried after a restart",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      assert :ok = set_mode!(ctx, "off")
+      dir = Records.dir(ctx.base)
+      config = Path.join(dir, "launch.json")
+      assert %{"mode" => "off"} = config |> File.read!() |> JSON.decode!()
+
+      # Back to watched, with the step's directory refusing writes.
+      File.chmod!(dir, 0o555)
+      on_exit(fn -> File.chmod(dir, 0o755) end)
+      assert {:error, {:not_applied, why}} = set_mode!(ctx, "auto")
+      assert why =~ "not yet written"
+      assert MemoryGuard.read(@host).notEnforcedReason =~ "not yet applied"
+      assert %{"mode" => "off"} = config |> File.read!() |> JSON.decode!()
+      assert Unguarded.mode_in_force(ctx.db, @host) == nil
+
+      # The step still reads `off`, so a launch that needs it is held.
+      session!(ctx, "agent:p")
+      queue!(ctx, "agent:p", "needs a launch")
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:p")
+
+      # A restart; the directory takes writes again; the resolver publishes.
+      stop_supervised!(MemoryGuard)
+      File.chmod!(dir, 0o755)
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert %{"mode" => "watched"} = config |> File.read!() |> JSON.decode!()
+      assert {:ok, []} = Journal.page(ctx.db, @host, "publish_config", nil, nil, 8)
+      assert :ok = MemoryGuard.admit("agent:p")
+    end
+
+    test "O7 (crash 2/3/5, D3): off brought into force while the guard is down, its settings not writable: not applied, then the Watcher publishes it",
+         ctx do
+      fs = Path.join(ctx.root, "sys/fs/cgroup")
+      File.mkdir_p!(fs)
+      dir = Records.dir(ctx.base)
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "launch.json"), ~s({"v":1,"mode":"watched"}))
+      File.chmod!(dir, 0o555)
+      on_exit(fn -> File.chmod(dir, 0o755) end)
+
+      assert {:not_applied, why} =
+               Unguarded.bring_off_into_force(ctx.db, @host, ctx.base,
+                 cgroup_fs: fs,
+                 harness_candidates: fn -> {:ok, []} end
+               )
+
+      assert why =~ "recorded; the launch step's settings are not yet written"
+      assert Unguarded.mode_in_force(ctx.db, @host) == nil
+
+      File.chmod!(dir, 0o755)
+
+      start_supervised!(
+        {Watcher,
+         db: ctx.db,
+         base_dir: ctx.base,
+         local_host: @host,
+         interval_ms: :manual,
+         name: :o7_watcher,
+         guard_running?: fn -> false end,
+         finding: fn -> strict_finding() end}
+      )
+
+      :ok = Watcher.tick(:o7_watcher)
+      assert Unguarded.mode_in_force(ctx.db, @host) == "off"
+      assert %{"mode" => "off"} = Path.join(dir, "launch.json") |> File.read!() |> JSON.decode!()
+    end
+
+    test "O8 (crash 1/2): an inventory whose marker cannot be written is not initialized; it is written on the next start",
+         ctx do
+      sessions = Path.join(Records.dir(ctx.base), "sessions")
+      File.mkdir_p!(sessions)
+      File.chmod!(sessions, 0o555)
+      on_exit(fn -> File.chmod(sessions, 0o755) end)
+
+      assert {:error, why} = Records.init_inventory(ctx.db, ctx.base, "boot-1", @host)
+      assert why =~ "not yet initialized"
+
+      assert {:ok, [%{kind: "publish_marker"}]} =
+               Journal.page(ctx.db, @host, "publish_marker", nil, nil, 8)
+
+      File.chmod!(sessions, 0o755)
+      assert {:ok, generation} = Records.init_inventory(ctx.db, ctx.base, "boot-1", @host)
+
+      assert File.read!(Path.join(sessions, ".generation")) == generation or
+               Records.check_inventory(ctx.base, generation) == :ok
+
+      assert {:ok, []} = Journal.page(ctx.db, @host, "publish_marker", nil, nil, 8)
+    end
+  end
+
+  describe "durable effects: holds, clocks and last use (O9, O10, O17, O18)" do
+    alias Tightbeam.MemoryGuard.Episodes
+
+    test "O17/O9: a restart during a continuous hold keeps its start and place, and posts no second waiting marker",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 1 * @gib)
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      session!(ctx, "agent:h")
+      queue!(ctx, "agent:h", "needs a launch")
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:h")
+
+      {:ok, [[since]]} =
+        DB.query(
+          ctx.db,
+          "SELECT openedAt FROM memory_guard_open WHERE kind='hold' AND ref='agent:h'",
+          []
+        )
+
+      assert [_] = markers(ctx.db, "agent:h")
+
+      stop_supervised!(MemoryGuard)
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert %{since: ^since} = :sys.get_state(MemoryGuard).held["agent:h"]
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:h")
+      assert [_] = markers(ctx.db, "agent:h")
+
+      {:ok, [[^since]]} =
+        DB.query(
+          ctx.db,
+          "SELECT openedAt FROM memory_guard_open WHERE kind='hold' AND ref='agent:h'",
+          []
+        )
+    end
+
+    test "O10: a restart 10 minutes into a stuck custody refusal opens the episode 15 minutes after the refusal began",
+         ctx do
+      Application.put_env(:tightbeam, :memory_guard_stuck_ms, 15 * 60_000)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_stuck_ms) end)
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      clock = :counters.new(1, [])
+      t0 = System.system_time(:millisecond)
+      :counters.put(clock, 1, t0)
+      at = fn -> :counters.get(clock, 1) end
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+      proc!(ctx.root, 951, 1, 951, 10 * @mib)
+      launch!(ctx.base, "sl-stuck", "sid-stuck", 951, 951, 512 * @mib)
+      opts = [kill_result: {:error, :harness_group_failed}, signal_works: false, clock: at]
+      guard!(ctx, opts)
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a new adapter")
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+
+      :counters.add(clock, 1, 10 * 60_000)
+      :ok = MemoryGuard.tick()
+      stop_supervised!(MemoryGuard)
+      guard!(ctx, opts)
+      :counters.add(clock, 1, 4 * 60_000)
+      :ok = MemoryGuard.tick()
+      assert Episodes.active(ctx.db, @host) == []
+
+      :counters.add(clock, 1, 60_000)
+      :ok = MemoryGuard.tick()
+      assert [%{"kind" => "custody", "since" => ^t0}] = Episodes.active(ctx.db, @host)
+    end
+
+    test "O18 (rev 4 D4): last use is the latest started turn's activity, past a newer queued tail; none started within 256 is unknown",
+         ctx do
+      session!(ctx, "agent:u", "sid-u")
+      old = queue!(ctx, "agent:u", "done long ago")
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE turns SET status='delivered', startedAt=1000, endedAt=2000 WHERE seq=?1",
+          [old]
+        )
+
+      queue!(ctx, "agent:u", "queued now")
+      assert MemoryGuard.durable_last_use(ctx.db, "sid-u") == 2000
+
+      # More than 256 newer turns that never started: unknown.
+      for n <- 1..257, do: queue!(ctx, "agent:u", "q#{n}")
+      assert MemoryGuard.durable_last_use(ctx.db, "sid-u") == nil
+
+      # A session whose turns never started: unknown.
+      session!(ctx, "agent:v", "sid-v")
+      queue!(ctx, "agent:v", "never ran")
+      assert MemoryGuard.durable_last_use(ctx.db, "sid-v") == nil
+    end
+  end
+
+  describe "durable effects: the bound and its liveness (rev 3 D5)" do
+    test "D5: one sample acts on at most a page of a stream; a backlog drains within its bound while new rows keep arriving",
+         ctx do
+      guard!(ctx)
+      now = System.system_time(:millisecond)
+
+      add = fn from, count, at ->
+        {:ok, _} =
+          DB.transaction(ctx.db, fn txn ->
+            for n <- from..(from + count - 1) do
+              Journal.intend_in_txn(
+                txn,
+                "unit_remove",
+                "u#{n}",
+                @host,
+                "u#{n}",
+                %{unit: "/none/u#{n}", fs: Path.join(ctx.root, "no-fs")},
+                at
+              )
+            end
+          end)
+      end
+
+      add.(1, 300, now - 1_000)
+
+      old = fn ->
+        {:ok, [[n]]} =
+          DB.query(
+            ctx.db,
+            "SELECT COUNT(*) FROM memory_guard_effects WHERE kind='unit_remove' AND phase != 'done' AND createdAt < ?1",
+            [now]
+          )
+
+        n
+      end
+
+      :ok = MemoryGuard.tick()
+      assert 300 - old.() <= 32
+
+      # New rows keep arriving; every row present when the cycle began is
+      # acted on within ceil(300 / 6) samples.
+      for i <- 1..50 do
+        add.(1000 + i * 5, 5, now + i)
+        :ok = MemoryGuard.tick()
+      end
+
+      assert old.() == 0
+    end
+
+    test "D5 liveness: an eligible waiter behind more than 256 rows blocked by another reason is reached within ceil(stale / 256) + 1 evaluations",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      key = "claude:shared@testhost"
+
+      {:ok, _} =
+        DB.transaction(ctx.db, fn txn ->
+          for n <- 1..300 do
+            Tightbeam.DB.Txn.q(
+              txn,
+              """
+              INSERT INTO memory_guard_open (kind, ref, subject, host, detail, openedAt, orderKey, adapterKey)
+              VALUES ('hold', ?1, ?1, ?2, '{"details":{},"seq":0}', ?3, ?4, ?5)
+              """,
+              ["agent:p#{n}", @host, n, "00:" <> String.pad_leading("#{n}", 20, "0"), key]
+            )
+          end
+        end)
+
+      # Each of them is held by an open limit-fallback evaluation.
+      for n <- 1..300 do
+        session!(ctx, "agent:p#{n}")
+        seq = queue!(ctx, "agent:p#{n}", "w")
+
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "INSERT INTO limit_fallback_evaluations (sessionKey, turnSeq, heldAt, createdAt) VALUES (?1, ?2, 1, 1)",
+            [
+              "agent:p#{n}",
+              seq
+            ]
+          )
+      end
+
+      session!(ctx, "agent:s")
+      queue!(ctx, "agent:s", "eligible")
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO memory_guard_open (kind, ref, subject, host, detail, openedAt, orderKey, adapterKey)
+          VALUES ('hold', 'agent:s', 'agent:s', ?1, '{"details":{},"seq":0}', 999, '99:0', ?2)
+          """,
+          [@host, key]
+        )
+
+      adapter = adapter!()
+      resident!(adapter, ["sid-x"])
+      refute_received {:nudged, "agent:s"}
+      resident!(adapter, ["sid-y"])
+      assert_received {:nudged, "agent:s"}
+
+      {:ok, [[blocked]]} =
+        DB.query(
+          ctx.db,
+          "SELECT COUNT(*) FROM memory_guard_open WHERE kind='hold' AND blocked IS NOT NULL",
+          []
+        )
+
+      assert blocked == 300
     end
   end
 end
