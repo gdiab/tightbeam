@@ -389,6 +389,10 @@ defmodule Tightbeam.ParkStrandingTest do
     assert HarnessProcess.parked?(db, @codex_key)
     refute HarnessProcess.parked?(db, pi_key)
 
+    # T16 (migration contract v3.13): no release is recorded for the kept park.
+    assert Enum.filter(lifecycle(db, "rate_limit_hold_released"), &(&1.subject == incident.id)) ==
+             []
+
     # Start-up arms the carried-over park's stranding check, once.
     assert :ok = ParkStranding.arm_standing(db)
     assert :ok = ParkStranding.arm_standing(db)
