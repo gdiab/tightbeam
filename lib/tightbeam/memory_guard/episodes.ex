@@ -39,24 +39,40 @@ defmodule Tightbeam.MemoryGuard.Episodes do
   def stuck_ms, do: Application.get_env(:tightbeam, :memory_guard_stuck_ms, @stuck_ms)
 
   @doc """
-  The active episodes, optionally of one host: `[episode]`, each with its
-  `"recovery"` and `"override"` (or nil). Raises when they cannot be read:
-  an unread set is not an empty one.
+  The active episodes of one host: `[episode]`, each with its `"recovery"`
+  and `"override"` (or nil). An index search on the host's active rows
+  (`memory_guard_episodes_active_host`): it costs that host's active
+  episodes, whatever other hosts have. Raises when they cannot be read: an
+  unread set is not an empty one.
   """
-  @spec active(DB.server() | Txn.t(), String.t() | nil) :: [map()]
-  def active(db, host \\ nil)
-
-  def active(%Txn{} = txn, host) do
+  @spec active(DB.server() | Txn.t(), String.t()) :: [map()]
+  def active(%Txn{} = txn, host) when is_binary(host) do
     txn
     |> Txn.q(
-      "SELECT #{@columns} FROM memory_guard_episodes WHERE active=1 AND (?1 IS NULL OR host=?1) ORDER BY openedAt, episodeId",
+      "SELECT #{@columns} FROM memory_guard_episodes WHERE host=?1 AND active=1 ORDER BY openedAt, episodeId",
       [host]
     )
     |> Enum.map(&row/1)
   end
 
-  def active(db, host) do
+  def active(db, host) when is_binary(host) do
     case DB.transaction(db, &active(&1, host)) do
+      {:ok, episodes} -> episodes
+      {:error, error} -> raise "episodes cannot be read: #{Exception.message(error)}"
+    end
+  end
+
+  @doc """
+  Every host's active episodes, for the start's reboot check only (it runs
+  until it has once succeeded, never per sample). Raises when unreadable.
+  """
+  @spec active_all(DB.server()) :: [map()]
+  def active_all(db) do
+    case DB.transaction(db, fn txn ->
+           txn
+           |> Txn.q("SELECT #{@columns} FROM memory_guard_episodes WHERE active=1", [])
+           |> Enum.map(&row/1)
+         end) do
       {:ok, episodes} -> episodes
       {:error, error} -> raise "episodes cannot be read: #{Exception.message(error)}"
     end
@@ -473,25 +489,33 @@ defmodule Tightbeam.MemoryGuard.Episodes do
     end)
   end
 
-  @doc "Record that an accepted override's effect was carried out, once."
+  @doc """
+  Record that an accepted override's effect was carried out, once. Called
+  only after the effect (FS9 B4 "when done"), or in the transaction that is
+  the effect (`applied_in_txn/2`).
+  """
   @spec applied(DB.server(), String.t()) :: :ok | {:error, String.t()}
-  def applied(db, episode_id) do
-    transact(db, fn txn ->
-      Txn.q(
-        txn,
-        "UPDATE memory_guard_episodes SET applied=1 WHERE episodeId=?1 AND override IS NOT NULL AND applied=0",
-        [episode_id]
-      )
+  def applied(db, episode_id), do: transact(db, &applied_in_txn(&1, episode_id))
 
-      if Txn.changes(txn) == 1 do
-        EventLog.lifecycle_in_txn(
-          txn,
-          "memory_guard_override_applied",
-          episode_id,
-          JSON.encode!(%{episodeId: episode_id, at: System.system_time(:millisecond)})
-        )
-      end
-    end)
+  @doc "`applied/2` inside the transaction that carries out the effect."
+  @spec applied_in_txn(Txn.t(), String.t()) :: :ok
+  def applied_in_txn(%Txn{} = txn, episode_id) do
+    Txn.q(
+      txn,
+      "UPDATE memory_guard_episodes SET applied=1 WHERE episodeId=?1 AND override IS NOT NULL AND applied=0",
+      [episode_id]
+    )
+
+    if Txn.changes(txn) == 1 do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "memory_guard_override_applied",
+        episode_id,
+        JSON.encode!(%{episodeId: episode_id, at: System.system_time(:millisecond)})
+      )
+    end
+
+    :ok
   end
 
   @doc """

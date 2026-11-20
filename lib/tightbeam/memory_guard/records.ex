@@ -180,8 +180,8 @@ defmodule Tightbeam.MemoryGuard.Records do
   @doc """
   Whether everything the launch step needs is in place (v1.13 FS2): its
   configuration reads, the launch-record directory takes a write, its refusal
-  records can be read (else a refusal could not be told from a harness
-  failure), and the process's own `oom_score_adj` reads. `:ok` or
+  records can be read and written (else a refusal could not be told from a
+  harness failure), and the process's own `oom_score_adj` reads. `:ok` or
   `{:error, message}`.
   """
   @spec step_prerequisites(String.t(), String.t()) :: :ok | {:error, String.t()}
@@ -189,9 +189,17 @@ defmodule Tightbeam.MemoryGuard.Records do
     sessions = Path.join(dir(base_dir), "sessions")
     probe = Path.join(sessions, ".probe-#{System.unique_integer([:positive])}")
 
+    refusals_dir = Path.join(dir(base_dir), "refusals")
+    refusal_probe = Path.join(refusals_dir, ".probe-#{System.unique_integer([:positive])}")
+
     with {:ok, text} <- File.read(Path.join(dir(base_dir), "launch.json")),
          refusals when not is_tuple(refusals) or elem(refusals, 0) != :error <-
            refusal_for(base_dir, "", 0),
+         # A refusal the step cannot record cannot be told from a harness
+         # failure: its directory must take a write too.
+         :ok <- File.mkdir_p(refusals_dir),
+         :ok <- File.write(refusal_probe, ""),
+         :ok <- File.rm(refusal_probe),
          {:ok, %{"v" => 1, "mode" => mode}} when is_binary(mode) <- JSON.decode(text),
          :ok <- File.write(probe, ""),
          :ok <- File.rm(probe),

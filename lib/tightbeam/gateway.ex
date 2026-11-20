@@ -4345,7 +4345,8 @@ defmodule Tightbeam.Gateway do
 
                 step_refusal != nil ->
                   "Tightbeam did not start this agent's process: its memory guard's launch step " <>
-                    "refused (#{step_refusal.reason}). Nothing ran; the turn is queued again."
+                    "refused (#{step_refusal.reason}). Nothing ran; Tightbeam queues the turn again " <>
+                    "unless its session can take no new turn."
 
                 true ->
                   reason

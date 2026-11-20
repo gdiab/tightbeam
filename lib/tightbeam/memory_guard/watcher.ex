@@ -133,17 +133,13 @@ defmodule Tightbeam.MemoryGuard.Watcher do
   # been held, without a break, since then. Holds that cannot be read open
   # nothing now and are read again on the next pass.
   defp open_guard_episode(state, now) do
-    case Unguarded.held_sessions(state.db) do
+    case Unguarded.held_sessions(state.db, state.host) do
       {:error, reason} ->
         Logger.warning("memory guard watcher: holds cannot be read: #{reason}")
         state
 
       {:ok, held} ->
-        since =
-          for {session_key, host} <- held,
-              host == state.host,
-              %{since: since} <- [Unguarded.open_hold(state.db, session_key)],
-              do: since
+        since = for {_session_key, _host, since} <- held, do: since
 
         with [_ | _] <- since,
              oldest = Enum.min(since),

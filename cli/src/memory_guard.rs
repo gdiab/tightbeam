@@ -328,9 +328,20 @@ fn refuse(dir: &Path, sid: &str, adapter_launch: &str, refusal: &Refusal) -> i32
     record.insert("adapterLaunchId", serde_json::json!(adapter_launch));
     record.insert("reason", serde_json::json!(refusal.reason));
     record.insert("at", serde_json::json!(now_ms()));
+    // The refusal is what tells the gateway this was not a harness failure:
+    // a failed write is tried again before giving up, and said on stderr.
     let body = serde_json::to_vec(&record).unwrap_or_default();
-    let written = fs::create_dir_all(&refusals)
-        .and_then(|_| atomic_write(&refusals.join(format!("{}.json", refusal.launch)), &body));
+    let path = refusals.join(format!("{}.json", refusal.launch));
+    let mut written = Err(std::io::Error::other("not attempted"));
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        written = fs::create_dir_all(&refusals).and_then(|_| atomic_write(&path, &body));
+        if written.is_ok() {
+            break;
+        }
+    }
     if let Err(error) = written {
         eprintln!("{STEP_NAME}: the refusal could not be recorded: {error}");
     }

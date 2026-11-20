@@ -40,26 +40,33 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
         key = {Harness.parse!(session.harness).id(), "shared", session.host}
         live = Keyword.get(opts, :live_adapter, &live_adapter/1).(key)
 
+        # FS7: an admission is its release's durable step. A release whose
+        # record cannot be written has not happened: the turn stays held, and
+        # the next ask retries it.
+        admitted = fn result -> if result == :ok, do: :ok, else: {:held, [@detail]} end
+
         cond do
           # A resident session needs no launch: its turns are never held (FS1).
           resident?(db, session, live, opts) ->
-            release(db, session_key, session.host, "resident")
-            :ok
+            admitted.(release(db, session_key, session.host, "resident"))
 
           # `off` in force lets a session launch onto a live adapter proceed;
           # a new adapter still waits for the guard (FS1, R2a).
           live != nil and mode_in_force(db, session.host) == "off" ->
-            release(db, session_key, session.host, "off")
-            :ok
+            admitted.(release(db, session_key, session.host, "off"))
 
           # FS9: a root override of the host's guard episode admits held
           # launches without the guard; the risk stays shown until it answers.
-          # The override's effect is recorded first; a record that fails
-          # leaves the launch held, and the next ask retries it (FS7).
-          (episode = overridden_guard_episode(db, session.host)) != nil and
-              Tightbeam.MemoryGuard.Episodes.applied(db, episode["episodeId"]) == :ok ->
-            release(db, session_key, session.host, "root override #{episode["episodeId"]}")
-            :ok
+          # The admission (the hold's release) and `override_applied` are one
+          # transaction: neither is recorded without the other (FS9 B4, FS7).
+          (episode = overridden_guard_episode(db, session.host)) != nil ->
+            id = episode["episodeId"]
+
+            admitted.(
+              release(db, session_key, session.host, "root override #{id}",
+                then: &Tightbeam.MemoryGuard.Episodes.applied_in_txn(&1, id)
+              )
+            )
 
           true ->
             hold(db, session_key, session.host)
@@ -137,15 +144,17 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
   end
 
   @doc """
-  Every session with an open `guard_unavailable` hold, `{:ok, [{session_key,
-  host}]}`, or `{:error, message}` when they cannot be read. The open holds
-  are current state (`Tightbeam.MemoryGuard.State`), so this costs the holds
-  open now, never the history (review B7).
+  The sessions with an open `guard_unavailable` hold on `host` (or on every
+  host, `:all`, for the guard's start): `{:ok, [{session_key, host, since}]}`,
+  or `{:error, message}` when they cannot be read. The open holds are current
+  state (`Tightbeam.MemoryGuard.State`) searched by host, so this costs that
+  host's holds open now, never the history or other hosts (review B7).
   """
-  @spec held_sessions(DB.server()) :: {:ok, [{String.t(), String.t()}]} | {:error, String.t()}
-  def held_sessions(db) do
-    with {:ok, holds} <- State.list(db, @open_kind),
-         do: {:ok, Enum.map(holds, &{&1.subject, &1.host})}
+  @spec held_sessions(DB.server(), String.t() | :all) ::
+          {:ok, [{String.t(), String.t(), integer()}]} | {:error, String.t()}
+  def held_sessions(db, host) do
+    with {:ok, holds} <- State.list(db, @open_kind, host),
+         do: {:ok, Enum.map(holds, &{&1.subject, &1.host, &1.opened_at})}
   end
 
   @doc """
@@ -205,8 +214,9 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
   `{:error, message}` when the release could not be recorded (the hold stands
   and the release is retried).
   """
-  @spec release(DB.server(), String.t(), String.t(), String.t()) :: :ok | {:error, String.t()}
-  def release(db, session_key, host, because) do
+  @spec release(DB.server(), String.t(), String.t(), String.t(), keyword()) ::
+          :ok | {:error, String.t()}
+  def release(db, session_key, host, because, opts \\ []) do
     DB.transaction(db, fn txn ->
       if open_hold_in_txn(txn, session_key) do
         State.close_in_txn(txn, @open_kind, session_key)
@@ -218,6 +228,9 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
           JSON.encode!(%{host: host, detail: @detail, because: because})
         )
       end
+
+      # A record of the release's own effect, in the same step.
+      Keyword.get(opts, :then, fn _txn -> :ok end).(txn)
     end)
     |> case do
       {:ok, _} -> :ok
@@ -266,48 +279,68 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
     # contract can exist there, so only the mode record is evidence.
     local? = Keyword.get(opts, :local?, true)
 
+    config = Path.join(Records.dir(base_dir), "launch.json")
+    before = File.read(config)
+
     with :ok <- no_incomplete_transition(db, host),
-         :ok <- if(local?, do: no_kernel_limits(root, fs, opts), else: :ok) do
-      {:ok, _} =
-        DB.transaction(db, fn txn ->
-          EventLog.lifecycle_in_txn(
-            txn,
-            "memory_guard_mode",
-            host,
-            JSON.encode!(%{
-              host: host,
-              mode: "off",
-              reason: "an admin turned memory limits off for this host",
-              transition: nil,
-              by: "settings"
-            })
-          )
+         :ok <- if(local?, do: no_kernel_limits(root, fs, opts), else: :ok),
+         :ok <-
+           committed(
+             DB.transaction(db, fn txn ->
+               EventLog.lifecycle_in_txn(
+                 txn,
+                 "memory_guard_mode",
+                 host,
+                 JSON.encode!(%{
+                   host: host,
+                   mode: "off",
+                   reason: "an admin turned memory limits off for this host",
+                   transition: nil,
+                   by: "settings"
+                 })
+               )
 
-          # The step's configuration and the record are one step (FS2, FS7).
-          case Records.publish_config(base_dir, %{
-                 mode: "off",
-                 fs: nil,
-                 harness: nil,
-                 sessionLimit: nil,
-                 oomRaise: 100
-               }) do
-            :ok ->
-              :ok
+               # The step's configuration and the record are one step (FS2, FS7).
+               case Records.publish_config(base_dir, %{
+                      mode: "off",
+                      fs: nil,
+                      harness: nil,
+                      sessionLimit: nil,
+                      oomRaise: 100
+                    }) do
+                 :ok ->
+                   :ok
 
-            {:error, error} ->
-              raise "the launch step's configuration could not be written: #{inspect(error)}"
-          end
-        end)
-
+                 {:error, error} ->
+                   raise "the launch step's configuration could not be written: #{inspect(error)}"
+               end
+             end),
+             config,
+             before
+           ) do
       # The change is in force; a nudge that cannot be planned now is made by
       # the guard's next pass over the holds.
-      with {:ok, held} <- held_sessions(db),
-           do: for({session_key, ^host} <- held, do: nudge(session_key))
+      with {:ok, held} <- held_sessions(db, host),
+           do: for({session_key, _host, _since} <- held, do: nudge(session_key))
 
       :in_force
     end
   rescue
     error -> {:not_applied, Exception.message(error)}
+  end
+
+  # The configuration is published inside the transaction; if the record
+  # does not commit, the step is given back what it read before, so it never
+  # acts on an `off` that is not in force (FS7).
+  defp committed({:ok, _}, _config, _before), do: :ok
+
+  defp committed({:error, error}, config, before) do
+    case before do
+      {:ok, bytes} -> File.write(config, bytes)
+      {:error, _} -> File.rm(config)
+    end
+
+    {:not_applied, "the change could not be recorded: #{Exception.message(error)}"}
   end
 
   defp no_incomplete_transition(db, host) do

@@ -3191,6 +3191,11 @@ defmodule Tightbeam.MemoryGuardTest do
       assert MemoryGuard.read(@host).mode == "watched"
       refute Unguarded.mode_in_force(ctx.db, @host) == "off"
 
+      # R2 sweep: the step was told `off` before the record failed; it is told
+      # the mode the guard acts on, never left launching unrecorded under off.
+      config = Path.join(Records.dir(ctx.base), "launch.json")
+      assert %{"mode" => "watched"} = config |> File.read!() |> JSON.decode!()
+
       {:ok, _} = DB.query(ctx.db, "DROP TRIGGER mg_fail_mode")
       :ok = MemoryGuard.tick()
       assert MemoryGuard.read(@host).mode == "off"
@@ -3700,6 +3705,21 @@ defmodule Tightbeam.MemoryGuardTest do
       )
     end
 
+    # A replacement adapter for the key runs: it registers with the guard.
+    defp replacement_runs!(launch_id \\ "adapter-launch-2") do
+      adapter = start_supervised!({FakeAdapter, test: self()}, id: {:adapter, launch_id})
+
+      MemoryGuard.residency(
+        adapter,
+        {:claude, "shared", @host},
+        launch_id,
+        MapSet.new(["sid-new"])
+      )
+
+      _ = :sys.get_state(MemoryGuard)
+      adapter
+    end
+
     defp alert_rows(db) do
       {:ok, rows} =
         DB.query(
@@ -4134,7 +4154,11 @@ defmodule Tightbeam.MemoryGuardTest do
       assert %{"operator" => %{"sudoUser" => "george"}} = Episodes.override(ctx.db, id)
 
       # The replacement may launch: the fence no longer counts the named tree.
+      # The override is applied once the replacement runs (FS9 B4).
       assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      assert %{"applied" => false} = Episodes.override(ctx.db, id)
+      replacement_runs!()
+      :ok = MemoryGuard.tick()
       assert %{"applied" => true} = Episodes.override(ctx.db, id)
 
       # A second, different override for the same episode is rejected.
@@ -4254,7 +4278,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert error =~ "recovery-1.json"
     end
 
-    test "N9.unreadable (FS7, sweep): an override whose effect cannot be recorded does not lift the fence; it is retried",
+    test "N9.unreadable / N9.stale (FS9 B4, R2, custody): override_applied only once the replacement runs; a failed record is retried; a restart in the gap records it once",
          ctx do
       episode = custody_stuck!(ctx)
       id = episode["episodeId"]
@@ -4268,6 +4292,63 @@ defmodule Tightbeam.MemoryGuardTest do
       :ok = MemoryGuard.tick()
       root_record!(ctx, "override-1", override_record(ctx, episode, strict_finding()))
       :ok = MemoryGuard.tick()
+
+      # The fence is lifted for the named tree, but nothing has launched yet:
+      # nothing is recorded as applied, sample after sample.
+      key = {:claude, "shared", @host}
+      assert :ok = MemoryGuard.ensure_no_orphans(key)
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => false} = Episodes.override(ctx.db, id)
+      assert events(ctx.db, "memory_guard_override_applied") == []
+
+      # The gap: the gateway restarts after the fence was lifted and before
+      # the replacement ran. The override is still only accepted.
+      stop_supervised!(MemoryGuard)
+
+      guard!(ctx,
+        kill_result: {:error, :harness_group_failed},
+        signal_works: false,
+        root_uid: ctx.uid
+      )
+
+      assert :ok = MemoryGuard.ensure_no_orphans(key)
+      assert %{"applied" => false} = Episodes.override(ctx.db, id)
+
+      # The replacement runs, but the record cannot be written: still only
+      # accepted, and retried.
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER fs9_applied_fails BEFORE UPDATE OF applied ON memory_guard_episodes
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      replacement_runs!()
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => false} = Episodes.override(ctx.db, id)
+
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER fs9_applied_fails")
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => true} = Episodes.override(ctx.db, id)
+      assert [{^id, _}] = events(ctx.db, "memory_guard_override_applied")
+    end
+
+    test "N9.unreadable / N9.stale (FS9 B4, R2, guard up): override_applied only after the held launch is admitted; a failed record is retried; a restart in the gap records it once",
+         ctx do
+      # The guard runs but its launch step is not in place: launches are held
+      # guard_unavailable, and a guard episode has an accepted override.
+      empty = Path.join(ctx.root, "no-cli")
+      File.mkdir_p!(empty)
+      {:opened, ep} = Episodes.open(ctx.db, %{host: @host, kind: "guard", since: 1, why: "t"})
+      id = ep["episodeId"]
+      base = %{"episodeId" => id, "host" => @host, "kind" => "guard", "key" => nil}
+      {:accepted, _} = Episodes.judge(ctx.db, Map.put(base, "action", "recovery"), "r-g", @host)
+      :ok = Episodes.record_outcome(ctx.db, Episodes.recovery(ctx.db, id), "failed", [])
+      {:accepted, _} = Episodes.judge(ctx.db, Map.put(base, "action", "override"), "o-g", @host)
+      guard!(ctx, cli_bin: empty)
+
+      # Accepted, nothing admitted yet: nothing applied.
+      :ok = MemoryGuard.tick()
       assert %{"applied" => false} = Episodes.override(ctx.db, id)
 
       {:ok, _} =
@@ -4276,12 +4357,25 @@ defmodule Tightbeam.MemoryGuardTest do
         BEGIN SELECT RAISE(ABORT, 'injected'); END
         """)
 
-      assert {:error, _} = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      # The held launch is admitted; its record fails and is kept for retry.
+      session!(ctx, "agent:o1")
+      queue!(ctx, "agent:o1", "needs a launch")
+      assert :ok = MemoryGuard.admit("agent:o1")
       assert %{"applied" => false} = Episodes.override(ctx.db, id)
+      assert MapSet.member?(:sys.get_state(MemoryGuard).pending_applied, id)
 
+      # The gap: a restart loses the retry. The override is still accepted,
+      # so the next admission carried out from it records it, once.
+      stop_supervised!(MemoryGuard)
       {:ok, _} = DB.query(ctx.db, "DROP TRIGGER fs9_applied_fails")
-      assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      guard!(ctx, cli_bin: empty)
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => false} = Episodes.override(ctx.db, id)
+      session!(ctx, "agent:o2")
+      queue!(ctx, "agent:o2", "needs a launch")
+      assert :ok = MemoryGuard.admit("agent:o2")
       assert %{"applied" => true} = Episodes.override(ctx.db, id)
+      assert [{^id, _}] = events(ctx.db, "memory_guard_override_applied")
     end
 
     test "N10.unreadable: an episode read that cannot be completed says unknown, never none",
@@ -5311,6 +5405,19 @@ defmodule Tightbeam.MemoryGuardTest do
       guard!(ctx, opts)
       assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
       assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      # Applied once the replacement adapter runs (FS9 B4), recorded once.
+      assert %{"applied" => false} = Episodes.override(ctx.db, episode["episodeId"])
+      adapter = start_supervised!({FakeAdapter, test: self()}, id: {:adapter, "replacement"})
+
+      MemoryGuard.residency(
+        adapter,
+        {:claude, "shared", @host},
+        "adapter-launch-2",
+        MapSet.new(["sid-r"])
+      )
+
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
       assert %{"applied" => true} = Episodes.override(ctx.db, episode["episodeId"])
       assert length(events(ctx.db, "memory_guard_override_applied")) == 1
     end
@@ -5535,7 +5642,7 @@ defmodule Tightbeam.MemoryGuardTest do
   ## reads as none, empty or done.
 
   describe "sweep: failures never read as none (review class B3-B6)" do
-    alias Tightbeam.MemoryGuard.{RootPath, Unguarded}
+    alias Tightbeam.MemoryGuard.{Episodes, RootActions, RootPath, Unguarded}
 
     test "sweep (FS1 A3, FS2): an adapter whose session processes cannot get the launch step does not launch, outside off",
          ctx do
@@ -5568,6 +5675,166 @@ defmodule Tightbeam.MemoryGuardTest do
                [cmd: ["/bin/codex-acp"], env: []],
                ctx.db
              ) == []
+    end
+
+    test "N4.stale (R2 sweep): a running guard whose own launch step holds launches does not clear a guard recovery",
+         ctx do
+      Application.put_env(:tightbeam, :memory_guard_stuck_ms, 0)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_stuck_ms) end)
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      empty = Path.join(ctx.root, "no-cli")
+      File.mkdir_p!(empty)
+      guard!(ctx, cli_bin: empty, root_uid: File.stat!(ctx.root).uid)
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      assert [%{"kind" => "guard", "episodeId" => id}] = Episodes.active(ctx.db, @host)
+
+      dir = RootActions.dir(ctx.base)
+      File.mkdir_p!(dir)
+
+      File.write!(
+        Path.join(dir, "recovery-g.json"),
+        JSON.encode!(%{
+          v: 1,
+          action: "recovery",
+          episodeId: id,
+          host: @host,
+          kind: "guard",
+          key: nil,
+          at: System.system_time(:millisecond)
+        })
+      )
+
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      assert %{"outcome" => "pending"} = Episodes.recovery(ctx.db, id)
+      assert [%{"episodeId" => ^id}] = Episodes.active(ctx.db, @host)
+    end
+
+    test "N2.stale (R2 sweep): an episode opened before a restart whose alert was never recorded is alerted after it",
+         ctx do
+      Application.put_env(:tightbeam, :memory_guard_stuck_ms, 0)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_stuck_ms) end)
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE users SET createdAt=createdAt+1000 WHERE userId='guest'")
+
+      main!(ctx, "owner")
+      :ok = Org.put_setting(ctx.db, "owner-alerts-user", "owner")
+
+      # The episode was opened; the gateway stopped before its alert.
+      {:opened, ep} =
+        Episodes.open(ctx.db, %{
+          host: @host,
+          kind: "guard",
+          since: 1,
+          why: "the memory guard's launch step is not in place"
+        })
+
+      empty = Path.join(ctx.root, "no-cli")
+      File.mkdir_p!(empty)
+      guard!(ctx, cli_bin: empty)
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      id = ep["episodeId"]
+
+      assert %{"alert" => %{"outcome" => "created"}, "notified" => true} =
+               Episodes.get(ctx.db, id)
+    end
+
+    test "F8 (R2 sweep): off whose record cannot be committed gives the step back its earlier settings",
+         ctx do
+      fs = Path.join(ctx.root, "sys/fs/cgroup")
+      File.mkdir_p!(fs)
+      config = Path.join(Records.dir(ctx.base), "launch.json")
+      File.mkdir_p!(Path.dirname(config))
+      File.write!(config, ~s({"v":1,"mode":"watched"}))
+
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER off_fails BEFORE INSERT ON lifecycle_events WHEN NEW.kind='memory_guard_mode'
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      assert {:not_applied, why} =
+               Unguarded.bring_off_into_force(ctx.db, @host, ctx.base,
+                 cgroup_fs: fs,
+                 harness_candidates: fn -> {:ok, []} end
+               )
+
+      assert why =~ "could not be recorded"
+      assert File.read!(config) == ~s({"v":1,"mode":"watched"})
+    end
+
+    test "R1 (FS7): a guard-down admission whose release cannot be recorded stays held, for a resident session, under off and under a root override",
+         ctx do
+      session!(ctx, "agent:g", "sid-g")
+      queue!(ctx, "agent:g", "work")
+      none = [live_adapter: fn _ -> nil end]
+      assert {:held, ["guard_unavailable"]} = Unguarded.admit(ctx.db, "agent:g", none)
+      assert %{since: _} = Unguarded.open_hold(ctx.db, "agent:g")
+
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER r1_release_fails BEFORE DELETE ON memory_guard_open
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      live = [live_adapter: fn _ -> self() end]
+      resident = live ++ [resident?: fn _adapter, _sid -> true end]
+      not_resident = live ++ [resident?: fn _adapter, _sid -> false end]
+
+      # Resident.
+      assert {:held, ["guard_unavailable"]} = Unguarded.admit(ctx.db, "agent:g", resident)
+
+      # `off` in force.
+      EventLog.lifecycle(
+        ctx.db,
+        "memory_guard_mode",
+        @host,
+        JSON.encode!(%{host: @host, mode: "off", transition: nil})
+      )
+
+      assert {:held, ["guard_unavailable"]} = Unguarded.admit(ctx.db, "agent:g", not_resident)
+      {:ok, _} = DB.query(ctx.db, "DELETE FROM lifecycle_events WHERE kind='memory_guard_mode'")
+
+      # A root override of the host's guard episode.
+      {:opened, ep} = Episodes.open(ctx.db, %{host: @host, kind: "guard", since: 1, why: "t"})
+      id = ep["episodeId"]
+      base = %{"episodeId" => id, "host" => @host, "kind" => "guard", "key" => nil}
+      {:accepted, _} = Episodes.judge(ctx.db, Map.put(base, "action", "recovery"), "r-d", @host)
+      :ok = Episodes.record_outcome(ctx.db, Episodes.recovery(ctx.db, id), "failed", [])
+      {:accepted, _} = Episodes.judge(ctx.db, Map.put(base, "action", "override"), "o-d", @host)
+      assert {:held, ["guard_unavailable"]} = Unguarded.admit(ctx.db, "agent:g", none)
+
+      # Nothing was released or applied: the hold stands.
+      assert %{since: _} = Unguarded.open_hold(ctx.db, "agent:g")
+      assert events(ctx.db, "memory_guard_release") == []
+      assert %{"applied" => false} = Episodes.override(ctx.db, id)
+
+      # The release and override_applied are one step: if the applied record
+      # fails, the release does not happen either.
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER r1_release_fails")
+
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER r2_applied_fails BEFORE UPDATE OF applied ON memory_guard_episodes
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      assert {:held, ["guard_unavailable"]} = Unguarded.admit(ctx.db, "agent:g", none)
+      assert %{since: _} = Unguarded.open_hold(ctx.db, "agent:g")
+      assert events(ctx.db, "memory_guard_release") == []
+
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER r2_applied_fails")
+      assert :ok = Unguarded.admit(ctx.db, "agent:g", none)
+      assert Unguarded.open_hold(ctx.db, "agent:g") == nil
+
+      assert [{"agent:g", %{"because" => "root override " <> ^id}}] =
+               events(ctx.db, "memory_guard_release")
+
+      assert %{"applied" => true} = Episodes.override(ctx.db, id)
     end
 
     test "sweep (B2.unreadable): a launch record without its tree's pid is unreadable, not a record",
@@ -5655,7 +5922,13 @@ defmodule Tightbeam.MemoryGuardTest do
       assert error =~ "sl-x.json"
       assert {:error, _} = Records.step_prerequisites(ctx.base, ctx.root)
 
+      # A refusal directory that takes no write fails them too.
       File.chmod!(bad, 0o644)
+      File.chmod!(refusals, 0o555)
+      on_exit(fn -> File.chmod(refusals, 0o755) end)
+      assert {:error, _} = Records.step_prerequisites(ctx.base, ctx.root)
+      File.chmod!(refusals, 0o755)
+
       assert Records.refusal_for(ctx.base, "sid-other", 0) == nil
       assert %{reason: nil, at: 1} = Records.refusal_for(ctx.base, "sid-x", 0)
     end

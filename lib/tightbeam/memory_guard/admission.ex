@@ -338,12 +338,14 @@ defmodule Tightbeam.MemoryGuard.Admission do
   end
 
   @doc """
-  Sessions whose launches the step refused twice and are held (FS2):
-  `{:ok, sessions}` or `{:error, message}`.
+  Sessions on `host` whose launches the step refused twice and are held
+  (FS2): `{:ok, sessions}` or `{:error, message}`. The step runs only on the
+  guard's own host.
   """
-  @spec step_held_sessions(DB.server()) :: {:ok, [String.t()]} | {:error, String.t()}
-  def step_held_sessions(db) do
-    with {:ok, holds} <- State.list(db, @step_hold), do: {:ok, Enum.map(holds, & &1.subject)}
+  @spec step_held_sessions(DB.server(), String.t()) :: {:ok, [String.t()]} | {:error, String.t()}
+  def step_held_sessions(db, host) do
+    with {:ok, holds} <- State.list(db, @step_hold, host),
+         do: {:ok, Enum.map(holds, & &1.subject)}
   end
 
   @doc """
@@ -436,6 +438,22 @@ defmodule Tightbeam.MemoryGuard.Admission do
           EventLog.lifecycle_in_txn(txn, "memory_readmission_done", session_key, detail)
 
           Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
+        else
+          # A session that can take no new turn (gone, or its one turn used)
+          # never will: the re-admission is done, recorded as not enqueued,
+          # never left pending forever or claimed as queued.
+          unless State.open_in_txn?(txn, @readmitted_source, ref) do
+            detail =
+              JSON.encode!(%{
+                host: host,
+                sourceSeq: seq,
+                readmittedSeq: nil,
+                notEnqueueable: true
+              })
+
+            done_in_txn(txn, seq, session_key, host, detail)
+            EventLog.lifecycle_in_txn(txn, "memory_readmission_done", session_key, detail)
+          end
         end
 
       # M2: the source turn is gone; nothing to enqueue. The done record is
@@ -478,7 +496,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
         [@readmitted, since]
       )
 
-      txn |> State.list_in_txn(@readmitted) |> Enum.map(& &1.subject) |> Enum.uniq()
+      txn |> State.list_all_in_txn(@readmitted) |> Enum.map(& &1.subject) |> Enum.uniq()
     end)
     |> case do
       {:ok, sessions} -> {:ok, sessions}
@@ -536,10 +554,14 @@ defmodule Tightbeam.MemoryGuard.Admission do
   @doc "Whether any deferred hook, on any host, has not yet run (unknown is pending)."
   @spec pending?(DB.server()) :: boolean()
   def pending?(db) do
-    case {State.list(db, @quota_pending), State.list(db, @memory_pending)} do
-      {{:ok, []}, {:ok, []}} -> false
+    case DB.transaction(db, fn txn ->
+           State.any_in_txn?(txn, @quota_pending) or State.any_in_txn?(txn, @memory_pending)
+         end) do
+      {:ok, pending?} -> pending?
       # Unknown is pending: the next pass looks again.
-      _ -> true
+      {:error, _} -> true
     end
+  catch
+    :exit, _ -> true
   end
 end

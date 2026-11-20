@@ -41,6 +41,8 @@ defmodule Tightbeam.MemoryGuard.State do
   );
   CREATE UNIQUE INDEX IF NOT EXISTS memory_guard_episodes_active
     ON memory_guard_episodes(host, kind, ifnull(key, '')) WHERE active = 1;
+  CREATE INDEX IF NOT EXISTS memory_guard_episodes_active_host
+    ON memory_guard_episodes(host, openedAt, episodeId) WHERE active = 1;
   CREATE TABLE IF NOT EXISTS memory_guard_root_records (
     digest    TEXT PRIMARY KEY,
     episodeId TEXT,
@@ -59,6 +61,8 @@ defmodule Tightbeam.MemoryGuard.State do
     PRIMARY KEY (kind, ref)
   );
   CREATE INDEX IF NOT EXISTS memory_guard_open_subject ON memory_guard_open(subject, kind);
+  CREATE INDEX IF NOT EXISTS memory_guard_open_host
+    ON memory_guard_open(kind, host, openedAt, ref);
   """
 
   @doc "Create the current-state tables (additive; no stamp change)."
@@ -112,28 +116,58 @@ defmodule Tightbeam.MemoryGuard.State do
   end
 
   @doc """
-  The open items of `kind` (optionally of one host), oldest first:
-  `[%{ref, subject, host, detail, opened_at}]`.
+  The open items of `kind` on one host, oldest first:
+  `[%{ref, subject, host, detail, opened_at}]`. An index search on
+  `(kind, host, openedAt)`: it costs that host's open items of that kind.
   """
-  @spec list_in_txn(Txn.t(), String.t(), String.t() | nil) :: [map()]
-  def list_in_txn(%Txn{} = txn, kind, host \\ nil) do
+  @spec list_in_txn(Txn.t(), String.t(), String.t()) :: [map()]
+  def list_in_txn(%Txn{} = txn, kind, host) when is_binary(host) do
     txn
     |> Txn.q(
       """
       SELECT ref, subject, host, detail, openedAt FROM memory_guard_open
-      WHERE kind=?1 AND (?2 IS NULL OR host=?2) ORDER BY openedAt, ref
+      WHERE kind=?1 AND host=?2 ORDER BY openedAt, ref
       """,
       [kind, host]
     )
-    |> Enum.map(fn [ref, subject, host, detail, opened_at] ->
+    |> rows()
+  end
+
+  @doc """
+  The open items of `kind` on every host, for the few callers that act on all
+  of them (the guard's start, re-admission nudges): costs every open item of
+  that kind.
+  """
+  @spec list_all_in_txn(Txn.t(), String.t()) :: [map()]
+  def list_all_in_txn(%Txn{} = txn, kind) do
+    txn
+    |> Txn.q(
+      """
+      SELECT ref, subject, host, detail, openedAt FROM memory_guard_open
+      WHERE kind=?1 ORDER BY host, openedAt, ref
+      """,
+      [kind]
+    )
+    |> rows()
+  end
+
+  @doc "Whether any item of `kind` is open, on any host (one index probe)."
+  @spec any_in_txn?(Txn.t(), String.t()) :: boolean()
+  def any_in_txn?(%Txn{} = txn, kind),
+    do: Txn.q(txn, "SELECT 1 FROM memory_guard_open WHERE kind=?1 LIMIT 1", [kind]) != []
+
+  defp rows(rows) do
+    Enum.map(rows, fn [ref, subject, host, detail, opened_at] ->
       %{ref: ref, subject: subject, host: host, detail: detail, opened_at: opened_at}
     end)
   end
 
-  @doc "`list_in_txn/3` outside a transaction: `{:ok, items}` or `{:error, message}`."
-  @spec list(DB.server(), String.t(), String.t() | nil) :: {:ok, [map()]} | {:error, String.t()}
-  def list(db, kind, host \\ nil) do
-    case DB.transaction(db, &list_in_txn(&1, kind, host)) do
+  @doc "`list_in_txn/3` (host given) or `list_all_in_txn/2` (`:all`) outside a transaction."
+  @spec list(DB.server(), String.t(), String.t() | :all) :: {:ok, [map()]} | {:error, String.t()}
+  def list(db, kind, host) do
+    read = if host == :all, do: &list_all_in_txn(&1, kind), else: &list_in_txn(&1, kind, host)
+
+    case DB.transaction(db, read) do
       {:ok, items} -> {:ok, items}
       {:error, error} -> {:error, Exception.message(error)}
     end

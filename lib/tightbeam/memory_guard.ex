@@ -52,6 +52,7 @@ defmodule Tightbeam.MemoryGuard do
   @table :tightbeam_memory_guard
   @details ~w(resident_cap memory_floor memory_budget guard_unavailable)
   @kill_retention_ms 15 * 60_000
+  @readmitted_nudge_ms 30_000
   @gib 1024 * 1024 * 1024
 
   ## Public, ETS-backed reads (safe in any process and inside a transaction)
@@ -555,6 +556,10 @@ defmodule Tightbeam.MemoryGuard do
       # that failed; all retried each sample.
       pending_markers: %{},
       pending_alerts: %{},
+      # FS9 B4: overrides whose effect is done but whose record failed.
+      pending_applied: MapSet.new(),
+      # M3: when re-admitted turns still queued were last nudged.
+      readmitted_nudged_at: 0,
       pending_records: [],
       pending_removals: MapSet.new(),
       # Sessions whose hold record failed: nudged again so they re-ask.
@@ -575,6 +580,14 @@ defmodule Tightbeam.MemoryGuard do
       root_error: nil,
       # FS9: whether this start has ended the episodes of an earlier boot.
       reboot_checked: false,
+      # FS9: what of the guard's own holds launches now (nil: nothing), and
+      # this gateway's start (the runtime's), for guard recoveries.
+      guard_cause: nil,
+      started:
+        Keyword.get_lazy(opts, :started, fn ->
+          {since_start, _} = :erlang.statistics(:wall_clock)
+          System.system_time(:millisecond) - since_start
+        end),
       # FS9: who must own a root action record, and the root-path check.
       root_uid: Keyword.get(opts, :root_uid, 0),
       finding: Keyword.get(opts, :finding, fn -> Tightbeam.MemoryGuard.RootPath.finding() end),
@@ -738,8 +751,8 @@ defmodule Tightbeam.MemoryGuard do
   # again shortly (FS1: the guard answers).
   def handle_info(:release_unguarded, state) do
     released =
-      with {:ok, held} <- Unguarded.held_sessions(state.db) do
-        Enum.reduce(held, :ok, fn {session_key, host}, result ->
+      with {:ok, held} <- Unguarded.held_sessions(state.db, :all) do
+        Enum.reduce(held, :ok, fn {session_key, host, _since}, result ->
           case Unguarded.release(state.db, session_key, host, "guard_answers") do
             :ok ->
               nudge(state, session_key)
@@ -754,6 +767,18 @@ defmodule Tightbeam.MemoryGuard do
     with {:error, reason} <- released do
       Logger.warning("memory guard: guard_unavailable holds not yet released: #{reason}")
       Process.send_after(self(), :release_unguarded, 1_000)
+    end
+
+    # A lane held while the guard was down whose hold could not be recorded
+    # has no row to release: every lane with a queued turn asks again now
+    # (once per guard start), so none waits on a nudge that never comes.
+    case DB.query(state.db, "SELECT DISTINCT sessionKey FROM turns WHERE status='queued'", []) do
+      {:ok, rows} ->
+        for [session_key] <- rows, do: nudge(state, session_key)
+
+      {:error, error} ->
+        Logger.warning("memory guard: queued lanes cannot be read, retried: #{inspect(error)}")
+        Process.send_after(self(), :release_unguarded, 1_000)
     end
 
     {:noreply, state}
@@ -796,7 +821,7 @@ defmodule Tightbeam.MemoryGuard do
 
       {kill, :ok} ->
         :ets.insert(table(), {{:kill, id}, Map.put(kill, :confirmed, true)})
-        record_ended(state, kill.host, kill)
+        state = record_ended(state, kill.host, kill)
         {:noreply, publish_all(state)}
 
       {_kill, {:error, :ended_before_send}} ->
@@ -806,21 +831,23 @@ defmodule Tightbeam.MemoryGuard do
 
       {kill, {:error, reason}} ->
         # The kill was sent (FS6 attributes it), but the tree was not shown
-        # gone: recorded, and the next sample retries while it is over its limit.
-        EventLog.lifecycle(
-          state.db,
-          "memory_kill_failed",
-          kill.host,
-          JSON.encode!(%{
-            host: kill.host,
-            unit: id,
-            scope: kill.scope,
-            limit: kill.limit,
-            sessionId: kill.sid,
-            launchId: kill.launch_id,
-            error: inspect(reason)
-          })
-        )
+        # gone: recorded (kept and retried if the record fails, FS7), and the
+        # next sample retries while it is over its limit.
+        state =
+          record_effect(
+            state,
+            "memory_kill_failed",
+            kill.host,
+            JSON.encode!(%{
+              host: kill.host,
+              unit: id,
+              scope: kill.scope,
+              limit: kill.limit,
+              sessionId: kill.sid,
+              launchId: kill.launch_id,
+              error: inspect(reason)
+            })
+          )
 
         {:noreply, state}
     end
@@ -986,6 +1013,27 @@ defmodule Tightbeam.MemoryGuard do
     reason = Enum.join(Enum.reject([reason | gaps], &is_nil/1), "; ")
     reason = if reason == "", do: nil, else: reason
 
+    # FS7: the mode is in force only with its step in place. A step that
+    # could not be installed, or settings that could not be published, leave
+    # the change incomplete: recorded as a transition, so the mode is not read
+    # as in force, and retried every sample.
+    step_gap =
+      cond do
+        not local? ->
+          nil
+
+        match?({:error, _}, published) ->
+          "the launch step's settings could not be written"
+
+        match?({:unavailable, _}, step) and mode in ["watched", "enforced"] ->
+          "the launch step is not in place"
+
+        true ->
+          nil
+      end
+
+    transition = transition || step_gap
+
     host_state = %{
       local: local?,
       probe: probe,
@@ -1042,11 +1090,28 @@ defmodule Tightbeam.MemoryGuard do
             gap =
               "the change of memory limits mode could not be recorded (#{Exception.message(error)}); retried every sample"
 
+            fallback = if(local? and mode in ["enforced", "off"], do: "watched", else: mode)
+
+            # The step was already told the unrecorded mode: tell it the mode
+            # the guard now acts on, or hold launches if that cannot be said.
+            republished =
+              if fallback != mode,
+                do:
+                  Records.publish_config(state.base_dir, %{
+                    mode: fallback,
+                    fs: nil,
+                    harness: nil,
+                    sessionLimit: settings.session_limit,
+                    oomRaise: 100
+                  }),
+                else: :ok
+
             %{
               host_state
-              | mode: if(local? and mode in ["enforced", "off"], do: "watched", else: mode),
+              | mode: fallback,
                 reason: Enum.join(Enum.reject([host_state.reason, gap], &is_nil/1), "; "),
-                transition_error: host_state.transition_error || gap
+                transition_error: host_state.transition_error || gap,
+                step_ready: host_state.step_ready and republished == :ok
             }
         end
       else
@@ -1244,19 +1309,17 @@ defmodule Tightbeam.MemoryGuard do
 
     # FS9 guard override: the held launches are admitted without the guard's
     # own step or records, and the risk stays shown until the guard answers.
-    # The effect's record is written first; one that fails keeps the hold,
-    # and the next ask retries it (FS7).
-    own_reason =
-      if own_reason && guard_overridden?(state, session.host) do
-        applied =
-          for %{"kind" => "guard", "episodeId" => id, "override" => %{}} <-
-                Episodes.active(state.db, session.host),
-              do: Episodes.applied(state.db, id)
+    # `override_applied` is recorded after the admission (FS9 B4 "when done").
+    overriding =
+      if own_reason,
+        do:
+          for(
+            %{"kind" => "guard", "override" => %{}} = e <- Episodes.active(state.db, session.host),
+            do: e["episodeId"]
+          ),
+        else: []
 
-        if Enum.all?(applied, &(&1 == :ok)), do: nil, else: own_reason
-      else
-        own_reason
-      end
+    own_reason = if overriding != [], do: nil, else: own_reason
 
     step_reason = own_reason || custody_reason
 
@@ -1274,9 +1337,27 @@ defmodule Tightbeam.MemoryGuard do
           |> reserve(session, launch, reserved?)
           |> resume_if_held(session.session_key)
           |> mark_busy(session.session_key, session.host)
+          |> overrides_done(overriding)
 
         {:ok, state}
     end
+  end
+
+  # FS9 B4: an override's effect is done; record `override_applied` now. A
+  # record that cannot be written is kept and retried each sample (FS7); a
+  # crash before it is written leaves the override accepted, and the next
+  # effect carried out from that state records it.
+  defp overrides_done(state, episode_ids) do
+    Enum.reduce(episode_ids, state, fn id, acc ->
+      case Episodes.applied(acc.db, id) do
+        :ok ->
+          %{acc | pending_applied: MapSet.delete(acc.pending_applied, id)}
+
+        {:error, reason} ->
+          Logger.warning("memory guard: override #{id} applied, not yet recorded: #{reason}")
+          %{acc | pending_applied: MapSet.put(acc.pending_applied, id)}
+      end
+    end)
   end
 
   defp host_level_reasons(%{mode: mode} = host_state) when mode in ["watched", "enforced"] do
@@ -1641,6 +1722,8 @@ defmodule Tightbeam.MemoryGuard do
         notify_stuck(acc, pending.episode, pending.message)
       end)
 
+    state = overrides_done(state, MapSet.to_list(state.pending_applied))
+
     {records, failed} =
       Enum.split_with(state.pending_records, fn {kind, subject, detail} ->
         record(state, kind, subject, detail) == :ok
@@ -1664,23 +1747,32 @@ defmodule Tightbeam.MemoryGuard do
 
   # R6 / [SPIRIT] (matrix M1, M3): a held turn is never stranded by a lost
   # nudge. Each sample nudges again every held session that no reason holds
-  # now, and every re-admitted turn still queued (its handoff may not have
-  # reached the lane). A lane that is nudged needlessly re-asks and is held.
+  # now, and every 30 s every re-admitted turn still queued (its handoff may
+  # not have reached the lane). A lane nudged needlessly re-asks and is held.
   defp renudge_ready(state) do
     for {session_key, _held} <- state.held,
         evaluate_reasons(state, session_key) == [],
         Admission.other_reasons(state.db, session_key) == [],
         do: nudge(state, session_key)
 
-    case Admission.readmitted_queued(state.db) do
-      {:ok, sessions} ->
-        for session_key <- sessions, do: nudge(state, session_key)
+    # M3's safety net for a lost handoff after a re-admission's commit: it
+    # costs one probe per re-admission of the last hour, so it runs at most
+    # every 30 s, not every sample (review R3).
+    now = state.clock.()
 
-      {:error, reason} ->
-        Logger.warning("memory guard: re-admitted turns cannot be read, retried: #{reason}")
+    if now - state.readmitted_nudged_at >= @readmitted_nudge_ms do
+      case Admission.readmitted_queued(state.db) do
+        {:ok, sessions} ->
+          for session_key <- sessions, do: nudge(state, session_key)
+          %{state | readmitted_nudged_at: now}
+
+        {:error, reason} ->
+          Logger.warning("memory guard: re-admitted turns cannot be read, retried: #{reason}")
+          state
+      end
+    else
+      state
     end
-
-    state
   end
 
   # A nudge that fails is not the guard's failure: the next sample retries it.
@@ -1897,7 +1989,7 @@ defmodule Tightbeam.MemoryGuard do
 
   defp reboot_check(state) do
     results =
-      for %{"boot" => boot, "episodeId" => id} <- Episodes.active(state.db),
+      for %{"boot" => boot, "episodeId" => id} <- Episodes.active_all(state.db),
           is_binary(boot) and boot != state.boot,
           do: Episodes.finish(state.db, id, "reboot")
 
@@ -1994,6 +2086,8 @@ defmodule Tightbeam.MemoryGuard do
           nil
       end
 
+    state = %{state | guard_cause: cause}
+
     cond do
       cause && is_nil(state.guard_stuck_since) ->
         %{state | guard_stuck_since: now}
@@ -2028,8 +2122,13 @@ defmodule Tightbeam.MemoryGuard do
       {:opened, episode} ->
         notify_stuck(state, episode, Episodes.message(episode, state.finding.()))
 
-      {:active, _episode} ->
-        state
+      # An episode opened before a restart whose alert or Main notice was not
+      # yet recorded: sent now (the retry list was in the guard's memory).
+      {:active, %{"episodeId" => id} = episode} ->
+        if (episode["alert"] == nil or not episode["notified"]) and
+             not Map.has_key?(state.pending_alerts, id),
+           do: notify_stuck(state, episode, Episodes.message(episode, state.finding.())),
+           else: state
 
       {:error, reason} ->
         Logger.warning("memory guard: a stuck episode could not be opened, retried: #{reason}")
@@ -2085,9 +2184,11 @@ defmodule Tightbeam.MemoryGuard do
         now
       )
 
-      # The guard is running, so it answers.
-      RootActions.guard_outcomes(state.db, host, true, now, now)
+      # The guard answers only while nothing of its own holds launches; a
+      # guard recovery's clock runs from this gateway's start (FS9 Step 1).
+      RootActions.guard_outcomes(state.db, host, is_nil(state.guard_cause), state.started, now)
       custody_ends_on_proof(state, host_state, host)
+      custody_overrides_done(state, host)
 
       publish_error =
         case Episodes.publish(state.db, state.base_dir, host) do
@@ -2147,6 +2248,34 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
+  # FS9 B4: a custody override's effect is the replacement adapter's launch.
+  # Once one runs for the key (registered with the guard, or its row running),
+  # `override_applied` is recorded; until then, and when the record fails, it
+  # stays accepted and this is retried each sample.
+  defp custody_overrides_done(state, host) do
+    for %{
+          "kind" => "custody",
+          "key" => name,
+          "episodeId" => id,
+          "override" => %{"applied" => false}
+        } <-
+          Episodes.active(state.db, host),
+        replacement_running?(state, name) do
+      with {:error, reason} <- Episodes.applied(state.db, id),
+           do: Logger.warning("memory guard: override #{id} applied, not yet recorded: #{reason}")
+    end
+  end
+
+  defp replacement_running?(state, name) do
+    Enum.any?(state.adapters, fn {_pid, entry} ->
+      HarnessProcess.adapter_key_name(entry.key) == name
+    end) or
+      Enum.any?(
+        HarnessProcess.list(state.db),
+        &(&1.adapter_key == name and &1.state == "running")
+      )
+  end
+
   # FS9 "What an override does", custody: R2a's fence is lifted for the
   # named trees of an accepted override only (they stay shown as orphans).
   defp overridden_trees(state, {_harness, _preset, host} = key) do
@@ -2161,16 +2290,6 @@ defmodule Tightbeam.MemoryGuard do
         do: {tree["launchId"], id}
   rescue
     _ -> %{}
-  end
-
-  # FS9 "What an override does", guard: held launches are admitted without
-  # the guard's own launch step or records.
-  defp guard_overridden?(state, host) do
-    Enum.any?(Episodes.active(state.db, host), fn episode ->
-      episode["kind"] == "guard" and episode["override"] != nil
-    end)
-  rescue
-    _ -> false
   end
 
   # R2a / FS1 (A2): a launch that needs a new adapter for a key waits while a
@@ -2232,7 +2351,7 @@ defmodule Tightbeam.MemoryGuard do
   # FS2: once everything the step needs is in place, every step-refusal hold
   # is released and its lane nudged.
   defp release_step_holds(state) do
-    case Admission.step_held_sessions(state.db) do
+    case Admission.step_held_sessions(state.db, state.local_host) do
       {:ok, []} ->
         :ok
 
@@ -3443,6 +3562,8 @@ defmodule Tightbeam.MemoryGuard do
     %{scope: "adapter", row: row, unit: Map.get(unit, :unit), launch_id: unit.launch_id}
   end
 
+  # The tree's end, an effect that already happened: its record is kept and
+  # retried when it cannot be written (FS7), never dropped with the guard.
   defp record_ended(state, host, kill) do
     session_key =
       with sid when is_binary(sid) <- kill.sid,
@@ -3450,8 +3571,8 @@ defmodule Tightbeam.MemoryGuard do
            do: key,
            else: (_ -> nil)
 
-    EventLog.lifecycle(
-      state.db,
+    record_effect(
+      state,
       "memory_tree_ended",
       session_key || host,
       JSON.encode!(%{
@@ -3549,7 +3670,6 @@ defmodule Tightbeam.MemoryGuard do
 
             :ets.insert(table(), {{:kill, id}, kill})
             record_ended(state, host, kill)
-            state
         end
       else
         state
@@ -3729,13 +3849,8 @@ defmodule Tightbeam.MemoryGuard do
     # key; they stay recorded, shown as orphans with the risk.
     overridden = if key, do: overridden_trees(state, key), else: %{}
 
-    # FS7: the override's effect is recorded before the fence is lifted; trees
-    # whose override could not be recorded stay fenced, and it is retried.
-    unrecorded =
-      for id <- Enum.uniq(Map.values(overridden)), Episodes.applied(state.db, id) != :ok, do: id
-
-    overridden = Map.reject(overridden, fn {_launch, id} -> id in unrecorded end)
-
+    # The override's effect is the replacement adapter's launch; it is
+    # recorded once that adapter runs (`custody_overrides_done/2`), never here.
     victims =
       for {_id, record} <- state.launches,
           record["adapterLaunchId"] in key_launches,
@@ -4037,26 +4152,29 @@ defmodule Tightbeam.MemoryGuard do
     unit = Cgroup.adapter_unit(layout, launch_id)
     id = "adapter:" <> launch_id
 
-    with {:ok, %{"oom_group_kill" => group}} when group >= 1 <-
-           Cgroup.local_events(layout.fs, unit),
-         [] <- lookup({:kill, id}),
-         %{host: host} <- adapter_row(state, launch_id) do
-      kill = %{
-        host: host,
-        scope: "adapter",
-        limit: "budget",
-        sid: nil,
-        key: parse_key(adapter_row(state, launch_id).adapter_key),
-        launch_id: launch_id,
-        bytes: nil,
-        limit_bytes: host_state.settings.budget,
-        mode: "enforced",
-        at: state.clock.()
-      }
+    state =
+      with {:ok, %{"oom_group_kill" => group}} when group >= 1 <-
+             Cgroup.local_events(layout.fs, unit),
+           [] <- lookup({:kill, id}),
+           %{host: host} <- adapter_row(state, launch_id) do
+        kill = %{
+          host: host,
+          scope: "adapter",
+          limit: "budget",
+          sid: nil,
+          key: parse_key(adapter_row(state, launch_id).adapter_key),
+          launch_id: launch_id,
+          bytes: nil,
+          limit_bytes: host_state.settings.budget,
+          mode: "enforced",
+          at: state.clock.()
+        }
 
-      :ets.insert(table(), {{:kill, id}, kill})
-      record_ended(state, host, kill)
-    end
+        :ets.insert(table(), {{:kill, id}, kill})
+        record_ended(state, host, kill)
+      else
+        _ -> state
+      end
 
     remove_unit(state, layout.fs, unit)
   end
