@@ -3021,6 +3021,99 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## v1.13 FS3 / FS7: transitions and their records (matrix F1, F3, F4, F7; T24, T28)
+
+  describe "matrix F: transitions (FS3, FS7, T24, T28)" do
+    defp set!(ctx, name, value) do
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, name, value, "user:owner", 16 * @gib)
+        )
+
+      MemoryGuard.settings_changed(@host)
+    end
+
+    test "F3.unreadable (T24): a budget change the kernel does not take leaves the host enforced on the earlier budget, and the read shows that budget",
+         ctx do
+      {harness, _unit, _set_mode} = enforced_with_unit!(ctx)
+      before = MemoryGuard.read(@host).settings.budget
+      max = Path.join(harness, "memory.max")
+      File.chmod!(max, 0o444)
+      on_exit(fn -> File.chmod(max, 0o644) end)
+
+      assert {:error, {:not_applied, error}} = set!(ctx, "budget", "2G")
+      assert error =~ "earlier budget still acts"
+      read = MemoryGuard.read(@host)
+      assert read.mode == "enforced"
+      assert read.settings.budget == before
+      assert File.read!(max) == Integer.to_string(before)
+
+      File.chmod!(max, 0o644)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).settings.budget == 2 * @gib
+      assert File.read!(max) == Integer.to_string(2 * @gib)
+    end
+
+    test "F1.unreadable / F1.partial (T24): leaving enforced with limits not lifted names the kernel limits still in force",
+         ctx do
+      {_harness, unit, set_mode} = enforced_with_unit!(ctx)
+      file = Path.join(unit, "memory.max")
+      File.chmod!(file, 0o444)
+      on_exit(fn -> File.chmod(file, 0o644) end)
+
+      assert {:error, {:not_applied, _}} = set_mode.("off")
+      read = MemoryGuard.read(@host)
+      assert read.mode == "watched"
+      assert read.notEnforcedReason =~ "still in force: the budget group's memory.max (8.0 GiB)"
+      assert read.notEnforcedReason =~ "each session unit's own memory.max"
+    end
+
+    test "F4.unreadable (T28 c): stored settings that cannot be read keep the last effective ones, and the read says so",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      :ok = set!(ctx, "residentCap", "4")
+      assert MemoryGuard.read(@host).settings.residentCap == 4
+
+      {:ok, _} = DB.query(ctx.db, "ALTER TABLE host_memory_settings RENAME TO hms_hidden")
+
+      try do
+        _ = MemoryGuard.settings_changed(@host)
+        read = MemoryGuard.read(@host)
+        assert read.settings.residentCap == 4
+        assert read.notEnforcedReason =~ "stored memory settings cannot be read"
+        assert read.notEnforcedReason =~ "last effective settings stay in use"
+      after
+        {:ok, _} = DB.query(ctx.db, "ALTER TABLE hms_hidden RENAME TO host_memory_settings")
+      end
+    end
+
+    test "F7.unreadable (T28 a): a mode change whose record cannot be written is not established, reads watched, and is retried",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER mg_fail_mode BEFORE INSERT ON lifecycle_events
+        WHEN NEW.kind='memory_guard_mode'
+        BEGIN SELECT RAISE(ABORT, 'injected mode record failure'); END
+        """)
+
+      assert {:error, {:not_applied, error}} = set!(ctx, "mode", "off")
+      assert error =~ "could not be recorded"
+      assert MemoryGuard.read(@host).mode == "watched"
+      refute Unguarded.mode_in_force(ctx.db, @host) == "off"
+
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER mg_fail_mode")
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "off"
+      assert Unguarded.mode_in_force(ctx.db, @host) == "off"
+      assert :ok = MemoryGuard.settings_changed(@host)
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
