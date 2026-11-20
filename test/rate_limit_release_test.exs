@@ -796,6 +796,114 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert length(lifecycle(db, "admission_resumed")) == 1
     end
 
+    test "G2.partial: a quota hook covering two sessions waits until every one of them is clear, then re-admits both once",
+         %{db: db, root: root} do
+      error = future_codex_error(System.system_time(:millisecond))
+      first = fail_turn(db, "c1", error)
+      second = fail_turn(db, "c2", error)
+
+      assert {:ok, _} =
+               DB.transaction(db, fn txn ->
+                 observe_in_txn(txn, "open", "c1", "testhost", System.system_time(:millisecond))
+               end)
+
+      assert HarnessProcess.parked?(db, @codex_key)
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+
+      # Only c1 is under an open evaluation; c2 is clear. The hook covers both.
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT INTO limit_fallback_evaluations (sessionKey, turnSeq, heldAt, createdAt) VALUES ('c1', ?1, 1, 1)",
+          [first]
+        )
+
+      release_at_reset!(db)
+      assert queued_messages(db) == []
+
+      assert [{_, %{"remaining" => ["limit_fallback"], "sessions" => ["c1"]}}] =
+               lifecycle(db, "admission_hold_remaining")
+
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == []
+
+      {:ok, _} =
+        DB.query(
+          db,
+          "UPDATE limit_fallback_evaluations SET outcome='withheld', reason='test', decidedAt=2"
+        )
+
+      :ok = Tightbeam.MemoryGuard.tick()
+
+      assert Enum.sort(queued_messages(db)) ==
+               Enum.sort([source_message(db, first), source_message(db, second)])
+
+      assert [_] = lifecycle(db, "admission_resumed")
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert length(queued_messages(db)) == 2
+    end
+
+    test "G5.unreadable: a re-admission whose record cannot be written does not happen; retried, it runs once",
+         %{db: db, root: root} do
+      {first, second} = parked_with_two_quota_failed_turns!(db)
+      release_at_reset!(db)
+      assert queued_messages(db) == []
+
+      {:ok, _} =
+        DB.query(db, """
+        CREATE TRIGGER g5_fail_resume BEFORE INSERT ON lifecycle_events
+        WHEN NEW.kind='quota_readmission_resumed'
+        BEGIN SELECT RAISE(ABORT, 'injected record failure'); END
+        """)
+
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+      # The hook and its record are one step: nothing was re-admitted.
+      assert queued_messages(db) == []
+      assert lifecycle(db, "admission_resumed") == []
+
+      {:ok, _} = DB.query(db, "DROP TRIGGER g5_fail_resume")
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert length(queued_messages(db)) == 2
+      assert [_] = lifecycle(db, "quota_readmission_resumed")
+    end
+
+    test "G4.unreadable / G4 (R6a, companion C1): a harness-process row still parking holds the quota hook until it is resolved",
+         %{db: db, root: root} do
+      {first, second} = parked_with_two_quota_failed_turns!(db)
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO harness_processes
+            (launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+             launchSequence, osPid, processGroupId, bootIdentity, identityToken, state, createdAt)
+          VALUES ('g4-parking', 'codex:shared@testhost', 'codex', 'shared', 'testhost', NULL,
+                  '/bin/false', '/nonexistent',
+                  (SELECT COALESCE(MAX(launchSequence),0)+1 FROM harness_processes),
+                  NULL, NULL, 'boot', 'g4-parking', 'kill_failed', 1)
+          """
+        )
+
+      release_at_reset!(db)
+      assert queued_messages(db) == []
+
+      assert [{_, %{"remaining" => ["harness_process_parking"]}}] =
+               lifecycle(db, "admission_hold_remaining")
+
+      {:ok, _} =
+        DB.query(db, "UPDATE harness_processes SET resolvedAt=2 WHERE launchId='g4-parking'")
+
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+    end
+
     test "(review R5) a quota release with no memory reason waits for a standing limit-fallback evaluation",
          %{db: db, root: root} do
       {first, second} = parked_with_two_quota_failed_turns!(db)

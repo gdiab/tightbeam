@@ -33,6 +33,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
         Enum.filter(
           [
             HarnessProcess.parked?(db, key) && "quota_park",
+            parking?(db, key) && "harness_process_parking",
             LimitFallback.held?(db, session_key) && "limit_fallback"
           ],
           & &1
@@ -56,6 +57,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
         Enum.filter(
           [
             HarnessProcess.parked_in_txn?(txn, key) && "quota_park",
+            parking_in_txn?(txn, key) && "harness_process_parking",
             fallback_open_in_txn?(txn, session_key) && "limit_fallback"
           ],
           & &1
@@ -65,6 +67,26 @@ defmodule Tightbeam.MemoryGuard.Admission do
         []
     end
   end
+
+  # R6a / companion C1 (matrix G4): a harness-process row of the key still
+  # parking, or whose kill failed, unresolved.
+  @parking_sql """
+  SELECT 1 FROM harness_processes
+  WHERE adapterKey=?1 AND state IN ('park_requested','kill_failed') AND resolvedAt IS NULL
+  LIMIT 1
+  """
+
+  defp parking?(db, key) do
+    case DB.query(db, @parking_sql, [HarnessProcess.adapter_key_name(key)]) do
+      {:ok, []} -> false
+      {:ok, _} -> true
+      # Unknown is standing (R6a): no hook runs on a guess.
+      {:error, _} -> true
+    end
+  end
+
+  defp parking_in_txn?(txn, key),
+    do: Txn.q(txn, @parking_sql, [HarnessProcess.adapter_key_name(key)]) != []
 
   defp fallback_open_in_txn?(txn, session_key) do
     Txn.q(
@@ -114,19 +136,34 @@ defmodule Tightbeam.MemoryGuard.Admission do
     end
   end
 
-  # The quota hook for the sessions no limit-fallback evaluation holds, in the
-  # transaction that checks it. Sessions still held leave the hook pending:
-  # its deferral is recorded once, and it is resumed only when none is left.
+  # The quota hook (companion B5) is one hook covering every session of the
+  # incident: it runs once, only when no session it covers is held by another
+  # standing reason (R6a "no re-admission hook SHALL run … until the last
+  # standing reason clears", T14; matrix G2). Until then it stays pending, its
+  # deferral recorded once, and nothing of it is re-admitted.
   defp readmit_quota_in_txn(txn, incident_id, harness, host, released, deferred?) do
-    {_count, held} =
-      Wakes.readmit_released_quota_intents_in_txn(
-        txn,
-        incident_id,
-        &(not fallback_open_in_txn?(txn, &1))
+    key = {Harness.parse!(harness).id(), "shared", host}
+
+    parking? = parking_in_txn?(txn, key)
+
+    held =
+      txn
+      |> Wakes.released_quota_intent_sessions_in_txn(incident_id)
+      |> Enum.filter(&(parking? or fallback_open_in_txn?(txn, &1)))
+
+    remaining =
+      Enum.filter(
+        [
+          parking? && "harness_process_parking",
+          Enum.any?(held, &fallback_open_in_txn?(txn, &1)) && "limit_fallback"
+        ],
+        & &1
       )
 
     cond do
       held == [] ->
+        Wakes.readmit_released_quota_intents_in_txn(txn, incident_id)
+
         if deferred?,
           do:
             EventLog.lifecycle_in_txn(
@@ -151,7 +188,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
             host: host,
             harness: harness,
             released: released,
-            remaining: ["limit_fallback"],
+            remaining: remaining,
             sessions: held
           })
         )
@@ -453,6 +490,9 @@ defmodule Tightbeam.MemoryGuard.Admission do
     |> case do
       {:ok, true} -> :pending
       {:ok, false} -> :ok
+      # FS7 (G5): the hook and its records are one step; a failed write means
+      # nothing happened, and the next pass retries it.
+      {:error, _} -> :pending
     end
   end
 

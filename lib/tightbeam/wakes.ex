@@ -3535,6 +3535,19 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
+  The sessions an open quota incident's pending pre-activity redeliveries
+  belong to: the sessions its re-admission hook covers (memory limits R6a).
+  """
+  @spec released_quota_intent_sessions_in_txn(Txn.t(), String.t()) :: [String.t()]
+  def released_quota_intent_sessions_in_txn(%Txn{} = txn, incident_id)
+      when is_binary(incident_id) do
+    txn
+    |> health_redelivery_sources_in_txn(incident_id, "rate-limit-dead")
+    |> Enum.map(&Enum.at(&1, 1))
+    |> Enum.uniq()
+  end
+
+  @doc """
   As `readmit_released_quota_intents_in_txn/2`, for the sessions `admit?`
   accepts only. Every other row stays pending, for a later call (memory limits
   v1.6 R6a: no re-admission while another reason holds its session). Returns
