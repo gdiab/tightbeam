@@ -492,6 +492,13 @@ defmodule Tightbeam.OwnerAlertsTest do
     assert_received {:harklight, ["send", "--execute", "--op-id", ^uncertain_op]}
     refute_received {:harklight, _}
 
+    # A session of the owner with a turn under way. After the removal #622
+    # refuses new rows for the user, so this is set up first.
+    later = session(db, "agent:george:after-removal")
+    later_session = Org.get(db, later)
+    later_seq = enqueue(db, later, %{})
+    assert {:ok, %{seq: ^later_seq} = later_turn} = Ledger.claim_next(db, later, "test-owner")
+
     # The owner is removed (#622 stamps removedAt; its own remove-user refuses
     # while the user still owns rows, so the state is written directly here).
     {:ok, _} =
@@ -500,9 +507,22 @@ defmodule Tightbeam.OwnerAlertsTest do
         System.system_time(:millisecond)
       ])
 
-    # As if the setting were unset: a later failure creates no alert.
-    later = session(db, "agent:george:after-removal")
-    fail_turn(db, later, @codex_limit)
+    # As if the setting were unset: a failure after the removal creates no alert.
+    assert {:ok, _} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, later_seq, "failed", inspect(@codex_limit),
+                        owner_lease: later_turn.owner_lease
+                      )
+
+               HarnessHealth.observe_turn_failure_in_txn(
+                 txn,
+                 later_session,
+                 Map.put(later_turn, :session_key, later),
+                 :prompt,
+                 @codex_limit
+               )
+             end)
+
     assert alert_for(db, later) == nil
 
     due = max(failed.created_at, uncertain.created_at) + 5 * @minute
