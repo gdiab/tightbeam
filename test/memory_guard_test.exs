@@ -317,7 +317,7 @@ defmodule Tightbeam.MemoryGuardTest do
   ## R17 / R17a / T13: settings
 
   describe "settings (R17, T13)" do
-    test "the defaults on Sirius's 31.25 GiB are the spec's numbers" do
+    test "F4.absent: the defaults on Sirius's 31.25 GiB are the spec's numbers" do
       total = trunc(31.25 * @gib)
       settings = Settings.effective(%{}, total)
 
@@ -483,7 +483,7 @@ defmodule Tightbeam.MemoryGuardTest do
       fs
     end
 
-    test "(a) no delegation reads watched with the plain-words reason", ctx do
+    test "F5.absent (T11 a): no delegation reads watched with the plain-words reason", ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       File.mkdir_p!(Path.join(ctx.root, "sys/fs/cgroup"))
       File.write!(Path.join(ctx.root, "sys/fs/cgroup/cgroup.controllers"), "memory\n")
@@ -499,7 +499,8 @@ defmodule Tightbeam.MemoryGuardTest do
       assert result.mem_total == 16 * @gib
     end
 
-    test "(b) delegation with OOMPolicy=stop reads watched and names the policy", ctx do
+    test "F5.partial (T11 b): delegation with OOMPolicy=stop reads watched and names the policy",
+         ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       cgroup_tree!(ctx.root, "/system.slice/tightbeam.service/gateway", [])
 
@@ -538,7 +539,8 @@ defmodule Tightbeam.MemoryGuardTest do
       assert File.read!(Path.join(Cgroup.dir(fs, unit), "memory.swap.max")) == "0"
     end
 
-    test "(c) no /proc/meminfo reads count-only and R3 still holds turns at the cap", ctx do
+    test "E5.absent (T11 c): no /proc/meminfo reads count-only and R3 still holds turns at the cap",
+         ctx do
       assert %{mode: :count_only, reason: reason} =
                Probe.probe(root: ctx.root, os: {:unix, :linux})
 
@@ -586,7 +588,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert reason =~ "need Linux"
     end
 
-    test "(d) a launch whose unit cannot be created runs watched and the host stays enforced",
+    test "C7.absent / C7.unreadable (T11 d): a launch whose unit cannot be created runs watched and the host stays enforced",
          ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
@@ -627,7 +629,8 @@ defmodule Tightbeam.MemoryGuardTest do
       assert MemoryGuard.read(@host).mode == "enforced"
     end
 
-    test "(review B2) an adapter whose unit join failed is recorded, sampled and limited", ctx do
+    test "C7.partial (review B2): an adapter whose unit join failed is recorded, sampled and limited",
+         ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
 
@@ -761,7 +764,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert File.read!(Path.join(unit, "memory.oom.group")) == "1"
     end
 
-    test "(review R2) an unreadable cgroup.events is not an empty unit, so the tree is not certified ended",
+    test "C1.unreadable / C1.absent (review R2): an unreadable cgroup.events is not an empty unit, so the tree is not certified ended",
          ctx do
       fs = Path.join(ctx.root, "cg")
       unit = "/h/session-x"
@@ -885,7 +888,7 @@ defmodule Tightbeam.MemoryGuardTest do
           {:returning, :unit_list}
         ] do
       @tag direction: direction, failure: failure
-      test "(review R4) #{direction} enforced with a #{failure} failure is not reported applied; retried until it is",
+      test "#{if direction == :leaving, do: "F1", else: "F2"}.#{if failure == :unit_write, do: "unreadable", else: "partial"} (review R4): #{direction} enforced with a #{failure} failure is not reported applied; retried until it is",
            ctx do
         {harness, unit, set_mode} = enforced_with_unit!(ctx)
 
@@ -1094,7 +1097,7 @@ defmodule Tightbeam.MemoryGuardTest do
       %{adapter: adapter}
     end
 
-    test "T4: a fourth session's turn closes the LRU idle process and runs; with all busy it is held, then runs when a slot frees",
+    test "T4 / D3.absent / K1.absent / K5.absent: a fourth session's turn closes the LRU idle process and runs; with all busy it is held, then runs when a slot frees",
          ctx do
       # s1 is the least recently used; s2 and s3 are busy.
       for key <- ["agent:s2", "agent:s3"] do
@@ -1538,7 +1541,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert %{reserved: true} = :sys.get_state(MemoryGuard).reservations[m]
     end
 
-    test "T21: only the founding user's Main has the slot; an admin's Main waits; with the founder gone the slot stays empty",
+    test "T21 / L5.absent / L5.stale: only the founding user's Main has the slot; an admin's Main waits; with the founder gone the slot stays empty",
          ctx do
       Devices.add_user(ctx.db, "synthetic-admin", true)
       full_cap!(ctx, ctx.adapter)
@@ -2055,7 +2058,7 @@ defmodule Tightbeam.MemoryGuardTest do
       :ok
     end
 
-    test "a failed group kill keeps the record, says the tree survives and refuses the replacement",
+    test "D2.unreadable: a failed group kill keeps the record, says the tree survives and refuses the replacement",
          ctx do
       # The helper fails while the tree lives and, like `harness-group` on an
       # empty group, succeeds once it has gone.
@@ -2097,7 +2100,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert Records.read_all(ctx.base) == {:ok, %{}}
     end
 
-    test "(review R2) a helper that reports a captured survivor is not overruled by the root's end",
+    test "D1.partial / D2.partial (review R2): a helper that reports a captured survivor is not overruled by the root's end",
          ctx do
       proc!(ctx.root, 952, 951, 952, 10 * @mib)
 
@@ -2143,7 +2146,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert Map.keys(elem(Records.read_all(ctx.base), 1)) == ["sl-a"]
     end
 
-    test "(review R1) an expected guard that is not running refuses; one restarting is waited for; none configured passes",
+    test "A2.absent / A2.unreadable (review R1): an expected guard that is not running refuses; one restarting is waited for; none configured passes",
          ctx do
       key = {:claude, "shared", @host}
       Application.put_env(:tightbeam, :memory_guard_restart_wait_ms, 200)
@@ -2178,7 +2181,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert Records.read_all(ctx.base) == {:ok, %{}}
     end
 
-    test "(review R1 siblings) an expected guard that is down refuses an unplaced launch and stands as a reason for deferred hooks",
+    test "A3.absent / A4.absent / A4.unreadable / A4.timeout / G3.unreadable (review R1 siblings): an expected guard that is down refuses an unplaced launch and stands as a reason for deferred hooks",
          ctx do
       local = Tightbeam.Placement.local_host_name()
       key = {:claude, "shared", local}
@@ -2254,7 +2257,8 @@ defmodule Tightbeam.MemoryGuardTest do
       assert :ok = MemoryGuard.admit("agent:new", ctx.db)
     end
 
-    test "a guard that cannot answer refuses the launch rather than allowing it", ctx do
+    test "A2.timeout: a guard that cannot answer refuses the launch rather than allowing it",
+         ctx do
       guard!(ctx)
       Application.put_env(:tightbeam, :memory_guard_call_timeout_ms, 500)
       on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_call_timeout_ms) end)
@@ -2466,7 +2470,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert Unguarded.mode_in_force(ctx.db, @host) == nil
     end
 
-    test "A3.unreadable / F6.absent: a session launch whose launch step is not in place is held guard_unavailable; under off it runs",
+    test "A3.unreadable / F6.absent / F6.unreadable: a session launch whose launch step is not in place is held guard_unavailable; under off it runs",
          ctx do
       guard!(ctx, cli_bin: nil)
       assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
@@ -2707,7 +2711,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert %{"v" => 1, "mode" => "off"} = config.()
     end
 
-    test "C8.absent: a session tree the step could not place in its unit on an enforced host is recorded once",
+    test "C8.absent / C8.unreadable / C8.partial: a session tree the step could not place in its unit on an enforced host is recorded once",
          ctx do
       {_harness, _unit, _set_mode} = enforced_with_unit!(ctx)
       dir = Path.join(Records.dir(ctx.base), "sessions")
@@ -2777,7 +2781,8 @@ defmodule Tightbeam.MemoryGuardTest do
       _ = :sys.get_state(MemoryGuard)
     end
 
-    test "K1.unreadable: turns that cannot be read are not idle; no close, recorded", ctx do
+    test "K1.unreadable / K1.timeout: turns that cannot be read are not idle; no close, recorded",
+         ctx do
       {:ok, _} = DB.query(ctx.db, "ALTER TABLE turns RENAME TO turns_hidden")
 
       try do
@@ -2793,7 +2798,7 @@ defmodule Tightbeam.MemoryGuardTest do
       end
     end
 
-    test "K2.absent: a resident process with no session for it is not idle; no close, recorded",
+    test "K2.absent / K4.absent: a resident process with no session for it is not idle; no close, recorded",
          ctx do
       {:ok, _} =
         DB.query(ctx.db, "DELETE FROM harness_pointers WHERE harnessSessionId='sid-idle'")
@@ -2805,7 +2810,7 @@ defmodule Tightbeam.MemoryGuardTest do
                events(ctx.db, "memory_guard_idle_unproven")
     end
 
-    test "K2.unreadable: an unreadable session pointer is not idle", ctx do
+    test "K2.unreadable / K2.timeout: an unreadable session pointer is not idle", ctx do
       {:ok, _} = DB.query(ctx.db, "ALTER TABLE harness_pointers RENAME TO hp_hidden")
 
       try do
@@ -2818,7 +2823,8 @@ defmodule Tightbeam.MemoryGuardTest do
       end
     end
 
-    test "K4.unreadable: a session whose priority class cannot be read is not closed", ctx do
+    test "K4.unreadable / K4.timeout: a session whose priority class cannot be read is not closed",
+         ctx do
       {:ok, _} = DB.query(ctx.db, "ALTER TABLE wakes RENAME TO wakes_hidden")
 
       try do
@@ -2831,7 +2837,7 @@ defmodule Tightbeam.MemoryGuardTest do
       end
     end
 
-    test "K3.unreadable / K3.timeout: an adapter that cannot answer is not idle; nothing closes, nothing is a failure",
+    test "K3.unreadable / K3.timeout / K3.absent: an adapter that cannot answer is not idle; nothing closes, nothing is a failure",
          ctx do
       shed!(ctx, idle_check: fn _adapter, _sid -> {:error, {:adapter_unavailable, :timeout}} end)
       settle_closes!()
@@ -2840,7 +2846,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert events(ctx.db, "memory_guard_close_failed") == []
     end
 
-    test "K7 (before the commit): a turn enqueued after the idle read and before the closing transaction commits stops the close",
+    test "K7.stale / K1.stale (before the commit): a turn enqueued after the idle read and before the closing transaction commits stops the close",
          ctx do
       test = self()
 
@@ -2858,7 +2864,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert events(ctx.db, "memory_guard_idle_closed") == []
     end
 
-    test "K7 (after the commit) / K6: a turn enqueued after the closing transaction waits for the close, then starts fresh",
+    test "K7.stale / K6.stale (after the commit): a turn enqueued after the closing transaction waits for the close, then starts fresh",
          ctx do
       test = self()
 
@@ -2880,7 +2886,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:idle", ctx.db)
     end
 
-    test "K8 / K3.stale: a prompt the adapter takes after the guard's idle read makes its close-if-idle refuse; no close, no event, no marker",
+    test "K8.stale / K3.stale: a prompt the adapter takes after the guard's idle read makes its close-if-idle refuse; no close, no event, no marker",
          ctx do
       shed!(ctx,
         closer: fn _adapter, sid, reason ->
@@ -2897,7 +2903,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert MemoryGuard.read(@host).residentCount == 1
     end
 
-    test "K5.unreadable / D3.partial (T26): a close acknowledged while the process lives leaves it resident and counted, recorded, and retried until it is gone",
+    test "K5.unreadable / K5.partial / D3.partial (T26): a close acknowledged while the process lives leaves it resident and counted, recorded, and retried until it is gone",
          ctx do
       proc!(ctx.root, 990, 1, 990, 100 * @mib)
       launch!(ctx.base, "sl-idle", "sid-idle", 990, 990, 512 * @mib)
@@ -3008,7 +3014,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert events(ctx.db, "memory_tree_ended") == []
     end
 
-    test "D5.timeout (T27 third): the kill's confirmation does not arrive: memory_limit at once, because the kill was sent",
+    test "D5.timeout / H1.timeout (T27 third): the kill's confirmation does not arrive: memory_limit at once, because the kill was sent",
          ctx do
       test = self()
 
@@ -3037,7 +3043,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert System.monotonic_time(:millisecond) - started < 2_000
     end
 
-    test "A5.absent / H1.absent: no record of a kill is harness_exited (nil), never a guess",
+    test "A5.absent / H1.absent / H1.unreadable: no record of a kill is harness_exited (nil), never a guess",
          ctx do
       guard!(ctx)
 
@@ -3045,7 +3051,7 @@ defmodule Tightbeam.MemoryGuardTest do
                nil
     end
 
-    test "H2.stale: a kill older than the turn's claim is not this turn's", ctx do
+    test "H2.stale / A5.stale: a kill older than the turn's claim is not this turn's", ctx do
       guard!(ctx, kill_result: fn target -> gone!(ctx.root, target.pid) && :ok end)
       :ok = MemoryGuard.tick()
       settle_kills!()
@@ -3103,7 +3109,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert read.notEnforcedReason =~ "each session unit's own memory.max"
     end
 
-    test "F4.unreadable (T28 c): stored settings that cannot be read keep the last effective ones, and the read says so",
+    test "F4.unreadable / F4.partial (T28 c): stored settings that cannot be read keep the last effective ones, and the read says so",
          ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       guard!(ctx)
@@ -3123,7 +3129,7 @@ defmodule Tightbeam.MemoryGuardTest do
       end
     end
 
-    test "F7.unreadable (T28 a): a mode change whose record cannot be written is not established, reads watched, and is retried",
+    test "F7.unreadable / F7.absent (T28 a): a mode change whose record cannot be written is not established, reads watched, and is retried",
          ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       guard!(ctx)
@@ -3172,7 +3178,7 @@ defmodule Tightbeam.MemoryGuardTest do
       settle_closes!()
     end
 
-    test "I2.unreadable (T28 b): a marker that cannot be posted is recorded, retried, and delivered exactly once",
+    test "I2.unreadable / I2.timeout (T28 b): a marker that cannot be posted is recorded, retried, and delivered exactly once",
          ctx do
       fail_kind!(ctx, "memory_guard_idle_closed_marker")
       floor_close!(ctx)
@@ -3281,7 +3287,7 @@ defmodule Tightbeam.MemoryGuardTest do
       :ok
     end
 
-    test "M1.unreadable / M1.partial: a nudge that fails is not lost; the next sample nudges every held session no reason holds",
+    test "M1.unreadable / M1.partial / M1.timeout: a nudge that fails is not lost; the next sample nudges every held session no reason holds",
          ctx do
       test = self()
       failures = :counters.new(1, [])
@@ -3324,7 +3330,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:a", ctx.db)
     end
 
-    test "M3.unreadable: a re-admitted turn whose handoff never reached its lane is nudged by the next sample",
+    test "M3.unreadable / M3.absent / M3.timeout: a re-admitted turn whose handoff never reached its lane is nudged by the next sample",
          ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       guard!(ctx)
@@ -3394,7 +3400,7 @@ defmodule Tightbeam.MemoryGuardTest do
       :ok
     end
 
-    test "B2.stale / B6.absent: with the identity missing and the leader gone, a surviving group member keeps the record and refuses the replacement; it is never signalled",
+    test "B2.stale / B3.stale / B6.absent: with the identity missing and the leader gone, a surviving group member keeps the record and refuses the replacement; it is never signalled",
          ctx do
       guard!(ctx, kill_result: {:error, :identity_missing})
       {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
@@ -3434,7 +3440,7 @@ defmodule Tightbeam.MemoryGuardTest do
                events(ctx.db, "memory_guard_orphans")
     end
 
-    test "E2.absent: a session leader that ended naturally with its group alive is not an ended tree; custody stays until the group is gone",
+    test "E2.absent / E6.absent: a session leader that ended naturally with its group alive is not an ended tree; custody stays until the group is gone",
          ctx do
       guard!(ctx)
       :ok = MemoryGuard.tick()
@@ -3477,10 +3483,10 @@ defmodule Tightbeam.MemoryGuardTest do
     end
 
     for {cell, table} <- [
-          {"L1.unreadable (the session row)", "sessions"},
-          {"L2.unreadable (the session's queued turns)", "turns"},
-          {"L3.unreadable (the harness session pointer)", "harness_pointers"},
-          {"L5.unreadable (the founding user)", "users"}
+          {"L1.unreadable / L1.timeout (the session row)", "sessions"},
+          {"L2.unreadable / L2.timeout (the session's queued turns)", "turns"},
+          {"L3.unreadable / L3.timeout (the harness session pointer)", "harness_pointers"},
+          {"L5.unreadable / L5.timeout (the founding user)", "users"}
         ] do
       @tag table: table
       test "#{cell}: a read the decision needs that fails holds the launch guard_unavailable, never admits it, and the lane asks again",
@@ -3507,12 +3513,13 @@ defmodule Tightbeam.MemoryGuardTest do
       assert :no_turn = MemoryGuard.admit("agent:nobody", ctx.db)
     end
 
-    test "L2.absent: no queued turn: nothing is claimed until a turn arrives", ctx do
+    test "L2.absent / L2.stale: no queued turn: nothing is claimed until a turn arrives", ctx do
       session!(ctx, "agent:empty", "sid-empty")
       assert :no_turn = MemoryGuard.admit("agent:empty", ctx.db)
     end
 
-    test "L4.absent: an adapter that has gone no longer counts its sessions as resident", _ctx do
+    test "L4.absent / M1.absent: an adapter that has gone no longer counts its sessions as resident",
+         _ctx do
       adapter = adapter!()
       resident!(adapter, ["sid-new"])
       assert MemoryGuard.read(@host).residentCount == 1
@@ -3681,7 +3688,7 @@ defmodule Tightbeam.MemoryGuardTest do
                events(ctx.db, "memory_guard_stuck_alert")
     end
 
-    test "N2.unreadable / N2.partial: an alert that fails is retried until sent, once, while the Main notice is not sent twice",
+    test "N2.unreadable / N2.partial / N2.timeout: an alert that fails is retried until sent, once, while the Main notice is not sent twice",
          ctx do
       failures = :counters.new(1, [])
       test = self()
@@ -3751,7 +3758,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert Episodes.active(ctx.db, @host) == []
     end
 
-    test "N4.unreadable (T31 3): a survivor still there 60 s after root's kill makes the recovery failed, with its state",
+    test "N4.unreadable / N4.timeout (T31 3): a survivor still there 60 s after root's kill makes the recovery failed, with its state",
          ctx do
       episode = custody_stuck!(ctx)
       killed_at = System.system_time(:millisecond) - 61_000
@@ -3873,7 +3880,7 @@ defmodule Tightbeam.MemoryGuardTest do
                "can gain root, here through groups (docker)"
     end
 
-    test "N7.stale (T34 e) / N9 (T31 3, T36 a): an accepted custody override lifts the fence for the named tree only, once; the episode stays open with its risk",
+    test "N7.stale / N9.unreadable / N3.stale / N10.stale (T34 e, T31 3, T36 a): an accepted custody override lifts the fence for the named tree only, once; the episode stays open with its risk",
          ctx do
       episode = custody_stuck!(ctx)
       id = episode["episodeId"]
@@ -4115,7 +4122,8 @@ defmodule Tightbeam.MemoryGuardTest do
       assert RootPath.kind(finding) == "residual"
     end
 
-    test "T35 (e): none of them: strict, saying unchecked paths cannot be ruled out", ctx do
+    test "T35 (e) / N5.absent: none of them: strict, saying unchecked paths cannot be ruled out",
+         ctx do
       finding = RootPath.finding(runner: runner({"gd\n", 0}, @no_sudo, []), sockets: [ctx.socket])
       assert RootPath.kind(finding) == "strict"
       assert RootPath.statement(finding) =~ "cannot be ruled out"
@@ -4530,7 +4538,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert MemoryGuard.read(@host).mode == "watched"
     end
 
-    test "F5.timeout: a systemctl that does not answer is no delegation: watched with the reason",
+    test "F5.timeout / F5.unreadable: a systemctl that does not answer is no delegation: watched with the reason",
          ctx do
       cgroup_tree!(ctx.root, "/system.slice/tightbeam.service/gateway", [])
 
@@ -4711,13 +4719,137 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  describe "matrix cells: the last ones" do
+    alias Tightbeam.MemoryGuard.{Episodes, RootActions}
+
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      :ok
+    end
+
+    test "B6.unreadable: an identity that cannot be read means the helper never ran; the recorded tree is ended through its parent chain, with proof",
+         ctx do
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      proc!(ctx.root, 951, 950, 951, 10 * @mib)
+      launch!(ctx.base, "sl-a", "sid-a", 951, 951, 512 * @mib)
+      guard!(ctx, kill_result: {:error, :eacces})
+
+      assert :ok = MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
+      assert_received {:signalled, [951]}
+      assert Records.read_all(ctx.base) == {:ok, %{}}
+    end
+
+    test "E6.unreadable: an adapter whose own cgroup file cannot be read is treated as not placed and measured watched",
+         ctx do
+      fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
+      guard!(ctx, probe: enforced_probe(), cgroup_fs: fs)
+
+      _ =
+        MemoryGuard.launch_env(
+          {:codex, "shared", @host},
+          "L-e6",
+          [cmd: ["/bin/x"], env: []],
+          ctx.db
+        )
+
+      harness = Path.join(fs, "svc/tightbeam.service/harness")
+      File.write!(Path.join(harness, "memory.current"), "0")
+      insert_adapter_row!(ctx.db, "L-e6", 975, "codex")
+      proc!(ctx.root, 975, 1, 975, 10 * @mib)
+      cgroup_file = Path.join(ctx.root, "proc/975/cgroup")
+      File.write!(cgroup_file, "0::/svc/tightbeam.service/harness/adapter-L-e6\n")
+      File.chmod!(cgroup_file, 0o000)
+      on_exit(fn -> File.chmod(cgroup_file, 0o644) end)
+
+      :ok = MemoryGuard.tick()
+      assert [{@host, %{"launchId" => "L-e6"}}] = events(ctx.db, "memory_guard_launch_unplaced")
+    end
+
+    test "H3.stale: host available at an outside kill is the last sample's", ctx do
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 5, 100))
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.note_adapter_exit("L-low", 143)
+      assert %{status: 143, host_low: true} = MemoryGuard.adapter_exit("L-low")
+    end
+
+    test "L3.absent: a session with no harness session pointer needs a launch, and the cap counts it",
+         ctx do
+      guard!(ctx)
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "residentCap", "1", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+      adapter = adapter!()
+      session!(ctx, "agent:busy", "sid-busy")
+      resident!(adapter, ["sid-busy"])
+      queue!(ctx, "agent:busy", "working")
+      assert :ok = MemoryGuard.admit("agent:busy", ctx.db)
+      session!(ctx, "agent:nopointer")
+      queue!(ctx, "agent:nopointer", "go")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit("agent:nopointer", ctx.db)
+    end
+
+    test "N9.stale: after a restart between acceptance and effect, an accepted custody override is carried out once from its accepted state",
+         ctx do
+      Application.put_env(:tightbeam, :memory_guard_stuck_ms, 0)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_stuck_ms) end)
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+      proc!(ctx.root, 951, 1, 951, 10 * @mib)
+      launch!(ctx.base, "sl-stuck", "sid-stuck", 951, 951, 512 * @mib)
+      uid = File.stat!(ctx.root).uid
+      opts = [kill_result: {:error, :harness_group_failed}, signal_works: false, root_uid: uid]
+      guard!(ctx, opts)
+      assert {:error, _} = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      :ok = MemoryGuard.tick()
+      [episode] = Episodes.active(ctx.db, @host)
+      dir = RootActions.dir(ctx.base)
+      File.mkdir_p!(dir)
+
+      for {name, record} <- [
+            {"recovery",
+             %{action: "recovery", killedAt: System.system_time(:millisecond) - 61_000}},
+            {"override", %{action: "override", statementKind: "strict", statement: "s"}}
+          ] do
+        File.write!(
+          Path.join(dir, name <> ".json"),
+          JSON.encode!(
+            Map.merge(record, %{
+              episodeId: episode["episodeId"],
+              host: @host,
+              kind: "custody",
+              key: episode["key"]
+            })
+          )
+        )
+
+        :ok = MemoryGuard.tick()
+      end
+
+      assert %{"applied" => false} = Episodes.override(ctx.db, episode["episodeId"])
+      # The gateway restarts before the effect.
+      stop_supervised!(MemoryGuard)
+      guard!(ctx, opts)
+      assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      assert %{"applied" => true} = Episodes.override(ctx.db, episode["episodeId"])
+      assert length(events(ctx.db, "memory_guard_override_applied")) == 1
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       :ok
     end
 
-    test "a setting stored while the guard cannot answer says it is not yet applied", ctx do
+    test "A7.timeout: a setting stored while the guard cannot answer says it is not yet applied",
+         ctx do
       guard!(ctx)
       Application.put_env(:tightbeam, :memory_guard_call_timeout_ms, 300)
       on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_call_timeout_ms) end)
@@ -4770,7 +4902,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert events(ctx.db, "memory_guard_idle_closed") == []
     end
 
-    test "E4.absent / E4.unreadable (T33): a missing harness-process table is never 'nothing to end' (R2a) nor an empty host; launches are held guard_unavailable",
+    test "E4.absent / E4.unreadable / E4.timeout (T33): a missing harness-process table is never 'nothing to end' (R2a) nor an empty host; launches are held guard_unavailable",
          ctx do
       guard!(ctx)
       session!(ctx, "agent:new", "sid-new")

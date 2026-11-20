@@ -773,7 +773,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   end
 
   describe "memory limits v1.4 R11a and the idle test" do
-    test "a session process that died under a prompt leaves no residency; another failure keeps it" do
+    test "I1.absent / I1.unreadable / I1.timeout (R11a): a session process that died under a prompt leaves no residency; another failure keeps it" do
       {adapter, _capture} = start_adapter(probe: false)
       assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
       assert Adapter.knows_session?(adapter, sid)
