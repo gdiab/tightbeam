@@ -2609,6 +2609,78 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## v1.13 FS2 / R14 (matrix B5, C8, J3; the step's own cells are in cli/tests)
+
+  describe "matrix B5 / C8 / J3: the launch step (FS2, R14)" do
+    test "B5.stale / F6: the guard publishes the step's configuration in every mode, off included",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      config = fn -> JSON.decode!(File.read!(Path.join(Records.dir(ctx.base), "launch.json"))) end
+      assert %{"v" => 1, "mode" => "watched"} = config.()
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "mode", "off", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+      assert %{"v" => 1, "mode" => "off"} = config.()
+    end
+
+    test "C8.absent: a session tree the step could not place in its unit on an enforced host is recorded once",
+         ctx do
+      {_harness, _unit, _set_mode} = enforced_with_unit!(ctx)
+      dir = Path.join(Records.dir(ctx.base), "sessions")
+
+      File.write!(
+        Path.join(dir, "sl-out.json"),
+        JSON.encode!(%{
+          v: 1,
+          launchId: "sl-out",
+          sessionId: "out",
+          pid: 2,
+          start: 2,
+          placement: "watched",
+          unit: nil,
+          errors: [
+            "session unit /svc/tightbeam.service/harness/session-out could not be created: eacces"
+          ],
+          sessionLimit: 536_870_912
+        })
+      )
+
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+
+      assert [{@host, %{"launchId" => "sl-out", "scope" => "session", "error" => error}}] =
+               events(ctx.db, "memory_guard_launch_unplaced")
+
+      assert error =~ "could not be created"
+      assert MemoryGuard.read(@host).mode == "enforced"
+    end
+
+    test "J3.unreadable: the read shows oom_score_adj values that cannot be read as unknown, never a substituted value",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+
+      assert MemoryGuard.read(@host).oomScoreAdj == %{
+               gatewayAndAdapters: nil,
+               sessionProcesses: nil
+             }
+
+      File.mkdir_p!(Path.join(ctx.root, "proc/self"))
+      File.write!(Path.join(ctx.root, "proc/self/oom_score_adj"), "950\n")
+
+      assert MemoryGuard.read(@host).oomScoreAdj == %{
+               gatewayAndAdapters: 950,
+               sessionProcesses: 1000
+             }
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)

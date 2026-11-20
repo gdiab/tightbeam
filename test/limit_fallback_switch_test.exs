@@ -1544,6 +1544,91 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       end)
     end
 
+    test "T23 / B1 / B5 (FS2): a launch the step refuses is not started and not health evidence; re-admitted once, then held guard_unavailable until the step's prerequisites are healthy" do
+      with_gateway(fn ctx ->
+        host_root = memory_host!(ctx, 16 * @gib, 12 * @gib)
+        memory_guard!(ctx, host_root)
+        key = "mg-step-refused"
+        s1_session!(ctx, key, :claude)
+        lane!(ctx, key)
+        refusals = Path.join(Tightbeam.MemoryGuard.Records.dir(ctx.base), "refusals")
+        File.mkdir_p!(refusals)
+
+        # Each attempt: the step refused to start the session process and left
+        # its record; the adapter reports only that the process exited.
+        :ok =
+          GenServer.call(
+            ctx.claude,
+            {:set, :prompt,
+             fn n, _text, _opts ->
+               File.write!(
+                 Path.join(refusals, "sl-refused-#{n}.json"),
+                 JSON.encode!(%{
+                   v: 1,
+                   launchId: "sl-refused-#{n}",
+                   sessionId: "claude-session-1",
+                   reason: "launch record could not be written: eacces",
+                   at: System.system_time(:millisecond)
+                 })
+               )
+
+               {:error,
+                "The Claude Agent process exited unexpectedly. Please start a new session."}
+             end}
+          )
+
+        seq = deliver!(ctx, key, "mg-refused")
+
+        await_until!(fn ->
+          count(
+            ctx.db,
+            "SELECT COUNT(*) FROM lifecycle_events WHERE kind='memory_guard_step_hold'"
+          ) == 1
+        end)
+
+        [^seq, first, held] = same_message_turns(ctx.db, seq)
+        assert turn_status(ctx.db, seq) == "failed"
+        assert turn_status(ctx.db, first) == "failed"
+        assert turn_error(ctx.db, seq) =~ "launch step"
+        assert turn_status(ctx.db, held) == "queued"
+
+        assert count(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM lifecycle_events WHERE kind='memory_guard_step_refused'"
+               ) == 2
+
+        # Never harness-health, incident or quota evidence; never an unknown effect.
+        assert count(ctx.db, "SELECT COUNT(*) FROM harness_health_observations") == 0
+        assert count(ctx.db, "SELECT COUNT(*) FROM harness_park_fences") == 0
+        assert unknown_effect_notices(ctx.db) == []
+
+        # The fake host's own oom_score_adj is missing: not healthy, still held.
+        :ok = Tightbeam.MemoryGuard.tick()
+        assert turn_status(ctx.db, held) == "queued"
+
+        File.mkdir_p!(Path.join(host_root, "proc/self"))
+        File.write!(Path.join(host_root, "proc/self/oom_score_adj"), "0\n")
+        :ok = GenServer.call(ctx.claude, {:set, :prompt, fn n, _text, _opts -> ok_reply(n) end})
+        :ok = Tightbeam.MemoryGuard.tick()
+        await_turns_settled!(ctx.db, key)
+
+        assert turn_status(ctx.db, held) == "delivered"
+
+        assert count(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM lifecycle_events WHERE kind='memory_guard_step_ready'"
+               ) == 1
+      end)
+    end
+
+    defp await_until!(check, attempts \\ 300) do
+      cond do
+        check.() -> :ok
+        attempts == 0 -> flunk("condition never held")
+        true -> Process.sleep(50) && await_until!(check, attempts - 1)
+      end
+    end
+
     test "T9/R15: an outside kill of the adapter while the host is low on memory is harness_exited with the signal, never memory_limit, and the relaunch is held" do
       with_gateway(fn ctx ->
         host_root = memory_host!(ctx, 16 * @gib, div(16 * @gib, 2))

@@ -269,40 +269,171 @@ fn mode_off_launches_the_harness_untouched() {
     assert!(!fixture.guard_dir.join("sessions").exists());
 }
 
-#[test]
-fn an_unreadable_configuration_still_starts_the_harness_and_records_why() {
-    let fixture = start("broken", 0, "watched");
-    // Overwrite with an unknown version before the session launches is racy;
-    // instead start a second session by hand against a broken file.
-    fs::write(fixture.guard_dir.join("launch.json"), "{not json").unwrap();
-    let output = Command::new(fixture.guard_dir.join("bin/tightbeam-session-exec"))
-        .args(["--session-id=sess-2"])
+/// Run the step by hand for `sid` against `guard_dir`, with `/bin/echo` as
+/// the harness, and with extra environment.
+fn run_step(guard_dir: &Path, sid: &str, env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = Command::new(guard_dir.join("bin/tightbeam-session-exec"));
+    command
+        .arg(format!("--session-id={sid}"))
         .env("TIGHTBEAM_SESSION_EXEC_TARGET", "/bin/echo")
-        .env("TIGHTBEAM_MEMORY_GUARD_DIR", &fixture.guard_dir)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "--session-id=sess-2"
-    );
+        .env("TIGHTBEAM_MEMORY_GUARD_DIR", guard_dir);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
 
-    let sessions = fixture.guard_dir.join("sessions");
-    let broken = fs::read_dir(&sessions)
+/// The step refused: no harness output, the refusal status, a refusal record
+/// naming `why`, and no launch record for `sid` (v1.13 FS2, T23).
+fn assert_refused(guard_dir: &Path, sid: &str, output: &std::process::Output, why: &str) {
+    assert_eq!(output.status.code(), Some(75), "refusal status");
+    assert!(output.stdout.is_empty(), "the harness never ran");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("REFUSED"));
+    let refusal = fs::read_dir(guard_dir.join("refusals"))
         .unwrap()
         .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .map(|entry| {
             serde_json::from_str::<serde_json::Value>(&fs::read_to_string(entry.path()).unwrap())
                 .unwrap()
         })
-        .find(|record| record["sessionId"] == "sess-2")
-        .expect("a record for sess-2");
-    assert_eq!(broken["placement"], "watched");
+        .find(|record| record["sessionId"] == sid)
+        .expect("a refusal record");
     assert!(
-        broken["errors"][0]
+        refusal["reason"].as_str().unwrap().contains(why),
+        "{refusal}"
+    );
+    let recorded = fs::read_dir(guard_dir.join("sessions"))
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                fs::read_to_string(entry.path())
+                    .map(|text| text.contains(&format!("\"sessionId\":\"{sid}\"")))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(!recorded, "no launch record for a refused launch");
+}
+
+#[test]
+fn b5_unreadable_an_invalid_configuration_refuses_and_records_why() {
+    let fixture = start("broken", 0, "watched");
+    fs::write(fixture.guard_dir.join("launch.json"), "{not json").unwrap();
+    let output = run_step(&fixture.guard_dir, "sess-2", &[]);
+    assert_refused(
+        &fixture.guard_dir,
+        "sess-2",
+        &output,
+        "launch.json is invalid",
+    );
+}
+
+#[test]
+fn b5_absent_a_missing_configuration_refuses() {
+    let fixture = start("missing", 0, "watched");
+    fs::remove_file(fixture.guard_dir.join("launch.json")).unwrap();
+    let output = run_step(&fixture.guard_dir, "sess-3", &[]);
+    assert_refused(
+        &fixture.guard_dir,
+        "sess-3",
+        &output,
+        "launch.json could not be read",
+    );
+}
+
+#[test]
+fn b1_unreadable_a_launch_record_that_cannot_be_written_refuses() {
+    let fixture = start("norecord", 0, "watched");
+    let sessions = fixture.guard_dir.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let _ = record(&fixture);
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o555)).unwrap();
+    let output = run_step(&fixture.guard_dir, "sess-4", &[]);
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_refused(
+        &fixture.guard_dir,
+        "sess-4",
+        &output,
+        "identity could not be opened",
+    );
+}
+
+#[test]
+fn j1_unreadable_and_absent_an_oom_score_adj_that_cannot_be_read_refuses() {
+    let fixture = start("oomread", 0, "watched");
+    let missing = fixture.dir.join("no-such-oom");
+    let output = run_step(
+        &fixture.guard_dir,
+        "sess-5",
+        &[(
+            "TIGHTBEAM_TEST_OOM_SCORE_ADJ_PATH",
+            missing.to_str().unwrap(),
+        )],
+    );
+    assert_refused(
+        &fixture.guard_dir,
+        "sess-5",
+        &output,
+        "oom_score_adj could not be read",
+    );
+
+    let malformed = fixture.dir.join("malformed-oom");
+    fs::write(&malformed, "lots\n").unwrap();
+    let output = run_step(
+        &fixture.guard_dir,
+        "sess-6",
+        &[(
+            "TIGHTBEAM_TEST_OOM_SCORE_ADJ_PATH",
+            malformed.to_str().unwrap(),
+        )],
+    );
+    assert_refused(&fixture.guard_dir, "sess-6", &output, "malformed");
+}
+
+#[test]
+fn j2_unreadable_an_oom_score_adj_that_cannot_be_raised_refuses() {
+    let fixture = start("oomwrite", 0, "watched");
+    let read_only = fixture.dir.join("read-only-oom");
+    fs::write(&read_only, "0\n").unwrap();
+    fs::set_permissions(&read_only, fs::Permissions::from_mode(0o444)).unwrap();
+    let output = run_step(
+        &fixture.guard_dir,
+        "sess-7",
+        &[(
+            "TIGHTBEAM_TEST_OOM_SCORE_ADJ_PATH",
+            read_only.to_str().unwrap(),
+        )],
+    );
+    assert_refused(
+        &fixture.guard_dir,
+        "sess-7",
+        &output,
+        "oom_score_adj could not be raised",
+    );
+}
+
+#[test]
+fn count_only_launches_the_harness_untouched() {
+    let fixture = start("countonly", 0, "count-only");
+    assert_eq!(
+        wait_for(&fixture.dir.join("session.oom")),
+        own_oom().to_string()
+    );
+    assert!(!fixture.guard_dir.join("sessions").exists());
+}
+
+#[test]
+fn c8_absent_an_enforced_launch_without_its_unit_runs_watched_and_says_why() {
+    let fixture = start("nounit", 0, "enforced");
+    let launched = record(&fixture);
+    assert_eq!(launched["placement"], "watched");
+    assert!(
+        launched["errors"][0]
             .as_str()
             .unwrap()
-            .contains("launch.json is invalid")
+            .contains("lacks the enforced layout")
+    );
+    assert_eq!(
+        wait_for(&fixture.dir.join("session.oom")),
+        (own_oom() + 100).min(1000).to_string()
     );
 }

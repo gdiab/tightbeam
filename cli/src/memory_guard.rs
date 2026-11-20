@@ -14,9 +14,17 @@
 //! 4. records the launch (harness session id, pid, start time, adapter launch,
 //!    placement and limit) and an identity the kill path can verify;
 //!
-//! then execs the real harness with the same arguments. Every step fails open:
-//! the harness always starts, and a tree that could not be placed under the
-//! kernel limit is recorded as `watched` (R12a) so the gateway samples it.
+//! then execs the real harness with the same arguments.
+//!
+//! v1.13 FS2: the step fails **closed** on Tightbeam's own failures. When it
+//! cannot read its configuration, raise `oom_score_adj` (R14), write the
+//! identity or write the launch record, it does not exec the harness: an
+//! unrecorded tree would have no custody, no per-tree limit and no attribution.
+//! It leaves a refusal record (`<dir>/refusals/<launchId>.json`) so the gateway
+//! can tell the refusal from a harness failure, and exits with
+//! [`REFUSED_EXIT`]. Only a configuration reading `off` (or `count-only`, a
+//! host without the mechanisms) execs the harness untouched. A tree that could
+//! not be placed under the kernel limit still runs `watched`, recorded (R12a).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,6 +38,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The name the gateway's link to this binary carries.
 pub const STEP_NAME: &str = "tightbeam-session-exec";
+
+/// The exit status of a refusal (v1.13 FS2), distinct from the harness's own.
+pub const REFUSED_EXIT: i32 = 75;
 
 const DIR_ENV: &str = "TIGHTBEAM_MEMORY_GUARD_DIR";
 const TARGET_ENV: &str = "TIGHTBEAM_SESSION_EXEC_TARGET";
@@ -55,7 +66,9 @@ pub fn session_step(args: &[String]) -> i32 {
 
     if let (Some(sid), Ok(dir)) = (session_id(args), std::env::var(DIR_ENV)) {
         let adapter_launch = std::env::var(ADAPTER_LAUNCH_ENV).unwrap_or_default();
-        prepare(Path::new(&dir), &sid, &adapter_launch);
+        if let Err(refusal) = prepare(Path::new(&dir), &sid, &adapter_launch) {
+            return refuse(Path::new(&dir), &sid, &adapter_launch, &refusal);
+        }
     }
 
     let mut command = Command::new(&target);
@@ -118,7 +131,7 @@ pub fn read_config(dir: &Path) -> Result<LaunchConfig, String> {
         mode: value
             .get("mode")
             .and_then(|v| v.as_str())
-            .unwrap_or("watched")
+            .ok_or("launch.json names no mode")?
             .to_string(),
         fs: value.get("fs").and_then(|v| v.as_str()).map(str::to_string),
         harness: value
@@ -129,66 +142,62 @@ pub fn read_config(dir: &Path) -> Result<LaunchConfig, String> {
     })
 }
 
-fn prepare(dir: &Path, sid: &str, adapter_launch: &str) {
-    let launch = launch_id(sid);
-    let mut errors: Vec<String> = Vec::new();
-    let config = match read_config(dir) {
-        Ok(config) => config,
-        Err(error) => {
-            errors.push(error);
-            LaunchConfig {
-                mode: "watched".into(),
-                ..LaunchConfig::default()
-            }
-        }
-    };
+/// Why the step did not start the harness, and the launch it would have been.
+#[derive(Debug)]
+pub struct Refusal {
+    pub launch: String,
+    pub reason: String,
+}
 
-    // `off` (an admin turned the guard off) and `count-only` launch the harness
-    // untouched; only the resident cap, counted by the gateway, applies.
+fn prepare(dir: &Path, sid: &str, adapter_launch: &str) -> Result<(), Refusal> {
+    let launch = launch_id(sid);
+    let refuse = |reason: String| Refusal {
+        launch: launch.clone(),
+        reason,
+    };
+    let mut errors: Vec<String> = Vec::new();
+
+    // FS2 (B5): the guard publishes the configuration in every mode, so a
+    // missing or unreadable one is a fault, never "no contract".
+    let config = read_config(dir).map_err(&refuse)?;
+
+    // `off` (an admin turned the guard off) launches the harness untouched,
+    // and so does `count-only`, a host without the mechanisms (R12a).
     if config.mode != "watched" && config.mode != "enforced" {
-        return;
+        return Ok(());
     }
 
     // R14: the session tree runs at the value inherited from the adapter (the
-    // gateway's, 0 on Sirius) plus 100, capped
-    // at 1000. Raising one's own value needs no privilege.
-    let raise = 100;
-    let inherited = fs::read_to_string("/proc/self/oom_score_adj")
-        .ok()
-        .and_then(|text| text.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let oom = (inherited + raise).min(1000);
-    let oom_written = match fs::write("/proc/self/oom_score_adj", oom.to_string()) {
-        Ok(()) => Some(oom),
-        Err(error) => {
-            errors.push(format!("oom_score_adj could not be raised: {error}"));
-            None
-        }
-    };
+    // gateway's, 0 on Sirius) plus 100, capped at 1000. Raising one's own value
+    // needs no privilege. A value that cannot be read or set refuses (J1, J2).
+    let inherited = read_oom_score_adj().map_err(&refuse)?;
+    let oom = raised_oom(inherited);
+    fs::write(oom_path(), oom.to_string())
+        .map_err(|error| refuse(format!("oom_score_adj could not be raised: {error}")))?;
 
     let sessions = dir.join("sessions");
-    if let Err(error) = fs::create_dir_all(&sessions) {
-        eprintln!("{STEP_NAME}: launch records directory could not be created: {error}");
-        return;
-    }
+    fs::create_dir_all(&sessions).map_err(|error| {
+        refuse(format!(
+            "launch records directory could not be created: {error}"
+        ))
+    })?;
     let identity_path = sessions.join(format!("{launch}.identity"));
-    let identity = OpenOptions::new()
+    let mut identity = OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
-        .open(&identity_path);
-    let identity_error = match identity {
-        Ok(mut file) => {
-            crate::harness_process::prepare_session_identity(&identity_path, &mut file, &launch)
-                .err()
-                .map(|(step, error)| format!("{step}: {error}"))
-        }
-        Err(error) => Some(format!("identity could not be opened: {error}")),
-    };
-    if let Some(error) = identity_error {
-        errors.push(error);
+        .open(&identity_path)
+        .map_err(|error| refuse(format!("identity could not be opened: {error}")))?;
+    if let Err((step, error)) =
+        crate::harness_process::prepare_session_identity(&identity_path, &mut identity, &launch)
+    {
+        let _ = fs::remove_file(&identity_path);
+        return Err(refuse(format!(
+            "identity could not be written: {step}: {error}"
+        )));
     }
 
+    // R12a: a tree the kernel cannot take runs watched, recorded (C8).
     let (placement, unit) = if config.mode == "enforced" {
         match join_session_unit(&config, sid) {
             Ok(unit) => ("enforced", Some(unit)),
@@ -216,14 +225,62 @@ fn prepare(dir: &Path, sid: &str, adapter_launch: &str) {
         serde_json::json!(identity_path.to_string_lossy()),
     );
     record.insert("sessionLimit", serde_json::json!(config.session_limit));
-    record.insert("oomScoreAdj", serde_json::json!(oom_written));
+    record.insert("oomScoreAdj", serde_json::json!(oom));
     record.insert("errors", serde_json::json!(errors));
     record.insert("launchedAt", serde_json::json!(now_ms()));
 
     let body = serde_json::to_vec(&record).unwrap_or_default();
-    if let Err(error) = atomic_write(&sessions.join(format!("{launch}.json")), &body) {
-        eprintln!("{STEP_NAME}: launch record could not be written: {error}");
+    atomic_write(&sessions.join(format!("{launch}.json")), &body).map_err(|error| {
+        let _ = fs::remove_file(&identity_path);
+        refuse(format!("launch record could not be written: {error}"))
+    })
+}
+
+/// R14's value: the inherited one plus 100, capped at 1000, never lowered.
+pub fn raised_oom(inherited: i64) -> i64 {
+    (inherited + 100).min(1000).max(inherited)
+}
+
+/// The process's own `oom_score_adj`. Debug builds (tests only) may name
+/// another file, so the refusal paths can be driven without privilege.
+fn oom_path() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var("TIGHTBEAM_TEST_OOM_SCORE_ADJ_PATH") {
+        return PathBuf::from(path);
     }
+    PathBuf::from("/proc/self/oom_score_adj")
+}
+
+fn read_oom_score_adj() -> Result<i64, String> {
+    let text = fs::read_to_string(oom_path())
+        .map_err(|error| format!("oom_score_adj could not be read: {error}"))?;
+    text.trim()
+        .parse::<i64>()
+        .map_err(|_| format!("oom_score_adj is malformed: {:?}", text.trim()))
+}
+
+/// Record the refusal for the gateway, say it on stderr, and exit
+/// [`REFUSED_EXIT`] without starting the harness (FS2).
+fn refuse(dir: &Path, sid: &str, adapter_launch: &str, refusal: &Refusal) -> i32 {
+    eprintln!(
+        "{STEP_NAME}: REFUSED to start the session process: {}",
+        refusal.reason
+    );
+    let refusals = dir.join("refusals");
+    let mut record = BTreeMap::new();
+    record.insert("v", serde_json::json!(1));
+    record.insert("launchId", serde_json::json!(refusal.launch));
+    record.insert("sessionId", serde_json::json!(sid));
+    record.insert("adapterLaunchId", serde_json::json!(adapter_launch));
+    record.insert("reason", serde_json::json!(refusal.reason));
+    record.insert("at", serde_json::json!(now_ms()));
+    let body = serde_json::to_vec(&record).unwrap_or_default();
+    let written = fs::create_dir_all(&refusals)
+        .and_then(|_| atomic_write(&refusals.join(format!("{}.json", refusal.launch)), &body));
+    if let Err(error) = written {
+        eprintln!("{STEP_NAME}: the refusal could not be recorded: {error}");
+    }
+    REFUSED_EXIT
 }
 
 /// Join a fresh `harness/session-<sid>` unit. A leftover empty unit of an
@@ -353,6 +410,23 @@ mod tests {
         )));
         assert!(!invoked_as_step(Some("/usr/local/bin/tightbeam")));
         assert!(!invoked_as_step(None));
+    }
+
+    #[test]
+    fn j2_stale_raised_oom_is_capped_at_1000_and_never_lowered() {
+        assert_eq!(raised_oom(0), 100);
+        assert_eq!(raised_oom(950), 1000);
+        assert_eq!(raised_oom(1000), 1000);
+        assert_eq!(raised_oom(-500), -400);
+    }
+
+    #[test]
+    fn b5_partial_a_configuration_without_a_mode_is_refused() {
+        let dir = std::env::temp_dir().join(format!("tb-mg-nomode-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("launch.json"), r#"{"v":1}"#).unwrap();
+        assert!(read_config(&dir).unwrap_err().contains("no mode"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

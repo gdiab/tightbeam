@@ -122,6 +122,56 @@ defmodule Tightbeam.MemoryGuard.Records do
     error -> {:error, Exception.message(error)}
   end
 
+  @doc """
+  The launch step's refusal for harness session `sid` at or after `since`
+  (ms), from `<dir>/refusals` (v1.13 FS2): `%{launch_id, reason, at}` or nil.
+  """
+  @spec refusal_for(String.t(), String.t() | nil, integer()) :: map() | nil
+  def refusal_for(_base_dir, nil, _since), do: nil
+
+  def refusal_for(base_dir, sid, since) do
+    refusals = Path.join(dir(base_dir), "refusals")
+
+    with {:ok, entries} <- File.ls(refusals) do
+      entries
+      |> Enum.filter(&String.ends_with?(&1, ".json"))
+      |> Enum.flat_map(fn entry ->
+        with {:ok, text} <- File.read(Path.join(refusals, entry)),
+             {:ok, %{"sessionId" => ^sid, "at" => at} = record} when at >= since <-
+               JSON.decode(text) do
+          [%{launch_id: record["launchId"], reason: record["reason"], at: at}]
+        else
+          _ -> []
+        end
+      end)
+      |> Enum.max_by(& &1.at, fn -> nil end)
+    else
+      _ -> nil
+    end
+  end
+
+  @doc """
+  Whether everything the launch step needs is in place (v1.13 FS2): its
+  configuration reads, the launch-record directory takes a write, and the
+  process's own `oom_score_adj` reads. `:ok` or `{:error, message}`.
+  """
+  @spec step_prerequisites(String.t(), String.t()) :: :ok | {:error, String.t()}
+  def step_prerequisites(base_dir, root) do
+    sessions = Path.join(dir(base_dir), "sessions")
+    probe = Path.join(sessions, ".probe-#{System.unique_integer([:positive])}")
+
+    with {:ok, text} <- File.read(Path.join(dir(base_dir), "launch.json")),
+         {:ok, %{"v" => 1, "mode" => mode}} when is_binary(mode) <- JSON.decode(text),
+         :ok <- File.write(probe, ""),
+         :ok <- File.rm(probe),
+         {:ok, oom} <- File.read(Path.join(root, "proc/self/oom_score_adj")),
+         {_value, _} <- Integer.parse(String.trim(oom)) do
+      :ok
+    else
+      other -> {:error, "the launch step's prerequisites are not in place: #{inspect(other)}"}
+    end
+  end
+
   @doc "The memory-guard runtime directory of a base."
   def dir(base_dir), do: Path.join([base_dir, "run", "memory-guard"])
 
