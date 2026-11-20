@@ -1090,15 +1090,20 @@ defmodule Tightbeam.OwnerAlerts do
   # own lifecycle records.
   defp memory_closing(run_or_open) do
     case Map.get(run_or_open, :guard_actions) do
-      %{held: held, closed: closed, ended: ended} when held or closed > 0 or ended > 0 ->
-        Enum.join([guard_actions_text(held, closed, ended), @memory_warning], " ")
+      %{held: held, closed: closed, over_limit: over, for_budget: budget}
+      when held or closed > 0 or over > 0 or budget > 0 ->
+        Enum.join([guard_actions_text(held, closed, over, budget), @memory_warning], " ")
 
       _ ->
         @memory_watching <> " " <> @memory_warning
     end
   end
 
-  defp guard_actions_text(held, closed, ended) do
+  # An agent stopped for its own limit (limit `session`) and a process stopped
+  # because all of Tightbeam's agents together passed their budget (limit
+  # `budget`, an agent or the shared adapter, which has no limit of its own)
+  # are different facts, and say so.
+  defp guard_actions_text(held, closed, over, budget) do
     first =
       case {held, closed} do
         {true, 0} -> ["Tightbeam has paused starting new agent processes."]
@@ -1108,13 +1113,27 @@ defmodule Tightbeam.OwnerAlerts do
       end
 
     second =
-      case ended do
+      case over do
         0 -> []
         1 -> ["It has stopped 1 agent that went over its own memory limit."]
         n -> ["It has stopped #{n} agents that went over their own memory limits."]
       end
 
-    Enum.join(first ++ second, " ")
+    third =
+      case budget do
+        0 ->
+          []
+
+        1 ->
+          ["It has stopped 1 process to keep its agents together within their memory budget."]
+
+        n ->
+          [
+            "It has stopped #{n} processes to keep its agents together within their memory budget."
+          ]
+      end
+
+    Enum.join(first ++ second ++ third, " ")
   end
 
   defp idle(1), do: "1 idle one"
@@ -1124,7 +1143,7 @@ defmodule Tightbeam.OwnerAlerts do
   # Counts of the memory guard's actions on `host` since `since` (ms), from
   # its lifecycle rows: held launches, closed idle processes, ended trees.
   def memory_guard_actions_in_txn(_txn, _host, since) when not is_integer(since),
-    do: %{held: false, closed: 0, ended: 0}
+    do: %{held: false, closed: 0, over_limit: 0, for_budget: 0}
 
   def memory_guard_actions_in_txn(%Txn{} = txn, host, since) do
     count = fn kinds, where ->
@@ -1145,7 +1164,16 @@ defmodule Tightbeam.OwnerAlerts do
           "subject=?2 OR json_extract(detail,'$.host')=?2"
         ) > 0,
       closed: count.("'memory_guard_idle_closed'", "json_extract(detail,'$.host')=?2"),
-      ended: count.("'memory_tree_ended'", "json_extract(detail,'$.host')=?2")
+      over_limit:
+        count.(
+          "'memory_tree_ended'",
+          "json_extract(detail,'$.host')=?2 AND json_extract(detail,'$.limit')='session'"
+        ),
+      for_budget:
+        count.(
+          "'memory_tree_ended'",
+          "json_extract(detail,'$.host')=?2 AND json_extract(detail,'$.limit')='budget'"
+        )
     }
   end
 
