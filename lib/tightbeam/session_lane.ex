@@ -664,12 +664,18 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp claim_and_start(state) do
-    if harness_parked?(state) do
-      state
-    else
-      claim_next(state)
+    cond do
+      harness_parked?(state) -> state
+      limit_fallback_held?(state) -> state
+      true -> claim_next(state)
     end
   end
+
+  # Contract c R5: while a limit-fallback evaluation of this session's failed
+  # turn has no committed outcome, the lane claims nothing. The outcome's
+  # commit releases the hold and nudges the lane.
+  defp limit_fallback_held?(state),
+    do: Tightbeam.LimitFallback.held?(state.db, state.session_key)
 
   defp harness_parked?(state) do
     case DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [

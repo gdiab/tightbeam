@@ -555,6 +555,9 @@ defmodule Tightbeam.Credentials do
        start: Keyword.get(opts, :start, fn _provider, _kind -> :ok end),
        resume: Keyword.get(opts, :resume, fn _provider -> :ok end),
        on_credential_present: Keyword.get(opts, :on_credential_present, fn _provider -> :ok end),
+       # Quota companion v1.2 B6: called once a credential activation has
+       # committed, never for a failed or abandoned one.
+       on_activated: Keyword.get(opts, :on_activated, fn _provider -> :ok end),
        capture_sessions: Keyword.get(opts, :capture_sessions, fn _provider -> [] end),
        publish_sessions:
          Keyword.get(opts, :publish_sessions, fn _payload, _transition -> :ok end),
@@ -1026,6 +1029,7 @@ defmodule Tightbeam.Credentials do
           :ok ->
             result =
               with :ok <- mark_onboarded!(state, provider, :subscription, credential),
+                   :ok <- activated(state, provider),
                    :ok <- state.on_credential_present.(provider),
                    captured <- capture_sessions(state, provider),
                    :ok <- state.resume.(provider) do
@@ -1055,6 +1059,20 @@ defmodule Tightbeam.Credentials do
       end
 
     {:reply, result, state}
+  end
+
+  # The activation has committed; what it releases must never undo or fail it.
+  defp activated(state, provider) do
+    state.on_activated.(provider)
+    :ok
+  rescue
+    error ->
+      Logger.error("credential activation release raised: #{Exception.message(error)}")
+      :ok
+  catch
+    kind, _reason ->
+      Logger.error("credential activation release failed: #{inspect(kind)}")
+      :ok
   end
 
   defp capture_sessions(state, provider) do
@@ -1554,7 +1572,8 @@ defmodule Tightbeam.Credentials do
       case activate_staged_credential(state, provider, kind, credential) do
         :ok ->
           result =
-            with :ok <- state.on_credential_present.(provider),
+            with :ok <- activated(state, provider),
+                 :ok <- state.on_credential_present.(provider),
                  captured <- capture_sessions(state, provider),
                  :ok <- state.resume.(provider) do
               publish_sessions(state, captured, :onboarded)

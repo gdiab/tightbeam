@@ -9,8 +9,8 @@ defmodule Tightbeam.OwnerAlerts do
   the owner, so it does not count as alerted. Delivery
   uses the ordinary `Tightbeam.HarklightSend` operation with the owner's Main
   as the origin of record. The row carries its own next attempt time; this
-  process keeps one timer for the earliest pending row, so a restart resumes
-  from the table and nothing is polled.
+  process keeps one timer for the earliest due time, so a restart resumes
+  from the tables.
 
   An uncertain send is settled through its own operation, never resent. A
   definite failure is retried with a new operation 5, 15 and 60 minutes after
@@ -18,11 +18,30 @@ defmodule Tightbeam.OwnerAlerts do
   alert becomes `undelivered`. The alert follows its operation row, so a
   settlement made by boot recovery is adopted rather than repeated.
 
-  Each row records its owner at creation. Before any new operation, the owner
-  setting is read again in the transaction that records the attempt: if it is
-  cleared, names no user, or names a different user, the alert is withdrawn
-  as `off` instead of sent. An uncertain send is still settled on its own
-  operation.
+  Three kinds exist. A `usage-limit` alert is created in the transaction that
+  records a usage-limit turn failure. A `model-fallback` alert is created in
+  the transaction that commits a limit-fallback switch's outcome, applied or
+  withheld, and like `usage-limit` is never withdrawn as `stale`. A `stall` alert is created when an
+  owner's open work item has had no progress for the stall threshold and no
+  open assignment of it is held or waiting; its identity is the item and its
+  anchor, the latest recorded time anything moved. Stall detection reads
+  records only. The stall time of every item is computable, so the same timer
+  also covers the earliest predicted stall, and a pass at least every ten
+  minutes (never longer than the threshold) plans the stall times that new
+  writes create. Every write that moves the work moves the anchor, which puts
+  its stall time beyond the next pass; the writes that can make an item stall
+  without moving its anchor (a changed setting, a reopened item) tell this
+  process directly. A stall found only by a later pass that was due before the
+  previous pass is a missed event: it is logged and marked on the alert's
+  creation event. Before every new send of a stall alert, the stall is
+  re-evaluated in the transaction that records the attempt, and an alert whose
+  stall is no longer current is withdrawn as `stale` instead.
+
+  Each row of either kind records its owner at creation. Before any new
+  operation, the owner setting is read again in the transaction that records
+  the attempt: if it is cleared, names no user, or names a different user, the
+  alert is withdrawn as `off` instead of sent. An uncertain send is still
+  settled on its own operation.
 
   Nothing here creates, queues or changes a turn or a wake of any session. The
   only session records touched are the origin transcript markers for a failed
@@ -32,7 +51,7 @@ defmodule Tightbeam.OwnerAlerts do
   use GenServer
   require Logger
 
-  alias Tightbeam.{DB, EventLog, HarklightSend, Id, Org, UserAdmin}
+  alias Tightbeam.{DB, EventLog, HarklightSend, HarnessHealth, Id, Org, UserAdmin}
   alias Tightbeam.DB.Txn
 
   @shape "owner-alerts-v1-0114"
@@ -52,6 +71,13 @@ defmodule Tightbeam.OwnerAlerts do
   # After an unexpected error, wait this long before the same row is tried
   # again so a persistent fault cannot spin the process.
   @repair_delay_ms 60_000
+  # S7: a stall is alerted within ten minutes. While alerts are on, a full
+  # pass runs at least this often, and never less often than the threshold,
+  # so a stall time created by any anchor-moving write is planned before it
+  # comes due. The floor keeps a tiny threshold from spinning the process.
+  @horizon_ms 600_000
+  @min_horizon_ms 60_000
+  @max_listed_uncovered 5
 
   # A2: a row withdrawn as `off` (§7.1 C2-off) never reached the owner, so it
   # does not hold its dedupeKey (C3-on). This one predicate is the partial
@@ -246,10 +272,14 @@ defmodule Tightbeam.OwnerAlerts do
   user, or one removed since it was set (§7, #622), reads as unset.
   """
   @spec owner_in_txn(Txn.t()) :: String.t() | nil
-  def owner_in_txn(%Txn{} = txn) do
-    case Txn.q(txn, "SELECT value FROM org_settings WHERE key=?1", [@owner_setting]) do
+  def owner_in_txn(%Txn{} = txn), do: owner_via(in_txn(txn))
+
+  defp owner_via(q) do
+    case q.("SELECT value FROM org_settings WHERE key=?1", [@owner_setting]) do
       [[user_id]] when is_binary(user_id) and user_id != "" ->
-        if active_user_in_txn?(txn, user_id), do: user_id, else: nil
+        if q.("SELECT 1 FROM users WHERE userId=?1", [user_id]) == [[1]],
+          do: user_id,
+          else: nil
 
       _ ->
         nil
@@ -260,8 +290,26 @@ defmodule Tightbeam.OwnerAlerts do
   @spec stall_ms(DB.server()) :: pos_integer()
   def stall_ms(db \\ DB), do: parse_stall_ms(Org.get_setting(db, @stall_setting))
 
+  defp stall_ms_via(q) do
+    case q.("SELECT value FROM org_settings WHERE key=?1", [@stall_setting]) do
+      [[value]] -> parse_stall_ms(value)
+      [] -> @default_stall_ms
+    end
+  end
+
   defp parse_stall_ms(nil), do: @default_stall_ms
   defp parse_stall_ms(value), do: String.to_integer(value)
+
+  # One query shape for reads outside a transaction and inside one, so the
+  # detection pass and the transactions that act on it evaluate the same rules.
+  defp reader(db) do
+    fn sql, params ->
+      {:ok, rows} = DB.query(db, sql, params)
+      rows
+    end
+  end
+
+  defp in_txn(txn), do: fn sql, params -> Txn.q(txn, sql, params) end
 
   @doc "The presented value of one owner-alert setting."
   def setting_value(db, @owner_setting), do: Org.get_setting(db, @owner_setting)
@@ -339,7 +387,7 @@ defmodule Tightbeam.OwnerAlerts do
              [turn.seq]
            ) do
       session_key = turn.session_key
-      first_seq = episode_first_seq_in_txn(txn, session_key, turn.seq)
+      first_seq = HarnessHealth.limit_episode_first_seq_in_txn(txn, session_key, turn.seq)
       dedupe_key = "usage-limit:#{session_key}:#{first_seq}"
 
       if Txn.q(txn, "SELECT 1 FROM owner_alerts WHERE dedupeKey=?1 AND #{@holds_key}", [
@@ -375,43 +423,58 @@ defmodule Tightbeam.OwnerAlerts do
 
   def usage_limit_failure_in_txn(%Txn{}, _turn, _failure_class, _result, _observed_at), do: :ok
 
-  # A session's limit episode runs from its first usage-limit failure to its
-  # next delivered turn. Its first failure is the earliest rate-limit-dead
-  # failure after the session's latest delivered turn. A session's lane runs
-  # one turn at a time and claims the lowest queued seq, so seq order is the
-  # order its turns ended.
-  defp episode_first_seq_in_txn(txn, session_key, seq) do
-    delivered =
-      case Txn.q(
-             txn,
-             """
-             SELECT seq FROM turns WHERE sessionKey=?1 AND status='delivered'
-             ORDER BY seq DESC LIMIT 1
-             """,
-             [session_key]
-           ) do
-        [[delivered]] -> delivered
-        [] -> 0
-      end
+  ## (c) model-fallback outcome
 
-    case Txn.q(
-           txn,
-           """
-           SELECT t.seq FROM turns t
-           JOIN harness_health_observations o
-             ON o.correlationId = 'harness-turn:' || t.seq || ':rate-limit-dead'
-           WHERE t.sessionKey=?1 AND t.seq>?2 AND t.status IN ('failed','failed_unknown')
-           ORDER BY t.seq LIMIT 1
-           """,
-           [session_key, delivered]
-         ) do
-      [[first]] -> first
-      [] -> seq
+  @doc """
+  Create the `model-fallback` alert of one limit-fallback outcome (contract c
+  v1.4 R15), inside the transaction that commits the outcome. Only a session
+  whose owner is the alert owner gets one. An applied outcome's `dedupeKey` is
+  `model-fallback:<sessionKey>:<trigger>`, so each switch alerts. A withheld
+  outcome's is `model-fallback:<sessionKey>:withheld:<episode>`, where
+  `episode` is the seq of the first failed turn of the session's limit
+  episode, so a withheld episode alerts once however often it is evaluated.
+  The shared creation path, sender, retry, undelivered and `off` rules apply
+  unchanged, and like `usage-limit` it is never withdrawn as `stale`.
+  """
+  @spec model_fallback_in_txn(Txn.t(), %{
+          required(:session_key) => String.t(),
+          required(:dedupe_ref) => {:applied, String.t()} | {:withheld, pos_integer()},
+          required(:title) => String.t(),
+          required(:body) => String.t(),
+          optional(:turn_seq) => pos_integer() | nil
+        }) :: :ok
+  def model_fallback_in_txn(
+        %Txn{} = txn,
+        %{session_key: session_key, dedupe_ref: dedupe_ref, title: title, body: body} = input
+      ) do
+    with owner when is_binary(owner) <- owner_in_txn(txn),
+         [[^owner]] <-
+           Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      create_in_txn(txn, %{
+        kind: "model-fallback",
+        dedupe_key: model_fallback_dedupe_key(session_key, dedupe_ref),
+        owner: owner,
+        session_key: session_key,
+        turn_seq: Map.get(input, :turn_seq),
+        title: title,
+        body: body
+      })
     end
+
+    :ok
   end
 
-  # The Claude reset Tightbeam parsed from this failure is the due time of
-  # its rate-limit-reset wake. No other provider reset is parsed on this line.
+  defp model_fallback_dedupe_key(session_key, {:applied, trigger_ref})
+       when is_binary(trigger_ref),
+       do: "model-fallback:#{session_key}:#{trigger_ref}"
+
+  defp model_fallback_dedupe_key(session_key, {:withheld, episode})
+       when is_integer(episode) and episode > 0,
+       do: "model-fallback:#{session_key}:withheld:#{episode}"
+
+  # The provider reset Tightbeam parsed from this failure (Claude's
+  # "resets …", or Codex's "try again at …" on the gateway's own host) is the
+  # due time of its rate-limit-reset wake.
   defp reset_at_in_txn(txn, {_, %{observationId: observation_id}})
        when is_binary(observation_id) do
     case Txn.q(txn, "SELECT dueAt FROM wakes WHERE wakeId=?1", [
@@ -570,10 +633,424 @@ defmodule Tightbeam.OwnerAlerts do
     end
   end
 
+  ## (a) stall trigger
+
+  # S1: the owner's open items with at least one open assignment.
+  @candidates_sql """
+  SELECT w.id FROM work_items w
+  WHERE w.ownerUserId=?1 AND w.state='open'
+    AND EXISTS (SELECT 1 FROM assignments a WHERE a.workItemId=w.id AND a.state='open')
+  ORDER BY w.id
+  """
+
+  # S2: an open assignment is covered while it is held (C1, a standing
+  # cannot-proceed; this line has no assignment_hold record), waits on a named
+  # fact or dependency (C2), waits on a decision (C3), or waits on work it
+  # delegated (C4). On this line C4 is an open assignment on the same work
+  # item, opened by this assignment's holder no earlier than this assignment.
+  # A condition wake whose condition already fired is held only for notice
+  # batching; its firedAt is set while it is still pending, so it no longer
+  # waits on anything and covers nothing.
+  @open_assignments_sql """
+  SELECT a.id, a.subject, a.holderKey,
+    EXISTS (SELECT 1 FROM assignment_cannot_proceed c
+            WHERE c.assignmentId=a.id AND c.state='standing')
+    OR EXISTS (SELECT 1 FROM wakes k
+               WHERE k.assignmentId=a.id AND k.state='pending' AND k.firedAt IS NULL
+                 AND (k.conditionKind IS NOT NULL OR k.waitMode='dependency'))
+    OR EXISTS (SELECT 1 FROM decision_requests d
+               WHERE d.assignmentId=a.id AND d.status='open')
+    OR EXISTS (SELECT 1 FROM assignments c
+               WHERE c.workItemId=a.workItemId AND c.state='open' AND c.id<>a.id
+                 AND c.openedBySession=a.holderKey AND c.openedAt>=a.openedAt)
+  FROM assignments a
+  WHERE a.workItemId=?1 AND a.state='open'
+  ORDER BY a.openedAt, a.id
+  """
+
+  # S4: the latest of every progress event (any attest), every opening and
+  # closing of the item's assignments, and the end of every coverage of an open
+  # assignment that has ended. A reopening clears an assignment's closedAt and
+  # keeps it, with the reopening time, on its reopening row. A C4 child is on
+  # the same item on this line, so its closedAt is already an item closing. A
+  # superseded operator request ends when its successor is raised; the
+  # successor names it in its context.
+  @anchor_sql """
+  SELECT MAX(t) FROM (
+    SELECT MAX(x.ts) AS t FROM attests x
+      JOIN assignments a ON a.id=x.assignmentId WHERE a.workItemId=?1
+    UNION ALL SELECT MAX(a.openedAt) FROM assignments a WHERE a.workItemId=?1
+    UNION ALL SELECT MAX(a.closedAt) FROM assignments a WHERE a.workItemId=?1
+    UNION ALL SELECT MAX(r.ts) FROM assignment_reopenings r
+      JOIN assignments a ON a.id=r.assignmentId WHERE a.workItemId=?1
+    UNION ALL SELECT MAX(r.priorClosedAt) FROM assignment_reopenings r
+      JOIN assignments a ON a.id=r.assignmentId WHERE a.workItemId=?1
+    UNION ALL SELECT MAX(c.settledAt) FROM assignment_cannot_proceed c
+      JOIN assignments a ON a.id=c.assignmentId
+      WHERE a.workItemId=?1 AND a.state='open' AND c.state='settled'
+    UNION ALL SELECT MAX(COALESCE(k.firedAt, k.canceledAt)) FROM wakes k
+      JOIN assignments a ON a.id=k.assignmentId
+      WHERE a.workItemId=?1 AND a.state='open'
+        AND (k.conditionKind IS NOT NULL OR k.waitMode='dependency')
+    UNION ALL SELECT MAX(COALESCE(d.ruledAt, d.answeredAt, d.withdrawnAt, d.returnedAt))
+      FROM decision_requests d JOIN assignments a ON a.id=d.assignmentId
+      WHERE a.workItemId=?1 AND a.state='open' AND d.status<>'open'
+    UNION ALL SELECT MAX(n.raisedAt) FROM decision_requests d
+      JOIN assignments a ON a.id=d.assignmentId
+      JOIN decision_requests n
+        ON (CASE WHEN n.kind='operator' AND json_valid(n.context)
+                 THEN json_extract(n.context, '$.supersedes') END)=d.id
+      WHERE a.workItemId=?1 AND a.state='open' AND d.status='superseded'
+  )
+  """
+
+  @last_progress_sql """
+  SELECT x.kind, x.verdictKind, x.ts, a.id, a.subject, s.displayName, x.byUser
+  FROM attests x
+  JOIN assignments a ON a.id=x.assignmentId
+  LEFT JOIN sessions s ON s.sessionKey=x.bySession
+  WHERE a.workItemId=?1
+  ORDER BY x.ts DESC, x.rowid DESC LIMIT 1
+  """
+
+  @doc """
+  Create the stall alert of every item stalled at `now` (§6), and report the
+  earliest future stall time of the items that are not stalled yet.
+
+  Options: `:now` (milliseconds, default the system clock) and
+  `:missed_before`: a stall that came due before this time was missed by the
+  event path, so its creation is logged and marked as a miss. Returns the
+  alert owner (nil when alerts are off), the threshold, the earliest predicted
+  stall time, and counts of created alerts and failed items.
+  """
+  @spec detect_stalls(DB.server(), keyword()) :: %{
+          owner: String.t() | nil,
+          stall_ms: pos_integer() | nil,
+          next_at: integer() | nil,
+          created: non_neg_integer(),
+          errors: non_neg_integer()
+        }
+  def detect_stalls(db \\ DB, opts \\ []) do
+    now = Keyword.get_lazy(opts, :now, fn -> System.system_time(:millisecond) end)
+    missed_before = Keyword.get(opts, :missed_before)
+    q = reader(db)
+
+    case owner_via(q) do
+      nil ->
+        %{owner: nil, stall_ms: nil, next_at: nil, created: 0, errors: 0}
+
+      owner ->
+        stall_ms = stall_ms_via(q)
+        initial = %{owner: owner, stall_ms: stall_ms, next_at: nil, created: 0, errors: 0}
+
+        Enum.reduce(q.(@candidates_sql, [owner]), initial, fn [work_item_id], acc ->
+          try do
+            case stall_status(q, work_item_id, owner, stall_ms, now) do
+              # S6: one alert per stall identity, not counting one withdrawn
+              # as off, which never reached the owner (§7.1 C3-on).
+              {:stalled, anchor} ->
+                if q.("SELECT 1 FROM owner_alerts WHERE dedupeKey=?1 AND #{@holds_key}", [
+                     stall_dedupe_key(work_item_id, anchor)
+                   ]) == [] and create_stall(db, work_item_id, now, missed_before) == :created,
+                   do: %{acc | created: acc.created + 1},
+                   else: acc
+
+              {:due, at} ->
+                %{acc | next_at: if(acc.next_at, do: min(acc.next_at, at), else: at)}
+
+              _quiet_or_out_of_scope ->
+                acc
+            end
+          rescue
+            error ->
+              if overloaded?(error), do: reraise(error, __STACKTRACE__)
+
+              Logger.error(
+                "owner alert stall check of #{work_item_id} failed: #{Exception.message(error)}"
+              )
+
+              %{acc | errors: acc.errors + 1}
+          end
+        end)
+    end
+  end
+
+  defp overloaded?(%DB.Overloaded{}), do: true
+  defp overloaded?(%MatchError{term: {:error, %DB.Overloaded{}}}), do: true
+  defp overloaded?(_error), do: false
+
+  defp stall_status(q, work_item_id, owner, stall_ms, now) do
+    case evaluate(q, work_item_id, owner) do
+      nil -> :out_of_scope
+      %{quiet?: true} -> :quiet
+      %{anchor: anchor} when now - anchor >= stall_ms -> {:stalled, anchor}
+      %{anchor: anchor} -> {:due, anchor + stall_ms}
+    end
+  end
+
+  # §6.1 and §6.2 for one item, from records only: nil when the item is out of
+  # scope, else its anchor, its open assignments and whether it is quiet.
+  defp evaluate(q, work_item_id, owner) do
+    with [[title]] <-
+           q.("SELECT title FROM work_items WHERE id=?1 AND ownerUserId=?2 AND state='open'", [
+             work_item_id,
+             owner
+           ]),
+         [_ | _] = rows <- q.(@open_assignments_sql, [work_item_id]) do
+      [[anchor]] = q.(@anchor_sql, [work_item_id])
+
+      open =
+        Enum.map(rows, fn [id, subject, holder, covered] ->
+          %{id: id, subject: subject, holder: holder, covered?: covered == 1}
+        end)
+
+      %{
+        work_item_id: work_item_id,
+        title: title,
+        anchor: anchor,
+        open: open,
+        quiet?: Enum.all?(open, & &1.covered?)
+      }
+    else
+      _ -> nil
+    end
+  end
+
+  defp stall_dedupe_key(work_item_id, anchor), do: "stall:#{work_item_id}:#{anchor}"
+
+  # A2: the row is created in the transaction that finds the stall, so the
+  # stall is re-evaluated here against the committed records.
+  defp create_stall(db, work_item_id, now, missed_before) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        q = in_txn(txn)
+
+        with owner when is_binary(owner) <- owner_via(q),
+             stall_ms = stall_ms_via(q),
+             %{quiet?: false, anchor: anchor} = item when now - anchor >= stall_ms <-
+               evaluate(q, work_item_id, owner) do
+          stall_at = anchor + stall_ms
+          missed? = is_integer(missed_before) and stall_at < missed_before
+
+          lifecycle =
+            if missed?,
+              do: %{workItemId: work_item_id, anchorAt: anchor, missedEvent: true},
+              else: %{workItemId: work_item_id, anchorAt: anchor}
+
+          created =
+            create_in_txn(txn, %{
+              kind: "stall",
+              dedupe_key: stall_dedupe_key(work_item_id, anchor),
+              owner: owner,
+              work_item_id: work_item_id,
+              anchor_at: anchor,
+              title: stall_title(div(now - anchor, @hour_ms), item.title),
+              body: stall_body(stall_facts(q, item, now)),
+              now: now,
+              lifecycle: Map.put(lifecycle, :lateMs, now - stall_at)
+            })
+
+          case created do
+            {:created, _alert_id} when missed? -> {:missed, anchor, now - stall_at}
+            {:created, _alert_id} -> :created
+            :exists -> :exists
+          end
+        else
+          _ -> :not_stalled
+        end
+      end)
+
+    case result do
+      {:missed, anchor, late_ms} ->
+        Logger.warning(
+          "owner alert event miss: stall of work item #{work_item_id} (anchor #{anchor}) " <>
+            "was found by a later pass, #{late_ms} ms after it came due"
+        )
+
+        :created
+
+      other ->
+        other
+    end
+  end
+
+  defp stall_facts(q, item, now) do
+    last =
+      case q.(@last_progress_sql, [item.work_item_id]) do
+        [[kind, verdict_kind, at, assignment_id, subject, display_name, by_user]] ->
+          %{
+            kind: kind,
+            verdict_kind: verdict_kind,
+            at: at,
+            assignment_id: assignment_id,
+            subject: subject,
+            by:
+              cond do
+                is_binary(display_name) -> "'#{display_name}'"
+                is_binary(by_user) -> "user #{by_user}"
+                true -> "an unknown filer"
+              end
+          }
+
+        [] ->
+          nil
+      end
+
+    {uncovered, covered} = Enum.split_with(item.open, &(not &1.covered?))
+
+    %{
+      work_item_id: item.work_item_id,
+      now: now,
+      last: last,
+      uncovered: uncovered |> Enum.take(@max_listed_uncovered) |> Enum.map(&holder_view(q, &1)),
+      unlisted: max(length(uncovered) - @max_listed_uncovered, 0),
+      covered: length(covered)
+    }
+  end
+
+  defp holder_view(q, assignment) do
+    [[name, harness, model, created_at]] =
+      q.("SELECT displayName, harness, model, createdAt FROM sessions WHERE sessionKey=?1", [
+        assignment.holder
+      ])
+
+    Map.merge(assignment, %{
+      holder_name: name,
+      harness: harness,
+      model: model,
+      state: holder_state(q, assignment.holder, created_at)
+    })
+  end
+
+  # S8's visible holder state, from records only (V3). A running turn is
+  # named as such, but it never covers an assignment (§2).
+  defp holder_state(q, session_key, created_at) do
+    case q.(
+           """
+           SELECT COALESCE(startedAt, createdAt) FROM turns
+           WHERE sessionKey=?1 AND status='running' ORDER BY seq LIMIT 1
+           """,
+           [session_key]
+         ) do
+      [[since]] ->
+        {:running, since}
+
+      [] ->
+        cond do
+          q.(
+            """
+            SELECT 1 FROM harness_health_members m
+            JOIN harness_health_incidents i ON i.id=m.incidentId
+            WHERE m.sessionKey=?1 AND i.state='open' AND i.failureClass='rate-limit-dead'
+            LIMIT 1
+            """,
+            [session_key]
+          ) != [] ->
+            :paused
+
+          q.("SELECT 1 FROM turns WHERE sessionKey=?1 AND status='queued' LIMIT 1", [
+            session_key
+          ]) != [] ->
+            :queued
+
+          true ->
+            [[ended_at]] = q.("SELECT MAX(endedAt) FROM turns WHERE sessionKey=?1", [session_key])
+            {:idle, ended_at || created_at}
+        end
+    end
+  end
+
+  @doc false
+  def stall_title(hours, work_item_title), do: "No progress for #{hours}h: #{work_item_title}"
+
+  @doc false
+  def stall_body(facts) do
+    last =
+      case facts.last do
+        nil ->
+          "Last progress: none yet."
+
+        last ->
+          kind =
+            if last.kind == "verdict" and is_binary(last.verdict_kind),
+              do: "verdict (#{last.verdict_kind})",
+              else: last.kind
+
+          "Last progress: a #{kind} attest at #{format_local(last.at)} " <>
+            "(#{duration(facts.now - last.at)} ago) on '#{last.subject}' " <>
+            "(#{last.assignment_id}), filed by #{last.by}."
+      end
+
+    uncovered =
+      Enum.map(facts.uncovered, fn view ->
+        harness = view.harness |> to_string() |> String.capitalize()
+
+        "- '#{view.subject}' (#{view.id}), held by '#{view.holder_name}' on #{harness}, " <>
+          "model #{view.model || "unknown"}: #{holder_state_text(view.state)}."
+      end)
+
+    unlisted =
+      if facts.unlisted > 0,
+        do: ["- and #{facts.unlisted} more not held or waiting."],
+        else: []
+
+    covered =
+      case facts.covered do
+        0 -> "No other open assignments are held or waiting."
+        1 -> "1 other open assignment is held or waiting."
+        n -> "#{n} other open assignments are held or waiting."
+      end
+
+    Enum.join(
+      ["Work item #{facts.work_item_id}.", last, "Open assignments not held or waiting:"] ++
+        uncovered ++
+        unlisted ++
+        [
+          covered,
+          "No reply needed. This alert repeats only if the work moves and then stalls again."
+        ],
+      "\n"
+    )
+  end
+
+  defp holder_state_text({:running, since}), do: "running a turn since #{format_local(since)}"
+  defp holder_state_text(:queued), do: "queued"
+  defp holder_state_text({:idle, since}), do: "idle since #{format_local(since)}"
+  defp holder_state_text(:paused), do: "its harness is paused by a usage limit"
+
+  defp duration(ms) do
+    ms = max(ms, 0)
+    "#{div(ms, @hour_ms)}h #{div(rem(ms, @hour_ms), 60_000)}m"
+  end
+
+  @doc """
+  After this transaction commits, tell the alert process that a stall input
+  changed without moving any item's anchor: an alert setting, or an item
+  reopened from the icebox. Every other write that can end a stall's quiet or
+  start one moves the anchor, so its stall time is planned by the next pass.
+  """
+  @spec stall_inputs_changed_in_txn(Txn.t()) :: :ok
+  def stall_inputs_changed_in_txn(%Txn{} = txn), do: Txn.handoff(txn, __MODULE__, :stall_inputs)
+
+  # A7: a stall alert is sent only while its stall identity is current. The
+  # threshold is not re-read: a setting change applies to alerts created after
+  # it. Usage-limit alerts report a past event and are never withdrawn as
+  # stale. The caller has already found the recorded owner still current.
+  defp stale_withdrawal_in_txn(_txn, %{kind: kind}) when kind != "stall", do: nil
+
+  defp stale_withdrawal_in_txn(txn, alert) do
+    case evaluate(in_txn(txn), alert.work_item_id, alert.owner) do
+      nil -> {"stale", "out-of-scope"}
+      %{quiet?: true} -> {"stale", "held-or-waiting"}
+      %{anchor: anchor} when anchor != alert.anchor_at -> {"stale", "work-moved"}
+      _current -> nil
+    end
+  end
+
   ## Shared record
 
   defp create_in_txn(txn, input) do
-    now = System.system_time(:millisecond)
+    now = Map.get_lazy(input, :now, fn -> System.system_time(:millisecond) end)
     alert_id = "oal_" <> Id.uuid4()
 
     Txn.q(
@@ -602,9 +1079,14 @@ defmodule Tightbeam.OwnerAlerts do
     )
 
     if Txn.changes(txn) == 1 do
-      lifecycle_in_txn(txn, "owner_alert_created", alert_id, input.kind, "pending", %{
-        dedupeKey: input.dedupe_key
-      })
+      lifecycle_in_txn(
+        txn,
+        "owner_alert_created",
+        alert_id,
+        input.kind,
+        "pending",
+        Map.merge(%{dedupeKey: input.dedupe_key}, Map.get(input, :lifecycle, %{}))
+      )
 
       Txn.handoff(txn, __MODULE__, :due)
       {:created, alert_id}
@@ -723,7 +1205,7 @@ defmodule Tightbeam.OwnerAlerts do
         """
         SELECT alertId, kind, originSessionKey, title, body, state, createdAt, opId,
                attempts, firstFailureAt, lastOutcome, lastFailureReason, nextAttemptAt,
-               ownerUserId
+               ownerUserId, workItemId, anchorAt
         FROM owner_alerts WHERE alertId=?1
         """,
         [alert_id]
@@ -745,7 +1227,9 @@ defmodule Tightbeam.OwnerAlerts do
           last_outcome,
           last_reason,
           next_attempt_at,
-          owner
+          owner,
+          work_item_id,
+          anchor_at
         ]
       ] ->
         %{
@@ -762,7 +1246,9 @@ defmodule Tightbeam.OwnerAlerts do
           last_outcome: last_outcome,
           last_reason: last_reason,
           next_attempt_at: next_attempt_at,
-          owner: owner
+          owner: owner,
+          work_item_id: work_item_id,
+          anchor_at: anchor_at
         }
 
       [] ->
@@ -820,8 +1306,9 @@ defmodule Tightbeam.OwnerAlerts do
 
     # The op id is recorded before anything runs, so a crash at any later
     # point leaves the alert bound to the one operation that may have run.
-    # §7.1 C2-off: the owner setting is re-read in this same transaction,
-    # which records either this attempt or the alert's withdrawal.
+    # §7.1 C2-off and A7: the owner setting, and a stall alert's stall, are
+    # re-evaluated in this same transaction, which records either this attempt
+    # or the alert's withdrawal.
     {:ok, decision} =
       DB.transaction(db, fn txn ->
         case withdrawal_in_txn(txn, alert) do
@@ -852,10 +1339,12 @@ defmodule Tightbeam.OwnerAlerts do
   # withdrawn, never re-addressed: every attempt's origin is the recorded
   # owner's Main. The withdrawal is recorded as `off` with its fine-grained
   # reason (A2), so the alert's key is free for the next trigger (C3-on).
+  # While the owner is current, a stall alert is withdrawn as `stale` if its
+  # stall is stale (A7); that row still holds its key.
   defp withdrawal_in_txn(txn, alert) do
     case owner_in_txn(txn) do
       nil -> {"off", "alerts-off"}
-      owner when owner == alert.owner -> nil
+      owner when owner == alert.owner -> stale_withdrawal_in_txn(txn, alert)
       _other -> {"off", "owner-changed"}
     end
   end
@@ -872,10 +1361,19 @@ defmodule Tightbeam.OwnerAlerts do
 
     if Txn.changes(txn) != 1, do: raise("owner alert is no longer pending")
 
-    lifecycle_in_txn(txn, "owner_alert_withdrawn", alert.alert_id, alert.kind, "withdrawn", %{
-      reason: reason,
-      withdrawnAs: withdrawn_as
-    })
+    subject =
+      if alert.kind == "stall",
+        do: %{workItemId: alert.work_item_id, anchorAt: alert.anchor_at},
+        else: %{}
+
+    lifecycle_in_txn(
+      txn,
+      "owner_alert_withdrawn",
+      alert.alert_id,
+      alert.kind,
+      "withdrawn",
+      Map.merge(subject, %{reason: reason, withdrawnAs: withdrawn_as})
+    )
   end
 
   defp send_op(db, alert, op_id, now, opts) do
@@ -1088,53 +1586,88 @@ defmodule Tightbeam.OwnerAlerts do
     min(next, created_at + @window_ms)
   end
 
-  ## Process: one timer for the earliest due alert
+  ## Process: one timer for the earliest due time
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @impl true
   def init(opts) do
-    send(self(), :due)
+    # The boot pass finds every stall that came due while the gateway was
+    # down (S7) and every pending delivery, from the tables alone.
+    send(self(), {:pass, :boot})
 
     {:ok,
      %{
        db: Keyword.get(opts, :db, DB),
        runner: Keyword.get(opts, :send_runner),
-       timer: nil
+       timer: nil,
+       last_pass_at: nil
      }}
   end
 
   @impl true
-  def handle_cast(:due, state), do: {:noreply, run(state)}
+  def handle_cast(:due, state), do: {:noreply, run(state, :event)}
+  def handle_cast(:stall_inputs, state), do: {:noreply, run(state, :inputs)}
 
   @impl true
-  def handle_info(:due, state), do: {:noreply, run(state)}
+  def handle_info({:pass, reason}, state), do: {:noreply, run(state, reason)}
 
-  defp run(state) do
+  defp run(state, reason) do
     if state.timer, do: Process.cancel_timer(state.timer)
+    now = System.system_time(:millisecond)
 
-    timer =
-      try do
-        errors = deliver_due(state.db, runner: state.runner)
-        arm(state.db, errors > 0)
-      rescue
-        error ->
-          Logger.error("owner alert delivery pass failed: #{Exception.message(error)}")
-          Process.send_after(self(), :due, @repair_delay_ms)
-      end
+    # A stall that came due before the previous pass and is found only now was
+    # missed by the event path. The boot pass and a pass for a changed input
+    # find long-due stalls by design, so neither counts misses.
+    missed_before = if reason in [:boot, :inputs], do: nil, else: state.last_pass_at
 
-    %{state | timer: timer}
+    try do
+      stalls =
+        DB.background_pass(
+          fn -> detect_stalls(state.db, now: now, missed_before: missed_before) end,
+          :deferred
+        )
+
+      {stall_dues, last_pass_at, stall_errors} =
+        case stalls do
+          :deferred ->
+            {[now + @repair_delay_ms], state.last_pass_at, 0}
+
+          %{owner: nil} ->
+            {[], now, 0}
+
+          %{} ->
+            horizon = stalls.stall_ms |> min(@horizon_ms) |> max(@min_horizon_ms)
+            {[stalls.next_at, now + horizon], now, stalls.errors}
+        end
+
+      errors = deliver_due(state.db, runner: state.runner)
+
+      %{
+        state
+        | timer: arm(state.db, stall_dues, errors + stall_errors > 0),
+          last_pass_at: last_pass_at
+      }
+    rescue
+      error ->
+        Logger.error("owner alert pass failed: #{Exception.message(error)}")
+        %{state | timer: Process.send_after(self(), {:pass, :timer}, @repair_delay_ms)}
+    end
   end
 
-  defp arm(db, repair?) do
-    {:ok, [[due]]} =
+  defp arm(db, stall_dues, repair?) do
+    {:ok, [[delivery_due]]} =
       DB.query(db, "SELECT MIN(nextAttemptAt) FROM owner_alerts WHERE state='pending'")
 
-    if is_integer(due) do
-      delay = max(due - System.system_time(:millisecond), 0)
-      delay = if repair?, do: max(delay, @repair_delay_ms), else: delay
-      Process.send_after(self(), :due, delay)
+    case Enum.filter([delivery_due | stall_dues], &is_integer/1) do
+      [] ->
+        nil
+
+      dues ->
+        delay = max(Enum.min(dues) - System.system_time(:millisecond), 0)
+        delay = if repair?, do: max(delay, @repair_delay_ms), else: delay
+        Process.send_after(self(), {:pass, :timer}, delay)
     end
   end
 end

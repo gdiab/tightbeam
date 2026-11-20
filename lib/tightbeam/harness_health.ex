@@ -24,6 +24,7 @@ defmodule Tightbeam.HarnessHealth do
     Id,
     Ledger,
     Org,
+    ParkStranding,
     Wire.Payloads,
     Projection,
     Wakes
@@ -902,6 +903,63 @@ defmodule Tightbeam.HarnessHealth do
   def unavailable?(db \\ DB, harness, host),
     do: ConditionFacts.harness_unavailable?(db, harness, host)
 
+  @doc """
+  The typed carrier of a usage-limit turn failure, or nil. Only the protocol's
+  typed fields count: Codex `codexErrorInfo == "usageLimitExceeded"` and
+  Claude `errorKind == "rate_limit"`. A limit recognized only from text is not
+  a typed limit (contract c: text never switches a session to its fallback).
+  """
+  @spec typed_limit_evidence(term()) :: String.t() | nil
+  def typed_limit_evidence(%{"data" => %{"codexErrorInfo" => "usageLimitExceeded"}}),
+    do: "usageLimitExceeded"
+
+  def typed_limit_evidence(%{"data" => %{"errorKind" => "rate_limit"}}), do: "rate_limit"
+  def typed_limit_evidence(_reason), do: nil
+
+  @doc """
+  The seq of the first failed turn of the session's current limit episode.
+  A limit episode runs from the session's first usage-limit failure to its
+  next delivered turn; a failure after that starts a new one. Its first
+  failure is the earliest `rate-limit-dead` failure after the session's latest
+  delivered turn, or `seq` when none is recorded. A session's lane runs one
+  turn at a time and claims the lowest queued seq, so seq order is the order
+  its turns ended.
+
+  This one definition keys both the owner usage-limit alert (`usage-limit:`,
+  contract b B2) and the withheld limit-fallback outcome (contract c R11,
+  R15), so the two cannot disagree on what one episode is.
+  """
+  @spec limit_episode_first_seq_in_txn(Txn.t(), String.t(), pos_integer()) :: pos_integer()
+  def limit_episode_first_seq_in_txn(%Txn{} = txn, session_key, seq) do
+    delivered =
+      case Txn.q(
+             txn,
+             """
+             SELECT seq FROM turns WHERE sessionKey=?1 AND status='delivered'
+             ORDER BY seq DESC LIMIT 1
+             """,
+             [session_key]
+           ) do
+        [[delivered]] -> delivered
+        [] -> 0
+      end
+
+    case Txn.q(
+           txn,
+           """
+           SELECT t.seq FROM turns t
+           JOIN harness_health_observations o
+             ON o.correlationId = 'harness-turn:' || t.seq || ':rate-limit-dead'
+           WHERE t.sessionKey=?1 AND t.seq>?2 AND t.status IN ('failed','failed_unknown')
+           ORDER BY t.seq LIMIT 1
+           """,
+           [session_key, delivered]
+         ) do
+      [[first]] -> first
+      [] -> seq
+    end
+  end
+
   @doc "Classify a terminal turn reason without collapsing auth and rate limiting."
   @spec classify_turn_failure(term()) :: String.t() | nil
   def classify_turn_failure(%{
@@ -1075,9 +1133,9 @@ defmodule Tightbeam.HarnessHealth do
   defp typed_redelivery_failure_class(_reason), do: nil
 
   @doc "Record classified turn-failure evidence inside the turn's terminal transaction."
-  @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
+  @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term(), keyword()) ::
           nil | (-> :ok)
-  def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+  def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason, opts \\ []) do
     case classify_turn_failure(reason) do
       nil ->
         # The terminal failure path has no assistant output. Preserve a
@@ -1125,11 +1183,17 @@ defmodule Tightbeam.HarnessHealth do
             _ -> "unclassified"
           end
 
-        Wakes.record_health_redelivery_source_in_txn(
-          txn,
-          turn.seq,
-          redelivery_failure_class
-        )
+        # A turn held for a limit-fallback evaluation (contract c R5) gets its
+        # redelivery row from that evaluation's outcome instead: kept as today
+        # when the session is not switched or the turn is replayed, never
+        # written when the switched turn's effects are unknown (R9b).
+        unless Keyword.get(opts, :defer_redelivery, false) do
+          Wakes.record_health_redelivery_source_in_txn(
+            txn,
+            turn.seq,
+            redelivery_failure_class
+          )
+        end
 
         Tightbeam.RateLimitReset.schedule_in_txn(txn, session, result, reason, observed_at)
 
@@ -2288,10 +2352,21 @@ defmodule Tightbeam.HarnessHealth do
     )
 
     if input.failure_class == "rate-limit-dead" do
-      HarnessProcess.begin_park_in_txn(txn, adapter_key(input.harness, input.host))
+      HarnessProcess.begin_quota_park_in_txn(
+        txn,
+        adapter_key(input.harness, input.host),
+        incident_id
+      )
     end
 
     snapshot_affected_work(txn, incident_id, input)
+
+    # Contract v3 R11: the park this incident began has one durable
+    # six-hour stranding check. It runs after the member snapshot, which
+    # supplies its anchor when the observation names no session.
+    if input.failure_class == "rate-limit-dead" do
+      ParkStranding.schedule_in_txn(txn, incident_id, input)
+    end
 
     if input.failure_class == @other_failure_class do
       create_other_review_in_txn(txn, incident_id, input, recipient)
@@ -2379,7 +2454,10 @@ defmodule Tightbeam.HarnessHealth do
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
         if input.failure_class == "rate-limit-dead" do
-          HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
+          # Quota v3 R9(b), a named release (companion v1.2 B2): a later success
+          # lifts the quota park and does what every release does (B5, R12).
+          HarnessProcess.release_quota_park_in_txn(txn, adapter_key(input.harness, input.host))
+          Tightbeam.QuotaRelease.released_in_txn(txn, incident.id, input.harness, input.host)
         end
 
         EventLog.lifecycle_in_txn(
@@ -3771,6 +3849,13 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
+  @doc false
+  # The repair sentence the incident read carries for a class, for a notice
+  # that must repeat today's guidance verbatim (contract v3 R11).
+  @spec repair_message(String.t()) :: String.t()
+  def repair_message(failure_class) when failure_class in @failure_classes,
+    do: repair_guidance(failure_class).message
+
   defp with_repair_guidance(incident),
     do: Map.put(incident, :repair, repair_guidance(incident.failureClass))
 
@@ -3810,7 +3895,7 @@ defmodule Tightbeam.HarnessHealth do
       action: "resume",
       requires: [],
       message:
-        "The harness remains parked until an opener or admin explicitly resumes it after the limit clears."
+        "The park releases at the provider's declared reset when its error names one, or on a later successful turn on this harness and host. Otherwise the opener, an admin, the holder's delivery owner or Main explicitly resumes it after the limit clears."
     }
 
   defp repair_guidance("auth-dead"),

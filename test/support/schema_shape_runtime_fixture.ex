@@ -188,7 +188,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     assert {:ok, _} =
              DB.query(
                db,
-               "UPDATE schema_stamp SET shape='session-identity-v1-0114' WHERE shape='user-removal-v1-0114'"
+               "UPDATE schema_stamp SET shape='session-identity-v1-0114' WHERE shape IN ('user-removal-v1-0114', 'limit-fallback-v1-0114')"
              )
 
     :ok

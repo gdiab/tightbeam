@@ -43,6 +43,13 @@ pub enum TuneControl {
     Effort(String),
     Fast(String),
     Host(String),
+    /// The session's limit-fallback marker: `off` restricts the session from
+    /// the automatic usage-limit fallback (recording who, when and an optional
+    /// reason); `on` clears the marker.
+    LimitFallback {
+        state: String,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +246,10 @@ pub enum Command {
         handle: Option<String>,
         host: Option<String>,
         work_item_id: Option<String>,
+        /// `Some("off")` creates the session already restricted from the
+        /// automatic usage-limit fallback; `off` is the only spawn value.
+        limit_fallback: Option<String>,
+        limit_fallback_reason: Option<String>,
     },
     List {
         identity: Identity,
@@ -905,6 +916,7 @@ COMMANDS:
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
         [--context <variant>] [--host <host>] [--work-item <workItemId>]
+        [--limit-fallback off [--limit-fallback-reason <text>]]
         [--key <idempotencyKey>]
       Hire a new session (a worker). --display is its human label; --name
       registers a role bound to the new session — do NOT confuse it with --as,
@@ -919,7 +931,9 @@ COMMANDS:
       A model is named by FIELDS, never one packed string: --model is the
       model itself, --effort its reasoning level, --context the vendor's
       context-window variant when it offers more than one. All must come from
-      list's model catalog — never invent one.
+      list's model catalog — never invent one. --limit-fallback off creates
+      the session restricted from its archetype's automatic usage-limit
+      fallback model.
 
   list
       Show the sessions you can address (with handles + provenance), the
@@ -945,7 +959,8 @@ COMMANDS:
       End a session deliberately.
 
   tune --session <key> (--harness <harness> [--model <model>] |
-       --model <model> | --effort <level> | --fast on|off | --host <host>)
+       --model <model> | --effort <level> | --fast on|off | --host <host> |
+       --limit-fallback off|on [--limit-fallback-reason <text>])
        [--effort <level>] [--context <variant>]
       Change one runtime control on an existing session. Model identity remains
       separate fields. Same-harness model, effort, and Fast changes preserve the
@@ -955,6 +970,9 @@ COMMANDS:
       unsupported sessions refuse it. Naming the resident harness again is a
       refusal: omit --harness for a same-harness model change. --host moves the
       session workdir to an allowed host and keeps the Tightbeam session.
+      --limit-fallback off restricts the session from its archetype's
+      automatic usage-limit fallback model, recording you, the time and an
+      optional reason; --limit-fallback on removes that restriction.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
                    [--priority <0..8>] [--key <idempotencyKey>]
@@ -2666,6 +2684,19 @@ fn parse_with_optional_catalog(
             let display_name =
                 nonempty(flags, "display").ok_or_else(|| "--display is required".to_owned())?;
             let harness = nonempty(flags, "harness");
+            let limit_fallback = nonempty(flags, "limit-fallback");
+            let limit_fallback_reason = nonempty(flags, "limit-fallback-reason");
+            if flags.contains_key("limit-fallback") && limit_fallback.as_deref() != Some("off") {
+                return Err("--limit-fallback on spawn must be off".to_owned());
+            }
+            if flags.contains_key("limit-fallback-reason")
+                && (limit_fallback.is_none() || limit_fallback_reason.is_none())
+            {
+                return Err(
+                    "--limit-fallback-reason requires a non-empty value and --limit-fallback off"
+                        .to_owned(),
+                );
+            }
             Ok(Command::Spawn {
                 identity: identity(flags)?,
                 owner_user_id: nonempty(flags, "owner"),
@@ -2679,6 +2710,8 @@ fn parse_with_optional_catalog(
                 handle: nonempty(flags, "name"),
                 host: nonempty(flags, "host"),
                 work_item_id: nonempty(flags, "work-item"),
+                limit_fallback,
+                limit_fallback_reason,
             })
         }
         "list" => Ok(Command::List {
@@ -4052,7 +4085,7 @@ fn parse_host_toolchain_set(
 }
 
 fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off | --host <host>)";
+    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off | --host <host> | --limit-fallback off|on [--limit-fallback-reason <text>])";
     const ALLOWED: &[&str] = &[
         "session",
         "harness",
@@ -4061,6 +4094,8 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
         "context",
         "fast",
         "host",
+        "limit-fallback",
+        "limit-fallback-reason",
         "as",
         "as-user",
         "as-process",
@@ -4075,10 +4110,49 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
     };
     let session_key = required("session")?;
 
-    for name in ["harness", "model", "effort", "context", "fast", "host"] {
+    for name in [
+        "harness",
+        "model",
+        "effort",
+        "context",
+        "fast",
+        "host",
+        "limit-fallback",
+        "limit-fallback-reason",
+    ] {
         if flags.contains_key(name) && nonempty(flags, name).is_none() {
             return Err(format!("--{name} requires a non-empty value"));
         }
+    }
+
+    // The limit-fallback marker is its own control: it changes no engine
+    // field, so it travels alone.
+    if let Some(state) = nonempty(flags, "limit-fallback") {
+        if ["harness", "model", "effort", "context", "fast", "host"]
+            .iter()
+            .any(|name| flags.contains_key(*name))
+        {
+            return Err("--limit-fallback is mutually exclusive with --harness, --model, --effort, --context, --fast, and --host".to_owned());
+        }
+        let reason = nonempty(flags, "limit-fallback-reason");
+        match state.as_str() {
+            "off" => {}
+            "on" if reason.is_none() => {}
+            "on" => {
+                return Err(
+                    "--limit-fallback-reason is recorded only with --limit-fallback off".to_owned(),
+                );
+            }
+            _ => return Err("--limit-fallback must be off or on".to_owned()),
+        }
+        return Ok(Command::Tune {
+            identity: identity(flags)?,
+            session_key,
+            control: TuneControl::LimitFallback { state, reason },
+        });
+    }
+    if flags.contains_key("limit-fallback-reason") {
+        return Err("--limit-fallback-reason requires --limit-fallback off".to_owned());
     }
 
     let harness = nonempty(flags, "harness");
@@ -5755,6 +5829,126 @@ mod tests {
                 serde_json::from_str::<serde_json::Value>(&request.body_json).unwrap(),
                 expected
             );
+        }
+    }
+
+    // Contract c R10: the limit-fallback marker is its own tune control and a
+    // spawn option, crossing as `limitFallback` and `limitFallbackReason`.
+    #[test]
+    fn limit_fallback_marker_forms_dispatch_and_illegal_forms_refuse() {
+        let cases = [
+            (
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--limit-fallback",
+                    "off",
+                    "--limit-fallback-reason",
+                    "claude-only review",
+                    "--as-user",
+                    "mike",
+                ]),
+                serde_json::json!({
+                    "asUser": "mike",
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {
+                        "setting": "set_limit_fallback",
+                        "limitFallback": "off",
+                        "limitFallbackReason": "claude-only review"
+                    }
+                }),
+            ),
+            (
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--limit-fallback",
+                    "on",
+                ]),
+                serde_json::json!({
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {"setting": "set_limit_fallback", "limitFallback": "on"}
+                }),
+            ),
+            (
+                strings(&[
+                    "spawn",
+                    "--display",
+                    "Worker",
+                    "--key",
+                    "k",
+                    "--limit-fallback",
+                    "off",
+                    "--limit-fallback-reason",
+                    "family pinned",
+                    "--as-user",
+                    "mike",
+                ]),
+                serde_json::json!({
+                    "asUser": "mike",
+                    "verb": "spawn",
+                    "params": {
+                        "displayName": "Worker",
+                        "idempotencyKey": "k",
+                        "limitFallback": "off",
+                        "limitFallbackReason": "family pinned"
+                    }
+                }),
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let command = parse(args).expect("legal limit-fallback form parses");
+            let request = crate::dispatch::build_request(&command).expect("form dispatches");
+            assert_eq!(request.path, "/agent/dispatch");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request.body_json).unwrap(),
+                expected
+            );
+        }
+
+        for args in [
+            strings(&["tune", "--session", "s_1", "--limit-fallback", "maybe"]),
+            strings(&["tune", "--session", "s_1", "--limit-fallback", ""]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--limit-fallback",
+                "on",
+                "--limit-fallback-reason",
+                "why",
+            ]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--limit-fallback-reason",
+                "no marker",
+            ]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--limit-fallback",
+                "off",
+                "--harness",
+                "claude",
+            ]),
+            strings(&["spawn", "--display", "Worker", "--limit-fallback", "on"]),
+            strings(&[
+                "spawn",
+                "--display",
+                "Worker",
+                "--limit-fallback-reason",
+                "no marker",
+            ]),
+        ] {
+            assert!(parse(args.clone()).is_err(), "accepted {args:?}");
         }
     }
 
@@ -8191,6 +8385,8 @@ mod tests {
                     handle: Some("reviewer".to_owned()),
                     host: Some("testhost-c".to_owned()),
                     work_item_id: None,
+                    limit_fallback: None,
+                    limit_fallback_reason: None,
                 },
             ),
             (

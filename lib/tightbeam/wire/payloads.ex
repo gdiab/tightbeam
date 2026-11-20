@@ -202,6 +202,43 @@ defmodule Tightbeam.Wire.Payloads do
         do: {key, value}
       )
     )
+    |> Map.merge(limit_fallback_fields(s))
+  end
+
+  @doc """
+  A session's limit-fallback state (contract c R10, R8a), each key present
+  only when set: `limitFallbackOff` (the fallback-off marker: by, at, reason)
+  and `fallbackActive` (since, the `from` tuple, trigger).
+  """
+  @spec limit_fallback_fields(map()) :: payload()
+  def limit_fallback_fields(s) do
+    %{}
+    |> put_if_present(
+      "limitFallbackOff",
+      case s[:limit_fallback_off] do
+        nil -> nil
+        marker -> %{"by" => marker.by, "at" => marker.at, "reason" => marker.reason}
+      end
+    )
+    |> put_if_present(
+      "fallbackActive",
+      case s[:fallback_active] do
+        nil ->
+          nil
+
+        state ->
+          %{
+            "since" => state.since,
+            "trigger" => state.trigger,
+            "from" => %{
+              "harness" => state.from.harness,
+              "model" => state.from.model.family,
+              "effort" => state.from.model.effort,
+              "context" => state.from.model.context
+            }
+          }
+      end
+    )
   end
 
   @spec stream_snapshot([payload()]) :: payload()

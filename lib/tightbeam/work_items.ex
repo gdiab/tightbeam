@@ -889,6 +889,8 @@ defmodule Tightbeam.WorkItems do
     end
 
     Txn.q(txn, "UPDATE work_items SET state = 'open', failReason = NULL WHERE id = ?1", [item.id])
+    # Reopening moves no stall anchor, so the item may be stalled already.
+    Tightbeam.OwnerAlerts.stall_inputs_changed_in_txn(txn)
     arm_routing_in_txn(txn, item.id, item.ownerUserId, item.title)
   end
 

@@ -480,7 +480,7 @@ defmodule Tightbeam.UserAdminTest do
       for _boot <- 1..2 do
         assert :ok = Schema.ensure_all(ctx.db)
 
-        assert {:ok, [["user-removal-v1-0114"]]} =
+        assert {:ok, [["limit-fallback-v1-0114"]]} =
                  DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
         assert {:ok, ^users} =
