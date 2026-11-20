@@ -321,17 +321,22 @@ Supported. Give each instance its own `TIGHTBEAM_BASE_DIR` and its own
 
 A release build runs without Erlang distribution: it starts no EPMD, registers no
 node name and listens on no distribution port, so no other process can attach to
-it and run code inside it. The package carries no Erlang cookie.
-`tightbeam-gateway rpc`, `remote` and `eval` are refused.
+it and run code inside it. The package carries no Erlang cookie. `tightbeam-gateway`
+offers only `start`, `stop`, `pid` and `version`; every other command (`eval`, `rpc`,
+`remote`, `start_iex`, `daemon`, ...) is refused, and so is every command but `start`
+and `version` on the release's own `release/bin/tightbeam_gateway`. The launch ignores
+inherited `RELEASE_*`, `ERL_*` and `ELIXIR_*` variables and runs its tools from
+`/usr/bin:/bin`; the gateway gets the service's own `PATH` back once it starts.
 
 For debugging only, an operator can enable distribution by hand in the service's
-environment: `TIGHTBEAM_DEBUG_DISTRIBUTION=loopback`. The node is then
-`tightbeam_gateway_<port>@127.0.0.1`, listening on loopback only, and any EPMD it
-starts listens on loopback only. Its cookie is generated at first start in
-`<base_dir>/debug-distribution.cookie` (mode 0600). Any process of the gateway's
-account can read that cookie and run code in the gateway, so remove the setting and
-restart when you are done. An EPMD that another program already started keeps its
-own addresses.
+environment: `TIGHTBEAM_DEBUG_DISTRIBUTION=loopback:<port>`. The node is then
+`tightbeam_gateway_<TIGHTBEAM_PORT>@127.0.0.1`, listening only on `127.0.0.1:<port>`,
+and it registers with no EPMD. Its cookie is generated at first start in
+`<base_dir>/debug-distribution.cookie` (mode 0600). Attach with
+`erl -name op@127.0.0.1 -setcookie "$(cat <cookie file>)" -start_epmd false
+-dist_listen false -erl_epmd_port <port> -remsh tightbeam_gateway_<TIGHTBEAM_PORT>@127.0.0.1`.
+Any process of the gateway's account can read that cookie and run code in the
+gateway, so remove the setting and restart when you are done.
 
 The lifecycle verbs `tightbeam-gateway stop` and `pid` FIND a running
 gateway through its descriptor at `<base_dir>/gateway.json` — resolved from

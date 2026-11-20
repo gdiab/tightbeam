@@ -6,6 +6,16 @@
 # npm exposes bins as SYMLINKS in node_modules/.bin, so $0's directory is the symlink's
 # home, not the package's. Resolve the link first — measured failure, not speculation:
 # the unresolved form exec'd node_modules/release/... which does not exist.
+
+# Core fix (A), C21.1: this script and the release's launch scripts run their tools
+# (sed, dirname, cut, ...) from system directories only. The service's PATH lists
+# user-writable directories first, and a tool planted there would run inside the
+# gateway's start and could steer the VM's flags. The service's own PATH is handed to
+# the gateway, which restores it at start for the harness CLIs it runs.
+TIGHTBEAM_GATEWAY_PATH="$PATH"
+PATH=/usr/bin:/bin
+export TIGHTBEAM_GATEWAY_PATH PATH
+
 SELF="$0"
 while [ -L "$SELF" ]; do
   LINK="$(readlink "$SELF")"
@@ -24,8 +34,8 @@ REL="$DIR/release/bin/tightbeam_gateway"
 # it. The mix release resolves `stop`/`rpc` by NODE NAME, an inherited
 # RELEASE_NODE wins, and the shared Erlang cookie let the test's `stop` reach and
 # halt PRODUCTION. So the incident verb no longer resolves a node at all: `stop`
-# SIGTERMs the OS pid the descriptor records, identity-gated. `rpc`, `remote` and
-# `eval` are refused: the release runs without Erlang distribution (core C21).
+# SIGTERMs the OS pid the descriptor records, identity-gated. Only start, stop, pid
+# and version are offered; every other verb is refused (core C21).
 #
 # There is NO TIGHTBEAM_HOME fallback, NO ~/.tightbeam default, NO port-derived
 # guess: an absent TIGHTBEAM_BASE_DIR or descriptor is a REFUSAL, so reaching an
@@ -180,26 +190,32 @@ case "$verb" in
     # replace a systemd-managed production with an UNMANAGED process — the exact
     # failure class this work removes. Isolated restart = `stop` then `start`;
     # production restart = `systemctl restart tightbeam`.
-    printf 'tightbeam-gateway: the `restart` verb was removed.\n' >&2
+    printf 'tightbeam-gateway: the `restart` verb was removed (C21.2: only start, stop, pid and version).\n' >&2
     printf '  Isolated restart: run `stop` then `start`.\n' >&2
     printf '  Production restart: `systemctl restart tightbeam`.\n' >&2
     exit 64
     ;;
-  rpc | remote | eval)
-    # Core fix (A), C21.2: the production launcher offers no release debug entry. The
-    # gateway runs without Erlang distribution (rel/env.sh.eex), and no command here
-    # runs code in it or beside it.
-    printf 'tightbeam-gateway: `%s` is not available (C21.2): the gateway offers no route\n' "$verb" >&2
-    printf '  into the running node. Use the routed interfaces: the tightbeam CLI and Chat.\n' >&2
-    exit 64
-    ;;
-  *)
-    # start and every other release verb (version, daemon, ...). The release
-    # runs without Erlang distribution, so it registers no node name and two
-    # instances on one machine cannot collide on one.
+  start | version)
+    # Core fix (A), C21: an ALLOWLIST, not a denylist. `start` runs the gateway and
+    # `version` prints it; `stop` and `pid` are handled above from the descriptor.
+    # Nothing the caller's environment carries reaches the release: every RELEASE_*,
+    # ERL_* and ELIXIR_* variable is cleared here, and the release's env.sh fixes
+    # its own settings again (rel/env.sh.eex), so no flag channel can turn on
+    # distribution or run code. TIGHTBEAM_* settings pass through.
+    for tb_var in $(env | sed -n 's/^\(RELEASE_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(ERL_[A-Za-z0-9_]*\)=.*/\1/p; s/^\(ELIXIR_[A-Za-z0-9_]*\)=.*/\1/p'); do
+      unset "$tb_var"
+    done
     case "${1:-}" in
       "" | -*) set -- start "$@" ;;
     esac
     exec "$REL" "$@"
+    ;;
+  *)
+    # Core fix (A), C21.2: every other verb is refused: the release's start_iex,
+    # daemon, daemon_iex, eval, rpc and remote give a shell, run code or need
+    # Erlang distribution, and the production launcher offers none of them.
+    printf 'tightbeam-gateway: `%s` is not available (C21.2): the gateway offers no route\n' "$verb" >&2
+    printf '  into the running node. Use the routed interfaces: the tightbeam CLI and Chat.\n' >&2
+    exit 64
     ;;
 esac
