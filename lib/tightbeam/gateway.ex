@@ -264,9 +264,6 @@ defmodule Tightbeam.Gateway do
     memory_guard? =
       Map.get(config, :memory_guard, Application.get_env(:tightbeam, :memory_guard, true))
 
-    # A guard this tree runs is expected: while it restarts, launch fencing
-    # waits for it or refuses (R2a), never passes as if none were configured.
-    Tightbeam.MemoryGuard.expect(memory_guard?)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 
     adapter_opts = fn key, context ->
