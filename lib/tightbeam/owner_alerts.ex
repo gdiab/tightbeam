@@ -277,7 +277,8 @@ defmodule Tightbeam.OwnerAlerts do
   defp owner_via(q) do
     case q.("SELECT value FROM org_settings WHERE key=?1", [@owner_setting]) do
       [[user_id]] when is_binary(user_id) and user_id != "" ->
-        # An unknown user, or one removed since it was set, reads as unset.
+        # Only an active user: one removed since the setting was made reads as
+        # unset (removed-user parts; every owner read goes through here).
         if q.("SELECT 1 FROM users WHERE userId=?1 AND removedAt IS NULL", [user_id]) == [[1]],
           do: user_id,
           else: nil
