@@ -302,6 +302,27 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
       epmd.()
     end
 
+    # A cookie file that is not 64 hex characters refuses to start, even at 0600.
+    for bad <- ["short", String.duplicate("g", 64), String.duplicate("a", 63) <> "\n"] do
+      bad_base = Path.join(root, "bad-cookie-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(bad_base)
+      cookie_file = Path.join(bad_base, "debug-distribution.cookie")
+      File.write!(cookie_file, bad)
+      File.chmod!(cookie_file, 0o600)
+
+      {out, status} =
+        System.cmd(probe_packaged, ["start"],
+          env: [
+            {"TIGHTBEAM_DEBUG_DISTRIBUTION", "loopback:#{dist_port}"},
+            {"TIGHTBEAM_BASE_DIR", bad_base}
+          ],
+          stderr_to_stdout: true
+        )
+
+      assert status == 1, "#{inspect(bad)}: #{out}"
+      assert out =~ "must hold 64 hex characters"
+    end
+
     # Malformed or widened settings refuse to start.
     for value <- ~w(loopback loopback:80 loopback:x loopback:70000 wildcard:#{dist_port}) do
       {out, status} =

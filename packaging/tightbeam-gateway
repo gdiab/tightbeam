@@ -171,9 +171,10 @@ do_pid() {
 verb="${1:-}"
 case "$verb" in
   "" | -*)
-    # A LEADING FLAG STILL MEANS `start`. `tightbeam-gateway --erl "+sbwt none"`
-    # passes that option to start; treating a leading `-` as a subcommand would
-    # answer it with `Unknown command --erl`. Only a bare word is a subcommand.
+    # A LEADING FLAG STILL MEANS `start`, so `tightbeam-gateway --anything` starts the
+    # gateway rather than answering `Unknown command`. The flag itself reaches nothing:
+    # the release's `start` takes no options, and the VM's flags come only from the
+    # release's own vm.args (core C21.1). Only a bare word is a subcommand.
     verb=start
     ;;
 esac
