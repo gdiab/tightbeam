@@ -35,17 +35,21 @@ defmodule Tightbeam.MemoryGuard do
   require Logger
 
   alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Org, Placement}
+  alias Tightbeam.DB.Txn
 
   alias Tightbeam.MemoryGuard.{
     Admission,
     Cgroup,
     Episodes,
+    Journal,
+    Publish,
     RootActions,
     Priority,
     Probe,
     ProcTree,
     Records,
     Settings,
+    State,
     Unguarded
   }
 
@@ -215,22 +219,12 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   @doc """
-  A re-admission hook was deferred (R6a): the sampler retries deferred hooks
-  each second until none is pending, so a hook runs once the last standing
-  reason of any kind clears (a memory release, a park release, a fallback
-  outcome).
+  A re-admission hook was deferred (R6a). Deferred hooks are durable open
+  items, visited by the sampler's bounded streams every second, so a hook runs
+  once the last standing reason of any kind clears; nothing needs noting.
   """
   @spec note_deferred() :: :ok
-  def note_deferred do
-    :ets.insert(table(), {:deferred_pending, true})
-    :ok
-  rescue
-    ArgumentError -> :ok
-  end
-
-  defp deferred_pending? do
-    match?([{:deferred_pending, true}], lookup(:deferred_pending))
-  end
+  def note_deferred, do: :ok
 
   @doc false
   @spec note_adapter_exit(String.t() | nil, integer()) :: :ok
@@ -556,12 +550,8 @@ defmodule Tightbeam.MemoryGuard do
       # that failed; all retried each sample.
       pending_markers: %{},
       pending_alerts: %{},
-      # FS9 B4: overrides whose effect is done but whose record failed.
-      pending_applied: MapSet.new(),
       # M3: when re-admitted turns still queued were last nudged.
       readmitted_nudged_at: 0,
-      pending_records: [],
-      pending_removals: MapSet.new(),
       # Sessions whose hold record failed: nudged again so they re-ask.
       renudge: MapSet.new(),
       # FS9: since when the guard's own launch step or records have held
@@ -580,6 +570,10 @@ defmodule Tightbeam.MemoryGuard do
       root_error: nil,
       # FS9: whether this start has ended the episodes of an earlier boot.
       reboot_checked: false,
+      # The bounded streams (agreed design rev 3 D5): per stream, its keyset
+      # cursor and the cycle's high-water key; and whose turn starts.
+      cursors: %{},
+      stream_turn: 0,
       # FS9: what of the guard's own holds launches now (nil: nothing), and
       # this gateway's start (the runtime's), for guard recoveries.
       guard_cause: nil,
@@ -599,7 +593,16 @@ defmodule Tightbeam.MemoryGuard do
       close_confirm_ms: Keyword.get(opts, :close_confirm_ms, 5_000)
     }
 
-    state = state |> determine_all() |> publish_all()
+    state =
+      state
+      |> determine_all()
+      |> publish_all()
+      |> rebuild_kills()
+      |> load_clocks()
+      |> sweep_units()
+
+    # O17: the durable holds come back, a page per message.
+    send(self(), {:rehydrate_holds, nil})
     # Deferrals recorded before a restart are picked up by the first samples.
     note_deferred()
     # v1.13 FS1: the guard answers again, so every `guard_unavailable` hold is
@@ -657,9 +660,27 @@ defmodule Tightbeam.MemoryGuard do
       |> trim_to_cap(host)
       |> release_check(host)
 
-    case state.hosts[host].transition_error do
-      nil -> {:reply, :ok, state}
-      error -> {:reply, {:error, {:not_applied, error}}, state}
+    # D3: a change whose step configuration is not yet written is stored,
+    # not yet applied, like one whose transition is incomplete.
+    pending? =
+      state.hosts[host].local and
+        try do
+          not Publish.config_done?(state.db, host)
+        rescue
+          _ -> true
+        end
+
+    case {state.hosts[host].transition_error, pending?} do
+      {nil, false} ->
+        {:reply, :ok, state}
+
+      {nil, true} ->
+        {:reply,
+         {:error, {:not_applied, "the launch step's settings are not yet written; retried"}},
+         state}
+
+      {error, _} ->
+        {:reply, {:error, {:not_applied, error}}, state}
     end
   end
 
@@ -688,8 +709,6 @@ defmodule Tightbeam.MemoryGuard do
 
   def handle_call(:tick, _from, state) do
     state = sample(%{state | unclosable: MapSet.new()})
-    run_deferred(state)
-    release_step_holds(state)
     state = retry_bookkeeping(state)
     state = stuck(state)
     {:reply, :ok, state}
@@ -729,7 +748,17 @@ defmodule Tightbeam.MemoryGuard do
       )
 
     now = state.clock.()
-    last_used = Enum.reduce(added, state.last_used, &Map.put(&2, {host, &1}, now))
+
+    # O18 (agreed design rev 4 D4): a session the guard has no last use for
+    # (after a restart, or first seen) takes its durable last use, never the
+    # report's time; unknown counts as most recent.
+    last_used =
+      Enum.reduce(added, state.last_used, fn sid, acc ->
+        if Map.has_key?(acc, {host, sid}),
+          do: acc,
+          else: Map.put(acc, {host, sid}, durable_last_use(state.db, sid) || now)
+      end)
+
     state = %{state | adapters: Map.put(state.adapters, adapter, entry), last_used: last_used}
     {:noreply, state |> release_check(host) |> publish_all()}
   end
@@ -737,8 +766,6 @@ defmodule Tightbeam.MemoryGuard do
   @impl true
   def handle_info(:tick, state) do
     state = sample(%{state | unclosable: MapSet.new()})
-    run_deferred(state)
-    release_step_holds(state)
     state = retry_bookkeeping(state)
     state = stuck(state)
     Process.send_after(self(), :tick, state.sample_ms)
@@ -749,36 +776,59 @@ defmodule Tightbeam.MemoryGuard do
 
   # A hold whose release cannot be read or recorded stands, and is released
   # again shortly (FS1: the guard answers).
-  def handle_info(:release_unguarded, state) do
-    released =
-      with {:ok, held} <- Unguarded.held_sessions(state.db, :all) do
-        Enum.reduce(held, :ok, fn {session_key, host, _since}, result ->
-          case Unguarded.release(state.db, session_key, host, "guard_answers") do
-            :ok ->
-              nudge(state, session_key)
-              result
+  # FS1 at start: every guard-down hold is released (the guard answers), and
+  # every lane with a queued turn asks again (a hold that could not be
+  # recorded has no row to release). A page of 64 per message (rev 3 D5); a
+  # release or read that fails is retried.
+  def handle_info(:release_unguarded, state), do: handle_info({:release_unguarded, nil}, state)
 
-            {:error, _} = error ->
-              error
-          end
-        end)
-      end
+  def handle_info({:release_unguarded, cursor}, state) do
+    case State.page(state.db, "unguarded_hold", nil, cursor, nil, 64) do
+      {:ok, holds} ->
+        failed =
+          for %{subject: key, host: host} <- holds,
+              Unguarded.release(state.db, key, host, "guard_answers") != :ok,
+              do: key
 
-    with {:error, reason} <- released do
-      Logger.warning("memory guard: guard_unavailable holds not yet released: #{reason}")
-      Process.send_after(self(), :release_unguarded, 1_000)
+        for %{subject: key} <- holds, key not in failed, do: nudge(state, key)
+
+        cond do
+          failed != [] ->
+            Logger.warning("memory guard: guard_unavailable holds not yet released, retried")
+            Process.send_after(self(), {:release_unguarded, cursor}, 1_000)
+
+          length(holds) == 64 ->
+            last = List.last(holds)
+            send(self(), {:release_unguarded, {last.opened_at, last.ref}})
+
+          true ->
+            send(self(), {:nudge_queued, nil})
+        end
+
+      {:error, error} ->
+        Logger.warning("memory guard: guard_unavailable holds cannot be read, retried: #{error}")
+        Process.send_after(self(), {:release_unguarded, cursor}, 1_000)
     end
 
-    # A lane held while the guard was down whose hold could not be recorded
-    # has no row to release: every lane with a queued turn asks again now
-    # (once per guard start), so none waits on a nudge that never comes.
-    case DB.query(state.db, "SELECT DISTINCT sessionKey FROM turns WHERE status='queued'", []) do
+    {:noreply, state}
+  end
+
+  def handle_info({:nudge_queued, after_key}, state) do
+    case DB.query(
+           state.db,
+           """
+           SELECT DISTINCT sessionKey FROM turns
+           WHERE status='queued' AND sessionKey > ?1 ORDER BY sessionKey LIMIT 64
+           """,
+           [after_key || ""]
+         ) do
       {:ok, rows} ->
-        for [session_key] <- rows, do: nudge(state, session_key)
+        for [key] <- rows, do: nudge(state, key)
+        if length(rows) == 64, do: send(self(), {:nudge_queued, rows |> List.last() |> hd()})
 
       {:error, error} ->
         Logger.warning("memory guard: queued lanes cannot be read, retried: #{inspect(error)}")
-        Process.send_after(self(), :release_unguarded, 1_000)
+        Process.send_after(self(), {:nudge_queued, after_key}, 1_000)
     end
 
     {:noreply, state}
@@ -811,44 +861,80 @@ defmodule Tightbeam.MemoryGuard do
   # R1/R2 in watched mode: the kill is published as an ended tree, and counts
   # for settlement, only once the tree is shown gone. A failed kill is
   # recorded and retried by the next sample, which still sees it over its limit.
-  def handle_info({:killed, id, result}, state) do
+  # A kill's outcome (agreed design rev 3 D1): `proof` says whether a call
+  # proved a signal was sent. Only a proven send is attributed (FS6); the
+  # outcome, its record and the journal's `done` are one transaction. One that
+  # cannot be written stays in the journal and the resolver decides it.
+  def handle_info({:killed, id, result, proof}, state) do
     {kill, killing} = Map.pop(state.killing, id)
     state = %{state | killing: killing}
 
-    case {kill, result} do
-      {nil, _} ->
+    case {kill, result, proof} do
+      {nil, _, _} ->
         {:noreply, state}
 
-      {kill, :ok} ->
+      {kill, :ok, :sent} ->
         :ets.insert(table(), {{:kill, id}, Map.put(kill, :confirmed, true)})
-        state = record_ended(state, kill.host, kill)
-        {:noreply, publish_all(state)}
 
-      {_kill, {:error, :ended_before_send}} ->
+        {:noreply,
+         state |> complete_kill(kill, "ended", ended_record(state, kill)) |> publish_all()}
+
+      {kill, {:error, :ended_before_send}, _} ->
         # FS6: the tree ended before this guard's kill was sent: not a memory
         # kill. The record stays, marked, so settlement says harness_exited.
+        {:noreply, complete_kill(state, kill, "ended_before_send", nil)}
+
+      {kill, :ok, :not_sent} ->
+        # Shown gone without a proven send of ours: not attributed (A5, D1).
+        :ets.insert(table(), {{:kill, id}, Map.put(kill, :ended_before_send, true)})
+        {:noreply, complete_kill(state, kill, "unattributed_end", nil)}
+
+      {kill, {:error, reason}, :sent} ->
+        # The kill was sent (FS6 attributes it), but the tree was not shown
+        # gone: recorded, and the next sample retries while it is over its limit.
+        {:noreply, complete_kill(state, kill, "failed", failed_record(kill, inspect(reason)))}
+
+      {kill, {:error, _reason}, :not_sent} ->
+        :ets.insert(table(), {{:kill, id}, Map.put(kill, :ended_before_send, true)})
+        {:noreply, complete_kill(state, kill, "not_sent", nil)}
+    end
+  end
+
+  # O17 (agreed design): the holds as they were, with their place in line and
+  # their durable start; a waiting marker not yet posted is posted (its key is
+  # that start, so one already posted is not posted again). 64 per message.
+  def handle_info({:rehydrate_holds, cursor}, state) do
+    case State.page(state.db, "hold", nil, cursor, nil, 64) do
+      {:ok, rows} ->
+        state =
+          Enum.reduce(rows, state, fn %{
+                                        subject: key,
+                                        host: host,
+                                        detail: detail,
+                                        opened_at: since
+                                      },
+                                      acc ->
+            %{"details" => details, "seq" => seq} = JSON.decode!(detail)
+            held = %{host: host, seq: seq, details: details, since: since}
+            acc = %{acc | held: Map.put(acc.held, key, held)}
+
+            with %{} = session <- Org.get(acc.db, key),
+                 true <- Priority.user_originated_pending?(acc.db, key),
+                 [detail | _] <- Map.keys(details) do
+              waiting_marker(acc, session, detail, since)
+            else
+              _ -> acc
+            end
+          end)
+
+        if length(rows) == 64,
+          do: send(self(), {:rehydrate_holds, {List.last(rows).opened_at, List.last(rows).ref}})
+
         {:noreply, state}
 
-      {kill, {:error, reason}} ->
-        # The kill was sent (FS6 attributes it), but the tree was not shown
-        # gone: recorded (kept and retried if the record fails, FS7), and the
-        # next sample retries while it is over its limit.
-        state =
-          record_effect(
-            state,
-            "memory_kill_failed",
-            kill.host,
-            JSON.encode!(%{
-              host: kill.host,
-              unit: id,
-              scope: kill.scope,
-              limit: kill.limit,
-              sessionId: kill.sid,
-              launchId: kill.launch_id,
-              error: inspect(reason)
-            })
-          )
-
+      {:error, error} ->
+        Logger.warning("memory guard: holds not rehydrated, retried: #{error}")
+        Process.send_after(self(), {:rehydrate_holds, cursor}, 1_000)
         {:noreply, state}
     end
   end
@@ -985,9 +1071,11 @@ defmodule Tightbeam.MemoryGuard do
         end
       end
 
-    published =
+    # The step's configuration for this mode: published only after the mode
+    # record that decides it commits (agreed design O6, D3).
+    config_bytes =
       if local? do
-        Records.publish_config(state.base_dir, %{
+        Publish.config_bytes(%{
           mode: mode,
           fs: if(mode == "enforced" and layout, do: layout.fs),
           harness: if(mode == "enforced" and layout, do: layout.harness),
@@ -1003,9 +1091,7 @@ defmodule Tightbeam.MemoryGuard do
         [
           settings_gap,
           (match?({:unavailable, _}, step) and mode in ["watched", "enforced"]) &&
-            "session processes are not limited one by one: the launch step is unavailable (#{elem(step, 1)})",
-          match?({:error, _}, published) &&
-            "the launch step's settings could not be written: #{inspect(elem(published, 1))}"
+            "session processes are not limited one by one: the launch step is unavailable (#{elem(step, 1)})"
         ],
         &(&1 in [nil, false])
       )
@@ -1014,23 +1100,12 @@ defmodule Tightbeam.MemoryGuard do
     reason = if reason == "", do: nil, else: reason
 
     # FS7: the mode is in force only with its step in place. A step that
-    # could not be installed, or settings that could not be published, leave
-    # the change incomplete: recorded as a transition, so the mode is not read
-    # as in force, and retried every sample.
+    # could not be installed leaves the change incomplete: recorded as a
+    # transition, so the mode is not read as in force, and retried every
+    # sample. (Settings not yet written are a pending publication, below.)
     step_gap =
-      cond do
-        not local? ->
-          nil
-
-        match?({:error, _}, published) ->
-          "the launch step's settings could not be written"
-
-        match?({:unavailable, _}, step) and mode in ["watched", "enforced"] ->
-          "the launch step is not in place"
-
-        true ->
-          nil
-      end
+      if local? and match?({:unavailable, _}, step) and mode in ["watched", "enforced"],
+        do: "the launch step is not in place"
 
     transition = transition || step_gap
 
@@ -1043,8 +1118,9 @@ defmodule Tightbeam.MemoryGuard do
       layout: layout,
       step: step,
       # The step is in place only when it is installed and its configuration
-      # was published (FS1 A3, FS2).
-      step_ready: is_binary(step) and published == :ok,
+      # for the committed mode is published (FS1 A3, FS2; set below).
+      step_ready: false,
+      config_bytes: config_bytes,
       available: previous && previous.available,
       floor_held: (previous && previous.floor_held) || false,
       floor_since: previous && previous.floor_since,
@@ -1059,7 +1135,8 @@ defmodule Tightbeam.MemoryGuard do
 
     changed? =
       is_nil(previous) or previous.mode != mode or previous.reason != reason or
-        previous.settings != settings or previous.transition_error != transition
+        previous.settings != settings or previous.transition_error != transition or
+        Map.get(previous, :config_bytes) != config_bytes
 
     # FS7 (F7): a mode change and its record are one step. When the record
     # cannot be written the change is not established: the gateway's own host
@@ -1068,21 +1145,40 @@ defmodule Tightbeam.MemoryGuard do
     host_state =
       if changed? do
         try do
-          EventLog.lifecycle(
-            state.db,
-            "memory_guard_mode",
-            host,
-            JSON.encode!(%{
-              host: host,
-              mode: mode,
-              reason: reason,
-              # Not nil while the requested change is not yet in force (FS3); a
-              # down guard's admission reads the mode in force from this (FS1).
-              transition: transition,
-              settings: settings_json(settings),
-              invalid: settings.invalid
-            })
-          )
+          now = state.clock.()
+
+          {:ok, publish} =
+            DB.transaction(state.db, fn txn ->
+              publish = config_bytes && Publish.config_in_txn(txn, host, config_bytes, now)
+
+              EventLog.lifecycle_in_txn(
+                txn,
+                "memory_guard_mode",
+                host,
+                JSON.encode!(%{
+                  host: host,
+                  mode: mode,
+                  reason: reason,
+                  # Not nil while the requested change is not yet in force (FS3); a
+                  # down guard's admission reads the mode in force from this (FS1).
+                  transition: transition,
+                  settings: settings_json(settings),
+                  invalid: settings.invalid,
+                  # Its step configuration's publication (D3): not in force
+                  # until that is done.
+                  publish: publish
+                })
+              )
+
+              publish
+            end)
+
+          # After the commit: write the file; one that cannot be written stays
+          # pending and is retried (the guard's resolver, or the Watcher).
+          with true <- is_binary(publish),
+               {:error, error} <-
+                 Publish.config(state.db, state.base_dir, publish, config_bytes, now),
+               do: Logger.warning("memory guard: launch step settings not yet written: #{error}")
 
           host_state
         rescue
@@ -1092,34 +1188,51 @@ defmodule Tightbeam.MemoryGuard do
 
             fallback = if(local? and mode in ["enforced", "off"], do: "watched", else: mode)
 
-            # The step was already told the unrecorded mode: tell it the mode
-            # the guard now acts on, or hold launches if that cannot be said.
-            republished =
-              if fallback != mode,
-                do:
-                  Records.publish_config(state.base_dir, %{
-                    mode: fallback,
-                    fs: nil,
-                    harness: nil,
-                    sessionLimit: settings.session_limit,
-                    oomRaise: 100
-                  }),
-                else: :ok
-
+            # Nothing was published for the unrecorded mode (D3), and the step
+            # still reads the last committed one: launches that need the step
+            # are held until the record is written (retried every sample).
             %{
               host_state
               | mode: fallback,
                 reason: Enum.join(Enum.reject([host_state.reason, gap], &is_nil/1), "; "),
                 transition_error: host_state.transition_error || gap,
-                step_ready: host_state.step_ready and republished == :ok
+                config_bytes: Map.get(previous || %{}, :config_bytes),
+                step_ready: :unrecorded
             }
         end
       else
         host_state
       end
 
-    %{state | hosts: Map.put(state.hosts, host, host_state)}
+    %{state | hosts: Map.put(state.hosts, host, step_ready(state, host, host_state))}
   end
+
+  # D3: launches that need the step are admitted only while the committed
+  # mode's configuration is published (no `publish_config` pending). While it
+  # is pending the mode reads "requested, not applied".
+  defp step_ready(state, host, %{local: true} = host_state) do
+    pending? =
+      try do
+        not Publish.config_done?(state.db, host)
+      rescue
+        _ -> true
+      end
+
+    ready = host_state.step_ready != :unrecorded and is_binary(host_state.step) and not pending?
+    gap = "not yet applied: the launch step's settings are not yet written"
+
+    %{
+      host_state
+      | step_ready: ready,
+        reason:
+          if(pending? and not String.contains?(host_state.reason || "", gap),
+            do: Enum.join(Enum.reject([host_state.reason, gap], &is_nil/1), "; "),
+            else: host_state.reason
+          )
+    }
+  end
+
+  defp step_ready(_state, _host, host_state), do: %{host_state | step_ready: false}
 
   # `{mode, reason, layout, lift, transition}` for a host that can enforce.
   defp enter_enforced(state, previous, probe, settings) do
@@ -1331,33 +1444,53 @@ defmodule Tightbeam.MemoryGuard do
         details = host_reasons ++ List.wrap(step_reason) ++ List.wrap(cap_reason)
         {:held, details, hold(state, session, seq, details)}
 
+      # FS9 B4 (agreed design D2): an admission under a guard override is
+      # journaled first, naming the exact turn; `override_applied` follows
+      # only from that turn's durable claim. If the intent cannot be written,
+      # the launch is not admitted.
+      overriding != [] and override_intent(state, overriding, session, seq) != :ok ->
+        {:held, ["guard_unavailable"], hold(state, session, seq, ["guard_unavailable"])}
+
       true ->
         state =
           state
           |> reserve(session, launch, reserved?)
           |> resume_if_held(session.session_key)
           |> mark_busy(session.session_key, session.host)
-          |> overrides_done(overriding)
 
         {:ok, state}
     end
   end
 
-  # FS9 B4: an override's effect is done; record `override_applied` now. A
-  # record that cannot be written is kept and retried each sample (FS7); a
-  # crash before it is written leaves the override accepted, and the next
-  # effect carried out from that state records it.
-  defp overrides_done(state, episode_ids) do
-    Enum.reduce(episode_ids, state, fn id, acc ->
-      case Episodes.applied(acc.db, id) do
-        :ok ->
-          %{acc | pending_applied: MapSet.delete(acc.pending_applied, id)}
+  defp override_intent(state, episode_ids, session, seq) do
+    now = state.clock.()
 
-        {:error, reason} ->
-          Logger.warning("memory guard: override #{id} applied, not yet recorded: #{reason}")
-          %{acc | pending_applied: MapSet.put(acc.pending_applied, id)}
+    DB.transaction(state.db, fn txn ->
+      for id <- episode_ids do
+        Journal.intend_in_txn(
+          txn,
+          "override_admission",
+          "#{id}:#{seq}",
+          session.host,
+          session.session_key,
+          %{episodeId: id, sessionKey: session.session_key, seq: seq},
+          now
+        )
       end
     end)
+    |> case do
+      {:ok, _} ->
+        :ok
+
+      {:error, error} ->
+        Logger.warning(
+          "memory guard: override admission not journaled, held: #{Exception.message(error)}"
+        )
+
+        :error
+    end
+  catch
+    :exit, _ -> :error
   end
 
   defp host_level_reasons(%{mode: mode} = host_state) when mode in ["watched", "enforced"] do
@@ -1432,33 +1565,131 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
-  # R3a: how many sessions waiting for a launch on this host go before
-  # `session` (class first, then the oldest waiting turn).
+  # R3a: whether a session waiting for a launch on this host goes before
+  # `session` (class first, then the oldest waiting turn): 1 if one does, 0 if
+  # none (agreed design rev 3 D5: an indexed, bounded selection).
   defp waiting_ahead(state, session, seq) do
-    mine = {Priority.rank(Priority.class(state.db, session)), seq}
-
-    state
-    |> waiters(session.host, session.session_key)
-    |> Enum.count(fn {_key, place} -> place < mine end)
+    case eligible_waiters(
+           state,
+           session.host,
+           session.session_key,
+           order_key(state, session, seq),
+           1
+         ) do
+      {[], :complete} -> 0
+      _ -> 1
+    end
   end
 
-  # Sessions on `host` still waiting for a launch, each with its place
-  # `{class rank, oldest queued seq}`: held here, a turn still queued, no other
-  # standing reason (R6a: priority never admits past a park), and not the
-  # reserved Main, which never competes for a slot under the cap (R3b).
-  defp waiters(state, host, exclude) do
-    reserved = reserved_main_key(state)
+  @hold_page 32
+  @hold_examine 256
 
-    for {key, %{host: ^host}} <- state.held,
-        key != exclude,
-        key != reserved,
-        seq <- [oldest_queued(state.db, key)],
-        is_integer(seq),
-        Admission.other_reasons(state.db, key) == [],
-        %{} = session <- [Org.get(state.db, key)] do
-      {key, {Priority.rank(Priority.class(state.db, session)), seq}}
+  # Up to `want` confirmed-eligible waiters on `host` ahead of `before` (an
+  # order key, or nil for all), in order, from the eligible-holds index.
+  # Each candidate's other reasons and queued turn are confirmed; a stale row
+  # is marked blocked (or dropped, its turn gone) for good, in one transaction
+  # per page, so stale rows ahead only ever decrease. At most 256 rows are
+  # examined: `{waiters, :complete | :cut}`, and `:cut` is read as "someone
+  # may be ahead" (held, safe; the next evaluation goes further).
+  defp eligible_waiters(state, host, exclude, before, want) do
+    reserved = reserved_main_key(state)
+    walk_eligible(state, host, [exclude, reserved], before, want, nil, 0, [])
+  end
+
+  defp walk_eligible(_state, _host, _skip, _before, want, _cursor, _examined, acc)
+       when length(acc) >= want,
+       do: {Enum.reverse(acc), :complete}
+
+  defp walk_eligible(_state, _host, _skip, _before, _want, _cursor, examined, acc)
+       when examined >= @hold_examine,
+       do: {Enum.reverse(acc), :cut}
+
+  defp walk_eligible(state, host, skip, before, want, cursor, examined, acc) do
+    {after_key, after_ref} = cursor || {"", ""}
+
+    {:ok, rows} =
+      DB.query(
+        state.db,
+        """
+        SELECT ref, orderKey FROM memory_guard_open
+        WHERE kind='hold' AND host=?1 AND blocked IS NULL
+          AND (orderKey, ref) > (?2, ?3) AND orderKey < ?4
+        ORDER BY orderKey, ref LIMIT ?5
+        """,
+        [host, after_key, after_ref, before || "~", @hold_page]
+      )
+
+    {confirmed, stale} =
+      rows
+      |> Enum.reject(fn [ref, _] -> ref in skip end)
+      |> Enum.reduce({[], []}, fn [ref, _], {ok, stale} ->
+        cond do
+          is_nil(oldest_queued(state.db, ref)) ->
+            {ok, [{ref, :gone} | stale]}
+
+          (reasons = Admission.other_reasons(state.db, ref)) != [] ->
+            {ok, [{ref, hd(reasons)} | stale]}
+
+          true ->
+            {[ref | ok], stale}
+        end
+      end)
+
+    if stale != [] do
+      DB.transaction(state.db, fn txn ->
+        for {ref, why} <- stale do
+          if why == :gone,
+            do: drop_hold_in_txn(txn, ref),
+            else:
+              Txn.q(txn, "UPDATE memory_guard_open SET blocked=?2 WHERE kind='hold' AND ref=?1", [
+                ref,
+                why
+              ])
+        end
+      end)
     end
-    |> Enum.sort_by(&elem(&1, 1))
+
+    acc = Enum.reverse(confirmed) |> Enum.reduce(acc, &[&1 | &2])
+
+    case rows do
+      rows when length(rows) < @hold_page ->
+        {acc |> Enum.reverse() |> Enum.take(want), :complete}
+
+      rows ->
+        [last_ref, last_key] = List.last(rows)
+
+        walk_eligible(
+          state,
+          host,
+          skip,
+          before,
+          want,
+          {last_key, last_ref},
+          examined + length(rows),
+          acc
+        )
+    end
+  end
+
+  defp backlog_read(state) do
+    for {stream, {cursor, _high}} <- state.cursors, cursor != nil, into: %{} do
+      probe =
+        case stream do
+          {:journal, kind} -> Journal.backlog(state.db, state.local_host, kind)
+          {:open, "step_hold"} -> State.backlog(state.db, "step_hold", state.local_host)
+          {:open, kind} -> State.backlog(state.db, kind, nil)
+          :readmitted -> State.backlog(state.db, "readmitted_queued", nil)
+        end
+
+      name = if is_tuple(stream), do: elem(stream, 1), else: Atom.to_string(stream)
+
+      {name,
+       case probe do
+         {:ok, :more} -> "more than 256"
+         {:ok, :within} -> "256 or fewer"
+         {:error, _} -> "unknown"
+       end}
+    end
   end
 
   defp reserved_main_key(state) do
@@ -1561,57 +1792,131 @@ defmodule Tightbeam.MemoryGuard do
 
   ## Holds (R6, R6a, R7)
 
+  # O17 (agreed design): a hold is a durable row (`memory_guard_open`, kind
+  # `hold`) with its reasons, original `since`, place in line (`orderKey`),
+  # its other standing reason (`blocked`, NULL when eligible) and its adapter
+  # key, written in one transaction with its `memory_guard_hold` records. FS7
+  # (I3): if that transaction fails, the hold is not established; the turn
+  # stays unclaimed and the lane is nudged to ask again.
   defp hold(state, session, seq, details) do
     now = state.clock.()
 
     previous =
       Map.get(state.held, session.session_key, %{details: %{}, host: session.host, seq: seq})
 
-    # FS7 (I3): a hold and its record are one step. A detail whose record
-    # cannot be written is not established; the turn stays unclaimed and the
-    # lane is nudged to ask again.
-    recorded =
-      for detail <- details, not Map.has_key?(previous.details, detail) do
-        {detail,
-         record(
-           state,
-           "memory_guard_hold",
-           session.session_key,
-           JSON.encode!(%{
-             host: session.host,
-             reasonClass: "host_capacity",
-             detail: detail,
-             since: now,
-             condition: condition(state, session.host, detail)
-           })
-         )}
-      end
+    new = for detail <- details, not Map.has_key?(previous.details, detail), do: detail
 
-    failed = for {detail, {:error, _}} <- recorded, do: detail
+    held_details =
+      for detail <- details, into: %{}, do: {detail, Map.get(previous.details, detail, now)}
 
-    new_details =
-      for detail <- details, detail not in failed, into: %{} do
-        {detail, Map.get(previous.details, detail, now)}
-      end
+    order_key = order_key(state, session, seq)
+    blocked = blocked_reason(state, session.session_key)
+    adapter_key = adapter_key_of(session)
 
-    state =
-      if failed == [],
-        do: state,
-        else: %{state | renudge: MapSet.put(state.renudge, session.session_key)}
+    result =
+      DB.transaction(state.db, fn txn ->
+        for detail <- new do
+          EventLog.lifecycle_in_txn(
+            txn,
+            "memory_guard_hold",
+            session.session_key,
+            JSON.encode!(%{
+              host: session.host,
+              reasonClass: "host_capacity",
+              detail: detail,
+              since: now,
+              condition: condition(state, session.host, detail)
+            })
+          )
+        end
 
-    held = %{host: session.host, seq: seq, details: new_details}
+        if held_details == %{} do
+          drop_hold_in_txn(txn, session.session_key)
+          nil
+        else
+          put_hold_in_txn(txn, session, held_details, seq, order_key, blocked, adapter_key, now)
+        end
+      end)
 
-    state =
-      if new_details == %{},
-        do: %{state | held: Map.delete(state.held, session.session_key)},
-        else: %{state | held: Map.put(state.held, session.session_key, held)}
+    case result do
+      {:ok, nil} ->
+        %{state | held: Map.delete(state.held, session.session_key)}
 
-    # R7: a user-originated turn that becomes held gets one plain-words
-    # marker in its own conversation, once per hold.
-    if previous.details == %{} and
-         Priority.user_originated_pending?(state.db, session.session_key),
-       do: waiting_marker(state, session, hd(details), now),
-       else: state
+      {:ok, since} ->
+        held = %{host: session.host, seq: seq, details: held_details, since: since}
+        state = %{state | held: Map.put(state.held, session.session_key, held)}
+
+        # R7: a user-originated turn that becomes held gets one plain-words
+        # marker in its own conversation, once per hold: its key is the hold's
+        # durable start (O9), so a restart never makes a second one.
+        if previous.details == %{} and
+             Priority.user_originated_pending?(state.db, session.session_key),
+           do: waiting_marker(state, session, hd(details), since),
+           else: state
+
+      {:error, _} ->
+        %{state | renudge: MapSet.put(state.renudge, session.session_key)}
+    end
+  end
+
+  # Returns the hold's durable start (`openedAt`), kept across updates.
+  defp put_hold_in_txn(txn, session, details, seq, order_key, blocked, adapter_key, now) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO memory_guard_open
+        (kind, ref, subject, host, detail, openedAt, orderKey, blocked, adapterKey)
+      VALUES ('hold', ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      ON CONFLICT(kind, ref) DO UPDATE SET host=excluded.host, detail=excluded.detail,
+        orderKey=excluded.orderKey, blocked=excluded.blocked, adapterKey=excluded.adapterKey
+      """,
+      [
+        session.session_key,
+        session.host,
+        JSON.encode!(%{details: details, seq: seq}),
+        now,
+        order_key,
+        blocked,
+        adapter_key
+      ]
+    )
+
+    [[since]] =
+      Txn.q(txn, "SELECT openedAt FROM memory_guard_open WHERE kind='hold' AND ref=?1", [
+        session.session_key
+      ])
+
+    since
+  end
+
+  defp drop_hold_in_txn(txn, session_key) do
+    Txn.q(txn, "DELETE FROM memory_guard_open WHERE kind='hold' AND ref=?1", [session_key])
+  end
+
+  # R3a: class first, then the oldest waiting turn; zero-padded so the text
+  # orders as the numbers do.
+  defp order_key(state, session, seq) do
+    rank = Priority.rank(Priority.class(state.db, session))
+
+    String.pad_leading(Integer.to_string(rank), 2, "0") <>
+      ":" <> String.pad_leading(Integer.to_string(seq), 20, "0")
+  end
+
+  defp blocked_reason(state, session_key) do
+    case Admission.other_reasons(state.db, session_key) do
+      [] -> nil
+      [reason | _] -> reason
+    end
+  rescue
+    _ -> "unknown"
+  end
+
+  defp adapter_key_of(session) do
+    HarnessProcess.adapter_key_name(
+      {Harness.parse!(session.harness).id(), "shared", session.host}
+    )
+  rescue
+    _ -> nil
   end
 
   defp waiting_marker(state, session, detail, since) do
@@ -1722,27 +2027,425 @@ defmodule Tightbeam.MemoryGuard do
         notify_stuck(acc, pending.episode, pending.message)
       end)
 
-    state = overrides_done(state, MapSet.to_list(state.pending_applied))
+    for session_key <- state.renudge, do: nudge(state, session_key)
+    state = %{state | renudge: MapSet.new()}
+    state |> renudge_ready() |> drain_streams()
+  end
 
-    {records, failed} =
-      Enum.split_with(state.pending_records, fn {kind, subject, detail} ->
-        record(state, kind, subject, detail) == :ok
-      end)
+  ## The journal's resolvers and the bounded streams (agreed design: rev 2 (b)–(d),
+  ## as amended by rev 3 D1/D5, rev 4 D1/D4 and rev 5)
 
-    _ = records
-    state = %{state | pending_records: failed}
+  @open_streams [
+    {:open, "hold"},
+    {:open, "memory_readmission"},
+    {:open, "quota_readmission"},
+    {:open, "step_hold"}
+  ]
 
-    state =
-      Enum.reduce(state.pending_removals, state, fn {fs, unit} = removal, acc ->
-        case Cgroup.remove(fs, unit) do
-          :ok -> %{acc | pending_removals: MapSet.delete(acc.pending_removals, removal)}
-          {:error, _} -> acc
+  @sample_budget 64
+  @page_rows 32
+
+  # One sample's bounded work (rev 3 D5): ten streams, six journal kinds and
+  # four kinds of open items, take turns (the first rotates each sample).
+  # Each gets an equal part of the remaining budget of 64 actions, at most a
+  # page of 32, at least 1. An action costs at most one transaction. A
+  # stream's cycle runs from its cursor up to the high-water key read when the
+  # cycle began, so rows added meanwhile wait for the next cycle.
+  defp drain_streams(state) do
+    streams = Enum.map(Journal.kinds(), &{:journal, &1}) ++ @open_streams
+    n = length(streams)
+    offset = rem(state.stream_turn, n)
+    ordered = Enum.drop(streams, offset) ++ Enum.take(streams, offset)
+
+    {state, _budget} =
+      ordered
+      |> Enum.with_index()
+      |> Enum.reduce({state, @sample_budget}, fn {stream, i}, {acc, budget} ->
+        if budget <= 0 do
+          {acc, 0}
+        else
+          share = budget |> div(n - i) |> max(1) |> min(@page_rows)
+          {acc, used} = drain_stream(acc, stream, share)
+          {acc, budget - used}
         end
       end)
 
-    for session_key <- state.renudge, do: nudge(state, session_key)
-    state = %{state | renudge: MapSet.new()}
-    renudge_ready(state)
+    _ = Journal.prune(state.db, state.clock.())
+    %{state | stream_turn: state.stream_turn + 1}
+  rescue
+    error ->
+      Logger.warning("memory guard: stream pass failed, retried: #{Exception.message(error)}")
+      state
+  end
+
+  defp drain_stream(state, stream, limit) do
+    {cursor, high} = Map.get(state.cursors, stream, {nil, nil})
+
+    high =
+      high ||
+        case stream_high(state, stream) do
+          {:ok, high} -> high
+          {:error, _} -> nil
+        end
+
+    with true <- high != nil,
+         {:ok, rows} <- stream_page(state, stream, cursor, high, limit) do
+      state = Enum.reduce(rows, state, &stream_act(&2, stream, &1))
+
+      next =
+        if length(rows) < limit,
+          do: {nil, nil},
+          else: {stream_key(stream, List.last(rows)), high}
+
+      {%{state | cursors: Map.put(state.cursors, stream, next)}, length(rows)}
+    else
+      _ -> {%{state | cursors: Map.put(state.cursors, stream, {nil, nil})}, 0}
+    end
+  end
+
+  # The journal pages the local host's rows; open items page every host
+  # (one guard serves them all) on the age index, except step holds, which
+  # only the local host has.
+  defp stream_high(state, {:journal, kind}),
+    do: Journal.high_water(state.db, state.local_host, kind)
+
+  defp stream_high(state, {:open, "step_hold"}),
+    do: State.high_water(state.db, "step_hold", state.local_host)
+
+  defp stream_high(state, {:open, kind}), do: State.high_water(state.db, kind, nil)
+
+  defp stream_page(state, {:journal, kind}, cursor, high, limit),
+    do: Journal.page(state.db, state.local_host, kind, cursor, high, limit)
+
+  defp stream_page(state, {:open, "step_hold"}, cursor, high, limit),
+    do: State.page(state.db, "step_hold", state.local_host, cursor, high, limit)
+
+  defp stream_page(state, {:open, kind}, cursor, high, limit),
+    do: State.page(state.db, kind, nil, cursor, high, limit)
+
+  defp stream_key({:journal, _}, row), do: {row.created_at, row.id}
+  defp stream_key({:open, _}, row), do: {row.opened_at, row.ref}
+
+  defp stream_act(state, {:journal, _}, effect), do: resolve_effect(state, effect)
+
+  # R6 / [SPIRIT] (matrix M1): a held lane is never stranded by a lost nudge:
+  # a held session no reason holds now is nudged again.
+  defp stream_act(state, {:open, "hold"}, %{subject: session_key}) do
+    if evaluate_reasons(state, session_key) == [] and
+         Admission.other_reasons(state.db, session_key) == [],
+       do: nudge(state, session_key)
+
+    state
+  rescue
+    _ -> state
+  end
+
+  # Deferred hooks run once no memory reason stands on their host (R6a).
+  defp stream_act(state, {:open, kind}, %{host: host} = item)
+       when kind in ["memory_readmission", "quota_readmission"] do
+    with %{} = host_state <- Map.get(state.hosts, host),
+         [] <- host_level_reasons(host_state) do
+      result =
+        if kind == "memory_readmission",
+          do: Admission.run_memory_item(state.db, item),
+          else: Admission.run_quota_item(state.db, item)
+
+      with {:error, error} <- result,
+           do: Logger.warning("memory guard: deferred re-admission retried: #{error}")
+    end
+
+    state
+  end
+
+  # FS2: once everything the step needs is in place, a step-refusal hold is
+  # released and its lane nudged.
+  defp stream_act(state, {:open, "step_hold"}, %{subject: session_key}) do
+    with %{step_ready: true} <- Map.get(state.hosts, state.local_host),
+         :ok <- Records.step_prerequisites(state.base_dir, state.root),
+         :ok <- Admission.step_ready(state.db, session_key, state.local_host),
+         do: nudge(state, session_key)
+
+    state
+  end
+
+  defp resolve_effect(state, %{kind: "tree_kill"} = e) do
+    if Enum.any?(state.killing, fn {_id, kill} -> kill[:effect_id] == e.id end),
+      do: state,
+      else: resolve_kill(state, e)
+  end
+
+  defp resolve_effect(state, %{kind: "idle_close"} = e) do
+    if Enum.any?(state.closing, fn {_ref, closing} -> closing[:effect] == e.id end),
+      do: state,
+      else: resolve_close(state, e)
+  end
+
+  defp resolve_effect(state, %{kind: "unit_remove", intent: %{"unit" => unit, "fs" => fs}} = e) do
+    done? =
+      case Cgroup.remove(fs, unit) do
+        :ok -> true
+        {:error, _} -> Cgroup.populated?(fs, unit) == :gone
+      end
+
+    if done?, do: complete_effect(state, e.id, %{outcome: "removed"}, fn _txn -> :ok end)
+    state
+  end
+
+  defp resolve_effect(state, %{kind: "override_admission"} = e), do: resolve_override(state, e)
+
+  defp resolve_effect(state, %{kind: "publish_config"} = e) do
+    case Publish.resolve_config(state.db, state.base_dir, e, state.clock.()) do
+      :ok ->
+        # The configuration now matches the committed mode: launches may go.
+        %{state | hosts: Map.update!(state.hosts, e.host, &step_ready(state, e.host, &1))}
+
+      {:error, error} ->
+        Logger.warning("memory guard: launch step settings still not written: #{error}")
+        state
+    end
+  rescue
+    _ -> state
+  end
+
+  defp resolve_effect(state, %{kind: "publish_marker"} = e) do
+    with {:error, error} <- Publish.marker(state.db, e, state.clock.()),
+         do: Logger.warning("memory guard: inventory marker still not written: #{error}")
+
+    state
+  end
+
+  # Complete a journal row and its records in one transaction; a failure
+  # leaves the row for the next visit.
+  defp complete_effect(state, id, outcome, records) do
+    now = state.clock.()
+
+    case DB.transaction(state.db, fn txn ->
+           if Journal.complete_in_txn(txn, id, outcome, now), do: records.(txn)
+         end) do
+      {:ok, _} ->
+        :ok
+
+      {:error, error} ->
+        Logger.warning("memory guard: #{id} not yet completed: #{Exception.message(error)}")
+        :error
+    end
+  end
+
+  # Rev 3 D1: what the tree's state proves, from the kill's intent.
+  defp resolve_kill(state, e) do
+    kill = kill_from_intent(e)
+    target = target_from_intent(e.intent["target"])
+    sent_at = e.dispatch && e.dispatch["sentAt"]
+    window = 2 * Application.get_env(:tightbeam, :memory_guard_kill_wait_ms, 5_000)
+
+    case {e.phase, tree_evidence(state, Map.get(state.hosts, e.host), target)} do
+      {_, :unknown} ->
+        state
+
+      {"intended", :gone} ->
+        complete_kill(state, kill, "unattributed_end", nil)
+
+      {"intended", :alive} ->
+        complete_kill(state, kill, "not_sent", nil)
+
+      {"dispatched", :gone} ->
+        attributed = Map.merge(kill, %{sent_at: sent_at, confirmed: true})
+        :ets.insert(table(), {{:kill, kill.unit_id}, attributed})
+        complete_kill(state, kill, "ended", ended_record(state, kill))
+
+      {"dispatched", :alive} ->
+        if is_integer(sent_at) and state.clock.() >= sent_at + window,
+          do:
+            complete_kill(
+              state,
+              kill,
+              "failed",
+              failed_record(kill, "not shown gone after the kill")
+            ),
+          else: state
+    end
+  end
+
+  defp kill_from_intent(%{id: id, host: host, intent: intent}) do
+    %{
+      effect_id: id,
+      unit_id: intent["unit"],
+      host: host,
+      scope: intent["scope"],
+      limit: intent["limit"],
+      sid: intent["sid"],
+      key: intent["key"] && parse_key(intent["key"]),
+      launch_id: intent["launchId"],
+      bytes: intent["bytes"],
+      limit_bytes: intent["limitBytes"],
+      mode: intent["mode"],
+      at: intent["at"],
+      confirmed: false
+    }
+  end
+
+  defp target_from_intent(%{"scope" => "adapter"} = t),
+    do: %{scope: "adapter", row: %{os_pid: t["pid"]}, unit: t["unit"], members: []}
+
+  defp target_from_intent(t),
+    do: %{scope: "session", pid: t["pid"], start: t["start"], unit: t["unit"], members: []}
+
+  # `:gone`, `:alive` or `:unknown`: a tree whose root or unit cannot be read
+  # proves neither.
+  defp tree_evidence(state, host_state, target) do
+    {pid, _start} = root_of(target) || {nil, nil}
+    unit = Map.get(target, :unit)
+    fs = unit_fs(state, host_state)
+
+    cond do
+      is_integer(pid) and ProcTree.unreadable?(state.root, pid) -> :unknown
+      is_binary(unit) and is_binary(fs) and Cgroup.populated?(fs, unit) == :unreadable -> :unknown
+      gone?(state, host_state, target) -> :gone
+      true -> :alive
+    end
+  end
+
+  # Rev 4/5: what the session process's state proves, from the close's phase.
+  defp resolve_close(state, e) do
+    effect = %{id: e.id, host: e.host, intent: e.intent}
+    sent_at = e.dispatch && e.dispatch["sentAt"]
+
+    case {e.phase, session_process_evidence(state, e)} do
+      {_, :unknown} ->
+        state
+
+      {"intended", :gone} ->
+        close_outcome(state, effect, :unconfirmed)
+
+      {"intended", :alive} ->
+        close_outcome(state, effect, :abandoned)
+
+      {"dispatched", :gone} ->
+        close_outcome(state, effect, :confirmed)
+
+      {"dispatched", :alive} ->
+        if is_integer(sent_at) and state.clock.() >= sent_at + state.close_confirm_ms,
+          do:
+            close_outcome(state, effect, {:failed, "close issued, the process is still running"}),
+          else: state
+    end
+  end
+
+  # A session process with no launch record left is gone (records are removed
+  # only once their tree is shown gone); with one, its tree's state decides.
+  defp session_process_evidence(state, e) do
+    sid = e.intent["sid"]
+
+    if state.inventory_error do
+      :unknown
+    else
+      case state.launches |> Map.values() |> Enum.filter(&(&1["sessionId"] == sid)) do
+        [] ->
+          :gone
+
+        records ->
+          record = Enum.max_by(records, &(&1["launchedAt"] || 0))
+
+          tree_evidence(state, Map.get(state.hosts, e.host), %{
+            scope: "session",
+            pid: record["pid"],
+            start: record["start"],
+            unit: if(record["placement"] == "enforced", do: record["unit"]),
+            members: []
+          })
+      end
+    end
+  end
+
+  # Agreed design D2: `override_applied` only from the exact turn's durable
+  # claim after the decision; an unclaimed end is `not_applied`.
+  defp resolve_override(state, e) do
+    seq = e.intent["seq"]
+    episode_id = e.intent["episodeId"]
+
+    case DB.query(state.db, "SELECT status, startedAt FROM turns WHERE seq=?1", [seq]) do
+      {:ok, [[_status, started]]} when is_integer(started) and started >= e.created_at ->
+        complete_effect(
+          state,
+          e.id,
+          %{outcome: "applied"},
+          &Episodes.applied_in_txn(&1, episode_id)
+        )
+
+        state
+
+      {:ok, [["queued", nil]]} ->
+        nudge(state, e.intent["sessionKey"])
+        state
+
+      {:ok, _ended_unclaimed_or_gone} ->
+        complete_effect(state, e.id, %{outcome: "not_applied"}, fn _txn -> :ok end)
+        state
+
+      {:error, _} ->
+        state
+    end
+  end
+
+  # O5/O16 at start: an empty unit under the harness subtree that no launch
+  # record or live adapter row names (a removal lost to a restart, or a launch
+  # that never started) is removed, or journaled for the resolver.
+  defp sweep_units(state) do
+    with %{layout: %{} = layout} <- Map.get(state.hosts, state.local_host),
+         {:ok, units} <- Cgroup.units(layout) do
+      named =
+        MapSet.new(for {_id, r} <- state.launches, is_binary(r["unit"]), do: r["unit"])
+
+      live =
+        try do
+          for row <- HarnessProcess.list(state.db),
+              row.state in ["launching", "running", "park_requested"],
+              do: Cgroup.adapter_unit(layout, row.launch_id)
+        rescue
+          _ -> :unknown
+        end
+
+      if live != :unknown do
+        live = MapSet.new(live)
+
+        for unit <- units,
+            not MapSet.member?(named, unit),
+            not MapSet.member?(live, unit),
+            Cgroup.populated?(layout.fs, unit) == false,
+            do: remove_unit(state, layout.fs, unit)
+      end
+    end
+
+    state
+  rescue
+    error ->
+      Logger.warning("memory guard: unit sweep skipped: #{Exception.message(error)}")
+      state
+  end
+
+  # At start: the kill attribution settlement needs (FS6) is rebuilt from the
+  # journal, from proven sends only (rev 3 D1), for the retention window.
+  defp rebuild_kills(state) do
+    since = state.clock.() - @kill_retention_ms
+
+    case Journal.recent(state.db, state.local_host, "tree_kill", since, 256) do
+      {:ok, effects} ->
+        for %{dispatch: %{"sentAt" => sent_at}} = e <- effects,
+            e.phase == "dispatched" or e.outcome == %{"outcome" => "ended"} do
+          kill =
+            e
+            |> kill_from_intent()
+            |> Map.merge(%{sent_at: sent_at, confirmed: e.phase == "done"})
+
+          :ets.insert(table(), {{:kill, kill.unit_id}, kill})
+        end
+
+        state
+
+      {:error, error} ->
+        Logger.warning("memory guard: kill attribution not rebuilt: #{error}")
+        state
+    end
   end
 
   # R6 / [SPIRIT] (matrix M1, M3): a held turn is never stranded by a lost
@@ -1750,20 +2453,27 @@ defmodule Tightbeam.MemoryGuard do
   # now, and every 30 s every re-admitted turn still queued (its handoff may
   # not have reached the lane). A lane nudged needlessly re-asks and is held.
   defp renudge_ready(state) do
-    for {session_key, _held} <- state.held,
-        evaluate_reasons(state, session_key) == [],
-        Admission.other_reasons(state.db, session_key) == [],
-        do: nudge(state, session_key)
-
     # M3's safety net for a lost handoff after a re-admission's commit: it
     # costs one probe per re-admission of the last hour, so it runs at most
     # every 30 s, not every sample (review R3).
     now = state.clock.()
 
+    # A page of 64 per pass on the age index with a global cursor (rev 3 D5).
     if now - state.readmitted_nudged_at >= @readmitted_nudge_ms do
-      case Admission.readmitted_queued(state.db) do
-        {:ok, sessions} ->
-          for session_key <- sessions, do: nudge(state, session_key)
+      {cursor, high} = Map.get(state.cursors, :readmitted, {nil, nil})
+
+      with {:ok, high} when high != nil <-
+             if(high, do: {:ok, high}, else: State.high_water(state.db, "readmitted_queued", nil)),
+           {:ok, rows} <- State.page(state.db, "readmitted_queued", nil, cursor, high, 64),
+           :ok <- Admission.readmitted_page(state.db, rows, now) |> nudge_all(state) do
+        next =
+          if length(rows) < 64,
+            do: {nil, nil},
+            else: {{List.last(rows).opened_at, List.last(rows).ref}, high}
+
+        %{state | readmitted_nudged_at: now, cursors: Map.put(state.cursors, :readmitted, next)}
+      else
+        {:ok, nil} ->
           %{state | readmitted_nudged_at: now}
 
         {:error, reason} ->
@@ -1795,37 +2505,47 @@ defmodule Tightbeam.MemoryGuard do
     :exit, reason -> {:error, inspect(reason)}
   end
 
-  # An effect that already happened outside the database: its record is kept
-  # and retried until it is written, never dropped (FS7, matrix I3).
-  defp record_effect(state, kind, subject, detail) do
-    case record(state, kind, subject, detail) do
-      :ok ->
-        state
-
-      {:error, _} ->
-        %{state | pending_records: state.pending_records ++ [{kind, subject, detail}]}
-    end
-  end
-
-  # FS7 (C10): a unit that cannot be removed is recorded and retried; never
-  # evidence that a tree ended.
+  # FS7 (C10): a unit that cannot be removed is recorded, and its removal is
+  # a journal obligation (`unit_remove`) retried by the resolver across
+  # restarts; never evidence that a tree ended. If even that row cannot be
+  # written, the start sweep finds the empty unit (O16).
   defp remove_unit(state, fs, unit) do
     case Cgroup.remove(fs, unit) do
       :ok ->
         state
 
       {:error, error} ->
-        state =
-          once(state, {:unit_remove_failed, unit}, fn ->
-            record(
-              state,
-              "memory_guard_unit_remove_failed",
-              unit,
-              JSON.encode!(%{unit: unit, error: error})
-            )
-          end)
+        now = state.clock.()
 
-        %{state | pending_removals: MapSet.put(state.pending_removals, {fs, unit})}
+        DB.transaction(state.db, fn txn ->
+          Journal.intend_in_txn(
+            txn,
+            "unit_remove",
+            "#{unit}:#{now}",
+            state.local_host,
+            unit,
+            %{unit: unit, fs: fs},
+            now
+          )
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "memory_guard_unit_remove_failed",
+            unit,
+            JSON.encode!(%{unit: unit, error: error})
+          )
+        end)
+        |> case do
+          {:ok, _} ->
+            state
+
+          {:error, e} ->
+            Logger.warning(
+              "memory guard: unit #{unit} not removed, not journaled: #{Exception.message(e)}"
+            )
+
+            state
+        end
     end
   end
 
@@ -1854,10 +2574,22 @@ defmodule Tightbeam.MemoryGuard do
         1
 
       seq ->
-        mine = {Priority.rank(Priority.class(state.db, session)), seq}
-
-        ahead =
-          state |> waiters(session.host, session.session_key) |> Enum.count(&(elem(&1, 1) < mine))
+        # A capped count on the eligible-holds index (rev 3 D5).
+        {:ok, [[ahead]]} =
+          DB.query(
+            state.db,
+            """
+            SELECT COUNT(*) FROM (SELECT 1 FROM memory_guard_open
+              WHERE kind='hold' AND host=?1 AND blocked IS NULL AND orderKey < ?2
+                AND ref != ?3 AND ref != ifnull(?4, '') LIMIT 257)
+            """,
+            [
+              session.host,
+              order_key(state, session, seq),
+              session.session_key,
+              reserved_main_key(state)
+            ]
+          )
 
         ahead + 1
     end
@@ -1869,12 +2601,19 @@ defmodule Tightbeam.MemoryGuard do
         state
 
       {held, rest} ->
-        EventLog.lifecycle(
-          state.db,
-          "admission_resumed",
-          session_key,
-          JSON.encode!(%{host: held.host, after: Map.keys(held.details)})
-        )
+        # The hold's row and the resumption record are one step; if it cannot
+        # be written the admission does not happen (safe_admission holds).
+        {:ok, _} =
+          DB.transaction(state.db, fn txn ->
+            drop_hold_in_txn(txn, session_key)
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "admission_resumed",
+              session_key,
+              JSON.encode!(%{host: held.host, after: Map.keys(held.details)})
+            )
+          end)
 
         %{state | held: rest}
     end
@@ -1889,9 +2628,10 @@ defmodule Tightbeam.MemoryGuard do
     if Map.has_key?(state.held, reserved) and Map.get(state.held, reserved).host == host,
       do: nudge(state, reserved)
 
-    state
-    |> waiters(host, reserved)
-    |> Enum.each(fn {key, _place} -> nudge(state, key) end)
+    # The first confirmed-eligible waiters, a page at most (rev 3 D5); the
+    # rest are nudged by later releases and the per-sample hold stream.
+    {waiting, _} = eligible_waiters(state, host, reserved, nil, @hold_page)
+    Enum.each(waiting, &nudge(state, &1))
 
     state
   end
@@ -2062,6 +2802,7 @@ defmodule Tightbeam.MemoryGuard do
   # shown gone; one whose fence was lifted by an override stays open, its
   # orphans shown (FS9), until custody_ends_on_proof sees them gone.
   defp custody_cleared(state, key) do
+    clear_clock(state, custody_clock(key))
     %{state | custody_refused: Map.delete(state.custody_refused, key)}
   end
 
@@ -2090,7 +2831,7 @@ defmodule Tightbeam.MemoryGuard do
 
     cond do
       cause && is_nil(state.guard_stuck_since) ->
-        %{state | guard_stuck_since: now}
+        %{state | guard_stuck_since: stuck_clock(state, guard_clock(host), host)}
 
       cause && now - state.guard_stuck_since >= Episodes.stuck_ms() ->
         open_episode(state, %{
@@ -2113,6 +2854,7 @@ defmodule Tightbeam.MemoryGuard do
         for %{"kind" => "guard", "episodeId" => id} <- Episodes.active(state.db, host),
             do: Episodes.finish(state.db, id, "the memory guard answers")
 
+        if state.guard_stuck_since, do: clear_clock(state, guard_clock(host))
         %{state | guard_stuck_since: nil}
     end
   end
@@ -2339,7 +3081,73 @@ defmodule Tightbeam.MemoryGuard do
   defp custody_refused(state, key) do
     if Map.has_key?(state.custody_refused, key),
       do: state,
-      else: put_in(state.custody_refused[key], %{since: state.clock.()})
+      else:
+        put_in(state.custody_refused[key], %{
+          since: stuck_clock(state, custody_clock(key), elem(key, 2))
+        })
+  end
+
+  # O10 (agreed design): a stuck condition's start is a durable open item, so
+  # FS9's "15 minutes without a break" counts across a restart. If it cannot
+  # be written, the clock starts now (later, never earlier, than the truth).
+  defp stuck_clock(state, ref, host) do
+    now = state.clock.()
+
+    case DB.transaction(state.db, fn txn ->
+           Txn.q(
+             txn,
+             """
+             INSERT INTO memory_guard_open (kind, ref, subject, host, openedAt)
+             VALUES ('stuck_clock', ?1, ?1, ?2, ?3) ON CONFLICT(kind, ref) DO NOTHING
+             """,
+             [ref, host, now]
+           )
+
+           Txn.q(
+             txn,
+             "SELECT openedAt FROM memory_guard_open WHERE kind='stuck_clock' AND ref=?1",
+             [ref]
+           )
+         end) do
+      {:ok, [[since]]} -> since
+      _ -> now
+    end
+  end
+
+  defp clear_clock(state, ref) do
+    with {:error, error} <-
+           DB.transaction(
+             state.db,
+             &Txn.q(&1, "DELETE FROM memory_guard_open WHERE kind='stuck_clock' AND ref=?1", [ref])
+           ),
+         do:
+           Logger.warning(
+             "memory guard: stuck clock #{ref} not cleared: #{Exception.message(error)}"
+           )
+
+    :ok
+  end
+
+  defp custody_clock({_harness, _preset, host} = key),
+    do: "#{host}:custody:#{HarnessProcess.adapter_key_name(key)}"
+
+  defp guard_clock(host), do: "#{host}:guard"
+
+  # At start: the stuck clocks of this host, as they were.
+  defp load_clocks(state) do
+    case State.list(state.db, "stuck_clock", state.local_host) do
+      {:ok, clocks} ->
+        Enum.reduce(clocks, state, fn %{ref: ref, opened_at: since}, acc ->
+          case String.split(ref, ":custody:", parts: 2) do
+            [_host, name] -> put_in(acc.custody_refused[parse_key(name)], %{since: since})
+            [_guard] -> %{acc | guard_stuck_since: since}
+          end
+        end)
+
+      {:error, error} ->
+        Logger.warning("memory guard: stuck clocks not loaded: #{error}")
+        state
+    end
   end
 
   # FS2: the step refused this session's launch twice; it waits until the
@@ -2350,26 +3158,6 @@ defmodule Tightbeam.MemoryGuard do
 
   # FS2: once everything the step needs is in place, every step-refusal hold
   # is released and its lane nudged.
-  defp release_step_holds(state) do
-    case Admission.step_held_sessions(state.db, state.local_host) do
-      {:ok, []} ->
-        :ok
-
-      {:error, reason} ->
-        Logger.warning("memory guard: step holds cannot be read, retried: #{reason}")
-
-      {:ok, held} ->
-        with %{step_ready: true} <- Map.get(state.hosts, state.local_host),
-             :ok <- Records.step_prerequisites(state.base_dir, state.root) do
-          for session_key <- held,
-              Admission.step_ready(state.db, session_key, state.local_host) == :ok,
-              do: nudge(state, session_key)
-        end
-    end
-
-    :ok
-  end
-
   # FS4 scope: a launch is decided on Tightbeam's own inventories, read at the
   # decision; while either cannot be read the launch is held (FS1).
   defp inventory_reason(state) do
@@ -2556,20 +3344,32 @@ defmodule Tightbeam.MemoryGuard do
     state.before_close_commit.(session_key)
 
     case closing_mark(state, host, sid, session_key, reason) do
-      :ok ->
+      {:ok, effect, marker_key} ->
         guard = self()
         ref = make_ref()
         closer = state.closer
         idle_check = state.idle_check
         confirm = fn -> close_shown_complete(state, sid) end
+        db = state.db
+        clock = state.clock
 
         Task.start(fn ->
           result =
             case idle_check.(adapter, sid) do
               :idle ->
                 case closer.(adapter, sid, reason) do
-                  :ok -> confirm.()
-                  other -> other
+                  :ok ->
+                    # Rev 4 D1: only this record proves the close was issued.
+                    with {:error, error} <- Journal.dispatch(db, effect, %{sentAt: clock.()}),
+                         do:
+                           Logger.warning(
+                             "memory guard: close of #{sid} issued, not recorded: #{error}"
+                           )
+
+                    confirm.()
+
+                  other ->
+                    other
                 end
 
               other ->
@@ -2585,6 +3385,8 @@ defmodule Tightbeam.MemoryGuard do
           adapter: adapter,
           session_key: session_key,
           reason: reason,
+          effect: effect,
+          marker_key: marker_key,
           waiters: []
         }
 
@@ -2595,8 +3397,28 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
-  # The conditional `closing` transaction (K1, K6, K7).
+  # The conditional `closing` transaction (K1, K6, K7), with the close's
+  # journal intent (agreed design rev 4/5): the session process's identity
+  # and the one marker key every outcome of this close shares.
   defp closing_mark(state, host, sid, session_key, reason) do
+    now = state.clock.()
+    close_id = Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+    marker_key = "closed:#{session_key}:#{sid}:#{close_id}"
+
+    record =
+      state.launches
+      |> Map.values()
+      |> Enum.filter(&(&1["sessionId"] == sid))
+      |> Enum.max_by(&(&1["launchedAt"] || 0), fn -> nil end)
+
+    intent = %{
+      sid: sid,
+      sessionKey: session_key,
+      reason: reason,
+      markerKey: marker_key,
+      target: record && %{pid: record["pid"], start: record["start"], unit: record["unit"]}
+    }
+
     DB.transaction(state.db, fn txn ->
       pending =
         DB.Txn.q(
@@ -2613,7 +3435,18 @@ defmodule Tightbeam.MemoryGuard do
           JSON.encode!(%{host: host, sessionId: sid, reason: reason})
         )
 
-        :ok
+        effect =
+          Journal.intend_in_txn(
+            txn,
+            "idle_close",
+            "#{sid}:#{close_id}",
+            host,
+            session_key,
+            intent,
+            now
+          )
+
+        {:ok, effect, marker_key}
       else
         {:not_idle, "a turn of the session is queued or running"}
       end
@@ -2665,36 +3498,10 @@ defmodule Tightbeam.MemoryGuard do
     state =
       case result do
         :ok ->
-          # v1.6 R4's residual: without async-task updates an idle close also
-          # ends a background shell task the session left running; the close
-          # says so, and the session is told once (AS4).
-          residual? = not Tightbeam.Acp.Adapter.async_tasks_observed?()
-
-          # The close is shown complete (FS5): its event is retried until
-          # written (FS7, I3), and its marker delivered at most once (I2).
-          state =
-            record_effect(
-              state,
-              "memory_guard_idle_closed",
-              closing.session_key || closing.sid,
-              JSON.encode!(
-                Map.merge(
-                  %{host: closing.host, sessionId: closing.sid, reason: closing.reason},
-                  if(residual?,
-                    do: %{
-                      residual:
-                        "any background shell task this session had left running was ended"
-                    },
-                    else: %{}
-                  )
-                )
-              )
-            )
-
-          state =
-            if residual? and is_binary(closing.session_key),
-              do: residual_marker(state, closing, state.clock.()),
-              else: state
+          # The close is shown complete (FS5): its event, the R4 residual and
+          # marker (AS4), and the journal's `done` are one transaction; one
+          # that cannot be written stays in the journal for the resolver.
+          state = close_outcome(state, closing_effect(closing), :confirmed)
 
           # The close cleared the adapter's residency; reflect it now rather
           # than waiting for the adapter's own residency report.
@@ -2715,17 +3522,11 @@ defmodule Tightbeam.MemoryGuard do
         {:error, {:close_unconfirmed, why}} ->
           # FS5: acknowledged while the process lives: it stays resident and
           # counted under R3, with no close event or marker; recorded, and
-          # retried on a later decision.
-          EventLog.lifecycle(
-            state.db,
-            "memory_guard_close_failed",
-            closing.session_key || closing.sid,
-            JSON.encode!(%{
-              host: closing.host,
-              sessionId: closing.sid,
-              reason: closing.reason,
-              error: "close acknowledged, but " <> why
-            })
+          # retried on a later decision (with a new close).
+          close_outcome(
+            state,
+            closing_effect(closing),
+            {:failed, "close acknowledged, but " <> why}
           )
 
           %{
@@ -2744,19 +3545,9 @@ defmodule Tightbeam.MemoryGuard do
           # arrived) or the close failed: it stays resident and is not picked
           # again until a turn ends or the next sample. A failed close is
           # recorded; finding it busy is not a failure.
-          unless match?({:error, {:not_idle, _}}, result) do
-            EventLog.lifecycle(
-              state.db,
-              "memory_guard_close_failed",
-              closing.session_key || closing.sid,
-              JSON.encode!(%{
-                host: closing.host,
-                sessionId: closing.sid,
-                reason: closing.reason,
-                error: inspect(result)
-              })
-            )
-          end
+          if match?({:error, {:not_idle, _}}, result),
+            do: close_outcome(state, closing_effect(closing), :not_idle),
+            else: close_outcome(state, closing_effect(closing), {:failed, inspect(result)})
 
           state = %{state | unclosable: MapSet.put(state.unclosable, {closing.host, closing.sid})}
 
@@ -2788,16 +3579,127 @@ defmodule Tightbeam.MemoryGuard do
     end)
   end
 
-  defp residual_marker(state, closing, at) do
-    post_marker(state, %{
-      key: "closed:#{closing.session_key}:#{closing.sid}:#{at}",
-      kind: "memory_guard_idle_closed_marker",
-      session_key: closing.session_key,
-      detail: %{host: closing.host, reason: closing.reason},
-      message:
-        "To free memory, Tightbeam closed this session's process while it was idle. Any " <>
-          "background shell task you had left running was ended; start it again if you still need it."
-    })
+  defp closing_effect(closing) do
+    %{
+      id: closing.effect,
+      host: closing.host,
+      intent: %{
+        "sid" => closing.sid,
+        "sessionKey" => closing.session_key,
+        "reason" => closing.reason,
+        "markerKey" => closing.marker_key
+      }
+    }
+  end
+
+  @plain_marker "To free memory, Tightbeam closed this session's process while it was idle. Any " <>
+                  "background shell task you had left running was ended; start it again if you still need it."
+
+  # The spec author's ruling (w_26322c0d) for a close not established.
+  @conditional_marker "Your session's agent process ended while idle. Tightbeam had decided to " <>
+                        "close it to free memory and cannot confirm whether it did. If it did, any " <>
+                        "background shell task you had left running was ended. Check it and start " <>
+                        "it again if you still need it."
+
+  # One idle close's outcome, its records, its marker (one key per close, so
+  # never two) and the journal's `done`, in one transaction (rev 4/5 table):
+  # `:confirmed` (dispatched and shown gone), `:unconfirmed` (intended and
+  # gone), `:abandoned` (intended and alive), `:not_idle`, `{:failed, why}`.
+  # A transaction that fails leaves the row for the resolver.
+  defp close_outcome(state, effect, outcome) do
+    %{"sid" => sid, "sessionKey" => session_key, "reason" => reason, "markerKey" => key} =
+      effect.intent
+
+    subject = session_key || sid
+    now = state.clock.()
+    residual? = not Tightbeam.Acp.Adapter.async_tasks_observed?()
+
+    {name, record, marker} =
+      case outcome do
+        :confirmed ->
+          {"confirmed",
+           {"memory_guard_idle_closed",
+            Map.merge(
+              %{host: effect.host, sessionId: sid, reason: reason, certainty: "confirmed"},
+              if(residual?,
+                do: %{
+                  residual: "any background shell task this session had left running was ended"
+                },
+                else: %{}
+              )
+            )}, if(residual?, do: @plain_marker)}
+
+        :unconfirmed ->
+          {"unconfirmed",
+           {"memory_guard_close_unconfirmed",
+            %{
+              host: effect.host,
+              sessionId: sid,
+              reason: reason,
+              what:
+                "the idle session process ended before Tightbeam could confirm a close of its own; " <>
+                  "Tightbeam does not know whether it issued one"
+            }}, @conditional_marker}
+
+        :abandoned ->
+          {"abandoned", nil, nil}
+
+        :not_idle ->
+          {"not_idle", nil, nil}
+
+        {:failed, why} ->
+          {"failed",
+           {"memory_guard_close_failed",
+            %{host: effect.host, sessionId: sid, reason: reason, error: why}}, nil}
+      end
+
+    DB.transaction(state.db, fn txn ->
+      if Journal.complete_in_txn(txn, effect.id, %{outcome: name}, now) do
+        with {kind, detail} <- record,
+             do: EventLog.lifecycle_in_txn(txn, kind, subject, JSON.encode!(detail))
+
+        if is_binary(marker) and is_binary(session_key) and
+             not marker_posted_in_txn?(txn, session_key, key) do
+          EventLog.notice_in_txn(
+            txn,
+            "memory_guard_idle_closed_marker",
+            session_key,
+            JSON.encode!(%{host: effect.host, reason: reason, markerKey: key}),
+            audience: {:session, session_key},
+            message: marker,
+            attention: :normal
+          )
+        else
+          []
+        end
+      else
+        []
+      end
+    end)
+    |> case do
+      {:ok, plan} ->
+        EventLog.publish(plan, conn_registry: state.conn_registry)
+        state
+
+      {:error, error} ->
+        Logger.warning(
+          "memory guard: close outcome #{name} for #{sid} not yet recorded, resolved later: #{Exception.message(error)}"
+        )
+
+        state
+    end
+  end
+
+  defp marker_posted_in_txn?(txn, session_key, key) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM lifecycle_events
+      WHERE kind='memory_guard_idle_closed_marker' AND subject=?1
+        AND json_extract(detail,'$.markerKey')=?2 LIMIT 1
+      """,
+      [session_key, key]
+    ) != []
   end
 
   defp default_idle_check(adapter, sid), do: Tightbeam.Acp.Adapter.idle_session?(adapter, sid)
@@ -2859,7 +3761,7 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   defp ensure_inventory(%{inventory_generation: nil} = state) do
-    case Records.init_inventory(state.db, state.base_dir, state.boot) do
+    case Records.init_inventory(state.db, state.base_dir, state.boot, state.local_host) do
       {:ok, generation} -> {:ok, %{state | inventory_generation: generation}}
       {:error, _} = error -> error
     end
@@ -3341,7 +4243,10 @@ defmodule Tightbeam.MemoryGuard do
   defp restore_hold(state, _host, _detail), do: state
 
   defp released(state, host, detail, remaining_host) do
-    held_keys = for {key, held} <- state.held, held.host == host, do: key
+    # A page of the host's held sessions per event (rev 3 D5); the rest learn
+    # what remains when they are evaluated again.
+    held_keys =
+      for({key, held} <- state.held, held.host == host, do: key) |> Enum.take(@hold_page)
 
     for session_key <- held_keys do
       other = Admission.other_reasons(state.db, session_key)
@@ -3357,26 +4262,7 @@ defmodule Tightbeam.MemoryGuard do
       end
     end
 
-    if remaining_host == [], do: run_deferred(state)
-
     release_check(state, host)
-  end
-
-  # Deferred hooks run once nothing stands; the flag keeps the per-second
-  # sampler from querying when nothing was ever deferred.
-  # Deferred hooks run on every host no memory reason holds; the pending flag
-  # clears only when none is left anywhere. Hooks waiting on another reason
-  # (a limit-fallback evaluation) are retried each tick, in every mode.
-  defp run_deferred(state) do
-    if deferred_pending?() do
-      for {host, host_state} <- state.hosts,
-          host_level_reasons(host_state) == [],
-          do: Admission.run_deferred(state.db, host)
-
-      unless Admission.pending?(state.db), do: :ets.insert(table(), {:deferred_pending, false})
-    end
-
-    :ok
   end
 
   # R12a / C8: on an enforced host, a session tree the step could not place in
@@ -3483,6 +4369,7 @@ defmodule Tightbeam.MemoryGuard do
   # R10a: the intent is recorded before the first signal.
   defp kill_unit(state, host, unit, limit, mode) do
     now = state.clock.()
+    target = kill_target(state, unit)
 
     kill = %{
       host: host,
@@ -3499,51 +4386,168 @@ defmodule Tightbeam.MemoryGuard do
       confirmed: false
     }
 
-    # R10a: the intent is recorded before the first signal; it becomes a
-    # memory kill only once the tree is shown gone (handle_info :killed).
-    :ets.insert(table(), {{:kill, unit.id}, kill})
+    # R10a and the journal (rev 3 D1): the intent and the kill's journal row
+    # are one transaction, before any signal. If it cannot be written, nothing
+    # is sent; the next sample decides again.
+    intent = Map.merge(kill_json(kill, unit.id), %{target: target_json(target)})
 
-    EventLog.lifecycle(
-      state.db,
-      "memory_kill_intent",
-      host,
-      JSON.encode!(%{
-        host: host,
-        unit: unit.id,
-        scope: unit.scope,
-        limit: limit,
-        bytes: unit.bytes,
-        limitBytes: kill.limit_bytes,
-        sessionId: kill.sid,
-        launchId: unit.launch_id,
-        at: now
-      })
-    )
+    case DB.transaction(state.db, fn txn ->
+           effect =
+             Journal.intend_in_txn(
+               txn,
+               "tree_kill",
+               "#{unit.id}:#{now}",
+               host,
+               unit.id,
+               intent,
+               now
+             )
 
+           EventLog.lifecycle_in_txn(
+             txn,
+             "memory_kill_intent",
+             host,
+             JSON.encode!(%{
+               host: host,
+               unit: unit.id,
+               scope: unit.scope,
+               limit: limit,
+               bytes: unit.bytes,
+               limitBytes: kill.limit_bytes,
+               sessionId: kill.sid,
+               launchId: unit.launch_id,
+               effectId: effect,
+               at: now
+             })
+           )
+
+           effect
+         end) do
+      {:ok, effect} ->
+        kill = Map.put(kill, :effect_id, effect)
+        :ets.insert(table(), {{:kill, unit.id}, kill})
+        dispatch_kill(state, host, unit.id, kill, target)
+        %{state | killing: Map.put(state.killing, unit.id, kill)}
+
+      {:error, error} ->
+        Logger.warning(
+          "memory guard: kill intent for #{unit.id} not recorded; nothing sent: #{Exception.message(error)}"
+        )
+
+        state
+    end
+  end
+
+  defp dispatch_kill(state, host, unit_id, kill, target) do
     guard = self()
-    target = kill_target(state, unit)
     host_state = state.hosts[host]
-
     send_hook = state.before_kill_send
 
     Task.start(fn ->
       send_hook.(target)
 
       # FS6: the kill counts only if it is sent before the tree's end is
-      # observed; a tree already gone is not killed by this guard.
-      result =
+      # observed; a tree already gone is not killed by this guard. `dispatched`
+      # is written only when a call proves a signal went out (rev 3 D1).
+      {result, proof} =
         if root_present?(state, target) do
-          :ets.insert(table(), {{:kill, unit.id}, Map.put(kill, :sent_at, state.clock.())})
-          end_tree(state, host_state, target)
+          end_tree_proved(state, host_state, target, fn how ->
+            :ets.insert(table(), {{:kill, unit_id}, Map.put(kill, :sent_at, state.clock.())})
+
+            with {:error, error} <-
+                   Journal.dispatch(state.db, kill.effect_id, %{
+                     sentAt: state.clock.(),
+                     proof: how
+                   }),
+                 do:
+                   Logger.warning(
+                     "memory guard: kill of #{unit_id} sent, not yet recorded: #{error}"
+                   )
+          end)
         else
-          :ets.insert(table(), {{:kill, unit.id}, Map.put(kill, :ended_before_send, true)})
-          {:error, :ended_before_send}
+          :ets.insert(table(), {{:kill, unit_id}, Map.put(kill, :ended_before_send, true)})
+          {{:error, :ended_before_send}, :not_sent}
         end
 
-      send(guard, {:killed, unit.id, result})
+      send(guard, {:killed, unit_id, result, proof})
     end)
+  end
 
-    %{state | killing: Map.put(state.killing, unit.id, kill)}
+  # The outcome of a kill, its record and the journal's `done`, as one step.
+  defp complete_kill(state, kill, outcome, record) do
+    now = state.clock.()
+
+    DB.transaction(state.db, fn txn ->
+      if Journal.complete_in_txn(txn, kill.effect_id, %{outcome: outcome}, now) and record do
+        {kind, subject, detail} = record
+        EventLog.lifecycle_in_txn(txn, kind, subject, detail)
+      end
+    end)
+    |> case do
+      {:ok, _} ->
+        state
+
+      {:error, error} ->
+        Logger.warning(
+          "memory guard: kill outcome #{outcome} not yet recorded, resolved later: #{Exception.message(error)}"
+        )
+
+        state
+    end
+  end
+
+  defp kill_json(kill, unit_id) do
+    %{
+      unit: unit_id,
+      scope: kill.scope,
+      limit: kill.limit,
+      sid: kill.sid,
+      key: kill.key && HarnessProcess.adapter_key_name(kill.key),
+      launchId: kill.launch_id,
+      bytes: kill.bytes,
+      limitBytes: kill.limit_bytes,
+      mode: kill.mode,
+      at: kill.at
+    }
+  end
+
+  defp target_json(%{scope: "session"} = t),
+    do: %{scope: "session", pid: t.pid, start: t.start, unit: t.unit, launchId: t.launch_id}
+
+  defp target_json(%{scope: "adapter", row: row} = t),
+    do: %{scope: "adapter", pid: row.os_pid, unit: t.unit, launchId: t.launch_id}
+
+  defp ended_record(state, kill) do
+    session_key =
+      with sid when is_binary(sid) <- kill.sid,
+           {:ok, key} <- session_for_sid(state.db, sid),
+           do: key,
+           else: (_ -> nil)
+
+    {"memory_tree_ended", session_key || kill.host,
+     JSON.encode!(%{
+       host: kill.host,
+       scope: kill.scope,
+       limit: kill.limit,
+       sessionId: kill.sid,
+       launchId: kill.launch_id,
+       bytes: kill.bytes,
+       mode: kill.mode,
+       unitEvents: Map.get(kill, :events)
+     })}
+  end
+
+  defp failed_record(kill, error) do
+    {"memory_kill_failed", kill.host,
+     JSON.encode!(%{
+       host: kill.host,
+       unit: Map.get(kill, :unit_id),
+       scope: kill.scope,
+       limit: kill.limit,
+       sessionId: kill.sid,
+       launchId: kill.launch_id,
+       error: error
+     })}
   end
 
   defp kill_target(state, %{scope: "session", record: record} = unit) do
@@ -3562,30 +4566,12 @@ defmodule Tightbeam.MemoryGuard do
     %{scope: "adapter", row: row, unit: Map.get(unit, :unit), launch_id: unit.launch_id}
   end
 
-  # The tree's end, an effect that already happened: its record is kept and
-  # retried when it cannot be written (FS7), never dropped with the guard.
+  # A kernel kill's end (R10): recorded before its unit, the evidence, is
+  # removed. `:ok` or `{:error, message}`: a record that cannot be written
+  # leaves the unit, so the next sample observes the kernel's verdict again.
   defp record_ended(state, host, kill) do
-    session_key =
-      with sid when is_binary(sid) <- kill.sid,
-           {:ok, key} <- session_for_sid(state.db, sid),
-           do: key,
-           else: (_ -> nil)
-
-    record_effect(
-      state,
-      "memory_tree_ended",
-      session_key || host,
-      JSON.encode!(%{
-        host: host,
-        scope: kill.scope,
-        limit: kill.limit,
-        sessionId: kill.sid,
-        launchId: kill.launch_id,
-        bytes: kill.bytes,
-        mode: kill.mode,
-        unitEvents: Map.get(kill, :events)
-      })
-    )
+    {kind, subject, detail} = ended_record(state, Map.put(kill, :host, host))
+    record(state, kind, subject, detail)
   end
 
   # `memory.peak` (kernel 5.19+) of an enforced unit, when the kernel has it.
@@ -3640,14 +4626,14 @@ defmodule Tightbeam.MemoryGuard do
     layout = state.hosts[host].layout
     id = "session:" <> record["launchId"]
 
-    state =
+    recorded =
       if ((record["placement"] == "enforced" and layout) && not Map.has_key?(state.killing, id)) and
            lookup({:kill, id}) == [] do
         # The unit is removed below: keep the kernel's own verdict on it. An
         # unreadable verdict is no kernel attribution (matrix C4; FS6 decides).
         case kernel_kill(layout, record["unit"]) do
           nil ->
-            state
+            :ok
 
           {limit, counters} ->
             kill = %{
@@ -3669,12 +4655,26 @@ defmodule Tightbeam.MemoryGuard do
             }
 
             :ets.insert(table(), {{:kill, id}, kill})
-            record_ended(state, host, kill)
+
+            # FS7: the record of a kill that happened comes before its
+            # evidence goes; if it cannot be written, the unit and launch
+            # record stay and the next sample observes the verdict again.
+            with {:error, _} = error <- record_ended(state, host, kill) do
+              :ets.delete(table(), {:kill, id})
+              error
+            end
         end
       else
-        state
+        :ok
       end
 
+    case recorded do
+      :ok -> session_process_gone(state, host, record, layout)
+      {:error, _} -> state
+    end
+  end
+
+  defp session_process_gone(state, host, record, layout) do
     # R11a: a session process that ended for any reason other than a close by
     # Tightbeam leaves no stale residency behind.
     forget_residency(state, host, record["sessionId"])
@@ -3685,6 +4685,42 @@ defmodule Tightbeam.MemoryGuard do
     Records.remove(state.base_dir, record["launchId"])
     %{state | launches: Map.delete(state.launches, record["launchId"])}
   end
+
+  @doc false
+  # O18 (rev 4 D4): the latest started turn among the session's newest 256
+  # (its turns run one at a time): its end, or its start. Nil when none of
+  # them started (unknown; the caller counts it most recent).
+  def durable_last_use(db, sid) do
+    with {:ok, key} <- session_for_sid(db, sid),
+         {:ok, [[started, ended]]} <-
+           DB.query(
+             db,
+             """
+             SELECT startedAt, endedAt
+             FROM (
+               SELECT seq, startedAt, endedAt FROM turns
+               WHERE sessionKey = ?1
+               ORDER BY seq DESC
+               LIMIT 256
+             )
+             WHERE startedAt IS NOT NULL
+             ORDER BY seq DESC
+             LIMIT 1
+             """,
+             [key]
+           ) do
+      ended || started
+    else
+      _ -> nil
+    end
+  end
+
+  defp nudge_all({:ok, sessions}, state) do
+    Enum.each(sessions, &nudge(state, &1))
+    :ok
+  end
+
+  defp nudge_all({:error, _} = error, _state), do: error
 
   defp forget_residency(state, host, sid) do
     for {adapter, entry} <- state.adapters, entry.host == host, MapSet.member?(entry.sids, sid) do
@@ -3931,44 +4967,64 @@ defmodule Tightbeam.MemoryGuard do
     :no_identity,
     :eacces,
     :eisdir,
-    :enotdir
+    :enotdir,
+    # A unit that is gone has nothing left to kill: no signal was sent.
+    :unit_gone
   ]
 
   @doc false
-  def end_tree(state, host_state, target) do
+  def end_tree(state, host_state, target),
+    do: state |> end_tree_proved(host_state, target, fn _how -> :ok end) |> elem(0)
+
+  # `{result, :sent | :not_sent}`: whether a call proved a signal was sent
+  # (agreed design rev 3 D1). `on_sent` runs once, right after the first call
+  # that proves it: a `cgroup.kill` write made, the helper's success, or a
+  # signal delivered to an identity-checked member. Errors and unknown
+  # results prove nothing.
+  defp end_tree_proved(state, host_state, target, on_sent) do
     target = Map.put(target, :members, capture(state, target))
 
     # Already shown gone (its leader ended, or its pid now belongs to another
     # process, and nothing of its group or unit remains): nothing to kill, and
     # a reused pid is never signalled (matrix D2.stale).
     if gone?(state, host_state, target) do
-      :ok
+      {:ok, :not_sent}
     else
-      kill_and_prove(state, host_state, target)
+      kill_and_prove(state, host_state, target, on_sent)
     end
   end
 
-  defp kill_and_prove(state, host_state, target) do
+  defp kill_and_prove(state, host_state, target, on_sent) do
     first = state.killer.(target, host_state)
+    sent = if first == :ok, do: tap(:sent, fn _ -> on_sent.("killer") end), else: :not_sent
 
     wait = Application.get_env(:tightbeam, :memory_guard_kill_wait_ms, 5_000)
 
-    gone =
+    {gone, sent} =
       case await_gone(state, host_state, target, wait) do
         :ok ->
-          :ok
+          {:ok, sent}
 
         :alive ->
-          _ = walk_kill(state, target)
-          await_gone(state, host_state, target, wait)
+          walked = walk_kill(state, target)
+
+          sent =
+            if walked == :sent and sent == :not_sent,
+              do: tap(:sent, fn _ -> on_sent.("signals") end),
+              else: sent
+
+          {await_gone(state, host_state, target, wait), sent}
       end
 
-    cond do
-      gone == :alive -> {:error, {:tree_survives, first}}
-      first == :ok -> :ok
-      match?({:error, reason} when reason in @helper_not_run, first) -> :ok
-      true -> {:error, {:kill_incomplete, first}}
-    end
+    result =
+      cond do
+        gone == :alive -> {:error, {:tree_survives, first}}
+        first == :ok -> :ok
+        match?({:error, reason} when reason in @helper_not_run, first) -> :ok
+        true -> {:error, {:kill_incomplete, first}}
+      end
+
+    {result, sent}
   end
 
   # The tree's processes with their start times, read before the kill; a read
@@ -4109,13 +5165,18 @@ defmodule Tightbeam.MemoryGuard do
       end
 
     pids = Enum.uniq(captured ++ current)
-    if pids != [], do: state.signaller.(pids)
-    :ok
+
+    # Sent only when the signaller says every signal was delivered.
+    if pids != [] and state.signaller.(pids) == :ok, do: :sent, else: :not_sent
   end
 
   defp default_signal(pids) do
-    System.cmd("kill", ["-KILL" | Enum.map(pids, &Integer.to_string/1)], stderr_to_stdout: true)
-    :ok
+    case System.cmd("kill", ["-KILL" | Enum.map(pids, &Integer.to_string/1)],
+           stderr_to_stdout: true
+         ) do
+      {_, 0} -> :ok
+      {output, status} -> {:error, {status, String.trim(output)}}
+    end
   end
 
   # The ended launch, or (`:any_previous`, before a new launch) every launch of
@@ -4152,7 +5213,7 @@ defmodule Tightbeam.MemoryGuard do
     unit = Cgroup.adapter_unit(layout, launch_id)
     id = "adapter:" <> launch_id
 
-    state =
+    recorded =
       with {:ok, %{"oom_group_kill" => group}} when group >= 1 <-
              Cgroup.local_events(layout.fs, unit),
            [] <- lookup({:kill, id}),
@@ -4171,12 +5232,20 @@ defmodule Tightbeam.MemoryGuard do
         }
 
         :ets.insert(table(), {{:kill, id}, kill})
-        record_ended(state, host, kill)
+
+        with {:error, _} = error <- record_ended(state, host, kill) do
+          :ets.delete(table(), {:kill, id})
+          error
+        end
       else
-        _ -> state
+        _ -> :ok
       end
 
-    remove_unit(state, layout.fs, unit)
+    # FS7: the unit (the kernel's verdict) stays until its kill is recorded.
+    case recorded do
+      :ok -> remove_unit(state, layout.fs, unit)
+      {:error, _} -> state
+    end
   end
 
   defp remove_adapter_unit(state, _host_state, _launch_id), do: state
@@ -4194,6 +5263,8 @@ defmodule Tightbeam.MemoryGuard do
   def default_kill(%{unit: unit} = target, %{layout: %{fs: fs}}) when is_binary(unit) do
     case Cgroup.kill(fs, unit) do
       :ok -> :ok
+      # A unit holds its tree: once it is gone, nothing is left to kill.
+      {:error, :gone} -> {:error, :unit_gone}
       {:error, _} -> group_kill(target)
     end
   end
@@ -4265,6 +5336,9 @@ defmodule Tightbeam.MemoryGuard do
           # FS9: root's records, or the episodes root reads, that could not be
           # read, judged or published (retried each sample).
           rootActionsUnavailable: if(host_state.local, do: state.root_error),
+          # Rev 3 D5: streams still working through a backlog, from capped
+          # probes (never an exact count of an unbounded set).
+          backlog: if(host_state.local, do: backlog_read(state)),
           # FS9: open stuck episodes, shown until they end.
           stuckEpisodes: Episodes.read(state.db, host)
         }

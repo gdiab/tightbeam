@@ -17,7 +17,7 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
 
   alias Tightbeam.{DB, EventLog, Harness, Org}
   alias Tightbeam.DB.Txn
-  alias Tightbeam.MemoryGuard.{Cgroup, Probe, Records, State}
+  alias Tightbeam.MemoryGuard.{Cgroup, Probe, Publish, State}
 
   @detail "guard_unavailable"
   # The open hold's kind in `memory_guard_open` (one per session).
@@ -247,18 +247,28 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
   """
   @spec mode_in_force(DB.server(), String.t()) :: String.t() | nil
   def mode_in_force(db, host) do
-    case DB.query(
-           db,
-           """
-           SELECT json_extract(detail,'$.mode'), json_extract(detail,'$.transition')
-           FROM lifecycle_events WHERE kind='memory_guard_mode' AND subject=?1
-           ORDER BY id DESC LIMIT 1
-           """,
-           [host]
-         ) do
-      {:ok, [[mode, nil]]} -> mode
+    # D3: a mode whose step configuration is not yet published is requested,
+    # not applied.
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  """
+                  SELECT json_extract(detail,'$.mode'), json_extract(detail,'$.transition'),
+                         json_extract(detail,'$.publish')
+                  FROM lifecycle_events WHERE kind='memory_guard_mode' AND subject=?1
+                  ORDER BY id DESC LIMIT 1
+                  """,
+                  [host]
+                ) do
+             [[mode, nil, publish]] -> if Publish.done_in_txn?(txn, publish), do: mode
+             _ -> nil
+           end
+         end) do
+      {:ok, mode} -> mode
       _ -> nil
     end
+  catch
+    :exit, _ -> nil
   end
 
   @doc """
@@ -279,14 +289,26 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
     # contract can exist there, so only the mode record is evidence.
     local? = Keyword.get(opts, :local?, true)
 
-    config = Path.join(Records.dir(base_dir), "launch.json")
-    before = File.read(config)
+    bytes =
+      Publish.config_bytes(%{
+        mode: "off",
+        fs: nil,
+        harness: nil,
+        sessionLimit: nil,
+        oomRaise: 100
+      })
 
+    now = System.system_time(:millisecond)
+
+    # D3: the record and its publication intent commit first; the file is
+    # written after, and `off` is in force only once it is.
     with :ok <- no_incomplete_transition(db, host),
          :ok <- if(local?, do: no_kernel_limits(root, fs, opts), else: :ok),
-         :ok <-
-           committed(
+         {:ok, publish} <-
+           recorded(
              DB.transaction(db, fn txn ->
+               publish = if local?, do: Publish.config_in_txn(txn, host, bytes, now)
+
                EventLog.lifecycle_in_txn(
                  txn,
                  "memory_guard_mode",
@@ -296,28 +318,15 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
                    mode: "off",
                    reason: "an admin turned memory limits off for this host",
                    transition: nil,
-                   by: "settings"
+                   by: "settings",
+                   publish: publish
                  })
                )
 
-               # The step's configuration and the record are one step (FS2, FS7).
-               case Records.publish_config(base_dir, %{
-                      mode: "off",
-                      fs: nil,
-                      harness: nil,
-                      sessionLimit: nil,
-                      oomRaise: 100
-                    }) do
-                 :ok ->
-                   :ok
-
-                 {:error, error} ->
-                   raise "the launch step's configuration could not be written: #{inspect(error)}"
-               end
-             end),
-             config,
-             before
-           ) do
+               publish
+             end)
+           ),
+         :ok <- published(db, base_dir, publish, bytes, now) do
       # The change is in force; a nudge that cannot be planned now is made by
       # the guard's next pass over the holds.
       with {:ok, held} <- held_sessions(db, host),
@@ -329,18 +338,25 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
     error -> {:not_applied, Exception.message(error)}
   end
 
-  # The configuration is published inside the transaction; if the record
-  # does not commit, the step is given back what it read before, so it never
-  # acts on an `off` that is not in force (FS7).
-  defp committed({:ok, _}, _config, _before), do: :ok
+  defp recorded({:ok, publish}), do: {:ok, publish}
 
-  defp committed({:error, error}, config, before) do
-    case before do
-      {:ok, bytes} -> File.write(config, bytes)
-      {:error, _} -> File.rm(config)
+  defp recorded({:error, error}),
+    do: {:not_applied, "the change could not be recorded: #{Exception.message(error)}"}
+
+  # Nothing to publish for a remote host; otherwise `off` is in force only
+  # once its configuration is written. One that is not yet written stays a
+  # pending publication, which the Watcher retries.
+  defp published(_db, _base_dir, nil, _bytes, _now), do: :ok
+
+  defp published(db, base_dir, publish, bytes, now) do
+    case Publish.config(db, base_dir, publish, bytes, now) do
+      :ok ->
+        :ok
+
+      {:error, error} ->
+        {:not_applied,
+         "recorded; the launch step's settings are not yet written (#{error}); retried"}
     end
-
-    {:not_applied, "the change could not be recorded: #{Exception.message(error)}"}
   end
 
   defp no_incomplete_transition(db, host) do

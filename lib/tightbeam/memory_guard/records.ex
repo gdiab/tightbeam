@@ -32,19 +32,21 @@ defmodule Tightbeam.MemoryGuard.Records do
   """
   @spec init_inventory(Tightbeam.DB.server(), String.t(), String.t() | nil) ::
           {:ok, String.t()} | {:error, String.t()}
-  def init_inventory(db, base_dir, boot) do
+  def init_inventory(db, base_dir, boot, host \\ Tightbeam.Placement.local_host_name()) do
     sessions = Path.join(dir(base_dir), "sessions")
 
     case last_inventory(db, sessions) do
       {:ok, nil} ->
-        create_inventory(db, sessions, boot)
+        create_inventory(db, sessions, boot, host)
 
       {:ok, %{"boot" => recorded_boot, "generation" => generation}}
       when is_binary(boot) and recorded_boot != boot ->
         _ = generation
-        create_inventory(db, sessions, boot)
+        create_inventory(db, sessions, boot, host)
 
       {:ok, %{"generation" => generation}} ->
+        # O8: a marker whose publication is still pending is written now.
+        _ = publish_marker(db, host, generation)
         with :ok <- check_inventory(base_dir, generation), do: {:ok, generation}
 
       {:error, error} ->
@@ -92,8 +94,12 @@ defmodule Tightbeam.MemoryGuard.Records do
     error -> {:error, "the inventory record cannot be read: #{Exception.message(error)}"}
   end
 
-  defp create_inventory(db, sessions, boot) do
+  # O8 (agreed design): the record and the marker's publication intent commit
+  # together; the marker is written after the commit. Until it reads back the
+  # inventory is not initialized (FS4 holds), and the intent is retried.
+  defp create_inventory(db, sessions, boot, host) do
     generation = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+    now = System.system_time(:millisecond)
 
     Tightbeam.DB.transaction(db, fn txn ->
       Tightbeam.EventLog.lifecycle_in_txn(
@@ -103,23 +109,39 @@ defmodule Tightbeam.MemoryGuard.Records do
         JSON.encode!(%{boot: boot, generation: generation})
       )
 
-      # The marker and the record are one step: a failed write rolls back.
-      with :ok <- File.mkdir_p(sessions),
-           :ok <- File.write(Path.join(sessions, @marker), generation) do
-        :ok
-      else
-        {:error, reason} -> raise "the launch-record inventory cannot be created: #{reason}"
-      end
+      Tightbeam.MemoryGuard.Publish.marker_in_txn(
+        txn,
+        host,
+        Path.join(sessions, @marker),
+        generation,
+        now
+      )
     end)
     |> case do
-      {:ok, :ok} ->
-        {:ok, generation}
+      {:ok, _effect} ->
+        case publish_marker(db, host, generation) do
+          :ok ->
+            {:ok, generation}
+
+          {:error, error} ->
+            {:error, "the launch-record inventory is not yet initialized: #{error}"}
+        end
 
       {:error, error} ->
         {:error, "the launch-record inventory cannot be created: #{inspect(error)}"}
     end
   rescue
     error -> {:error, Exception.message(error)}
+  end
+
+  defp publish_marker(db, host, generation) do
+    id = Tightbeam.MemoryGuard.Journal.id("publish_marker", host, generation)
+
+    case Tightbeam.MemoryGuard.Journal.get(db, id) do
+      %{phase: "done"} -> :ok
+      nil -> :ok
+      effect -> Tightbeam.MemoryGuard.Publish.marker(db, effect, System.system_time(:millisecond))
+    end
   end
 
   @doc """

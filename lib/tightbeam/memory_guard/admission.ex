@@ -118,6 +118,17 @@ defmodule Tightbeam.MemoryGuard.Admission do
   @spec quota_released_in_txn(Txn.t(), String.t(), String.t(), String.t()) ::
           :deferred | :resumed
   def quota_released_in_txn(%Txn{} = txn, incident_id, harness, host) do
+    # Agreed design rev 3 D5: the park's release clears the blocked mark of
+    # the key's held sessions in its own transaction, so they re-enter the
+    # eligible-holds index.
+    key = HarnessProcess.adapter_key_name({Harness.parse!(harness).id(), "shared", host})
+
+    Txn.q(
+      txn,
+      "UPDATE memory_guard_open SET blocked=NULL WHERE kind='hold' AND adapterKey=?1 AND blocked IS NOT NULL",
+      [key]
+    )
+
     case Tightbeam.MemoryGuard.host_reasons(host) do
       [] ->
         readmit_quota_in_txn(txn, incident_id, harness, host, "quota_park", false)
@@ -474,29 +485,33 @@ defmodule Tightbeam.MemoryGuard.Admission do
   end
 
   @doc """
-  Sessions with a re-admitted turn (R9 not-started, FS2 refusal) still
-  queued in the last hour: their lanes are nudged each sample, in case the
-  handoff after the re-admission's commit never reached them (matrix M3).
+  Of one page of re-admitted turns (R9 not-started, FS2 refusal), the
+  sessions whose turn is still queued within the hour, to be nudged in case
+  the handoff after the re-admission's commit never reached them (matrix
+  M3); the others are closed. One transaction.
   """
-  @spec readmitted_queued(DB.server()) :: {:ok, [String.t()]} | {:error, String.t()}
-  def readmitted_queued(db) do
-    since = System.system_time(:millisecond) - 3_600_000
+  @spec readmitted_page(DB.server(), [map()], integer()) ::
+          {:ok, [String.t()]} | {:error, String.t()}
+  def readmitted_page(db, rows, now) do
+    since = now - 3_600_000
 
     DB.transaction(db, fn txn ->
-      # A re-admission whose turn left the queue, or that is older than the
-      # hour, needs no further nudge.
-      Txn.q(
-        txn,
-        """
-        DELETE FROM memory_guard_open
-        WHERE kind=?1 AND (openedAt < ?2 OR NOT EXISTS (
-          SELECT 1 FROM turns t WHERE t.seq = CAST(memory_guard_open.ref AS INTEGER)
-            AND t.status='queued'))
-        """,
-        [@readmitted, since]
-      )
+      Enum.reduce(rows, [], fn %{ref: ref, subject: session_key, opened_at: opened_at}, acc ->
+        queued? =
+          Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1 AND status='queued'", [
+            String.to_integer(ref)
+          ]) != []
 
-      txn |> State.list_all_in_txn(@readmitted) |> Enum.map(& &1.subject) |> Enum.uniq()
+        # A re-admission whose turn left the queue, or older than the hour,
+        # needs no further nudge.
+        if queued? and opened_at >= since do
+          [session_key | acc]
+        else
+          State.close_in_txn(txn, @readmitted, ref)
+          acc
+        end
+      end)
+      |> Enum.uniq()
     end)
     |> case do
       {:ok, sessions} -> {:ok, sessions}
@@ -549,6 +564,44 @@ defmodule Tightbeam.MemoryGuard.Admission do
       # nothing happened, and the next pass retries it.
       {:error, _} -> :pending
     end
+  end
+
+  @doc """
+  Run one deferred quota re-admission hook (a `quota_readmission` open item),
+  in one transaction, unless its key is parked again. Returns `:ok` or
+  `{:error, message}`; a hook still held stays pending.
+  """
+  @spec run_quota_item(DB.server(), map()) :: :ok | {:error, String.t()}
+  def run_quota_item(db, %{subject: incident_id, host: host, detail: detail}) do
+    %{"harness" => harness} = JSON.decode!(detail)
+    key = {Harness.parse!(harness).id(), "shared", host}
+
+    transact(db, fn txn ->
+      unless HarnessProcess.parked_in_txn?(txn, key),
+        do: readmit_quota_in_txn(txn, incident_id, harness, host, "memory", true)
+    end)
+  end
+
+  @doc """
+  Run one deferred not-started re-admission (a `memory_readmission` open
+  item), in one transaction, once no reason of any kind holds its session.
+  """
+  @spec run_memory_item(DB.server(), map()) :: :ok | {:error, String.t()}
+  def run_memory_item(db, %{subject: session_key, host: host, detail: detail}) do
+    %{"sourceSeq" => seq} = JSON.decode!(detail)
+
+    transact(db, fn txn ->
+      if other_reasons_in_txn(txn, session_key) == [], do: readmit_in_txn(txn, seq, host)
+    end)
+  end
+
+  defp transact(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, _} -> :ok
+      {:error, error} -> {:error, Exception.message(error)}
+    end
+  catch
+    :exit, reason -> {:error, inspect(reason)}
   end
 
   @doc "Whether any deferred hook, on any host, has not yet run (unknown is pending)."

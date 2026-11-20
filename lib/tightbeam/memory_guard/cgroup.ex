@@ -219,10 +219,16 @@ defmodule Tightbeam.MemoryGuard.Cgroup do
     end
   end
 
-  @doc "Kill every process of a cgroup and its descendants (`cgroup.kill`)."
-  @spec kill(String.t(), String.t()) :: :ok | {:error, String.t()}
+  @doc """
+  Kill every process of a cgroup and its descendants (`cgroup.kill`). `:ok`
+  only when the write was made (the kernel then kills every member); a unit
+  that is not there is `{:error, :gone}`: nothing was sent.
+  """
+  @spec kill(String.t(), String.t()) :: :ok | {:error, term()}
   def kill(fs, cgroup) do
-    if File.dir?(dir(fs, cgroup)), do: write(fs, cgroup, "cgroup.kill", "1"), else: :ok
+    if File.dir?(dir(fs, cgroup)),
+      do: write(fs, cgroup, "cgroup.kill", "1"),
+      else: {:error, :gone}
   end
 
   @doc "Remove an empty unit. A unit still populated, or gone already, is left."

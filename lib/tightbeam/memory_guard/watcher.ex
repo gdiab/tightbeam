@@ -20,7 +20,7 @@ defmodule Tightbeam.MemoryGuard.Watcher do
   require Logger
 
   alias Tightbeam.MemoryGuard
-  alias Tightbeam.MemoryGuard.{Episodes, RootActions, Unguarded}
+  alias Tightbeam.MemoryGuard.{Episodes, Journal, Publish, RootActions, Unguarded}
 
   def start_link(opts),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -76,6 +76,7 @@ defmodule Tightbeam.MemoryGuard.Watcher do
       state
     else
       now = state.clock.()
+      publish_pending(state, now)
       state = open_guard_episode(state, now)
 
       %{seen: seen, error: error} =
@@ -101,6 +102,24 @@ defmodule Tightbeam.MemoryGuard.Watcher do
     error ->
       Logger.warning("memory guard watcher: #{Exception.message(error)}")
       state
+  end
+
+  # D3: while the guard is down, this process owns the step configuration's
+  # pending publication (for example `off` brought into force without the
+  # guard), at most a page per pass.
+  defp publish_pending(state, now) do
+    case Journal.page(state.db, state.host, "publish_config", nil, nil, 8) do
+      {:ok, effects} ->
+        for effect <- effects,
+            {:error, error} <- [Publish.resolve_config(state.db, state.base_dir, effect, now)],
+            do:
+              Logger.warning(
+                "memory guard watcher: launch step settings not yet written: #{error}"
+              )
+
+      {:error, error} ->
+        Logger.warning("memory guard watcher: the effect journal cannot be read: #{error}")
+    end
   end
 
   defp notify(state, episode) do

@@ -14,8 +14,9 @@ defmodule Tightbeam.MemoryGuard.State do
     digest (a primary-key lookup).
   - `memory_guard_open`: one row per open item that a sample or an admission
     looks for (a hold, a step hold, a pending re-admission, a recent
-    re-admission), deleted when it closes. A read costs the open items of
-    its kind.
+    re-admission, a stuck clock), deleted when it closes. A read costs the
+    open items of its kind.
+  - `memory_guard_effects`: the durable effect journal (`Tightbeam.MemoryGuard.Journal`).
   """
 
   alias Tightbeam.DB
@@ -52,17 +53,47 @@ defmodule Tightbeam.MemoryGuard.State do
     judgedAt  INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS memory_guard_open (
-    kind     TEXT NOT NULL,
-    ref      TEXT NOT NULL,
-    subject  TEXT NOT NULL,
-    host     TEXT,
-    detail   TEXT,
-    openedAt INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    ref        TEXT NOT NULL,
+    subject    TEXT NOT NULL,
+    host       TEXT,
+    detail     TEXT,
+    openedAt   INTEGER NOT NULL,
+    -- Holds (kind 'hold'): their place in line, the other standing reason
+    -- that blocks them (NULL: eligible), and their adapter key.
+    orderKey   TEXT,
+    blocked    TEXT,
+    adapterKey TEXT,
     PRIMARY KEY (kind, ref)
   );
   CREATE INDEX IF NOT EXISTS memory_guard_open_subject ON memory_guard_open(subject, kind);
   CREATE INDEX IF NOT EXISTS memory_guard_open_host
     ON memory_guard_open(kind, host, openedAt, ref);
+  CREATE INDEX IF NOT EXISTS memory_guard_open_age
+    ON memory_guard_open(kind, openedAt, ref);
+  CREATE INDEX IF NOT EXISTS memory_guard_holds_order
+    ON memory_guard_open(host, orderKey, ref) WHERE kind = 'hold';
+  CREATE INDEX IF NOT EXISTS memory_guard_holds_eligible
+    ON memory_guard_open(host, orderKey, ref) WHERE kind = 'hold' AND blocked IS NULL;
+  CREATE INDEX IF NOT EXISTS memory_guard_holds_key
+    ON memory_guard_open(kind, adapterKey) WHERE kind = 'hold';
+  CREATE TABLE IF NOT EXISTS memory_guard_effects (
+    effectId   TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL CHECK (kind IN ('override_admission','idle_close','tree_kill',
+                                             'unit_remove','publish_config','publish_marker')),
+    host       TEXT NOT NULL,
+    subject    TEXT,
+    phase      TEXT NOT NULL CHECK (phase IN ('intended','dispatched','done')),
+    intent     TEXT NOT NULL,
+    dispatch   TEXT,
+    outcome    TEXT,
+    createdAt  INTEGER NOT NULL,
+    resolvedAt INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS memory_guard_effects_open
+    ON memory_guard_effects(host, kind, createdAt, effectId) WHERE phase != 'done';
+  CREATE INDEX IF NOT EXISTS memory_guard_effects_done
+    ON memory_guard_effects(resolvedAt, effectId) WHERE phase = 'done';
   """
 
   @doc "Create the current-state tables (additive; no stamp change)."
@@ -149,6 +180,98 @@ defmodule Tightbeam.MemoryGuard.State do
       [kind]
     )
     |> rows()
+  end
+
+  @doc """
+  A keyset page of open items of `kind`, oldest first by `(openedAt, ref)`,
+  after `cursor` and not past `high` (the cycle's high-water key), at most
+  `limit`. With `host` nil it pages every host (index `(kind, openedAt, ref)`);
+  with a host, that host's (index `(kind, host, openedAt, ref)`).
+  """
+  @spec page(
+          DB.server(),
+          String.t(),
+          String.t() | nil,
+          tuple() | nil,
+          tuple() | nil,
+          pos_integer()
+        ) ::
+          {:ok, [map()]} | {:error, String.t()}
+  def page(db, kind, host, cursor, high, limit) do
+    {after_at, after_ref} = cursor || {-1, ""}
+    {high_at, high_ref} = high || {9_223_372_036_854_775_807, "~"}
+
+    read(db, fn txn ->
+      txn
+      |> Txn.q(
+        """
+        SELECT ref, subject, host, detail, openedAt FROM memory_guard_open
+        WHERE kind=?1 AND (?2 IS NULL OR host=?2)
+          AND (openedAt, ref) > (?3, ?4) AND (openedAt, ref) <= (?5, ?6)
+        ORDER BY openedAt, ref LIMIT ?7
+        """
+        |> host_form(host),
+        [kind, host, after_at, after_ref, high_at, high_ref, limit]
+      )
+      |> rows()
+    end)
+  end
+
+  @doc "The newest `(openedAt, ref)` of `kind` (optionally of one host), or nil."
+  @spec high_water(DB.server(), String.t(), String.t() | nil) ::
+          {:ok, tuple() | nil} | {:error, String.t()}
+  def high_water(db, kind, host) do
+    read(db, fn txn ->
+      case Txn.q(
+             txn,
+             """
+             SELECT openedAt, ref FROM memory_guard_open
+             WHERE kind=?1 AND (?2 IS NULL OR host=?2)
+             ORDER BY openedAt DESC, ref DESC LIMIT 1
+             """
+             |> host_form(host),
+             [kind, host]
+           ) do
+        [[at, ref]] -> {at, ref}
+        [] -> nil
+      end
+    end)
+  end
+
+  # Two sargable forms, never an optional filter: with a host the predicate
+  # is `host=?2`; without one the `?2` term is dropped.
+  defp host_form(sql, nil),
+    do: String.replace(sql, " AND (?2 IS NULL OR host=?2)", " AND ?2 IS NULL")
+
+  defp host_form(sql, _host), do: String.replace(sql, "(?2 IS NULL OR host=?2)", "host=?2")
+
+  defp read(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> {:ok, result}
+      {:error, error} -> {:error, Exception.message(error)}
+    end
+  catch
+    :exit, reason -> {:error, inspect(reason)}
+  end
+
+  @doc """
+  Whether more than `cap` items of `kind` are open (on one host, or all):
+  `:within` or `:more`, a probe capped at `cap + 1` rows.
+  """
+  @spec backlog(DB.server(), String.t(), String.t() | nil, pos_integer()) ::
+          {:ok, :within | :more} | {:error, String.t()}
+  def backlog(db, kind, host, cap \\ 256) do
+    read(db, fn txn ->
+      [[n]] =
+        Txn.q(
+          txn,
+          "SELECT COUNT(*) FROM (SELECT 1 FROM memory_guard_open WHERE kind=?1 AND (?2 IS NULL OR host=?2) LIMIT ?3)"
+          |> host_form(host),
+          [kind, host, cap + 1]
+        )
+
+      if n > cap, do: :more, else: :within
+    end)
   end
 
   @doc "Whether any item of `kind` is open, on any host (one index probe)."
