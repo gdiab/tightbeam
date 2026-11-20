@@ -3503,6 +3503,37 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## v1.13 FS8: `off` and custody (matrix A2 under off; T29)
+
+  describe "matrix A2 under off (FS8, T29)" do
+    test "A2 (T29): a tree launched before a switch to off is still ended with its adapter, before any replacement; a tree launched under off has no record and is not touched",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      proc!(ctx.root, 951, 950, 951, 10 * @mib)
+      launch!(ctx.base, "sl-before", "sid-before", 951, 951, 512 * @mib)
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "mode", "off", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+      assert MemoryGuard.read(@host).mode == "off"
+
+      # Launched under off: the step wrote no record (cli/tests mode_off).
+      proc!(ctx.root, 952, 950, 952, 10 * @mib)
+
+      assert :ok = MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
+      assert_received {:killed, %{scope: "session", pid: 951}}
+      refute_received {:killed, %{pid: 952}}
+      assert Records.read_all(ctx.base) == {:ok, %{}}
+      assert File.dir?(Path.join(ctx.root, "proc/952"))
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
