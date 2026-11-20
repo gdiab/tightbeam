@@ -58,22 +58,37 @@ defmodule Tightbeam.MemoryGuard.Records do
          do: File.rename(pending, path)
   end
 
-  @doc "Every complete launch record, keyed by launch id."
-  @spec read_all(String.t()) :: %{String.t() => map()}
+  @doc """
+  Every launch record, keyed by launch id. These records are the custody of
+  live session processes (R2a), so a record that cannot be listed, read or
+  decoded is an error, never an absent record. No directory yet is no records.
+  (`*.pending` files are a step's write in progress, renamed when complete.)
+  """
+  @spec read_all(String.t()) :: {:ok, %{String.t() => map()}} | {:error, String.t()}
   def read_all(base_dir) do
     sessions = Path.join(dir(base_dir), "sessions")
 
     case File.ls(sessions) do
       {:ok, entries} ->
-        for entry <- entries,
-            String.ends_with?(entry, ".json"),
-            {:ok, text} <- [File.read(Path.join(sessions, entry))],
-            {:ok, %{"v" => 1, "launchId" => launch} = record} <- [JSON.decode(text)],
-            into: %{},
-            do: {launch, record}
+        entries
+        |> Enum.filter(&String.ends_with?(&1, ".json"))
+        |> Enum.reduce_while({:ok, %{}}, fn entry, {:ok, acc} ->
+          path = Path.join(sessions, entry)
 
-      {:error, _} ->
-        %{}
+          with {:ok, text} <- File.read(path),
+               {:ok, %{"v" => 1, "launchId" => launch} = record} <- JSON.decode(text) do
+            {:cont, {:ok, Map.put(acc, launch, record)}}
+          else
+            {:error, :enoent} -> {:cont, {:ok, acc}}
+            other -> {:halt, {:error, "launch record #{entry} is unreadable: #{inspect(other)}"}}
+          end
+        end)
+
+      {:error, :enoent} ->
+        {:ok, %{}}
+
+      {:error, reason} ->
+        {:error, "launch records cannot be listed: #{reason}"}
     end
   end
 

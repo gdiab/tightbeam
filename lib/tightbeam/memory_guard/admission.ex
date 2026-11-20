@@ -53,17 +53,10 @@ defmodule Tightbeam.MemoryGuard.Admission do
       [[harness, host]] ->
         key = {Harness.parse!(harness).id(), "shared", host}
 
-        fallback? =
-          Txn.q(
-            txn,
-            "SELECT 1 FROM limit_fallback_evaluations WHERE sessionKey=?1 AND outcome IS NULL LIMIT 1",
-            [session_key]
-          ) != []
-
         Enum.filter(
           [
             HarnessProcess.parked_in_txn?(txn, key) && "quota_park",
-            fallback? && "limit_fallback"
+            fallback_open_in_txn?(txn, session_key) && "limit_fallback"
           ],
           & &1
         )
@@ -73,17 +66,28 @@ defmodule Tightbeam.MemoryGuard.Admission do
     end
   end
 
+  defp fallback_open_in_txn?(txn, session_key) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM limit_fallback_evaluations WHERE sessionKey=?1 AND outcome IS NULL LIMIT 1",
+      [session_key]
+    ) != []
+  end
+
   @doc """
-  At a quota-park release (companion B5): when a memory reason still stands
-  on the key's host, record the remaining hold and defer the re-admission.
-  Returns `:deferred`, or `:resume` when nothing else stands and the caller
-  runs the hook now and records the resumption (`resumed_in_txn/4`).
+  At a quota-park release (companion B5), run the re-admission of the
+  incident's pre-activity quota-failed turns for every session nothing else
+  holds. When a memory reason still stands on the key's host the whole hook
+  is deferred; a session under an open limit-fallback evaluation keeps its
+  turns pending. Deferred work runs once, when its last reason clears
+  (`run_deferred/2`). Returns `:resumed` or `:deferred`.
   """
-  @spec quota_released_in_txn(Txn.t(), String.t(), String.t(), String.t()) :: :deferred | :resume
+  @spec quota_released_in_txn(Txn.t(), String.t(), String.t(), String.t()) ::
+          :deferred | :resumed
   def quota_released_in_txn(%Txn{} = txn, incident_id, harness, host) do
     case Tightbeam.MemoryGuard.host_reasons(host) do
       [] ->
-        :resume
+        readmit_quota_in_txn(txn, incident_id, harness, host, "quota_park", false)
 
       remaining ->
         EventLog.lifecycle_in_txn(
@@ -108,6 +112,81 @@ defmodule Tightbeam.MemoryGuard.Admission do
         Tightbeam.MemoryGuard.note_deferred()
         :deferred
     end
+  end
+
+  # The quota hook for the sessions no limit-fallback evaluation holds, in the
+  # transaction that checks it. Sessions still held leave the hook pending:
+  # its deferral is recorded once, and it is resumed only when none is left.
+  defp readmit_quota_in_txn(txn, incident_id, harness, host, released, deferred?) do
+    {_count, held} =
+      Wakes.readmit_released_quota_intents_in_txn(
+        txn,
+        incident_id,
+        &(not fallback_open_in_txn?(txn, &1))
+      )
+
+    cond do
+      held == [] ->
+        if deferred?,
+          do:
+            EventLog.lifecycle_in_txn(
+              txn,
+              "quota_readmission_resumed",
+              incident_id,
+              JSON.encode!(%{host: host, harness: harness})
+            )
+
+        resumed_in_txn(txn, incident_id, host, last_released(txn, incident_id, released))
+        :resumed
+
+      fallback_hold_recorded?(txn, incident_id) ->
+        :deferred
+
+      true ->
+        EventLog.lifecycle_in_txn(
+          txn,
+          "admission_hold_remaining",
+          incident_id,
+          JSON.encode!(%{
+            host: host,
+            harness: harness,
+            released: released,
+            remaining: ["limit_fallback"],
+            sessions: held
+          })
+        )
+
+        unless deferred?,
+          do:
+            EventLog.lifecycle_in_txn(
+              txn,
+              "quota_readmission_deferred",
+              incident_id,
+              JSON.encode!(%{host: host, harness: harness, incidentId: incident_id})
+            )
+
+        Tightbeam.MemoryGuard.note_deferred()
+        :deferred
+    end
+  end
+
+  defp fallback_hold_recorded?(txn, incident_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM lifecycle_events
+      WHERE kind='admission_hold_remaining' AND subject=?1
+        AND EXISTS (SELECT 1 FROM json_each(detail,'$.remaining') WHERE value='limit_fallback')
+      LIMIT 1
+      """,
+      [incident_id]
+    ) != []
+  end
+
+  # The reason whose release let the hook run: a limit-fallback evaluation
+  # when one held it last, else the release that ran it.
+  defp last_released(txn, incident_id, released) do
+    if fallback_hold_recorded?(txn, incident_id), do: "limit_fallback", else: released
   end
 
   @doc "Record that admission resumed on a key once its last standing reason cleared."
@@ -235,9 +314,10 @@ defmodule Tightbeam.MemoryGuard.Admission do
   end
 
   @doc """
-  The last memory reason on `host` cleared: run each deferred hook once.
-  A deferred quota re-admission whose key is parked again is left for that
-  park's own release.
+  No memory reason stands on `host`: run each deferred hook whose other
+  reasons have cleared, once. A deferred quota re-admission whose key is
+  parked again is left for that park's own release; one whose session is
+  under an open limit-fallback evaluation waits for its outcome.
   """
   @spec run_deferred(DB.server(), String.t()) :: :ok | :pending
   def run_deferred(db, host) do
@@ -247,18 +327,8 @@ defmodule Tightbeam.MemoryGuard.Admission do
         %{"harness" => harness} = JSON.decode!(detail)
         key = {Harness.parse!(harness).id(), "shared", host}
 
-        unless HarnessProcess.parked_in_txn?(txn, key) do
-          Wakes.readmit_released_quota_intents_in_txn(txn, subject)
-
-          EventLog.lifecycle_in_txn(
-            txn,
-            "quota_readmission_resumed",
-            subject,
-            JSON.encode!(%{host: host, harness: harness})
-          )
-
-          resumed_in_txn(txn, subject, host, "memory")
-        end
+        unless HarnessProcess.parked_in_txn?(txn, key),
+          do: readmit_quota_in_txn(txn, subject, harness, host, "memory", true)
       end
 
       # A not-started re-admission runs only when no reason of any kind
@@ -283,6 +353,30 @@ defmodule Tightbeam.MemoryGuard.Admission do
 
   # Rows of `pending_kind` on `host` with no matching `done_kind` row (matched
   # by subject for the quota hook, by source turn for the not-started one).
+  @doc "Whether any deferred hook, on any host, has not yet run."
+  @spec pending?(DB.server()) :: boolean()
+  def pending?(db) do
+    case DB.query(
+           db,
+           """
+           SELECT 1 FROM lifecycle_events p
+           WHERE (p.kind='quota_readmission_deferred' AND NOT EXISTS (
+                    SELECT 1 FROM lifecycle_events d
+                    WHERE d.kind='quota_readmission_resumed' AND d.subject=p.subject))
+              OR (p.kind='memory_readmission_pending' AND NOT EXISTS (
+                    SELECT 1 FROM lifecycle_events d
+                    WHERE d.kind='memory_readmission_done'
+                      AND json_extract(d.detail,'$.sourceSeq')=json_extract(p.detail,'$.sourceSeq')))
+           LIMIT 1
+           """,
+           []
+         ) do
+      {:ok, []} -> false
+      # Unknown is pending: the next pass looks again.
+      _ -> true
+    end
+  end
+
   defp pending_in_txn(txn, pending_kind, done_kind, host) do
     match =
       if pending_kind == "memory_readmission_pending",

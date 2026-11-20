@@ -89,7 +89,13 @@ defmodule Tightbeam.MemoryGuard.Cgroup do
   """
   @spec relax(layout()) :: :ok | {:error, String.t()}
   def relax(%{fs: fs, harness: harness} = layout) do
-    [harness | units(layout)]
+    with {:ok, units} <- units(layout) do
+      relax_all(fs, [harness | units])
+    end
+  end
+
+  defp relax_all(fs, cgroups) do
+    cgroups
     |> Enum.flat_map(fn cgroup ->
       [
         write(fs, cgroup, "memory.max", "max"),
@@ -108,8 +114,11 @@ defmodule Tightbeam.MemoryGuard.Cgroup do
   @spec restore_units(layout(), %{optional(String.t()) => non_neg_integer()}) ::
           :ok | {:error, String.t()}
   def restore_units(%{fs: fs} = layout, limits) do
-    layout
-    |> units()
+    with {:ok, units} <- units(layout), do: restore_all(fs, units, limits)
+  end
+
+  defp restore_all(fs, units, limits) do
+    units
     |> Enum.flat_map(fn unit ->
       [write(fs, unit, "memory.swap.max", "0"), write(fs, unit, "memory.oom.group", "1")] ++
         case Map.get(limits, unit) do
@@ -171,12 +180,25 @@ defmodule Tightbeam.MemoryGuard.Cgroup do
     end
   end
 
-  @doc "Whether a cgroup still holds processes (`cgroup.events` populated)."
-  @spec populated?(String.t(), String.t()) :: boolean() | :gone
+  @doc """
+  Whether a cgroup still holds processes (`cgroup.events` populated):
+  `:gone` only when the cgroup no longer exists; a file that cannot be read is
+  `:unreadable`, never empty.
+  """
+  @spec populated?(String.t(), String.t()) :: boolean() | :gone | :unreadable
   def populated?(fs, cgroup) do
-    case read(fs, cgroup, "cgroup.events") do
-      {:ok, text} -> Map.get(parse_flat_keyed(text), "populated", 0) == 1
-      _ -> :gone
+    case File.read(Path.join(dir(fs, cgroup), "cgroup.events")) do
+      {:ok, text} ->
+        case parse_flat_keyed(text) do
+          %{"populated" => populated} -> populated == 1
+          _ -> :unreadable
+        end
+
+      {:error, :enoent} ->
+        if File.dir?(dir(fs, cgroup)), do: :unreadable, else: :gone
+
+      {:error, _} ->
+        :unreadable
     end
   end
 
@@ -196,18 +218,21 @@ defmodule Tightbeam.MemoryGuard.Cgroup do
     end
   end
 
-  @doc "The units directly under the budget group."
-  @spec units(layout()) :: [String.t()]
+  @doc "The units directly under the budget group; a listing failure is an error."
+  @spec units(layout()) :: {:ok, [String.t()]} | {:error, String.t()}
   def units(%{fs: fs, harness: harness}) do
     case File.ls(dir(fs, harness)) do
       {:ok, entries} ->
-        for entry <- entries,
-            String.starts_with?(entry, "adapter-") or String.starts_with?(entry, "session-"),
-            File.dir?(Path.join(dir(fs, harness), entry)),
-            do: Path.join(harness, entry)
+        units =
+          for entry <- entries,
+              String.starts_with?(entry, "adapter-") or String.starts_with?(entry, "session-"),
+              File.dir?(Path.join(dir(fs, harness), entry)),
+              do: Path.join(harness, entry)
 
-      _ ->
-        []
+        {:ok, units}
+
+      {:error, reason} ->
+        {:error, "#{harness} cannot be listed: #{reason}"}
     end
   end
 

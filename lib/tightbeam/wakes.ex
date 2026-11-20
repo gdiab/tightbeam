@@ -3530,10 +3530,31 @@ defmodule Tightbeam.Wakes do
   def readmit_released_quota_intents_in_txn(%Txn{} = txn, incident_id)
       when is_binary(incident_id) do
     txn
-    |> health_redelivery_sources_in_txn(incident_id, "rate-limit-dead")
-    |> Enum.reduce(0, fn source, count ->
-      count + redeliver_health_source_in_txn(txn, source, :release)
-    end)
+    |> readmit_released_quota_intents_in_txn(incident_id, fn _session_key -> true end)
+    |> elem(0)
+  end
+
+  @doc """
+  As `readmit_released_quota_intents_in_txn/2`, for the sessions `admit?`
+  accepts only. Every other row stays pending, for a later call (memory limits
+  v1.6 R6a: no re-admission while another reason holds its session). Returns
+  the re-admitted count and the sessions left pending.
+  """
+  @spec readmit_released_quota_intents_in_txn(Txn.t(), String.t(), (String.t() -> boolean())) ::
+          {non_neg_integer(), [String.t()]}
+  def readmit_released_quota_intents_in_txn(%Txn{} = txn, incident_id, admit?)
+      when is_binary(incident_id) do
+    {ready, held} =
+      txn
+      |> health_redelivery_sources_in_txn(incident_id, "rate-limit-dead")
+      |> Enum.split_with(fn [_key, session_key | _] -> admit?.(session_key) end)
+
+    count =
+      Enum.reduce(ready, 0, fn source, count ->
+        count + redeliver_health_source_in_txn(txn, source, :release)
+      end)
+
+    {count, held |> Enum.map(&Enum.at(&1, 1)) |> Enum.uniq()}
   end
 
   defp health_redelivery_sources_in_txn(txn, incident_id, failure_class) do

@@ -148,6 +148,9 @@ defmodule Tightbeam.MemoryGuardTest do
         send(test, {:killed, target})
 
         case Keyword.get(opts, :kill_result, :ok) do
+          killer when is_function(killer, 1) ->
+            killer.(target)
+
           :ok ->
             for pid <- target_pids(target), do: gone!(ctx.root, pid)
             :ok
@@ -654,6 +657,184 @@ defmodule Tightbeam.MemoryGuardTest do
       assert File.read!(Path.join(unit, "memory.max")) == "536870912"
       assert File.read!(Path.join(unit, "memory.swap.max")) == "0"
       assert File.read!(Path.join(unit, "memory.oom.group")) == "1"
+    end
+
+    test "(review R2) an unreadable cgroup.events is not an empty unit, so the tree is not certified ended",
+         ctx do
+      fs = Path.join(ctx.root, "cg")
+      unit = "/h/session-x"
+      dir = Cgroup.dir(fs, unit)
+      events_file = Path.join(dir, "cgroup.events")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.chmod(events_file, 0o644) end)
+
+      File.write!(events_file, "populated 0\nfrozen 0\n")
+      assert Cgroup.populated?(fs, unit) == false
+      File.chmod!(events_file, 0o000)
+      assert Cgroup.populated?(fs, unit) == :unreadable
+
+      # The root is gone and the kernel kill succeeded, but the unit's own
+      # record cannot be read.
+      state = %{root: ctx.root, killer: fn _, _ -> :ok end, signaller: fn _ -> :ok end}
+      target = %{scope: "session", pid: 4242, start: 1, unit: unit}
+
+      assert {:error, {:tree_survives, :ok}} =
+               MemoryGuard.end_tree(state, %{layout: %{fs: fs}}, target)
+
+      File.chmod!(events_file, 0o644)
+      File.rm!(events_file)
+      assert Cgroup.populated?(fs, unit) == :unreadable
+      File.rmdir!(dir)
+      assert Cgroup.populated?(fs, unit) == :gone
+      assert :ok = MemoryGuard.end_tree(state, %{layout: %{fs: fs}}, target)
+    end
+
+    test "(review R3) an unplaced adapter whose tree cannot be read fails the sample, never drops out",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
+      guard!(ctx, probe: enforced_probe(), cgroup_fs: fs)
+
+      _ =
+        MemoryGuard.launch_env(
+          {:codex, "shared", @host},
+          "L-un",
+          [cmd: ["/bin/x"], env: []],
+          ctx.db
+        )
+
+      harness = Path.join(fs, "svc/tightbeam.service/harness")
+      File.write!(Path.join(harness, "memory.current"), Integer.to_string(100 * @mib))
+      File.write!(Path.join(harness, "adapter-L-un/memory.current"), "0")
+      insert_adapter_row!(ctx.db, "L-un", 970, "codex")
+      proc!(ctx.root, 970, 1, 970, 100 * @mib)
+      File.write!(Path.join(ctx.root, "proc/970/cgroup"), "0::/svc/tightbeam.service/gateway\n")
+      proc_dir = Path.join(ctx.root, "proc")
+      stat = Path.join(proc_dir, "970/stat")
+
+      on_exit(fn ->
+        File.chmod(proc_dir, 0o755)
+        File.chmod(stat, 0o644)
+      end)
+
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "enforced"
+      assert MemoryGuard.read(@host).tightbeamTotalBytes == 200 * @mib
+
+      # The known root exists but cannot be read.
+      File.chmod!(stat, 0o000)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "count-only"
+      assert [_] = events(ctx.db, "memory_guard_sampling_failed")
+
+      File.chmod!(stat, 0o644)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "enforced"
+
+      # The whole process table cannot be read.
+      File.chmod!(proc_dir, 0o000)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "count-only"
+      assert [_, _] = events(ctx.db, "memory_guard_sampling_failed")
+
+      File.chmod!(proc_dir, 0o755)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "enforced"
+    end
+
+    test "(review R3) in watched mode a known session root that cannot be read fails the sample",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      proc!(ctx.root, 981, 1, 981, 100 * @mib)
+      launch!(ctx.base, "sl-r", "sid-r", 981, 981, 512 * @mib)
+      stat = Path.join(ctx.root, "proc/981/stat")
+      on_exit(fn -> File.chmod(stat, 0o644) end)
+
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "watched"
+
+      File.chmod!(stat, 0o000)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "count-only"
+      # Not mistaken for its end: custody stays.
+      assert Map.has_key?(elem(Records.read_all(ctx.base), 1), "sl-r")
+    end
+
+    for {direction, failure} <- [
+          {:leaving, :unit_write},
+          {:leaving, :unit_list},
+          {:returning, :unit_write},
+          {:returning, :unit_list}
+        ] do
+      @tag direction: direction, failure: failure
+      test "(review R4) #{direction} enforced with a #{failure} failure is not reported applied; retried until it is",
+           ctx do
+        {harness, unit, set_mode} = enforced_with_unit!(ctx)
+
+        if ctx.direction == :returning, do: assert(:ok = set_mode.("off"))
+
+        breaks =
+          case ctx.failure do
+            :unit_write -> {Path.join(unit, "memory.max"), 0o444, 0o644}
+            :unit_list -> {harness, 0o300, 0o755}
+          end
+
+        {path, broken, fixed} = breaks
+        File.chmod!(path, broken)
+        on_exit(fn -> File.chmod(path, fixed) end)
+        requested = if ctx.direction == :leaving, do: "off", else: "auto"
+        modes_before = length(events(ctx.db, "memory_guard_mode"))
+
+        assert {:error, {:not_applied, error}} = set_mode.(requested)
+
+        case ctx.failure do
+          :unit_write -> assert error =~ "memory.max could not be written"
+          :unit_list -> assert error =~ "cannot be listed"
+        end
+
+        read = MemoryGuard.read(@host)
+        assert read.mode == "watched"
+        assert read.notEnforcedReason =~ "retried every sample"
+
+        # The launch step is told the mode in effect, without a unit to join.
+        assert %{"mode" => "watched", "fs" => nil, "harness" => nil} =
+                 JSON.decode!(File.read!(Path.join(Records.dir(ctx.base), "launch.json")))
+
+        # Neither the read nor the mode record says the requested mode.
+        refute Enum.any?(
+                 Enum.drop(events(ctx.db, "memory_guard_mode"), modes_before),
+                 fn {_, detail} -> detail["mode"] in ["off", "enforced"] end
+               )
+
+        # The host-memory verb says the stored setting is not yet applied.
+        session!(ctx, "agent:admin-session")
+
+        result =
+          Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})["host-memory-set"].(%{
+            origin: "user:owner",
+            principal: {:session, "agent:admin-session"},
+            params: %{host: @host, name: "mode", value: requested}
+          })
+
+        assert result.effect =~ "NOT yet applied"
+
+        # The sampler retries; once the kernel takes it, the mode is in effect.
+        File.chmod!(path, fixed)
+        :ok = MemoryGuard.tick()
+
+        if ctx.direction == :leaving do
+          assert MemoryGuard.read(@host).mode == "off"
+          assert File.read!(Path.join(unit, "memory.max")) == "max"
+          assert File.read!(Path.join(unit, "memory.oom.group")) == "0"
+        else
+          assert MemoryGuard.read(@host).mode == "enforced"
+          assert File.read!(Path.join(unit, "memory.max")) == "536870912"
+          assert File.read!(Path.join(unit, "memory.oom.group")) == "1"
+        end
+
+        assert :ok = MemoryGuard.settings_changed(@host)
+      end
     end
 
     test "(review B4) an adapter launched while off already starts its sessions through the step, which acts once the mode changes",
@@ -1611,6 +1792,68 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  defp enforced_probe do
+    %{
+      mode: :enforced,
+      reason: nil,
+      mem_total: 16 * @gib,
+      cgroup: %{
+        root: "/svc/tightbeam.service",
+        gateway: "/svc/tightbeam.service/gateway",
+        move_self: false
+      }
+    }
+  end
+
+  # An enforced host with one live session unit and its launch record; returns
+  # the budget group's directory, the unit's, and a mode setter.
+  defp enforced_with_unit!(ctx) do
+    meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+    fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
+    guard!(ctx, probe: enforced_probe(), cgroup_fs: fs)
+    harness = Path.join(fs, "svc/tightbeam.service/harness")
+    unit = Path.join(harness, "session-live")
+    File.mkdir_p!(unit)
+
+    for {f, v} <- [
+          {"memory.max", "536870912"},
+          {"memory.swap.max", "0"},
+          {"memory.oom.group", "1"},
+          {"memory.current", "0"}
+        ],
+        do: File.write!(Path.join(unit, f), v)
+
+    File.write!(Path.join(harness, "memory.current"), "0")
+    dir = Path.join(Records.dir(ctx.base), "sessions")
+    File.mkdir_p!(dir)
+
+    File.write!(
+      Path.join(dir, "sl-live.json"),
+      JSON.encode!(%{
+        v: 1,
+        launchId: "sl-live",
+        sessionId: "live",
+        pid: 1,
+        start: 1,
+        placement: "enforced",
+        unit: "/svc/tightbeam.service/harness/session-live",
+        sessionLimit: 536_870_912
+      })
+    )
+
+    set_mode = fn mode ->
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "mode", mode, "user:owner", 16 * @gib)
+        )
+
+      MemoryGuard.settings_changed(@host)
+    end
+
+    {harness, unit, set_mode}
+  end
+
   defp insert_adapter_row!(db, launch_id, os_pid, harness \\ "claude") do
     {:ok, _} =
       DB.transaction(db, fn txn ->
@@ -1661,7 +1904,7 @@ defmodule Tightbeam.MemoryGuardTest do
       Process.sleep(50)
       for sid <- ["sid-a", "sid-b", "sid-d"], do: assert_received({:forgot, ^sid})
 
-      remaining = Records.read_all(ctx.base) |> Map.keys()
+      remaining = Records.read_all(ctx.base) |> elem(1) |> Map.keys()
       assert remaining == ["sl-other"]
     end
   end
@@ -1677,12 +1920,21 @@ defmodule Tightbeam.MemoryGuardTest do
 
     test "a failed group kill keeps the record, says the tree survives and refuses the replacement",
          ctx do
-      guard!(ctx, kill_result: {:error, :harness_group_failed}, signal_works: false)
+      # The helper fails while the tree lives and, like `harness-group` on an
+      # empty group, succeeds once it has gone.
+      guard!(ctx,
+        kill_result: fn _target ->
+          if File.dir?(Path.join(ctx.root, "proc/951")),
+            do: {:error, :harness_group_failed},
+            else: :ok
+        end,
+        signal_works: false
+      )
 
       assert {:error, {:session_trees_survive, ["sl-a"]}} =
                MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
 
-      assert Map.keys(Records.read_all(ctx.base)) == ["sl-a"]
+      assert Map.keys(elem(Records.read_all(ctx.base), 1)) == ["sl-a"]
 
       assert [{@host, %{"survivors" => [%{"launchId" => "sl-a"}]}}] =
                events(ctx.db, "memory_guard_orphans")
@@ -1694,7 +1946,7 @@ defmodule Tightbeam.MemoryGuardTest do
       # ... and allows the launch once it has ended.
       gone!(ctx.root, 951)
       assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
-      assert Records.read_all(ctx.base) == %{}
+      assert Records.read_all(ctx.base) == {:ok, %{}}
     end
 
     test "a missing identity with the recorded process alive is ended through its parent chain",
@@ -1705,7 +1957,154 @@ defmodule Tightbeam.MemoryGuardTest do
 
       assert :ok = MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
       assert_received {:signalled, [951, 952]}
-      assert Records.read_all(ctx.base) == %{}
+      assert Records.read_all(ctx.base) == {:ok, %{}}
+    end
+
+    test "(review R2) a helper that reports a captured survivor is not overruled by the root's end",
+         ctx do
+      proc!(ctx.root, 952, 951, 952, 10 * @mib)
+
+      guard!(ctx,
+        kill_result: fn _target ->
+          gone!(ctx.root, 951)
+          {:error, {:harness_group_failed, 1, "captured process 952 outlived SIGKILL"}}
+        end,
+        signal_works: false
+      )
+
+      assert {:error, {:session_trees_survive, ["sl-a"]}} =
+               MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
+
+      # The captured descendant is signalled by its own identity, the root
+      # having gone, and the custody record stays.
+      assert_received {:signalled, [952]}
+      assert Map.keys(elem(Records.read_all(ctx.base), 1)) == ["sl-a"]
+      assert events(ctx.db, "memory_tree_ended") == []
+    end
+
+    test "(review R2) a helper error stands even when every process this read sees is gone",
+         ctx do
+      proc!(ctx.root, 952, 951, 952, 10 * @mib)
+
+      # An escaped descendant the helper captured is invisible to the parent
+      # chain: only the helper's verdict knows it.
+      guard!(ctx,
+        kill_result: fn _target ->
+          gone!(ctx.root, 951)
+          gone!(ctx.root, 952)
+          {:error, {:harness_group_failed, 1, "captured process 4242 outlived SIGKILL"}}
+        end
+      )
+
+      assert {:error, {:session_trees_survive, ["sl-a"]}} =
+               MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
+
+      assert [{@host, %{"survivors" => [%{"error" => error}]}}] =
+               events(ctx.db, "memory_guard_orphans")
+
+      assert error =~ "kill_incomplete"
+      assert Map.keys(elem(Records.read_all(ctx.base), 1)) == ["sl-a"]
+    end
+
+    test "(review R1) an expected guard that is not running refuses; one restarting is waited for; none configured passes",
+         ctx do
+      key = {:claude, "shared", @host}
+      Application.put_env(:tightbeam, :memory_guard_restart_wait_ms, 200)
+
+      on_exit(fn ->
+        Application.delete_env(:tightbeam, :memory_guard_restart_wait_ms)
+        MemoryGuard.expect(false)
+      end)
+
+      MemoryGuard.expect(false)
+      assert :ok = MemoryGuard.ensure_no_orphans(key)
+      assert :ok = MemoryGuard.adapter_ended(key, "adapter-launch-1")
+
+      MemoryGuard.expect(true)
+
+      assert {:error, {:memory_guard_unavailable, :not_running}} =
+               MemoryGuard.ensure_no_orphans(key)
+
+      assert {:error, {:memory_guard_unavailable, :not_running}} =
+               MemoryGuard.adapter_ended(key, "adapter-launch-1")
+
+      # Nothing was ended in its absence.
+      assert Map.keys(elem(Records.read_all(ctx.base), 1)) == ["sl-a"]
+
+      # A guard that comes back within the wait answers the call itself.
+      Application.put_env(:tightbeam, :memory_guard_restart_wait_ms, 5_000)
+      task = Task.async(fn -> MemoryGuard.adapter_ended(key, "adapter-launch-1") end)
+      Process.sleep(200)
+      guard!(ctx)
+      assert :ok = Task.await(task, 10_000)
+      assert_received {:killed, %{scope: "session", pid: 951}}
+      assert Records.read_all(ctx.base) == {:ok, %{}}
+    end
+
+    test "(review R1 siblings) an expected guard that is down refuses an unplaced launch and stands as a reason for deferred hooks",
+         ctx do
+      local = Tightbeam.Placement.local_host_name()
+      key = {:claude, "shared", local}
+      opts = [cmd: ["/bin/claude-acp"], env: []]
+      on_exit(fn -> MemoryGuard.expect(false) end)
+
+      MemoryGuard.expect(false)
+      assert MemoryGuard.launch_env(key, "L-down", opts, ctx.db) == []
+      assert MemoryGuard.host_reasons(local) == []
+
+      MemoryGuard.expect(true)
+
+      assert {:error, :memory_guard_unavailable} =
+               MemoryGuard.launch_env(key, "L-down", opts, ctx.db)
+
+      # A satellite launch is not the guard's to place.
+      assert MemoryGuard.launch_env(key, "L-down", [process_ssh: "sat"] ++ opts, ctx.db) == []
+      assert MemoryGuard.host_reasons(local) == ["memory_guard_unavailable"]
+
+      # A quota release meanwhile defers its hook rather than running it.
+      assert {:ok, :deferred} =
+               DB.transaction(
+                 ctx.db,
+                 &Admission.quota_released_in_txn(&1, "incident-down", "claude", local)
+               )
+
+      assert [{"incident-down", %{"remaining" => ["memory_guard_unavailable"]}}] =
+               events(ctx.db, "admission_hold_remaining")
+    end
+
+    test "(review R1) a launch record that cannot be read or listed keeps the fence and fails the sample",
+         ctx do
+      guard!(ctx)
+      key = {:claude, "shared", @host}
+      dir = Path.join(Records.dir(ctx.base), "sessions")
+      bad = Path.join(dir, "sl-bad.json")
+      File.write!(bad, "{not json")
+      on_exit(fn -> File.chmod(dir, 0o755) end)
+
+      assert {:error, {:custody_unreadable, error}} =
+               MemoryGuard.adapter_ended(key, "adapter-launch-1")
+
+      assert error =~ "sl-bad.json"
+      refute_received {:killed, _}
+      assert File.exists?(Path.join(dir, "sl-a.json"))
+
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+      assert {:error, {:custody_unreadable, _}} = MemoryGuard.ensure_no_orphans(key)
+
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).mode == "count-only"
+      assert [_] = events(ctx.db, "memory_guard_sampling_failed")
+
+      File.rm!(bad)
+      File.chmod!(dir, 0o000)
+      assert {:error, {:custody_unreadable, error}} = MemoryGuard.ensure_no_orphans(key)
+      assert error =~ "cannot be listed"
+      refute_received {:killed, _}
+
+      File.chmod!(dir, 0o755)
+      assert :ok = MemoryGuard.ensure_no_orphans(key)
+      assert_received {:killed, %{scope: "session", pid: 951}}
+      assert Records.read_all(ctx.base) == {:ok, %{}}
     end
 
     test "a guard that cannot answer refuses the launch rather than allowing it", ctx do

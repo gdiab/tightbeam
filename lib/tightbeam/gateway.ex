@@ -260,6 +260,13 @@ defmodule Tightbeam.Gateway do
     :ok = release_interrupted_limit_fallback_holds(db)
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
+
+    memory_guard? =
+      Map.get(config, :memory_guard, Application.get_env(:tightbeam, :memory_guard, true))
+
+    # A guard this tree runs is expected: while it restarts, launch fencing
+    # waits for it or refuses (R2a), never passes as if none were configured.
+    Tightbeam.MemoryGuard.expect(memory_guard?)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 
     adapter_opts = fn key, context ->
@@ -357,7 +364,7 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          # Memory limits v1.1: ahead of the adapters, whose residency it counts,
          # and the lanes, whose launches it admits.
-         if(Map.get(config, :memory_guard, Application.get_env(:tightbeam, :memory_guard, true)),
+         if(memory_guard?,
            do: {Tightbeam.MemoryGuard, db: db, base_dir: config.base_dir, cli_bin: cli_bin}
          ),
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
@@ -5736,6 +5743,9 @@ defmodule Tightbeam.Gateway do
             case Tightbeam.MemoryGuard.settings_changed(host) do
               :ok ->
                 "applies to the next decision on #{host}, without a restart"
+
+              {:error, {:not_applied, reason}} ->
+                "stored, but NOT yet applied: #{reason}"
 
               {:error, reason} ->
                 "stored, but NOT yet applied: the memory guard did not answer " <>

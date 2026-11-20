@@ -252,6 +252,10 @@ defmodule Tightbeam.HarnessProcess do
       [] ->
         env
 
+      {:error, reason} ->
+        raise "adapter launch refused for #{key_name(key)}: its session processes could " <>
+                "not be placed in the memory guard's custody (#{inspect(reason)})"
+
       extra ->
         names = MapSet.new(extra, &elem(&1, 0))
         Enum.reject(env, fn {name, _} -> MapSet.member?(names, name) end) ++ extra

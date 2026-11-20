@@ -742,6 +742,80 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert [{_incident, %{"after" => ["quota_park"]}}] = lifecycle(db, "admission_resumed")
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
     end
+
+    defp fallback!(db, seq, open?) do
+      {:ok, _} =
+        if open?,
+          do:
+            DB.query(
+              db,
+              "INSERT INTO limit_fallback_evaluations (sessionKey, turnSeq, heldAt, createdAt) VALUES ('c1', ?1, 1, 1)",
+              [seq]
+            ),
+          else:
+            DB.query(
+              db,
+              "UPDATE limit_fallback_evaluations SET outcome='withheld', reason='test', decidedAt=2"
+            )
+    end
+
+    test "(review R5) quota releases, then memory while a limit-fallback evaluation stands: the hook runs once, after the evaluation",
+         %{db: db, root: root} do
+      {first, second} = parked_with_two_quota_failed_turns!(db)
+      release_at_reset!(db)
+      assert queued_messages(db) == []
+
+      fallback!(db, first, true)
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+
+      # The memory release leaves the evaluation standing: nothing re-admitted,
+      # no resumption, the remaining hold recorded once.
+      assert queued_messages(db) == []
+      assert lifecycle(db, "admission_resumed") == []
+      assert lifecycle(db, "quota_readmission_resumed") == []
+
+      assert [
+               {_, %{"released" => "quota_park", "remaining" => ["memory_floor"]}},
+               {_,
+                %{"released" => "memory", "remaining" => ["limit_fallback"], "sessions" => ["c1"]}}
+             ] = lifecycle(db, "admission_hold_remaining")
+
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == []
+      assert length(lifecycle(db, "admission_hold_remaining")) == 2
+
+      fallback!(db, first, false)
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert [{_incident, %{"after" => ["limit_fallback"]}}] = lifecycle(db, "admission_resumed")
+      assert [_] = lifecycle(db, "quota_readmission_resumed")
+      assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert length(queued_messages(db)) == 2
+      assert length(lifecycle(db, "admission_resumed")) == 1
+    end
+
+    test "(review R5) a quota release with no memory reason waits for a standing limit-fallback evaluation",
+         %{db: db, root: root} do
+      {first, second} = parked_with_two_quota_failed_turns!(db)
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert Tightbeam.MemoryGuard.host_reasons("testhost") == []
+
+      fallback!(db, first, true)
+      release_at_reset!(db)
+      assert queued_messages(db) == []
+      assert lifecycle(db, "admission_resumed") == []
+
+      assert [{_, %{"released" => "quota_park", "remaining" => ["limit_fallback"]}}] =
+               lifecycle(db, "admission_hold_remaining")
+
+      fallback!(db, first, false)
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert [{_incident, %{"after" => ["limit_fallback"]}}] = lifecycle(db, "admission_resumed")
+      assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+    end
   end
 
   test "B5: a quota-failed wake turn that had started work gets no retry; one that had not keeps it",

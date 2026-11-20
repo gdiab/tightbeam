@@ -35,6 +35,18 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
     end
   end
 
+  @doc """
+  Whether `pid` exists under `<root>/proc` but cannot be read: a failed read
+  of a known process, never mistaken for its end.
+  """
+  @spec unreadable?(String.t(), pos_integer()) :: boolean()
+  def unreadable?(root, pid) do
+    proc = Path.join(root, "proc")
+    # The existence check follows the failed read, so a process that ended in
+    # between reads as gone, not unreadable.
+    read(proc, pid) == :error and File.dir?(Path.join(proc, Integer.to_string(pid)))
+  end
+
   @doc "One process, or :error once it has gone."
   @spec read(String.t(), pos_integer()) :: {:ok, proc()} | :error
   def read(proc, pid) do
