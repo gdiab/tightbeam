@@ -522,6 +522,68 @@ defmodule Tightbeam.MemoryGuardTest do
       assert MemoryGuard.read(@host).mode == "enforced"
     end
 
+    test "(review B2) an adapter whose unit join failed is recorded, sampled and limited", ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
+
+      probe = %{
+        mode: :enforced,
+        reason: nil,
+        mem_total: 16 * @gib,
+        cgroup: %{
+          root: "/svc/tightbeam.service",
+          gateway: "/svc/tightbeam.service/gateway",
+          move_self: false
+        }
+      }
+
+      guard!(ctx, probe: probe, cgroup_fs: fs)
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "budget", "2G", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+
+      # The unit was created for the launch, but the adapter never joined it:
+      # its own cgroup is still the gateway's.
+      env =
+        MemoryGuard.launch_env(
+          {:codex, "shared", @host},
+          "L-un",
+          [cmd: ["/bin/x"], env: []],
+          ctx.db
+        )
+
+      assert List.keymember?(env, "TIGHTBEAM_ADAPTER_CGROUP", 0)
+      harness = Path.join(fs, "svc/tightbeam.service/harness")
+      File.write!(Path.join(harness, "memory.current"), Integer.to_string(100 * @mib))
+      File.write!(Path.join(harness, "adapter-L-un/memory.current"), "0")
+      insert_adapter_row!(ctx.db, "L-un", 970, "codex")
+      proc!(ctx.root, 970, 1, 970, 2100 * @mib)
+      File.write!(Path.join(ctx.root, "proc/970/cgroup"), "0::/svc/tightbeam.service/gateway\n")
+
+      :ok = MemoryGuard.tick()
+
+      assert [{@host, %{"launchId" => "L-un", "error" => error}}] =
+               events(ctx.db, "memory_guard_launch_unplaced")
+
+      assert error =~ "not in its memory unit"
+      # Its memory counts toward the budget, and over the budget it is ended.
+      assert MemoryGuard.read(@host).tightbeamTotalBytes == 2200 * @mib
+      assert_receive {:killed, %{scope: "adapter", row: %{os_pid: 970}}}
+      settle_kills!()
+
+      assert [{@host, %{"limit" => "budget", "scope" => "adapter"}}] =
+               events(ctx.db, "memory_tree_ended")
+
+      # Recorded once.
+      :ok = MemoryGuard.tick()
+      assert length(events(ctx.db, "memory_guard_launch_unplaced")) == 1
+    end
+
     test "(e) mode off: nothing acts", ctx do
       meminfo!(ctx.root, 16 * @gib, 1 * @gib)
       guard!(ctx)
@@ -1384,7 +1446,7 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
-  defp insert_adapter_row!(db, launch_id, os_pid) do
+  defp insert_adapter_row!(db, launch_id, os_pid, harness \\ "claude") do
     {:ok, _} =
       DB.transaction(db, fn txn ->
         DB.Txn.q(
@@ -1393,11 +1455,11 @@ defmodule Tightbeam.MemoryGuardTest do
           INSERT INTO harness_processes
             (launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
              launchSequence, osPid, processGroupId, bootIdentity, identityToken, state, createdAt)
-          VALUES (?1, 'claude:shared@testhost', 'claude', 'shared', 'testhost', NULL, '/bin/false',
+          VALUES (?1, ?4 || ':shared@testhost', ?4, 'shared', 'testhost', NULL, '/bin/false',
                   '/nonexistent', (SELECT COALESCE(MAX(launchSequence),0)+1 FROM harness_processes),
                   ?2, ?2, 'boot', ?1, 'running', ?3)
           """,
-          [launch_id, os_pid, System.system_time(:millisecond)]
+          [launch_id, os_pid, System.system_time(:millisecond), harness]
         )
       end)
 
