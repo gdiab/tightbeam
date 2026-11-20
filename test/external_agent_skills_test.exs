@@ -90,8 +90,8 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     for name <- shipped_skill_names() do
       bytes = skill_bytes(name)
 
+      # `/tightbeam …` lines are Clawline user commands, not CLI commands.
       commands =
-        # `/tightbeam …` lines are Clawline user commands, not CLI commands.
         Regex.scan(~r/(?<![\w\/])tightbeam ([a-z][a-z-]*)/, bytes, capture: :all_but_first)
         |> List.flatten()
         |> Enum.uniq()
