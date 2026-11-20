@@ -186,9 +186,9 @@ do_debug() { # $@: the full argv (rpc <expr> | remote)
 verb="${1:-}"
 case "$verb" in
   "" | -*)
-    # A LEADING FLAG STILL MEANS `start`. `tightbeam-gateway --erl "+sbwt none"`
-    # passes that option to start; treating a leading `-` as a subcommand would
-    # answer it with `Unknown command --erl`. Only a bare word is a subcommand.
+    # A LEADING FLAG STILL MEANS `start`, so `tightbeam-gateway --anything` starts the
+    # gateway rather than answering `Unknown command`. The flag itself is not passed
+    # on: the release's `start` takes no options. Only a bare word is a subcommand.
     verb=start
     ;;
 esac
