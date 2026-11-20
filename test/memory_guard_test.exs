@@ -2508,8 +2508,10 @@ defmodule Tightbeam.MemoryGuardTest do
       assert set.(call.(%{host: @host, name: "residentCap", value: "4"})).effect =~
                "NOT yet applied"
 
-      # The test host is not the gateway's own, so it can carry no kernel limit.
-      assert set.(call.(%{host: @host, name: "mode", value: "off"})).effect =~ "in force"
+      # No kernel limit of this contract exists here (none was ever set up).
+      assert set.(call.(%{host: @host, name: "mode", value: "off"})).effect =~
+               "in force on testhost"
+
       assert Unguarded.mode_in_force(ctx.db, @host) == "off"
     end
   end

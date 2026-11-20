@@ -41,12 +41,8 @@ fn run(base: &Path, command: &str, id: &str, root: bool, stdin: &str) -> std::pr
         cmd.env("TIGHTBEAM_TEST_ASSUME_ROOT", "1");
     }
     let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // A command that refuses before reading its input closes the pipe.
+    let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
     child.wait_with_output().unwrap()
 }
 
