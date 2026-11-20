@@ -203,6 +203,7 @@ defmodule Tightbeam.MemoryGuardTest do
         end),
       idle_check: Keyword.get(opts, :idle_check, &Tightbeam.Acp.Adapter.idle_session?/2),
       before_close_commit: Keyword.get(opts, :before_close_commit, fn _ -> :ok end),
+      before_kill_send: Keyword.get(opts, :before_kill_send, fn _ -> :ok end),
       close_confirm_ms: Keyword.get(opts, :close_confirm_ms, 300),
       killer: fn target, _host_state ->
         send(test, {:killed, target})
@@ -1755,7 +1756,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert MemoryGuard.memory_kill(%{host: @host, harness_session_id: "sid-b", since: 0}) == nil
     end
 
-    test "review B3: a kill that does not end its tree is no memory kill and is recorded as failed",
+    test "D1.unreadable (B3, FS6): a sent kill that does not end its tree is never published as ended, is recorded as failed and retried; the turn it hit is still memory_limit (the kill was sent)",
          ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       proc!(ctx.root, 640, 1, 41, 900 * @mib)
@@ -1769,14 +1770,17 @@ defmodule Tightbeam.MemoryGuardTest do
       assert [{@host, %{"sessionId" => "sid-f"}}] = events(ctx.db, "memory_kill_intent")
       settle_kills!()
 
-      # ... but nothing claims the tree ended, and settlement finds no memory kill.
+      # ... nothing claims the tree ended ...
       assert events(ctx.db, "memory_tree_ended") == []
 
       assert [{@host, %{"sessionId" => "sid-f", "error" => error}}] =
                events(ctx.db, "memory_kill_failed")
 
       assert error =~ "tree_survives"
-      assert MemoryGuard.memory_kill(%{host: @host, harness_session_id: "sid-f", since: 0}) == nil
+
+      # ... and settlement attributes the kill, because it was sent (FS6).
+      assert %{limit: "session", scope: "session"} =
+               MemoryGuard.memory_kill(%{host: @host, harness_session_id: "sid-f", since: 0})
 
       # It is still over its limit, so the next sample tries again.
       :ok = MemoryGuard.tick()
@@ -2928,6 +2932,92 @@ defmodule Tightbeam.MemoryGuardTest do
       message -> flush_messages([message | acc])
     after
       0 -> Enum.reverse(acc)
+    end
+  end
+
+  ## v1.13 FS6: which cause wins (matrix A5, D4, D5, H1, H2; T27)
+
+  describe "matrix A5 / D4 / D5 / H: attribution (FS6, T27)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      proc!(ctx.root, 650, 1, 51, 900 * @mib)
+      launch!(ctx.base, "sl-k", "sid-k", 650, 51, 512 * @mib)
+      session!(ctx, "agent:k", "sid-k")
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_attribution_wait_ms) end)
+      %{match: %{host: @host, harness_session_id: "sid-k", since: 0}}
+    end
+
+    test "D4.stale (T27 first): the kill is sent while an outside SIGKILL also lands: memory_limit",
+         ctx do
+      guard!(ctx,
+        kill_result: fn target ->
+          # Both land: the tree is gone either way.
+          gone!(ctx.root, target.pid)
+          :ok
+        end
+      )
+
+      :ok = MemoryGuard.tick()
+      settle_kills!()
+      assert %{limit: "session"} = MemoryGuard.memory_kill(ctx.match)
+    end
+
+    test "D4.stale (T27 second): the tree's end is observed after the intent and before the kill is sent: harness_exited",
+         ctx do
+      guard!(ctx, before_kill_send: fn target -> gone!(ctx.root, target.pid) end)
+
+      :ok = MemoryGuard.tick()
+      settle_kills!()
+      refute_received {:killed, _}
+      assert [{@host, _}] = events(ctx.db, "memory_kill_intent")
+      assert MemoryGuard.memory_kill(ctx.match) == nil
+      assert events(ctx.db, "memory_tree_ended") == []
+    end
+
+    test "D5.timeout (T27 third): the kill's confirmation does not arrive: memory_limit at once, because the kill was sent",
+         ctx do
+      test = self()
+
+      guard!(ctx,
+        kill_result: fn _target ->
+          send(test, :sent)
+          Process.sleep(:infinity)
+        end
+      )
+
+      :ok = MemoryGuard.tick()
+      assert_receive :sent
+      started = System.monotonic_time(:millisecond)
+      assert %{limit: "session"} = MemoryGuard.memory_kill(ctx.match)
+      assert System.monotonic_time(:millisecond) - started < 1_000
+    end
+
+    test "A5.timeout: an intent never sent within the wait is not a memory kill; settlement does not wait past it",
+         ctx do
+      Application.put_env(:tightbeam, :memory_guard_attribution_wait_ms, 300)
+      guard!(ctx, before_kill_send: fn _target -> Process.sleep(:infinity) end)
+
+      :ok = MemoryGuard.tick()
+      started = System.monotonic_time(:millisecond)
+      assert MemoryGuard.memory_kill(ctx.match) == nil
+      assert System.monotonic_time(:millisecond) - started < 2_000
+    end
+
+    test "A5.absent / H1.absent: no record of a kill is harness_exited (nil), never a guess",
+         ctx do
+      guard!(ctx)
+
+      assert MemoryGuard.memory_kill(%{host: @host, harness_session_id: "sid-none", since: 0}) ==
+               nil
+    end
+
+    test "H2.stale: a kill older than the turn's claim is not this turn's", ctx do
+      guard!(ctx, kill_result: fn target -> gone!(ctx.root, target.pid) && :ok end)
+      :ok = MemoryGuard.tick()
+      settle_kills!()
+      assert %{} = MemoryGuard.memory_kill(ctx.match)
+      later = System.system_time(:millisecond) + 60_000
+      assert MemoryGuard.memory_kill(%{ctx.match | since: later}) == nil
     end
   end
 
