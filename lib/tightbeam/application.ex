@@ -172,16 +172,15 @@ defmodule Tightbeam.Application do
       # restart the DB. The DB admission still precedes startup writes.
       {Tightbeam.Diagnostics,
        path: Path.join(base_dir, "diagnostics/db-gateway-v1.log"), name: Tightbeam.Diagnostics},
-      # The database remains the first domain-state owner.
+      # The database remains the first domain-state owner. It takes the stage 1 S1.2
+      # base-directory lock before it opens state.db for writing and holds it while
+      # serving (Tightbeam.BaseLock), so a recovery ceremony and a gateway start never
+      # overlap.
       {Tightbeam.DB,
        path: db_path,
        name: Tightbeam.DB,
        guard_inputs: Map.get(config, :guard_inputs, []),
        payload_root: Application.app_dir(:tightbeam)},
-      # Stage 1 S1.2: the base-directory lock, taken after DB admission and before the
-      # first write, held while serving. The recovery ceremony and root-admin commands
-      # take the same lock, so they and a gateway start never overlap.
-      {Tightbeam.BaseLock, path: Path.join(base_dir, "gateway.lock")},
       # Schema + boot epoch as a transient one-shot after the DB is up.
       {Tightbeam.Boot, config},
       # Lane naming registry and the task supervisor for turn work.

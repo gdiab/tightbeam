@@ -75,15 +75,10 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
     config = %{base_dir: base, guard_inputs: []}
     children = Tightbeam.Application.children(config)
 
-    # Stage 1 S1.2: the base lock is taken after DB admission and before Boot.
-    assert [
-             {Tightbeam.Diagnostics, diagnostics},
-             {DB, options},
-             {Tightbeam.BaseLock, lock},
-             {Tightbeam.Boot, ^config} | _
-           ] = children
-
-    assert lock[:path] == Path.join(base, "gateway.lock")
+    # Stage 1 S1.2: the DB owner itself takes the base lock before it opens state.db
+    # for writing (device_recovery_cli_test), so there is no separate lock child.
+    assert [{Tightbeam.Diagnostics, diagnostics}, {DB, options}, {Tightbeam.Boot, ^config} | _] =
+             children
 
     assert diagnostics[:path] == Path.join(base, "diagnostics/db-gateway-v1.log")
     assert options[:guard_inputs] == config.guard_inputs

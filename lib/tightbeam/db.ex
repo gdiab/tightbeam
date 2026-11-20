@@ -616,11 +616,37 @@ defmodule Tightbeam.DB do
     path = Keyword.fetch!(opts, :path)
     {path, admission} = prepare_persistent_admission!(path, opts)
 
-    if admission do
-      _ = Tightbeam.LiveBaseAdmission.revalidate!(admission)
-      File.mkdir_p!(admission.base)
+    case admit_and_lock(admission, opts) do
+      {:ok, base_lock} -> open(path, admission, base_lock)
+      {:error, reason} -> {:stop, reason}
     end
+  end
 
+  # Stage 1 S1.2: the base-directory lock is taken after admission (which reads
+  # state.db only read-only) and BEFORE the first write-capable open, and this process
+  # holds it in its state: it cannot be lost while the database is open, and a
+  # refused start opens nothing.
+  defp admit_and_lock(nil, _opts), do: {:ok, nil}
+
+  defp admit_and_lock(admission, opts) do
+    _ = Tightbeam.LiveBaseAdmission.revalidate!(admission)
+    File.mkdir_p!(admission.base)
+
+    if skip_base_lock?(opts),
+      do: {:ok, nil},
+      else: Tightbeam.BaseLock.acquire(admission.base)
+  end
+
+  # Test builds only: a test that runs the CLI ceremonies against a base seeds and
+  # reads it through its own connection, which must not hold the gateway's lock.
+  # A production build ignores the option.
+  if Application.compile_env(:tightbeam, :test_fixtures, false) do
+    defp skip_base_lock?(opts), do: Keyword.get(opts, :base_lock, true) == false
+  else
+    defp skip_base_lock?(_opts), do: false
+  end
+
+  defp open(path, admission, base_lock) do
     {:ok, conn} = Sqlite3.open(path)
 
     try do
@@ -640,7 +666,14 @@ defmodule Tightbeam.DB do
       :persistent_term.put({__MODULE__, self()}, readers)
 
       {:ok,
-       %{conn: conn, readers: readers, retry: retry, admission: admission, reference_fences: %{}}}
+       %{
+         conn: conn,
+         readers: readers,
+         retry: retry,
+         admission: admission,
+         base_lock: base_lock,
+         reference_fences: %{}
+       }}
     rescue
       error ->
         :ok = Sqlite3.close(conn)
