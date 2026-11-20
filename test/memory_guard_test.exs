@@ -3446,6 +3446,63 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## Admission's own reads (matrix L1–L5; FS1)
+
+  describe "matrix L: admission reads (FS1)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a launch")
+      guard!(ctx)
+      :ok
+    end
+
+    for {cell, table} <- [
+          {"L1.unreadable (the session row)", "sessions"},
+          {"L2.unreadable (the session's queued turns)", "turns"},
+          {"L3.unreadable (the harness session pointer)", "harness_pointers"},
+          {"L5.unreadable (the founding user)", "users"}
+        ] do
+      @tag table: table
+      test "#{cell}: a read the decision needs that fails holds the launch guard_unavailable, never admits it, and the lane asks again",
+           ctx do
+        {:ok, _} = DB.query(ctx.db, "ALTER TABLE #{ctx.table} RENAME TO #{ctx.table}_hidden")
+
+        try do
+          assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+          assert Process.alive?(Process.whereis(MemoryGuard))
+
+          assert [{"agent:new", %{"error" => _}}] =
+                   events(ctx.db, "memory_guard_admission_unreadable")
+        after
+          {:ok, _} = DB.query(ctx.db, "ALTER TABLE #{ctx.table}_hidden RENAME TO #{ctx.table}")
+        end
+
+        :ok = MemoryGuard.tick()
+        assert_received {:nudged, "agent:new"}
+        assert :ok = MemoryGuard.admit("agent:new", ctx.db)
+      end
+    end
+
+    test "L1.absent: no such session: nothing to admit, nothing claimed", ctx do
+      assert :no_turn = MemoryGuard.admit("agent:nobody", ctx.db)
+    end
+
+    test "L2.absent: no queued turn: nothing is claimed until a turn arrives", ctx do
+      session!(ctx, "agent:empty", "sid-empty")
+      assert :no_turn = MemoryGuard.admit("agent:empty", ctx.db)
+    end
+
+    test "L4.absent: an adapter that has gone no longer counts its sessions as resident", _ctx do
+      adapter = adapter!()
+      resident!(adapter, ["sid-new"])
+      assert MemoryGuard.read(@host).residentCount == 1
+      GenServer.stop(adapter)
+      _ = :sys.get_state(MemoryGuard)
+      assert MemoryGuard.read(@host).residentCount == 0
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
