@@ -584,6 +584,134 @@ defmodule Tightbeam.MemoryGuardTest do
       assert length(events(ctx.db, "memory_guard_launch_unplaced")) == 1
     end
 
+    test "(review B4) enforced -> off lifts the kernel limits on live units; enforced again restores them",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
+
+      probe = %{
+        mode: :enforced,
+        reason: nil,
+        mem_total: 16 * @gib,
+        cgroup: %{
+          root: "/svc/tightbeam.service",
+          gateway: "/svc/tightbeam.service/gateway",
+          move_self: false
+        }
+      }
+
+      guard!(ctx, probe: probe, cgroup_fs: fs)
+      harness = Path.join(fs, "svc/tightbeam.service/harness")
+      unit = Path.join(harness, "session-live")
+      File.mkdir_p!(unit)
+
+      for {f, v} <- [
+            {"memory.max", "536870912"},
+            {"memory.swap.max", "0"},
+            {"memory.oom.group", "1"}
+          ],
+          do: File.write!(Path.join(unit, f), v)
+
+      dir = Path.join(Records.dir(ctx.base), "sessions")
+      File.mkdir_p!(dir)
+
+      File.write!(
+        Path.join(dir, "sl-live.json"),
+        JSON.encode!(%{
+          v: 1,
+          launchId: "sl-live",
+          sessionId: "live",
+          pid: 1,
+          start: 1,
+          placement: "enforced",
+          unit: "/svc/tightbeam.service/harness/session-live",
+          sessionLimit: 536_870_912
+        })
+      )
+
+      set_mode = fn mode ->
+        {:ok, {:ok, _}} =
+          DB.transaction(
+            ctx.db,
+            &Settings.set_in_txn(&1, @host, "mode", mode, "user:owner", 16 * @gib)
+          )
+
+        :ok = MemoryGuard.settings_changed(@host)
+      end
+
+      set_mode.("off")
+      assert MemoryGuard.read(@host).mode == "off"
+      assert File.read!(Path.join(harness, "memory.max")) == "max"
+      assert File.read!(Path.join(unit, "memory.max")) == "max"
+      assert File.read!(Path.join(unit, "memory.swap.max")) == "max"
+      assert File.read!(Path.join(unit, "memory.oom.group")) == "0"
+      # The live member stays where it is.
+      assert File.dir?(unit)
+
+      set_mode.("auto")
+      assert MemoryGuard.read(@host).mode == "enforced"
+      assert File.read!(Path.join(harness, "memory.max")) == Integer.to_string(8 * @gib)
+      assert File.read!(Path.join(unit, "memory.max")) == "536870912"
+      assert File.read!(Path.join(unit, "memory.swap.max")) == "0"
+      assert File.read!(Path.join(unit, "memory.oom.group")) == "1"
+    end
+
+    test "(review B4) an adapter launched while off already starts its sessions through the step, which acts once the mode changes",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      cli = Path.join(ctx.root, "cli")
+      File.mkdir_p!(cli)
+      File.write!(Path.join(cli, "tightbeam"), "#!/bin/sh\n")
+
+      start_supervised!(
+        {MemoryGuard,
+         db: ctx.db,
+         base_dir: ctx.base,
+         cli_bin: cli,
+         local_host: @host,
+         root: ctx.root,
+         probe: fn -> %{mode: :watched, reason: "test", mem_total: 16 * @gib, cgroup: nil} end,
+         sample_ms: :manual,
+         nudge: fn _ -> :ok end}
+      )
+
+      launch_json = fn ->
+        ctx.base |> Records.dir() |> Path.join("launch.json") |> File.read!() |> JSON.decode!()
+      end
+
+      set_mode = fn mode ->
+        {:ok, {:ok, _}} =
+          DB.transaction(
+            ctx.db,
+            &Settings.set_in_txn(&1, @host, "mode", mode, "user:owner", 16 * @gib)
+          )
+
+        :ok = MemoryGuard.settings_changed(@host)
+      end
+
+      set_mode.("off")
+      assert %{"mode" => "off"} = launch_json.()
+
+      env =
+        MemoryGuard.launch_env(
+          {:claude, "shared", @host},
+          "L-off",
+          [cmd: ["/x/.bin/claude-agent-acp"], env: [{"CLAUDE_CODE_EXECUTABLE", "/x/claude"}]],
+          ctx.db
+        )
+
+      assert {"CLAUDE_CODE_EXECUTABLE", step} = List.keyfind(env, "CLAUDE_CODE_EXECUTABLE", 0)
+      assert step == Records.step_path(ctx.base)
+
+      assert {"TIGHTBEAM_SESSION_EXEC_TARGET", "/x/claude"} =
+               List.keyfind(env, "TIGHTBEAM_SESSION_EXEC_TARGET", 0)
+
+      # The step reads the mode at each session launch: it passes through under
+      # `off` (cli/tests/memory_guard_step.rs) and acts once it reads `watched`.
+      set_mode.("auto")
+      assert %{"mode" => "watched"} = launch_json.()
+    end
+
     test "(e) mode off: nothing acts", ctx do
       meminfo!(ctx.root, 16 * @gib, 1 * @gib)
       guard!(ctx)

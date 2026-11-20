@@ -81,6 +81,48 @@ defmodule Tightbeam.MemoryGuard.Cgroup do
   def set_budget(%{fs: fs, harness: harness}, budget),
     do: write(fs, harness, "memory.max", Integer.to_string(budget))
 
+  @doc """
+  Lift the kernel's limits from the layout when the host leaves `enforced`
+  (R12, R17): `memory.max` and `memory.swap.max` to `max` and
+  `memory.oom.group` to 0 on the budget group and on every unit. Processes stay
+  in their units, so custody and counting are unchanged.
+  """
+  @spec relax(layout()) :: :ok | {:error, String.t()}
+  def relax(%{fs: fs, harness: harness} = layout) do
+    [harness | units(layout)]
+    |> Enum.flat_map(fn cgroup ->
+      [
+        write(fs, cgroup, "memory.max", "max"),
+        write(fs, cgroup, "memory.swap.max", "max"),
+        write(fs, cgroup, "memory.oom.group", "0")
+      ]
+    end)
+    |> Enum.find(:ok, &match?({:error, _}, &1))
+  end
+
+  @doc """
+  Restore the unit settings when the host becomes `enforced` again: swap 0
+  and `memory.oom.group` 1 on every unit, and each session unit's own
+  `sessionLimit` from `limits` (unit => bytes), the limit it was launched with.
+  """
+  @spec restore_units(layout(), %{optional(String.t()) => non_neg_integer()}) ::
+          :ok | {:error, String.t()}
+  def restore_units(%{fs: fs} = layout, limits) do
+    layout
+    |> units()
+    |> Enum.flat_map(fn unit ->
+      [write(fs, unit, "memory.swap.max", "0"), write(fs, unit, "memory.oom.group", "1")] ++
+        case Map.get(limits, unit) do
+          bytes when is_integer(bytes) ->
+            [write(fs, unit, "memory.max", Integer.to_string(bytes))]
+
+          _ ->
+            []
+        end
+    end)
+    |> Enum.find(:ok, &match?({:error, _}, &1))
+  end
+
   @doc "The adapter unit path for `launch_id`."
   @spec adapter_unit(layout(), String.t()) :: String.t()
   def adapter_unit(%{harness: harness}, launch_id),
