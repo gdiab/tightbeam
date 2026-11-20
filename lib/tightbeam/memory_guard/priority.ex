@@ -72,8 +72,14 @@ defmodule Tightbeam.MemoryGuard.Priority do
         nil
 
       user ->
+        # L5: an unreadable user is not a removed one; the decision that needs
+        # it is held instead (v1.13 FS1), and the slot is never lent on a guess.
         exists? =
-          match?({:ok, [[1]]}, DB.query(db, "SELECT 1 FROM users WHERE userId=?1", [user]))
+          case DB.query(db, "SELECT 1 FROM users WHERE userId=?1", [user]) do
+            {:ok, [[1]]} -> true
+            {:ok, []} -> false
+            {:error, error} -> raise "the founding user cannot be read: #{inspect(error)}"
+          end
 
         key = Org.personal_session_key(user)
 
@@ -100,8 +106,11 @@ defmodule Tightbeam.MemoryGuard.Priority do
             EventLog.lifecycle(db, "memory_guard_founder", user, JSON.encode!(%{user: user}))
             user
 
-          _ ->
+          {:ok, []} ->
             nil
+
+          {:error, error} ->
+            raise "the users cannot be read: #{inspect(error)}"
         end
     end
   end

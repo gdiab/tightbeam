@@ -550,7 +550,7 @@ defmodule Tightbeam.MemoryGuard do
 
   @impl true
   def handle_call({:admit, session_key}, from, state) do
-    case admission(state, session_key) do
+    case safe_admission(state, session_key) do
       {:ok, state} ->
         {:reply, :ok, publish_all(state)}
 
@@ -586,12 +586,27 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
+  # Reads never crash the guard: a read that cannot be completed says so.
   def handle_call({:hold_reasons, session_key}, _from, state) do
-    {:reply, evaluate_reasons(state, session_key), state}
+    reasons =
+      try do
+        evaluate_reasons(state, session_key)
+      rescue
+        _ -> Unguarded.hold_reasons(state.db, session_key)
+      end
+
+    {:reply, reasons, state}
   end
 
   def handle_call({:read, host}, _from, state) do
-    {:reply, supported_read(state, host), state}
+    read =
+      try do
+        supported_read(state, host)
+      rescue
+        error -> %{host: host, mode: "unknown", error: Exception.message(error)}
+      end
+
+    {:reply, read, state}
   end
 
   def handle_call(:tick, _from, state) do
@@ -1033,6 +1048,28 @@ defmodule Tightbeam.MemoryGuard do
 
   ## Admission
 
+  # FS1 (matrix L1–L5): a read the decision needs that fails means the guard
+  # cannot answer the admission check: the turn is held `guard_unavailable`,
+  # never admitted, never failed; recorded once, and its lane asks again.
+  defp safe_admission(state, session_key) do
+    admission(state, session_key)
+  rescue
+    error ->
+      message = Exception.message(error)
+
+      state =
+        once(state, {:admission_unreadable, session_key}, fn ->
+          record(
+            state,
+            "memory_guard_admission_unreadable",
+            session_key,
+            JSON.encode!(%{error: message})
+          )
+        end)
+
+      {:held, ["guard_unavailable"], %{state | renudge: MapSet.put(state.renudge, session_key)}}
+  end
+
   defp admission(state, session_key) do
     with %{} = session <- Org.get(state.db, session_key),
          %{} = host_state <- Map.get(state.hosts, session.host) || :unknown_host,
@@ -1308,7 +1345,9 @@ defmodule Tightbeam.MemoryGuard do
            [session_key]
          ) do
       {:ok, [[seq]]} -> seq
-      _ -> nil
+      {:ok, []} -> nil
+      # L2: a queue that cannot be read is not an empty one.
+      {:error, error} -> raise "the session's queued turns cannot be read: #{inspect(error)}"
     end
   end
 
