@@ -277,7 +277,9 @@ defmodule Tightbeam.OwnerAlerts do
   defp owner_via(q) do
     case q.("SELECT value FROM org_settings WHERE key=?1", [@owner_setting]) do
       [[user_id]] when is_binary(user_id) and user_id != "" ->
-        if q.("SELECT 1 FROM users WHERE userId=?1", [user_id]) == [[1]],
+        # Only an active user: one removed since the setting was made reads as
+        # unset (removed-user parts; every owner read goes through here).
+        if q.("SELECT 1 FROM users WHERE userId=?1 AND removedAt IS NULL", [user_id]) == [[1]],
           do: user_id,
           else: nil
 
@@ -357,9 +359,6 @@ defmodule Tightbeam.OwnerAlerts do
 
   defp user_exists_in_txn?(txn, user_id),
     do: Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1", [user_id]) == [[1]]
-
-  defp active_user_in_txn?(txn, user_id),
-    do: user_exists_in_txn?(txn, user_id) and not UserAdmin.removed_in_txn?(txn, user_id)
 
   ## (b) usage-limit trigger
 
