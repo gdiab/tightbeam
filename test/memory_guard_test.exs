@@ -225,7 +225,7 @@ defmodule Tightbeam.MemoryGuardTest do
         if Keyword.get(opts, :signal_works, true), do: for(pid <- pids, do: gone!(ctx.root, pid))
         :ok
       end,
-      nudge: fn key -> send(test, {:nudged, key}) end
+      nudge: Keyword.get(opts, :nudge, fn key -> send(test, {:nudged, key}) end)
     })
   end
 
@@ -3233,6 +3233,117 @@ defmodule Tightbeam.MemoryGuardTest do
       assert MemoryGuard.read(@host).hostAvailablePercent == nil
       :ok = MemoryGuard.note_adapter_exit("L-outside", 137)
       assert %{status: 137, host_low: "unknown"} = MemoryGuard.adapter_exit("L-outside")
+    end
+  end
+
+  ## Release delivery (matrix M1–M3; R6, R6a, R9)
+
+  describe "matrix M: release delivery (R6, R6a, R9)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      session!(ctx, "agent:a", "sid-a")
+      session!(ctx, "agent:b", "sid-b")
+      for key <- ["agent:a", "agent:b"], do: queue!(ctx, key, "needs a launch")
+      :ok
+    end
+
+    test "M1.unreadable / M1.partial: a nudge that fails is not lost; the next sample nudges every held session no reason holds",
+         ctx do
+      test = self()
+      failures = :counters.new(1, [])
+
+      guard!(ctx,
+        nudge: fn key ->
+          # The first nudge after the release fails.
+          if key == "agent:a" and :counters.get(failures, 1) == 0 do
+            :counters.add(failures, 1, 1)
+            raise "lane unavailable"
+          end
+
+          send(test, {:nudged, key})
+        end
+      )
+
+      :ok = MemoryGuard.tick()
+      for key <- ["agent:a", "agent:b"], do: assert({:held, _} = MemoryGuard.admit(key, ctx.db))
+
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 50, 100))
+      :ok = MemoryGuard.tick()
+      assert_received {:nudged, "agent:b"}
+      # The failed nudge is retried by the sample; the guard did not crash.
+      assert Process.alive?(Process.whereis(MemoryGuard))
+      :ok = MemoryGuard.tick()
+      assert_received {:nudged, "agent:a"}
+    end
+
+    test "M1.stale: a lane nudged after its reason stood again re-asks and is held; nothing is claimed without a decision",
+         ctx do
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:a", ctx.db)
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 50, 100))
+      :ok = MemoryGuard.tick()
+      assert_received {:nudged, "agent:a"}
+
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      :ok = MemoryGuard.tick()
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:a", ctx.db)
+    end
+
+    test "M3.unreadable: a re-admitted turn whose handoff never reached its lane is nudged by the next sample",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      seq = oldest!(ctx, "agent:a")
+
+      {:ok, :readmitted} =
+        DB.transaction(ctx.db, &Admission.not_started_in_txn(&1, seq, @host))
+
+      # LaneManager is not running here: the handoff after commit reached no lane.
+      :ok = MemoryGuard.tick()
+      assert_received {:nudged, "agent:a"}
+    end
+
+    test "M2.absent: a deferred re-admission whose source turn is gone records its end and is not pending forever",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+
+      EventLog.lifecycle(
+        ctx.db,
+        "memory_readmission_pending",
+        "agent:a",
+        JSON.encode!(%{host: @host, sourceSeq: 999_999})
+      )
+
+      assert Admission.pending?(ctx.db)
+      _ = Admission.run_deferred(ctx.db, @host)
+
+      assert [{_, %{"sourceSeq" => 999_999, "readmittedSeq" => nil, "sourceGone" => true}}] =
+               events(ctx.db, "memory_readmission_done")
+
+      refute Admission.pending?(ctx.db)
+    end
+
+    test "M2.stale: a source already re-admitted is never enqueued twice", ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      seq = oldest!(ctx, "agent:a")
+      {:ok, :readmitted} = DB.transaction(ctx.db, &Admission.not_started_in_txn(&1, seq, @host))
+
+      # The same source again (a replayed settlement): no second turn.
+      {:ok, _} =
+        DB.transaction(ctx.db, fn txn ->
+          EventLog.lifecycle_in_txn(
+            txn,
+            "memory_readmission_pending",
+            "agent:a",
+            JSON.encode!(%{host: @host, sourceSeq: seq})
+          )
+        end)
+
+      _ = Admission.run_deferred(ctx.db, @host)
+      assert length(events(ctx.db, "memory_readmission_done")) == 1
     end
   end
 

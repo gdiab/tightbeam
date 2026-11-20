@@ -443,8 +443,38 @@ defmodule Tightbeam.MemoryGuard.Admission do
           Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
         end
 
+      # M2: the source turn is gone; nothing to enqueue. The done record is
+      # still written, so the hook is not pending forever.
       [] ->
-        :ok
+        EventLog.lifecycle_in_txn(
+          txn,
+          "memory_readmission_done",
+          "turn:#{seq}",
+          JSON.encode!(%{host: host, sourceSeq: seq, readmittedSeq: nil, sourceGone: true})
+        )
+    end
+  end
+
+  @doc """
+  Sessions with a re-admitted turn (R9 not-started, FS2 refusal) still
+  queued in the last hour: their lanes are nudged each sample, in case the
+  handoff after the re-admission's commit never reached them (matrix M3).
+  """
+  @spec readmitted_queued(DB.server()) :: [String.t()]
+  def readmitted_queued(db) do
+    since = System.system_time(:millisecond) - 3_600_000
+
+    case DB.query(
+           db,
+           """
+           SELECT DISTINCT t.sessionKey FROM lifecycle_events d
+           JOIN turns t ON t.seq = json_extract(d.detail,'$.readmittedSeq')
+           WHERE d.kind='memory_readmission_done' AND d.ts >= ?1 AND t.status='queued'
+           """,
+           [since]
+         ) do
+      {:ok, rows} -> Enum.map(rows, &hd/1)
+      _ -> []
     end
   end
 

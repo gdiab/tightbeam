@@ -654,7 +654,7 @@ defmodule Tightbeam.MemoryGuard do
   def handle_info(:release_unguarded, state) do
     for {session_key, host} <- Unguarded.held_sessions(state.db) do
       Unguarded.release(state.db, session_key, host, "guard_answers")
-      state.nudge.(session_key)
+      nudge(state, session_key)
     end
 
     {:noreply, state}
@@ -1476,8 +1476,34 @@ defmodule Tightbeam.MemoryGuard do
         end
       end)
 
-    for session_key <- state.renudge, do: state.nudge.(session_key)
-    %{state | renudge: MapSet.new()}
+    for session_key <- state.renudge, do: nudge(state, session_key)
+    state = %{state | renudge: MapSet.new()}
+    renudge_ready(state)
+  end
+
+  # R6 / [SPIRIT] (matrix M1, M3): a held turn is never stranded by a lost
+  # nudge. Each sample nudges again every held session that no reason holds
+  # now, and every re-admitted turn still queued (its handoff may not have
+  # reached the lane). A lane that is nudged needlessly re-asks and is held.
+  defp renudge_ready(state) do
+    for {session_key, _held} <- state.held,
+        evaluate_reasons(state, session_key) == [],
+        Admission.other_reasons(state.db, session_key) == [],
+        do: nudge(state, session_key)
+
+    for session_key <- Admission.readmitted_queued(state.db), do: nudge(state, session_key)
+    state
+  end
+
+  # A nudge that fails is not the guard's failure: the next sample retries it.
+  defp nudge(state, session_key) do
+    state.nudge.(session_key)
+  rescue
+    error ->
+      Logger.warning("memory guard: nudge of #{session_key} failed: #{Exception.message(error)}")
+  catch
+    :exit, reason ->
+      Logger.warning("memory guard: nudge of #{session_key} failed: #{inspect(reason)}")
   end
 
   # A record that is a state change's own step: `:ok` or `{:error, message}`.
@@ -1579,11 +1605,11 @@ defmodule Tightbeam.MemoryGuard do
     reserved = reserved_main_key(state)
 
     if Map.has_key?(state.held, reserved) and Map.get(state.held, reserved).host == host,
-      do: state.nudge.(reserved)
+      do: nudge(state, reserved)
 
     state
     |> waiters(host, reserved)
-    |> Enum.each(fn {key, _place} -> state.nudge.(key) end)
+    |> Enum.each(fn {key, _place} -> nudge(state, key) end)
 
     state
   end
@@ -1664,7 +1690,7 @@ defmodule Tightbeam.MemoryGuard do
               JSON.encode!(%{host: state.local_host, detail: "guard_unavailable"})
             )
 
-            state.nudge.(session_key)
+            nudge(state, session_key)
           end
         end
     end
