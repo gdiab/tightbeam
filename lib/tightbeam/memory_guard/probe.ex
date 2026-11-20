@@ -269,7 +269,9 @@ defmodule Tightbeam.MemoryGuard.Probe do
              "per-agent memory limits are checked every second, not enforced by the kernel: " <>
                "#{unit} has OOMPolicy=#{policy}, which would stop the whole service on one agent's kill"}
 
-          :error ->
+          # F5: a systemctl that fails or does not answer is no evidence of
+          # `continue`; the host runs watched and says why.
+          _ ->
             {:error,
              "per-agent memory limits are checked every second, not enforced by the kernel: " <>
                "the OOMPolicy of #{unit} cannot be read"}

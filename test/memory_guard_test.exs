@@ -4230,6 +4230,487 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## The remaining matrix v4 cells, one test each
+
+  describe "matrix cells: the rest" do
+    alias Tightbeam.MemoryGuard.{Episodes, ProcTree, RootActions, RootPath}
+
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      on_exit(fn -> MemoryGuard.expect(false) end)
+      :ok
+    end
+
+    test "A1.absent / A6.absent / A7.absent: with no guard configured, a launch is admitted, the read says no guard runs, and a stored setting is not applied",
+         ctx do
+      MemoryGuard.expect(false)
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "go")
+      assert :ok = MemoryGuard.admit("agent:new", ctx.db)
+      handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})
+
+      assert %{code: "memory_guard_unavailable"} =
+               handlers["host-memory"].(%{origin: "user:owner", params: %{host: @host}})
+
+      session!(ctx, "agent:admin-session")
+
+      result =
+        handlers["host-memory-set"].(%{
+          origin: "user:owner",
+          principal: {:session, "agent:admin-session"},
+          params: %{host: @host, name: "residentCap", value: "4"}
+        })
+
+      assert result.effect =~ "NOT applied: no memory guard runs"
+    end
+
+    test "A6.timeout: a guard that does not answer the read is said so, never a mode", ctx do
+      guard!(ctx)
+      :sys.suspend(MemoryGuard)
+
+      try do
+        assert %{mode: "unknown", error: error} = MemoryGuard.read(@host)
+        assert error =~ "did not answer"
+      after
+        :sys.resume(MemoryGuard)
+      end
+    end
+
+    test "A5.unreadable: with the guard down, a kill cannot be attributed: harness_exited, never a guess",
+         ctx do
+      guard!(ctx)
+      stop_supervised!(MemoryGuard)
+      assert MemoryGuard.memory_kill(%{host: @host, harness_session_id: "sid-x", since: 0}) == nil
+    end
+
+    test "B1.partial: a launch record still being written (.pending) is never read as a record",
+         ctx do
+      dir = Path.join(Records.dir(ctx.base), "sessions")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "sl-half.json.pending"), "{\"v\":1,\"launchId\":\"sl-half\"")
+      assert Records.read_all(ctx.base) == {:ok, %{}}
+    end
+
+    for variant <- [:unreadable, :partial, :stale] do
+      @tag variant: variant
+      test "B4.#{variant}: restoring unit limits on entering enforced reads the inventory, never guesses it",
+           ctx do
+        {_harness, _unit, set_mode} = enforced_with_unit!(ctx)
+        :ok = MemoryGuard.tick()
+        assert :ok = set_mode.("off")
+        sessions = Path.join(Records.dir(ctx.base), "sessions")
+        on_exit(fn -> File.chmod(sessions, 0o755) end)
+
+        case ctx.variant do
+          :unreadable ->
+            File.chmod!(sessions, 0o000)
+            assert {:error, {:not_applied, _}} = set_mode.("auto")
+            assert MemoryGuard.read(@host).mode == "watched"
+
+          :partial ->
+            File.write!(Path.join(sessions, "sl-bad.json"), "{not json")
+            assert {:error, {:not_applied, _}} = set_mode.("auto")
+            assert MemoryGuard.read(@host).mode == "watched"
+
+          :stale ->
+            # A record whose unit no longer exists is skipped.
+            launch!(ctx.base, "sl-old", "old", 2, 2, 512 * @mib)
+            assert :ok = set_mode.("auto")
+            assert MemoryGuard.read(@host).mode == "enforced"
+        end
+      end
+    end
+
+    test "C1.partial: a cgroup.events without its populated key is unreadable, never empty",
+         ctx do
+      fs = Path.join(ctx.root, "cg")
+      dir = Cgroup.dir(fs, "/h/session-p")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "cgroup.events"), "frozen 0\n")
+      assert Cgroup.populated?(fs, "/h/session-p") == :unreadable
+    end
+
+    for {cell, target} <- [{"C2.absent", :harness}, {"C3.absent", :unit}] do
+      @tag target: target
+      test "#{cell}: a missing counter is a failed reading (C2) or an unknown size (C3), never 0",
+           ctx do
+        {harness, unit, _set_mode} = enforced_with_unit!(ctx)
+
+        case ctx.target do
+          :harness ->
+            File.rm!(Path.join(harness, "memory.current"))
+            :ok = MemoryGuard.tick()
+            assert [%{reading: "budget_total"}] = MemoryGuard.read(@host).unavailable
+
+          :unit ->
+            File.rm!(Path.join(unit, "memory.current"))
+            File.write!(Path.join(harness, "memory.current"), "100")
+            :ok = MemoryGuard.tick()
+            read = MemoryGuard.read(@host)
+            assert read.unavailable == []
+            assert read.tightbeamTotalBytes == 100
+        end
+      end
+    end
+
+    test "C4.absent / C4.unreadable / C4.stale: kernel attribution from a unit's counters, re-read briefly while they lag",
+         ctx do
+      Application.put_env(:tightbeam, :memory_guard_counter_retry_ms, 50)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_counter_retry_ms) end)
+      {harness, _unit, _set_mode} = enforced_with_unit!(ctx)
+      match = %{host: @host, harness_session_id: "k", since: 0}
+
+      # absent: no unit, no counters: no kernel attribution.
+      assert MemoryGuard.memory_kill(match) == nil
+
+      unit = Path.join(harness, "session-k")
+      File.mkdir_p!(unit)
+      events = Path.join(unit, "memory.events.local")
+      File.write!(events, "oom 1\noom_kill 1\noom_group_kill 1\n")
+      on_exit(fn -> File.chmod(events, 0o644) end)
+
+      # unreadable: no attribution.
+      File.chmod!(events, 0o000)
+      assert MemoryGuard.memory_kill(match) == nil
+      File.chmod!(events, 0o644)
+
+      # stale: the counters move just after the first read.
+      File.write!(events, "oom 0\noom_kill 0\noom_group_kill 0\n")
+
+      Task.start(fn ->
+        Process.sleep(80)
+        File.write!(events, "oom 1\noom_kill 1\noom_group_kill 1\n")
+      end)
+
+      assert %{limit: "session", mode: "enforced"} = MemoryGuard.memory_kill(match)
+    end
+
+    test "C5.absent / C5.unreadable: memory.peak is evidence only; without it the kernel's end is still recorded",
+         ctx do
+      {harness, unit, _set_mode} = enforced_with_unit!(ctx)
+      File.write!(Path.join(unit, "memory.events.local"), "oom 1\noom_kill 1\noom_group_kill 1\n")
+      File.write!(Path.join(unit, "cgroup.events"), "populated 0\n")
+      File.write!(Path.join(harness, "memory.current"), "0")
+      :ok = MemoryGuard.tick()
+
+      assert [{_, %{"limit" => "session", "bytes" => nil}}] = events(ctx.db, "memory_tree_ended")
+    end
+
+    for variant <- [:absent, :unreadable, :partial] do
+      @tag variant: variant
+      test "C6.#{variant}: a layout the guard cannot set up leaves the host watched, with the reason, never enforced",
+           ctx do
+        fs =
+          cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway",
+            read_only: ctx.variant == :unreadable
+          )
+
+        root_dir = Path.join(fs, "svc/tightbeam.service")
+
+        case ctx.variant do
+          :absent ->
+            File.chmod!(root_dir, 0o555)
+
+          :partial ->
+            harness = Path.join(root_dir, "harness")
+            File.mkdir_p!(harness)
+            File.write!(Path.join(harness, "memory.max"), "max")
+            File.chmod!(Path.join(harness, "memory.max"), 0o444)
+
+          :unreadable ->
+            :ok
+        end
+
+        on_exit(fn -> File.chmod(root_dir, 0o755) end)
+        guard!(ctx, probe: enforced_probe(), cgroup_fs: fs)
+        read = MemoryGuard.read(@host)
+        assert read.mode == "watched"
+        assert is_binary(read.notEnforcedReason)
+      end
+    end
+
+    test "C9.absent / C9.unreadable / C9.partial: cgroup.kill on a gone unit is nothing to do; one that cannot be written falls back to the tree kill; a unit still populated is no end",
+         ctx do
+      fs = Path.join(ctx.root, "cg")
+      host_state = %{layout: %{fs: fs}}
+
+      assert :ok =
+               MemoryGuard.default_kill(%{scope: "session", unit: "/h/session-gone"}, host_state)
+
+      dir = Cgroup.dir(fs, "/h/session-c")
+      File.mkdir_p!(dir)
+      kill_file = Path.join(dir, "cgroup.kill")
+      File.write!(kill_file, "")
+      File.chmod!(kill_file, 0o444)
+      on_exit(fn -> File.chmod(kill_file, 0o644) end)
+      # Unwritable cgroup.kill: the group kill runs instead (no identity here).
+      assert {:error, :no_identity} =
+               MemoryGuard.default_kill(%{scope: "session", unit: "/h/session-c"}, host_state)
+
+      File.chmod!(kill_file, 0o644)
+      File.write!(Path.join(dir, "cgroup.events"), "populated 1\n")
+      state = %{root: ctx.root, killer: &MemoryGuard.default_kill/2, signaller: fn _ -> :ok end}
+
+      assert {:error, {:tree_survives, :ok}} =
+               MemoryGuard.end_tree(state, host_state, %{
+                 scope: "session",
+                 pid: 4_000_001,
+                 start: 1,
+                 unit: "/h/session-c"
+               })
+    end
+
+    test "C10.absent: a unit already gone is removed without error", ctx do
+      assert :ok = Cgroup.remove(Path.join(ctx.root, "cg"), "/h/session-none")
+    end
+
+    test "D1.timeout / D2.timeout: a helper that times out is a failure, never an end", ctx do
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      proc!(ctx.root, 951, 950, 951, 10 * @mib)
+      launch!(ctx.base, "sl-a", "sid-a", 951, 951, 512 * @mib)
+      guard!(ctx, kill_result: {:error, :timeout}, signal_works: false)
+
+      assert {:error, {:session_trees_survive, ["sl-a"]}} =
+               MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
+    end
+
+    test "D2.stale / D1.stale / E2.stale: a recorded pid now used by another process is not ours: never signalled, and the record is released",
+         ctx do
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      # Recorded with start 1; the pid now runs another process (start 999).
+      proc!(ctx.root, 970, 1, 999, 900 * @mib)
+      launch!(ctx.base, "sl-reused", "sid-r", 970, 1, 512 * @mib)
+      guard!(ctx)
+
+      :ok = MemoryGuard.tick()
+      refute_received {:killed, _}
+      assert events(ctx.db, "memory_kill_intent") == []
+      assert Records.read_all(ctx.base) == {:ok, %{}}
+      assert File.dir?(Path.join(ctx.root, "proc/970"))
+    end
+
+    test "D3.timeout / K5.timeout: a close that times out stays resident and counted, recorded",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      adapter = adapter!()
+      session!(ctx, "agent:idle", "sid-idle")
+      guard!(ctx, close_result: {:error, :timeout})
+      resident!(adapter, ["sid-idle"])
+      :ok = MemoryGuard.tick()
+      settle_closes!()
+      assert [{"agent:idle", %{"error" => error}}] = events(ctx.db, "memory_guard_close_failed")
+      assert error =~ "timeout"
+      assert MemoryGuard.read(@host).residentCount == 1
+    end
+
+    test "E3.absent / E3.partial: a process that ended is not counted and not unreadable; a zombie's missing VmRSS counts 0",
+         ctx do
+      refute ProcTree.unreadable?(ctx.root, 123_456)
+      dir = Path.join(ctx.root, "proc/990")
+      File.mkdir_p!(dir)
+      zeros = Enum.map_join(1..17, " ", fn _ -> "0" end)
+      File.write!(Path.join(dir, "stat"), "990 (zombie) Z 1 #{zeros} 990 0 0\n")
+      File.write!(Path.join(dir, "status"), "Name:\tzombie\n")
+      assert {:ok, %{state: "Z", bytes: 0}} = ProcTree.read(Path.join(ctx.root, "proc"), 990)
+    end
+
+    test "E5.partial: a meminfo without MemAvailable is a failed reading: R5 unavailable", ctx do
+      File.write!(Path.join(ctx.root, "proc/meminfo"), "MemTotal: 16000000 kB\n")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert [%{reading: "meminfo", disables: ["R5"]}] = MemoryGuard.read(@host).unavailable
+    end
+
+    test "F1.absent: leaving enforced when the units cannot be listed (the budget group has gone) is not applied",
+         ctx do
+      {harness, _unit, set_mode} = enforced_with_unit!(ctx)
+      File.rm_rf!(harness)
+      assert {:error, {:not_applied, error}} = set_mode.("off")
+      assert error =~ "cannot be listed"
+      assert MemoryGuard.read(@host).mode == "watched"
+    end
+
+    test "F5.timeout: a systemctl that does not answer is no delegation: watched with the reason",
+         ctx do
+      cgroup_tree!(ctx.root, "/system.slice/tightbeam.service/gateway", [])
+
+      result =
+        Probe.probe(
+          root: ctx.root,
+          os: {:unix, :linux},
+          systemctl: fn _ -> {:error, :timeout} end
+        )
+
+      assert result.mode == :watched
+      assert is_binary(result.reason)
+    end
+
+    test "F5.stale: a settings change re-probes the host", ctx do
+      probes = :counters.new(1, [])
+
+      guard!(ctx,
+        probe: %{mode: :watched, reason: "test", mem_total: 16 * @gib, cgroup: nil},
+        probe_counter: probes
+      )
+
+      calls = :sys.get_state(MemoryGuard).probe
+
+      counting = fn ->
+        :counters.add(probes, 1, 1)
+        calls.()
+      end
+
+      :sys.replace_state(MemoryGuard, &%{&1 | probe: counting})
+      assert :ok = MemoryGuard.settings_changed(@host)
+      assert :counters.get(probes, 1) == 1
+    end
+
+    test "N3.partial: with some named trees gone, the episode stays open", ctx do
+      {:opened, episode} =
+        Episodes.open(ctx.db, %{
+          host: @host,
+          kind: "custody",
+          key: "claude:shared@testhost",
+          since: 1,
+          why: "t",
+          trees: [
+            %{launchId: "a", pid: 4_000_002, start: 1},
+            %{launchId: "b", pid: 981, start: 981}
+          ]
+        })
+
+      proc!(ctx.root, 981, 1, 981, 10 * @mib)
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert [%{"episodeId" => id}] = Episodes.active(ctx.db, @host)
+      assert id == episode["episodeId"]
+    end
+
+    test "N4.partial / N4.stale: at +60 s only the survivors are listed, and the terminal outcome is recorded once",
+         ctx do
+      proc!(ctx.root, 981, 1, 981, 10 * @mib)
+
+      {:opened, episode} =
+        Episodes.open(ctx.db, %{
+          host: @host,
+          kind: "custody",
+          key: "claude:shared@testhost",
+          since: 1,
+          why: "t",
+          trees: [
+            %{launchId: "gone", pid: 4_000_003, start: 1},
+            %{launchId: "alive", pid: 981, start: 981}
+          ]
+        })
+
+      digest = "d-1"
+
+      {:accepted, "recovery"} =
+        Episodes.judge(
+          ctx.db,
+          %{
+            "action" => "recovery",
+            "episodeId" => episode["episodeId"],
+            "host" => @host,
+            "kind" => "custody",
+            "key" => "claude:shared@testhost",
+            "killedAt" => System.system_time(:millisecond) - 61_000
+          },
+          digest,
+          @host
+        )
+
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+
+      assert %{"outcome" => "failed", "survivors" => [%{"launchId" => "alive"}]} =
+               Episodes.recovery(ctx.db, episode["episodeId"])
+
+      recovery = Episodes.recovery(ctx.db, episode["episodeId"])
+      :ok = Episodes.record_outcome(ctx.db, recovery, "cleared", [])
+      assert length(events(ctx.db, "memory_guard_recovery_outcome")) == 1
+    end
+
+    test "N5.partial / N5.stale: some mechanisms absent and some unknown is residual; the finding is taken afresh at each attempt",
+         _ctx do
+      partial = %{
+        "groups" => %{"result" => "absent", "detail" => []},
+        "sudo" => %{"result" => "unknown", "detail" => "x"},
+        "sockets" => %{"result" => "absent", "detail" => []}
+      }
+
+      assert RootPath.kind(partial) == "residual"
+      calls = :counters.new(1, [])
+
+      runner = fn command, _args ->
+        :counters.add(calls, 1, 1)
+        if command == "id", do: {"gd\n", 0}, else: {"sudo: a password is required", 1}
+      end
+
+      RootPath.finding(runner: runner, sockets: [])
+      RootPath.finding(runner: runner, sockets: [])
+      assert :counters.get(calls, 1) == 4
+    end
+
+    test "N7.unreadable: with the database unreachable, nothing is accepted", _ctx do
+      assert {:error, _} = Episodes.judge(:no_such_db, %{"action" => "override"}, "d", @host)
+    end
+
+    test "N8.absent / N8.partial / N8.unreadable: an accepted override records every field; what the record lacks is unknown",
+         ctx do
+      {:opened, episode} =
+        Episodes.open(ctx.db, %{host: @host, kind: "guard", since: 1, why: "t"})
+
+      {:accepted, "recovery"} =
+        Episodes.judge(
+          ctx.db,
+          %{
+            "action" => "recovery",
+            "episodeId" => episode["episodeId"],
+            "host" => @host,
+            "kind" => "guard"
+          },
+          "r-1",
+          @host
+        )
+
+      :ok =
+        Episodes.record_outcome(
+          ctx.db,
+          Episodes.recovery(ctx.db, episode["episodeId"]),
+          "failed",
+          []
+        )
+
+      dir = RootActions.dir(ctx.base)
+      File.mkdir_p!(dir)
+
+      File.write!(
+        Path.join(dir, "override.json"),
+        JSON.encode!(%{
+          action: "override",
+          episodeId: episode["episodeId"],
+          host: @host,
+          kind: "guard",
+          statementKind: "strict"
+        })
+      )
+
+      RootActions.intake(ctx.db, ctx.base, @host,
+        root_uid: File.stat!(ctx.root).uid,
+        finding: fn -> strict_finding() end
+      )
+
+      assert %{
+               "operator" => %{"user" => "root", "sudoUser" => "unknown", "sudoUid" => "unknown"},
+               "statement" => "unknown",
+               "trees" => "unknown",
+               "at" => "unknown",
+               "finding" => %{}
+             } = Episodes.override(ctx.db, episode["episodeId"])
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
