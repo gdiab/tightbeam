@@ -1750,7 +1750,9 @@ defmodule Tightbeam.Gateway do
     |> compile_handler_specs!()
   end
 
-  @direct_state_classes ~w(message.created transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
+  # `device.approved` is emitted by coded pairing's redemption (stage 1 S2.2), not by a
+  # handler: `approve-device` only issues the code.
+  @direct_state_classes ~w(message.created transition.recorded tool_call.started tool_call.ended wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated device.approved)
 
   @doc false
   @spec compile_handler_specs!(map()) ::
