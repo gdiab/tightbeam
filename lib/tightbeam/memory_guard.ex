@@ -239,8 +239,10 @@ defmodule Tightbeam.MemoryGuard do
         {_, %{available: available, settings: %{floor_hold: hold}}} when is_number(available) ->
           available < hold
 
+        # FS7 (H3): host memory that cannot be read is recorded as unknown,
+        # never a guessed value.
         _ ->
-          nil
+          "unknown"
       end
 
     :ets.insert(
@@ -519,6 +521,14 @@ defmodule Tightbeam.MemoryGuard do
       # FS5: closes that failed go after every other candidate and are
       # retried on a later decision.
       close_failed: MapSet.new(),
+      # FS7: markers not yet delivered (key => marker), records of effects
+      # that already happened but could not be written yet, and unit removals
+      # that failed; all retried each sample.
+      pending_markers: %{},
+      pending_records: [],
+      pending_removals: MapSet.new(),
+      # Sessions whose hold record failed: nudged again so they re-ask.
+      renudge: MapSet.new(),
       # Test seam (matrix K7): runs between choosing a close candidate and the
       # conditional `closing` transaction.
       before_close_commit: Keyword.get(opts, :before_close_commit, fn _session_key -> :ok end),
@@ -588,6 +598,7 @@ defmodule Tightbeam.MemoryGuard do
     state = sample(%{state | unclosable: MapSet.new()})
     run_deferred(state)
     release_step_holds(state)
+    state = retry_bookkeeping(state)
     {:reply, :ok, state}
   end
 
@@ -635,6 +646,7 @@ defmodule Tightbeam.MemoryGuard do
     state = sample(%{state | unclosable: MapSet.new()})
     run_deferred(state)
     release_step_holds(state)
+    state = retry_bookkeeping(state)
     Process.send_after(self(), :tick, state.sample_ms)
     {:noreply, state}
   end
@@ -1308,37 +1320,54 @@ defmodule Tightbeam.MemoryGuard do
     previous =
       Map.get(state.held, session.session_key, %{details: %{}, host: session.host, seq: seq})
 
-    new_details =
-      Map.new(details, fn detail -> {detail, Map.get(previous.details, detail, now)} end)
+    # FS7 (I3): a hold and its record are one step. A detail whose record
+    # cannot be written is not established; the turn stays unclaimed and the
+    # lane is nudged to ask again.
+    recorded =
+      for detail <- details, not Map.has_key?(previous.details, detail) do
+        {detail,
+         record(
+           state,
+           "memory_guard_hold",
+           session.session_key,
+           JSON.encode!(%{
+             host: session.host,
+             reasonClass: "host_capacity",
+             detail: detail,
+             since: now,
+             condition: condition(state, session.host, detail)
+           })
+         )}
+      end
 
-    for detail <- details, not Map.has_key?(previous.details, detail) do
-      EventLog.lifecycle(
-        state.db,
-        "memory_guard_hold",
-        session.session_key,
-        JSON.encode!(%{
-          host: session.host,
-          reasonClass: "host_capacity",
-          detail: detail,
-          since: now,
-          condition: condition(state, session.host, detail)
-        })
-      )
-    end
+    failed = for {detail, {:error, _}} <- recorded, do: detail
+
+    new_details =
+      for detail <- details, detail not in failed, into: %{} do
+        {detail, Map.get(previous.details, detail, now)}
+      end
+
+    state =
+      if failed == [],
+        do: state,
+        else: %{state | renudge: MapSet.put(state.renudge, session.session_key)}
 
     held = %{host: session.host, seq: seq, details: new_details}
-    state = %{state | held: Map.put(state.held, session.session_key, held)}
+
+    state =
+      if new_details == %{},
+        do: %{state | held: Map.delete(state.held, session.session_key)},
+        else: %{state | held: Map.put(state.held, session.session_key, held)}
 
     # R7: a user-originated turn that becomes held gets one plain-words
     # marker in its own conversation, once per hold.
     if previous.details == %{} and
          Priority.user_originated_pending?(state.db, session.session_key),
-       do: waiting_marker(state, session, hd(details))
-
-    state
+       do: waiting_marker(state, session, hd(details), now),
+       else: state
   end
 
-  defp waiting_marker(state, session, detail) do
+  defp waiting_marker(state, session, detail, since) do
     host = session.host
     host_state = Map.fetch!(state.hosts, host)
     place = place_in_line(state, session)
@@ -1366,25 +1395,134 @@ defmodule Tightbeam.MemoryGuard do
             "the memory guard's launch step is not ready. " <> line
       end
 
-    EventLog.notice(
-      state.db,
-      "memory_guard_waiting",
-      session.session_key,
-      JSON.encode!(%{host: host, detail: detail, placeInLine: place}),
-      audience: {:session, session.session_key},
-      message: message,
-      attention: :normal,
-      conn_registry: state.conn_registry
-    )
-  rescue
-    error ->
-      marker_failed(state, session.session_key, "memory_guard_waiting", Exception.message(error))
-  catch
-    :exit, reason ->
-      marker_failed(state, session.session_key, "memory_guard_waiting", inspect(reason))
+    post_marker(state, %{
+      key: "waiting:#{session.session_key}:#{since}",
+      kind: "memory_guard_waiting",
+      session_key: session.session_key,
+      detail: %{host: host, detail: detail, placeInLine: place},
+      message: message
+    })
   end
 
-  # A marker that could not be posted is recorded, not only logged (M-V2).
+  # R4 / R7 markers (FS7, matrix I2): delivered at most once, under an
+  # idempotency key carried in the marker's own record; one that could not be
+  # posted is recorded and retried each sample until it is.
+  defp post_marker(state, marker) do
+    if marker_posted?(state.db, marker) do
+      %{state | pending_markers: Map.delete(state.pending_markers, marker.key)}
+    else
+      try do
+        EventLog.notice(
+          state.db,
+          marker.kind,
+          marker.session_key,
+          JSON.encode!(Map.put(marker.detail, :markerKey, marker.key)),
+          audience: {:session, marker.session_key},
+          message: marker.message,
+          attention: :normal,
+          conn_registry: state.conn_registry
+        )
+
+        %{state | pending_markers: Map.delete(state.pending_markers, marker.key)}
+      rescue
+        error -> marker_pending(state, marker, Exception.message(error))
+      catch
+        :exit, reason -> marker_pending(state, marker, inspect(reason))
+      end
+    end
+  end
+
+  defp marker_posted?(db, marker) do
+    case DB.query(
+           db,
+           """
+           SELECT 1 FROM lifecycle_events
+           WHERE kind=?1 AND subject=?2 AND json_extract(detail,'$.markerKey')=?3 LIMIT 1
+           """,
+           [marker.kind, marker.session_key, marker.key]
+         ) do
+      {:ok, [[1]]} -> true
+      _ -> false
+    end
+  end
+
+  defp marker_pending(state, marker, error) do
+    state =
+      if Map.has_key?(state.pending_markers, marker.key),
+        do: state,
+        else: tap(state, &marker_failed(&1, marker.session_key, marker.kind, error))
+
+    %{state | pending_markers: Map.put(state.pending_markers, marker.key, marker)}
+  end
+
+  # FS7: retried each sample.
+  defp retry_bookkeeping(state) do
+    state =
+      Enum.reduce(Map.values(state.pending_markers), state, &post_marker(&2, &1))
+
+    {records, failed} =
+      Enum.split_with(state.pending_records, fn {kind, subject, detail} ->
+        record(state, kind, subject, detail) == :ok
+      end)
+
+    _ = records
+    state = %{state | pending_records: failed}
+
+    state =
+      Enum.reduce(state.pending_removals, state, fn {fs, unit} = removal, acc ->
+        case Cgroup.remove(fs, unit) do
+          :ok -> %{acc | pending_removals: MapSet.delete(acc.pending_removals, removal)}
+          {:error, _} -> acc
+        end
+      end)
+
+    for session_key <- state.renudge, do: state.nudge.(session_key)
+    %{state | renudge: MapSet.new()}
+  end
+
+  # A record that is a state change's own step: `:ok` or `{:error, message}`.
+  defp record(state, kind, subject, detail) do
+    EventLog.lifecycle(state.db, kind, subject, detail)
+  rescue
+    error -> {:error, Exception.message(error)}
+  catch
+    :exit, reason -> {:error, inspect(reason)}
+  end
+
+  # An effect that already happened outside the database: its record is kept
+  # and retried until it is written, never dropped (FS7, matrix I3).
+  defp record_effect(state, kind, subject, detail) do
+    case record(state, kind, subject, detail) do
+      :ok ->
+        state
+
+      {:error, _} ->
+        %{state | pending_records: state.pending_records ++ [{kind, subject, detail}]}
+    end
+  end
+
+  # FS7 (C10): a unit that cannot be removed is recorded and retried; never
+  # evidence that a tree ended.
+  defp remove_unit(state, fs, unit) do
+    case Cgroup.remove(fs, unit) do
+      :ok ->
+        state
+
+      {:error, error} ->
+        state =
+          once(state, {:unit_remove_failed, unit}, fn ->
+            record(
+              state,
+              "memory_guard_unit_remove_failed",
+              unit,
+              JSON.encode!(%{unit: unit, error: error})
+            )
+          end)
+
+        %{state | pending_removals: MapSet.put(state.pending_removals, {fs, unit})}
+    end
+  end
+
   defp marker_failed(state, session_key, kind, error) do
     Logger.warning("memory guard: #{kind} marker not posted for #{session_key}: #{error}")
 
@@ -1834,24 +1972,31 @@ defmodule Tightbeam.MemoryGuard do
           # says so, and the session is told once (AS4).
           residual? = not Tightbeam.Acp.Adapter.async_tasks_observed?()
 
-          EventLog.lifecycle(
-            state.db,
-            "memory_guard_idle_closed",
-            closing.session_key || closing.sid,
-            JSON.encode!(
-              Map.merge(
-                %{host: closing.host, sessionId: closing.sid, reason: closing.reason},
-                if(residual?,
-                  do: %{
-                    residual: "any background shell task this session had left running was ended"
-                  },
-                  else: %{}
+          # The close is shown complete (FS5): its event is retried until
+          # written (FS7, I3), and its marker delivered at most once (I2).
+          state =
+            record_effect(
+              state,
+              "memory_guard_idle_closed",
+              closing.session_key || closing.sid,
+              JSON.encode!(
+                Map.merge(
+                  %{host: closing.host, sessionId: closing.sid, reason: closing.reason},
+                  if(residual?,
+                    do: %{
+                      residual:
+                        "any background shell task this session had left running was ended"
+                    },
+                    else: %{}
+                  )
                 )
               )
             )
-          )
 
-          if residual? and is_binary(closing.session_key), do: residual_marker(state, closing)
+          state =
+            if residual? and is_binary(closing.session_key),
+              do: residual_marker(state, closing, state.clock.()),
+              else: state
 
           # The close cleared the adapter's residency; reflect it now rather
           # than waiting for the adapter's own residency report.
@@ -1945,35 +2090,16 @@ defmodule Tightbeam.MemoryGuard do
     end)
   end
 
-  defp residual_marker(state, closing) do
-    EventLog.notice(
-      state.db,
-      "memory_guard_idle_closed_marker",
-      closing.session_key,
-      JSON.encode!(%{host: closing.host, reason: closing.reason}),
-      audience: {:session, closing.session_key},
+  defp residual_marker(state, closing, at) do
+    post_marker(state, %{
+      key: "closed:#{closing.session_key}:#{closing.sid}:#{at}",
+      kind: "memory_guard_idle_closed_marker",
+      session_key: closing.session_key,
+      detail: %{host: closing.host, reason: closing.reason},
       message:
         "To free memory, Tightbeam closed this session's process while it was idle. Any " <>
-          "background shell task you had left running was ended; start it again if you still need it.",
-      attention: :normal,
-      conn_registry: state.conn_registry
-    )
-  rescue
-    error ->
-      marker_failed(
-        state,
-        closing.session_key,
-        "memory_guard_idle_closed_marker",
-        Exception.message(error)
-      )
-  catch
-    :exit, reason ->
-      marker_failed(
-        state,
-        closing.session_key,
-        "memory_guard_idle_closed_marker",
-        inspect(reason)
-      )
+          "background shell task you had left running was ended; start it again if you still need it."
+    })
   end
 
   defp default_idle_check(adapter, sid), do: Tightbeam.Acp.Adapter.idle_session?(adapter, sid)
@@ -2487,13 +2613,30 @@ defmodule Tightbeam.MemoryGuard do
   defp host_released(state, host, detail, facts) do
     remaining_host = host_level_reasons(state.hosts[host])
 
-    EventLog.lifecycle(
-      state.db,
-      "memory_guard_release",
-      host,
-      JSON.encode!(Map.merge(facts, %{host: host, detail: detail, remaining: remaining_host}))
-    )
+    case record(
+           state,
+           "memory_guard_release",
+           host,
+           JSON.encode!(
+             Map.merge(facts, %{host: host, detail: detail, remaining: remaining_host})
+           )
+         ) do
+      :ok -> released(state, host, detail, remaining_host)
+      # FS7: a release and its record are one step; unrecorded, the hold still
+      # stands and the next sample tries again.
+      {:error, _} -> restore_hold(state, host, detail)
+    end
+  end
 
+  defp restore_hold(state, host, "memory_floor"),
+    do: put_in(state.hosts[host].floor_held, true)
+
+  defp restore_hold(state, host, "memory_budget"),
+    do: put_in(state.hosts[host].budget_held, true)
+
+  defp restore_hold(state, _host, _detail), do: state
+
+  defp released(state, host, detail, remaining_host) do
     held_keys = for {key, held} <- state.held, held.host == host, do: key
 
     for session_key <- held_keys do
@@ -2831,7 +2974,9 @@ defmodule Tightbeam.MemoryGuard do
     # Tightbeam leaves no stale residency behind.
     forget_residency(state, host, record["sessionId"])
 
-    if layout && record["unit"], do: Cgroup.remove(layout.fs, record["unit"])
+    state =
+      if layout && record["unit"], do: remove_unit(state, layout.fs, record["unit"]), else: state
+
     Records.remove(state.base_dir, record["launchId"])
     %{state | launches: Map.delete(state.launches, record["launchId"])}
   end
@@ -2994,8 +3139,10 @@ defmodule Tightbeam.MemoryGuard do
         {record, :ok}, acc ->
           forget_residency(acc, host, record["sessionId"])
 
-          if host_state && host_state.layout && record["unit"],
-            do: Cgroup.remove(host_state.layout.fs, record["unit"])
+          acc =
+            if host_state && host_state.layout && record["unit"],
+              do: remove_unit(acc, host_state.layout.fs, record["unit"]),
+              else: acc
 
           Records.remove(acc.base_dir, record["launchId"])
           %{acc | launches: Map.delete(acc.launches, record["launchId"])}
@@ -3218,8 +3365,7 @@ defmodule Tightbeam.MemoryGuard do
       record_ended(state, host, kill)
     end
 
-    _ = Cgroup.remove(layout.fs, unit)
-    state
+    remove_unit(state, layout.fs, unit)
   end
 
   defp remove_adapter_unit(state, _host_state, _launch_id), do: state

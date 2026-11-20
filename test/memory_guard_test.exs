@@ -3114,6 +3114,128 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## v1.13 FS7: bookkeeping writes (matrix C10, H3, I2, I3; T28 b, d, e)
+
+  describe "matrix C10 / H3 / I2 / I3: bookkeeping (FS7, T28)" do
+    defp fail_kind!(ctx, kind) do
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER mg_fail_#{kind} BEFORE INSERT ON lifecycle_events
+        WHEN NEW.kind='#{kind}'
+        BEGIN SELECT RAISE(ABORT, 'injected #{kind} failure'); END
+        """)
+    end
+
+    defp heal_kind!(ctx, kind), do: {:ok, _} = DB.query(ctx.db, "DROP TRIGGER mg_fail_#{kind}")
+
+    defp floor_close!(ctx) do
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      adapter = adapter!()
+      session!(ctx, "agent:idle", "sid-idle")
+      guard!(ctx)
+      resident!(adapter, ["sid-idle"])
+      :ok = MemoryGuard.tick()
+      settle_closes!()
+    end
+
+    test "I2.unreadable (T28 b): a marker that cannot be posted is recorded, retried, and delivered exactly once",
+         ctx do
+      fail_kind!(ctx, "memory_guard_idle_closed_marker")
+      floor_close!(ctx)
+      assert [{"agent:idle", _}] = events(ctx.db, "memory_guard_idle_closed")
+      assert events(ctx.db, "memory_guard_idle_closed_marker") == []
+      assert [{"agent:idle", %{"marker" => _}}] = events(ctx.db, "memory_guard_marker_failed")
+
+      heal_kind!(ctx, "memory_guard_idle_closed_marker")
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+
+      assert [{"agent:idle", %{"markerKey" => _}}] =
+               events(ctx.db, "memory_guard_idle_closed_marker")
+
+      assert length(events(ctx.db, "memory_guard_marker_failed")) == 1
+    end
+
+    test "I3.unreadable (T28 b): a close shown complete stands when its event cannot be written; the event is retried until written",
+         ctx do
+      fail_kind!(ctx, "memory_guard_idle_closed")
+      floor_close!(ctx)
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+      assert MemoryGuard.read(@host).residentCount == 0
+
+      heal_kind!(ctx, "memory_guard_idle_closed")
+      :ok = MemoryGuard.tick()
+      assert [{"agent:idle", _}] = events(ctx.db, "memory_guard_idle_closed")
+      :ok = MemoryGuard.tick()
+      assert length(events(ctx.db, "memory_guard_idle_closed")) == 1
+    end
+
+    test "I3.unreadable (holds): a hold whose record cannot be written is not established; the turn stays unclaimed and its lane asks again",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a launch")
+      fail_kind!(ctx, "memory_guard_hold")
+
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:new", ctx.db)
+      refute Map.has_key?(:sys.get_state(MemoryGuard).held, "agent:new")
+
+      heal_kind!(ctx, "memory_guard_hold")
+      :ok = MemoryGuard.tick()
+      assert_received {:nudged, "agent:new"}
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:new", ctx.db)
+      assert [{"agent:new", %{"detail" => "memory_floor"}}] = events(ctx.db, "memory_guard_hold")
+    end
+
+    test "I3.unreadable (releases): a release whose record cannot be written leaves the hold standing until it is recorded",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      fail_kind!(ctx, "memory_guard_release")
+
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 50, 100))
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.host_reasons(@host) == ["memory_floor"]
+
+      heal_kind!(ctx, "memory_guard_release")
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.host_reasons(@host) == []
+      assert [{@host, %{"detail" => "memory_floor"}}] = events(ctx.db, "memory_guard_release")
+    end
+
+    test "C10.unreadable (T28 d): a unit that cannot be removed is recorded and retried, and is never evidence of an end",
+         ctx do
+      {harness, _unit, _set_mode} = enforced_with_unit!(ctx)
+      unit = Path.join(harness, "session-live")
+      File.write!(Path.join(unit, "cgroup.events"), "populated 0\nfrozen 0\n")
+      :ok = MemoryGuard.tick()
+
+      # The tree ended (its unit is empty); the unit directory still holds
+      # files, so removing it fails.
+      assert [{"/svc/tightbeam.service/harness/session-live", %{"error" => _}}] =
+               events(ctx.db, "memory_guard_unit_remove_failed")
+
+      assert File.dir?(unit)
+
+      for file <- File.ls!(unit), do: File.rm!(Path.join(unit, file))
+      :ok = MemoryGuard.tick()
+      refute File.dir?(unit)
+      assert length(events(ctx.db, "memory_guard_unit_remove_failed")) == 1
+    end
+
+    test "H3.absent / H3.unreadable (T28 e): host memory unknown at an outside kill is recorded as unknown, never guessed",
+         ctx do
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).hostAvailablePercent == nil
+      :ok = MemoryGuard.note_adapter_exit("L-outside", 137)
+      assert %{status: 137, host_low: "unknown"} = MemoryGuard.adapter_exit("L-outside")
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
