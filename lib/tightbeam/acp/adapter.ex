@@ -100,6 +100,20 @@ defmodule Tightbeam.Acp.Adapter do
 
   ## Client
 
+  # What this client declares at `initialize`. It has no async-tasks entry
+  # (claude-agent-acp's AIR async-tasks capability, acp-agent.js:1885), so the
+  # Claude adapter sends no `async_task_*` updates.
+  @client_capabilities %{fs: %{readTextFile: false, writeTextFile: false}, subagents: %{}}
+
+  @doc """
+  Whether this client declares the async-tasks capability, so a harness's
+  backgrounded shell tasks are reported and an idle test can see them (memory
+  limits v1.6 AS4). False on this line: an idle close may end such a task
+  (R4's residual).
+  """
+  @spec async_tasks_observed?() :: boolean()
+  def async_tasks_observed?, do: Map.has_key?(@client_capabilities, :asyncTasks)
+
   @type adapter :: GenServer.server()
 
   @typedoc "A model identity. Structured everywhere; rendered only at this seam."
@@ -591,10 +605,7 @@ defmodule Tightbeam.Acp.Adapter do
            "initialize",
            %{
              protocolVersion: 1,
-             clientCapabilities: %{
-               fs: %{readTextFile: false, writeTextFile: false},
-               subagents: %{}
-             }
+             clientCapabilities: @client_capabilities
            },
            timeout: :infinity
          ) do

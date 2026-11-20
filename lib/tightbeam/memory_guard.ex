@@ -316,12 +316,13 @@ defmodule Tightbeam.MemoryGuard do
   defp call_timeout, do: Application.get_env(:tightbeam, :memory_guard_call_timeout_ms, 60_000)
 
   @doc "A host's settings changed (R17): re-determine its mode and apply them."
-  @spec settings_changed(String.t()) :: :ok
+  @spec settings_changed(String.t()) :: :ok | {:error, term()}
   def settings_changed(host) do
-    if running?(), do: GenServer.call(__MODULE__, {:settings_changed, host}, 30_000)
-    :ok
+    if running?(),
+      do: GenServer.call(__MODULE__, {:settings_changed, host}, call_timeout()),
+      else: :ok
   catch
-    :exit, _ -> :ok
+    :exit, reason -> {:error, {:memory_guard_unavailable, reason}}
   end
 
   @doc """
@@ -626,20 +627,16 @@ defmodule Tightbeam.MemoryGuard do
     # R12/R17: leaving `enforced` lifts the kernel's limits on the units that
     # remain (processes stay where they are), so nothing acts once the read
     # says the host is not enforced.
-    if previous_layout && is_nil(layout) do
-      case Cgroup.relax(previous_layout) do
-        :ok ->
-          :ok
+    relax_gap =
+      if previous_layout && is_nil(layout) do
+        case Cgroup.relax(previous_layout) do
+          :ok ->
+            nil
 
-        {:error, error} ->
-          EventLog.lifecycle(
-            state.db,
-            "memory_guard_relax_failed",
-            host,
-            JSON.encode!(%{host: host, error: error})
-          )
+          {:error, error} ->
+            "the kernel's earlier memory limits could not all be lifted: #{error}"
+        end
       end
-    end
 
     step =
       if local? do
@@ -649,12 +646,12 @@ defmodule Tightbeam.MemoryGuard do
 
           {:error, error} ->
             Logger.warning("memory guard: session launch step unavailable: #{error}")
-            nil
+            {:unavailable, error}
         end
       end
 
-    if local? do
-      _ =
+    published =
+      if local? do
         Records.publish_config(state.base_dir, %{
           mode: mode,
           fs: layout && layout.fs,
@@ -662,7 +659,24 @@ defmodule Tightbeam.MemoryGuard do
           sessionLimit: settings.session_limit,
           oomRaise: 100
         })
-    end
+      end
+
+    # Anything that keeps this mode from being whole is said on the read and
+    # in the mode record (R12a, M-V2), never only logged.
+    gaps =
+      Enum.reject(
+        [
+          relax_gap,
+          (match?({:unavailable, _}, step) and mode in ["watched", "enforced"]) &&
+            "session processes are not limited one by one: the launch step is unavailable (#{elem(step, 1)})",
+          match?({:error, _}, published) &&
+            "the launch step's settings could not be written: #{inspect(elem(published, 1))}"
+        ],
+        &(&1 in [nil, false])
+      )
+
+    reason = Enum.join(Enum.reject([reason | gaps], &is_nil/1), "; ")
+    reason = if reason == "", do: nil, else: reason
 
     host_state = %{
       local: local?,
@@ -1052,9 +1066,22 @@ defmodule Tightbeam.MemoryGuard do
     )
   rescue
     error ->
-      Logger.warning("memory guard: waiting marker not posted: #{Exception.message(error)}")
+      marker_failed(state, session.session_key, "memory_guard_waiting", Exception.message(error))
   catch
-    :exit, reason -> Logger.warning("memory guard: waiting marker not posted: #{inspect(reason)}")
+    :exit, reason ->
+      marker_failed(state, session.session_key, "memory_guard_waiting", inspect(reason))
+  end
+
+  # A marker that could not be posted is recorded, not only logged (M-V2).
+  defp marker_failed(state, session_key, kind, error) do
+    Logger.warning("memory guard: #{kind} marker not posted for #{session_key}: #{error}")
+
+    EventLog.lifecycle(
+      state.db,
+      "memory_guard_marker_failed",
+      session_key,
+      JSON.encode!(%{marker: kind, error: error})
+    )
   end
 
   defp ordinal(1), do: "first"
@@ -1295,12 +1322,29 @@ defmodule Tightbeam.MemoryGuard do
     state =
       case result do
         :ok ->
+          # v1.6 R4's residual: without async-task updates an idle close also
+          # ends a background shell task the session left running; the close
+          # says so, and the session is told once (AS4).
+          residual? = not Tightbeam.Acp.Adapter.async_tasks_observed?()
+
           EventLog.lifecycle(
             state.db,
             "memory_guard_idle_closed",
             closing.session_key || closing.sid,
-            JSON.encode!(%{host: closing.host, sessionId: closing.sid, reason: closing.reason})
+            JSON.encode!(
+              Map.merge(
+                %{host: closing.host, sessionId: closing.sid, reason: closing.reason},
+                if(residual?,
+                  do: %{
+                    residual: "any background shell task this session had left running was ended"
+                  },
+                  else: %{}
+                )
+              )
+            )
           )
+
+          if residual? and is_binary(closing.session_key), do: residual_marker(state, closing)
 
           # The close cleared the adapter's residency; reflect it now rather
           # than waiting for the adapter's own residency report.
@@ -1311,10 +1355,25 @@ defmodule Tightbeam.MemoryGuard do
 
           %{state | adapters: adapters}
 
-        _ ->
+        result ->
           # Not idle after all (an observed background task, a prompt that
           # arrived) or the close failed: it stays resident and is not picked
-          # again until a turn ends or the next sample.
+          # again until a turn ends or the next sample. A failed close is
+          # recorded; finding it busy is not a failure.
+          unless match?({:error, {:not_idle, _}}, result) do
+            EventLog.lifecycle(
+              state.db,
+              "memory_guard_close_failed",
+              closing.session_key || closing.sid,
+              JSON.encode!(%{
+                host: closing.host,
+                sessionId: closing.sid,
+                reason: closing.reason,
+                error: inspect(result)
+              })
+            )
+          end
+
           %{state | unclosable: MapSet.put(state.unclosable, {closing.host, closing.sid})}
       end
 
@@ -1336,6 +1395,37 @@ defmodule Tightbeam.MemoryGuard do
           add_waiter(acc, ref, session_key, from)
       end
     end)
+  end
+
+  defp residual_marker(state, closing) do
+    EventLog.notice(
+      state.db,
+      "memory_guard_idle_closed_marker",
+      closing.session_key,
+      JSON.encode!(%{host: closing.host, reason: closing.reason}),
+      audience: {:session, closing.session_key},
+      message:
+        "To free memory, Tightbeam closed this session's process while it was idle. Any " <>
+          "background shell task you had left running was ended; start it again if you still need it.",
+      attention: :normal,
+      conn_registry: state.conn_registry
+    )
+  rescue
+    error ->
+      marker_failed(
+        state,
+        closing.session_key,
+        "memory_guard_idle_closed_marker",
+        Exception.message(error)
+      )
+  catch
+    :exit, reason ->
+      marker_failed(
+        state,
+        closing.session_key,
+        "memory_guard_idle_closed_marker",
+        inspect(reason)
+      )
   end
 
   defp default_idle_check(adapter, sid), do: Tightbeam.Acp.Adapter.idle_session?(adapter, sid)
@@ -1434,28 +1524,34 @@ defmodule Tightbeam.MemoryGuard do
 
   # Per unit: %{id, scope, sid?, key?, launch_id, bytes, limit_bytes, pids?, unit?}
   defp measure(state, host, host_state) do
-    adapters = local_adapters(state, host)
+    # The adapters cannot be listed: this is a failed sample (R12a), never an
+    # empty host that would undercount the Tightbeam total.
+    case local_adapters(state, host) do
+      {:ok, adapters} ->
+        case host_state.mode do
+          "enforced" -> measure_enforced(state, host_state, adapters)
+          "watched" -> measure_watched(state, adapters, Map.values(state.launches))
+        end
 
-    case host_state.mode do
-      "enforced" ->
-        measure_enforced(state, host_state, adapters)
-
-      "watched" ->
-        measure_watched(state, adapters, Map.values(state.launches))
+      :error ->
+        :error
     end
   end
 
   defp local_adapters(state, host) do
     rows = HarnessProcess.list(state.db)
 
-    for row <- rows,
-        row.host == host,
-        is_nil(row.ssh),
-        row.state == "running",
-        is_integer(row.os_pid),
-        do: row
+    adapters =
+      for row <- rows,
+          row.host == host,
+          is_nil(row.ssh),
+          row.state == "running",
+          is_integer(row.os_pid),
+          do: row
+
+    {:ok, adapters}
   rescue
-    _ -> []
+    _ -> :error
   end
 
   defp measure_watched(state, adapters, launches, exclude \\ nil) do
@@ -2094,8 +2190,15 @@ defmodule Tightbeam.MemoryGuard do
   defp end_adapter_sessions(state, {_harness, _preset, host} = key, launch_id) do
     state = refresh_launches(state)
     host_state = Map.get(state.hosts, host)
-    key_launches = launches_of_key(state, key, launch_id)
 
+    case launches_of_key(state, key, launch_id) do
+      {:ok, key_launches} -> end_launches(state, host, host_state, key_launches, launch_id)
+      # Not knowing which launches ended is not "nothing to end".
+      {:error, _} = error -> {error, state}
+    end
+  end
+
+  defp end_launches(state, host, host_state, key_launches, launch_id) do
     victims =
       for {_id, record} <- state.launches,
           record["adapterLaunchId"] in key_launches,
@@ -2257,8 +2360,9 @@ defmodule Tightbeam.MemoryGuard do
         else: true
     end)
     |> Enum.map(& &1.launch_id)
+    |> then(&{:ok, &1})
   rescue
-    _ -> []
+    error -> {:error, {:launches_unreadable, Exception.message(error)}}
   end
 
   # Before the unit goes, keep the kernel's verdict on it (R10): a budget kill

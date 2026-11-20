@@ -876,6 +876,43 @@ defmodule Tightbeam.MemoryGuardTest do
                })
     end
 
+    test "T5 variant (v1.6 R4 residual): with no async-task updates, an idle close says background shell tasks were ended, once",
+         ctx do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      refute Tightbeam.Acp.Adapter.async_tasks_observed?()
+
+      # s1's last turn left a run_in_background shell task running; nothing
+      # reports it on this line, so s1 counts as idle.
+      for key <- ["agent:s2", "agent:s3"] do
+        queue!(ctx, key, "working")
+        assert :ok = MemoryGuard.admit(key)
+      end
+
+      session!(ctx, "agent:s4")
+      queue!(ctx, "agent:s4", "fourth")
+      assert :ok = MemoryGuard.admit("agent:s4")
+      assert_receive {:closed, "sid-1", "resident_cap"}
+
+      assert [{"agent:s1", %{"residual" => residual, "reason" => "resident_cap"}}] =
+               events(ctx.db, "memory_guard_idle_closed")
+
+      assert residual == "any background shell task this session had left running was ended"
+
+      assert {:ok, [[text]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT content FROM messages WHERE sessionKey='agent:s1' AND content LIKE 'To free memory%'"
+               )
+
+      assert text =~ "Any background shell task you had left running was ended"
+
+      # Its next turn needs a fresh session process (residency is gone).
+      refute MapSet.member?(
+               :sys.get_state(MemoryGuard).adapters |> Map.values() |> hd() |> Map.get(:sids),
+               "sid-1"
+             )
+    end
+
     test "R4: a session with a queued or running turn is not idle", ctx do
       for n <- 1..3, do: queue!(ctx, "agent:s#{n}", "pending")
       session!(ctx, "agent:s4")
@@ -1682,6 +1719,88 @@ defmodule Tightbeam.MemoryGuardTest do
         assert {:error, {:memory_guard_unavailable, _}} = Task.await(task, 5_000)
       after
         :sys.resume(MemoryGuard)
+      end
+    end
+  end
+
+  describe "sibling failures (review family: failures never read as success)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      :ok
+    end
+
+    test "a setting stored while the guard cannot answer says it is not yet applied", ctx do
+      guard!(ctx)
+      Application.put_env(:tightbeam, :memory_guard_call_timeout_ms, 300)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_call_timeout_ms) end)
+      session!(ctx, "agent:admin-session")
+      :sys.suspend(MemoryGuard)
+
+      try do
+        result =
+          Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})["host-memory-set"].(%{
+            origin: "user:owner",
+            principal: {:session, "agent:admin-session"},
+            params: %{host: @host, name: "residentCap", value: "4"}
+          })
+
+        assert result.effect =~ "NOT yet applied"
+      after
+        :sys.resume(MemoryGuard)
+      end
+    end
+
+    test "a host whose launch step is unavailable says sessions are not limited one by one",
+         ctx do
+      guard!(ctx)
+      read = MemoryGuard.read(@host)
+      assert read.mode == "watched"
+      assert read.notEnforcedReason =~ "session processes are not limited one by one"
+      assert [_ | _] = events(ctx.db, "memory_guard_mode")
+    end
+
+    test "a failed idle close is recorded; a busy one is not a failure", ctx do
+      guard!(ctx, close_result: {:error, :close_timed_out})
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "residentCap", "1", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+      adapter = adapter!()
+      session!(ctx, "agent:idle", "sid-idle")
+      resident!(adapter, ["sid-idle"])
+      session!(ctx, "agent:new")
+      queue!(ctx, "agent:new", "go")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit("agent:new")
+      assert_receive {:closed, "sid-idle", "resident_cap"}
+
+      assert [{"agent:idle", %{"error" => error}}] = events(ctx.db, "memory_guard_close_failed")
+      assert error =~ "close_timed_out"
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+    end
+
+    test "an unreadable launch table is never 'nothing to end' (R2a) nor an empty host (sampling)",
+         ctx do
+      guard!(ctx)
+
+      {:ok, _} =
+        DB.query(ctx.db, "ALTER TABLE harness_processes RENAME TO harness_processes_hidden")
+
+      try do
+        assert {:error, {:launches_unreadable, _}} =
+                 MemoryGuard.adapter_ended({:claude, "shared", @host}, "L")
+
+        assert {:error, _} = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+
+        :ok = MemoryGuard.tick()
+        assert MemoryGuard.read(@host).mode == "count-only"
+        assert [_] = events(ctx.db, "memory_guard_sampling_failed")
+      after
+        {:ok, _} =
+          DB.query(ctx.db, "ALTER TABLE harness_processes_hidden RENAME TO harness_processes")
       end
     end
   end

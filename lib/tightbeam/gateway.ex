@@ -5748,7 +5748,16 @@ defmodule Tightbeam.Gateway do
              )
            end) do
         {:ok, {:ok, row}} ->
-          :ok = Tightbeam.MemoryGuard.settings_changed(host)
+          # Stored is not applied: say which one happened.
+          effect =
+            case Tightbeam.MemoryGuard.settings_changed(host) do
+              :ok ->
+                "applies to the next decision on #{host}, without a restart"
+
+              {:error, reason} ->
+                "stored, but NOT yet applied: the memory guard did not answer " <>
+                  "(#{inspect(reason)}); it applies when the guard next reads its settings"
+            end
 
           %{
             setting: %{
@@ -5758,7 +5767,7 @@ defmodule Tightbeam.Gateway do
               setBy: row.set_by,
               setAt: row.set_at
             },
-            effect: "applies to the next decision on #{host}, without a restart",
+            effect: effect,
             hostMemory: Tightbeam.MemoryGuard.read(host)
           }
 
