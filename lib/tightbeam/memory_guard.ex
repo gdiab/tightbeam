@@ -433,7 +433,8 @@ defmodule Tightbeam.MemoryGuard do
   def settings_changed(host) do
     case fence_guard() do
       :running -> GenServer.call(__MODULE__, {:settings_changed, host}, call_timeout())
-      :not_configured -> :ok
+      # A7.absent: stored, but nothing on this gateway applies it.
+      :not_configured -> {:error, :memory_guard_not_configured}
       # Stored, not applied: a down guard applies nothing (FS1, M-V2).
       :unavailable -> {:error, {:memory_guard_unavailable, :not_running}}
     end
@@ -460,7 +461,8 @@ defmodule Tightbeam.MemoryGuard do
   def read(host) do
     if running?(), do: GenServer.call(__MODULE__, {:read, host}, 10_000)
   catch
-    :exit, _ -> nil
+    # A6.timeout: a guard that does not answer is said so, never a mode.
+    :exit, _ -> %{host: host, mode: "unknown", error: "the memory guard did not answer"}
   end
 
   @doc "Run one sampling pass now (tests and the boot pass)."
@@ -600,7 +602,12 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   def handle_call({:settings_changed, host}, _from, state) do
-    state = state |> determine(host) |> publish_all() |> trim_to_cap(host) |> release_check(host)
+    state =
+      state
+      |> determine(host, reprobe: true)
+      |> publish_all()
+      |> trim_to_cap(host)
+      |> release_check(host)
 
     case state.hosts[host].transition_error do
       nil -> {:reply, :ok, state}
@@ -800,7 +807,9 @@ defmodule Tightbeam.MemoryGuard do
     Enum.reduce(Enum.uniq([state.local_host | hosts]), state, &determine(&2, &1))
   end
 
-  defp determine(state, host) do
+  # R12 (matrix F5.stale): a settings change determines the mode afresh,
+  # probe included; other passes reuse the probe of the last determination.
+  defp determine(state, host, opts \\ []) do
     local? = host == state.local_host
     previous = Map.get(state.hosts, host)
 
@@ -830,7 +839,7 @@ defmodule Tightbeam.MemoryGuard do
             cgroup: nil
           }
 
-        previous && previous.probe ->
+        previous && previous.probe && not Keyword.get(opts, :reprobe, false) ->
           previous.probe
 
         true ->
@@ -3397,7 +3406,32 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
-  defp enforced_counters(%{host: host} = match) do
+  # C4.stale (AS1, FS6): if the kernel's counters have not moved yet while the
+  # unit is still there, they are read again for a short, bounded time, well
+  # inside R9's 30 s.
+  defp enforced_counters(match, attempts \\ 5) do
+    case enforced_counters_once(match) do
+      nil ->
+        if attempts > 0 and unit_present?(match) do
+          Process.sleep(Application.get_env(:tightbeam, :memory_guard_counter_retry_ms, 100))
+          enforced_counters(match, attempts - 1)
+        end
+
+      found ->
+        found
+    end
+  end
+
+  defp unit_present?(%{host: host} = match) do
+    with %{mode: "enforced", layout: %{} = layout} <- host_view(host),
+         sid when is_binary(sid) <- Map.get(match, :harness_session_id) do
+      File.dir?(Cgroup.dir(layout.fs, Cgroup.session_unit(layout, sid)))
+    else
+      _ -> false
+    end
+  end
+
+  defp enforced_counters_once(%{host: host} = match) do
     with %{mode: "enforced", layout: %{} = layout} <- host_view(host) do
       sid = Map.get(match, :harness_session_id)
 
@@ -3589,6 +3623,18 @@ defmodule Tightbeam.MemoryGuard do
   @doc false
   def end_tree(state, host_state, target) do
     target = Map.put(target, :members, capture(state, target))
+
+    # Already shown gone (its leader ended, or its pid now belongs to another
+    # process, and nothing of its group or unit remains): nothing to kill, and
+    # a reused pid is never signalled (matrix D2.stale).
+    if gone?(state, host_state, target) do
+      :ok
+    else
+      kill_and_prove(state, host_state, target)
+    end
+  end
+
+  defp kill_and_prove(state, host_state, target) do
     first = state.killer.(target, host_state)
 
     gone =

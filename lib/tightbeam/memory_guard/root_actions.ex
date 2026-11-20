@@ -96,7 +96,22 @@ defmodule Tightbeam.MemoryGuard.RootActions do
 
       {:rejected, "statement mismatch"}
     else
-      Episodes.judge(db, record, digest, host, %{"finding" => finding, "statementKind" => kind})
+      # N8: every recorded field present; one that cannot be established is
+      # `unknown`, never omitted.
+      known = %{
+        "finding" => finding,
+        "statementKind" => kind,
+        "statement" => record["statement"] || "unknown",
+        "trees" => record["trees"] || "unknown",
+        "operator" =>
+          Map.merge(
+            %{"user" => "root", "sudoUser" => "unknown", "sudoUid" => "unknown"},
+            record["operator"] || %{}
+          ),
+        "at" => record["at"] || "unknown"
+      }
+
+      Episodes.judge(db, record, digest, host, known)
     end
   end
 

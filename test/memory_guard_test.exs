@@ -3410,10 +3410,13 @@ defmodule Tightbeam.MemoryGuardTest do
       assert Records.read_all(ctx.base) == {:ok, %{}}
     end
 
-    test "B6.stale: a helper that refuses a mismatched identity is a failure, never an end",
+    test "B6.stale: with a group member still there, a helper that refuses a mismatched identity is a failure, never an end",
          ctx do
-      guard!(ctx, kill_result: {:error, {:harness_group_failed, 1, "identity changed"}})
-      gone!(ctx.root, 960)
+      guard!(ctx,
+        kill_result: {:error, {:harness_group_failed, 1, "identity changed"}},
+        signal_works: false
+      )
+
       {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
 
       assert {:error, {:session_trees_survive, ["sl-a"]}} =

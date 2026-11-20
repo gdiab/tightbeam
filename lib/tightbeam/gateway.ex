@@ -5790,6 +5790,9 @@ defmodule Tightbeam.Gateway do
               {:error, {:not_applied, reason}} ->
                 "stored, but NOT yet applied: #{reason}"
 
+              {:error, :memory_guard_not_configured} ->
+                "stored, but NOT applied: no memory guard runs on this gateway"
+
               {:error, {:memory_guard_unavailable, _} = reason}
               when name == "mode" and value == "off" ->
                 # v1.13 FS1 / F8: without the guard, `off` comes into force

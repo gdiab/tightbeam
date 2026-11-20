@@ -250,6 +250,9 @@ defmodule Tightbeam.MemoryGuard.Episodes do
       {:ok, result} -> result
       {:error, error} -> {:error, inspect(error)}
     end
+  catch
+    # N7.unreadable: nothing is accepted; the record is judged afresh later.
+    :exit, reason -> {:error, inspect(reason)}
   end
 
   defp judge_in_txn(txn, record, digest, host, extra) do
