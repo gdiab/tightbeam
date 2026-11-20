@@ -950,10 +950,38 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
     assert OwnerAlerts.memory_restart_body(%{
              unknown?: true,
              host: "sirius",
-             guard_actions: %{held: true, closed: 4, ended: 1}
+             guard_actions: %{held: true, closed: 4, over_limit: 1, for_budget: 0}
            }) =~
              "Tightbeam has paused starting new agent processes and closed 4 idle ones. " <>
                "It has stopped 1 agent that went over its own memory limit. " <>
+               "If free memory keeps falling, the machine may stop responding."
+  end
+
+  test "T12: a budget victim is never called an agent over its own limit", ctx do
+    enable(ctx.db)
+    cgroup_v2(ctx, swap: true)
+    start_stack(ctx)
+
+    # The memory guard ended the shared adapter and one session to keep the
+    # total within the budget; neither went over a limit of its own.
+    for {scope, at} <- [{"adapter", 1_000}, {"session", 2_000}] do
+      {:ok, _} =
+        Tightbeam.DB.query(
+          ctx.db,
+          "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, 'memory_tree_ended', 'x', ?2)",
+          [ctx.wall0 + at, JSON.encode!(%{host: @host, scope: scope, limit: "budget"})]
+        )
+    end
+
+    memory(ctx, 19, swap_free: 0, psi: {14.0, 11.0})
+    for t <- 0..120//15, do: sample(ctx, t * 1_000)
+
+    assert [alert] = memory_alerts(ctx.db)
+    refute alert.body =~ "over its own memory limit"
+    refute alert.body =~ "over their own memory limits"
+
+    assert alert.body =~
+             "It has stopped 2 processes to keep its agents together within their memory budget. " <>
                "If free memory keeps falling, the machine may stop responding."
   end
 
