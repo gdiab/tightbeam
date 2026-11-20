@@ -279,7 +279,9 @@ defmodule Tightbeam.PairingFreezeTest do
       Path.wildcard(Path.join(root, "lib/**/*.ex")) ++
         Path.wildcard(Path.join(root, "cli/src/**/*.rs"))
 
-    naming = Enum.filter(sources, &(File.read!(&1) =~ "pairing-unfreeze"))
+    # The file's name, not the owner-alert kind 'pairing-unfreeze-ignored' that
+    # contract v3.14 R12 folds into the owner_alerts DDL.
+    naming = Enum.filter(sources, &(File.read!(&1) =~ ~r/pairing-unfreeze(?![\w-])/))
     assert Enum.map(naming, &Path.relative_to(&1, root)) == ["lib/tightbeam/pairing_freeze.ex"]
 
     reader = File.read!(Path.join(root, "lib/tightbeam/pairing_freeze.ex"))

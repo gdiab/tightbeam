@@ -369,7 +369,8 @@ defmodule Tightbeam.ParkStrandingTest do
     # before limit-fallback, and no stranding wake (that build had no R11).
     {:ok, _} = DB.query(db, "DELETE FROM wakes WHERE consumer='park_stranding'")
     :ok = DB.execute(db, "ALTER TABLE harness_park_fences DROP COLUMN quotaIncidentId")
-    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='session-identity-v1-0114'")
+    # The stamp before limit-fallback on the post-Part-A chain (contract v3.14 R11/C1).
+    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='user-removal-v1-0114'")
 
     assert :ok = Schema.ensure_all(db)
     assert {:ok, [["limit-fallback-v1-0114"]]} = DB.query(db, "SELECT shape FROM schema_stamp")

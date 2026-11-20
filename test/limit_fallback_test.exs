@@ -19,7 +19,9 @@ defmodule Tightbeam.LimitFallbackTest do
   alias Tightbeam.DB.Txn
 
   @shape "limit-fallback-v1-0114"
-  @predecessor "session-identity-v1-0114"
+  # Post-Part-A 0.1.14 chain (cross-line contract v3.14 R11/C1): the only
+  # predecessor of limit-fallback-v1-0114 is user-removal-v1-0114.
+  @predecessor "user-removal-v1-0114"
   @process_branch "(kind = 'progress' AND bySession IS NULL AND byUser IS NULL " <>
                     "AND verdictKind IS NULL AND byProcess IS NOT NULL)"
   @note "model-fallback applied session=holder from=codex/gpt-6-luna/max " <>
