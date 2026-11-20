@@ -1482,8 +1482,9 @@ defmodule Tightbeam.MemoryGuard do
             line
 
         "guard_unavailable" ->
-          "Waiting for Tightbeam to be able to start agent processes on #{host} safely: " <>
-            "the memory guard's launch step is not ready. " <> line
+          "Waiting for Tightbeam to be able to start agent processes on #{host} safely: its " <>
+            "memory guard cannot yet account for them (its launch step, its own records, or an " <>
+            "earlier agent process not yet confirmed stopped). " <> line
       end
 
     post_marker(state, %{

@@ -4044,6 +4044,189 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## T35 (FS9 Step 2, PO att_b685f272): the root-path check, one mechanism at a time
+
+  describe "matrix N5 / T35: the root-path check" do
+    alias Tightbeam.MemoryGuard.RootPath
+
+    defp runner(id_groups, sudo, writable) do
+      fn
+        "id", ["-Gn"] -> id_groups
+        "sudo", ["-n", "-l"] -> sudo
+        "test", ["-w", path] -> if path in writable, do: {"", 0}, else: {"", 1}
+      end
+    end
+
+    setup do
+      dir = Path.join(System.tmp_dir!(), "tb-t35-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      socket = Path.join(dir, "docker.sock")
+      File.write!(socket, "")
+      on_exit(fn -> File.rm_rf!(dir) end)
+      %{socket: socket}
+    end
+
+    @no_sudo {"sudo: a password is required\n", 1}
+
+    test "T35 (a): as gd on Sirius (docker, lxd, a passwordless sudo entry): residual, naming each path",
+         ctx do
+      finding =
+        RootPath.finding(
+          runner: runner({"gd docker lxd\n", 0}, {"(ALL) NOPASSWD: ALL\n", 0}, []),
+          sockets: [ctx.socket]
+        )
+
+      assert RootPath.kind(finding) == "residual"
+      statement = RootPath.statement(finding)
+      assert statement =~ "groups (docker, lxd)"
+      assert statement =~ "a passwordless sudo entry"
+    end
+
+    test "T35 (b) and (c): only docker membership, then only a passwordless sudo entry: residual",
+         ctx do
+      docker =
+        RootPath.finding(runner: runner({"gd docker\n", 0}, @no_sudo, []), sockets: [ctx.socket])
+
+      assert %{"groups" => %{"result" => "present"}, "sudo" => %{"result" => "absent"}} = docker
+      assert RootPath.kind(docker) == "residual"
+
+      sudo =
+        RootPath.finding(
+          runner: runner({"gd\n", 0}, {"(ALL) NOPASSWD: /bin/x\n", 0}, []),
+          sockets: [ctx.socket]
+        )
+
+      assert %{"groups" => %{"result" => "absent"}, "sudo" => %{"result" => "present"}} = sudo
+      assert RootPath.kind(sudo) == "residual"
+    end
+
+    test "T35 (d): only write access to the Docker socket (for example through an ACL): residual",
+         ctx do
+      finding =
+        RootPath.finding(
+          runner: runner({"gd\n", 0}, @no_sudo, [ctx.socket]),
+          sockets: [ctx.socket]
+        )
+
+      assert %{"sockets" => %{"result" => "present", "detail" => [_]}} = finding
+      assert RootPath.kind(finding) == "residual"
+    end
+
+    test "T35 (e): none of them: strict, saying unchecked paths cannot be ruled out", ctx do
+      finding = RootPath.finding(runner: runner({"gd\n", 0}, @no_sudo, []), sockets: [ctx.socket])
+      assert RootPath.kind(finding) == "strict"
+      assert RootPath.statement(finding) =~ "cannot be ruled out"
+    end
+
+    test "T35 (f) / N5.unreadable / N5.timeout: a mechanism that cannot be evaluated is unknown, and the statement is residual",
+         ctx do
+      failing = fn
+        "id", _ -> {:error, "id is not installed"}
+        "sudo", _ -> raise "sudo hung up"
+        "test", _ -> {"", 2}
+      end
+
+      finding = RootPath.finding(runner: failing, sockets: [ctx.socket])
+      assert Enum.all?(Map.values(finding), &(&1["result"] == "unknown"))
+      assert RootPath.kind(finding) == "residual"
+      assert RootPath.statement(finding) =~ "a path that could not be checked"
+    end
+  end
+
+  describe "T32 (FS3, FS8, FS9)" do
+    alias Tightbeam.MemoryGuard.{Episodes, RootActions}
+
+    test "T32: enforced switched to off, limits not all lifted, a pre-off survivor: off not applied and no bypass; the survivor keeps the replacement refused; one alert; root recovery clears the fence only on proof",
+         ctx do
+      Application.put_env(:tightbeam, :memory_guard_stuck_ms, 0)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_stuck_ms) end)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE users SET createdAt=createdAt+1000 WHERE userId='guest'")
+
+      main!(ctx, "owner")
+      {harness, unit, set_mode} = enforced_with_unit!(ctx)
+
+      # A session tree launched before the switch, of an adapter that has
+      # since ended; its unit still holds it.
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+      pre = Path.join(harness, "session-pre")
+      File.mkdir_p!(pre)
+      File.write!(Path.join(pre, "cgroup.events"), "populated 1\nfrozen 0\n")
+      proc!(ctx.root, 960, 1, 960, 10 * @mib)
+
+      File.write!(
+        Path.join([Records.dir(ctx.base), "sessions", "sl-pre.json"]),
+        JSON.encode!(%{
+          v: 1,
+          launchId: "sl-pre",
+          sessionId: "pre",
+          pid: 960,
+          start: 960,
+          adapterLaunchId: "adapter-launch-1",
+          placement: "enforced",
+          unit: "/svc/tightbeam.service/harness/session-pre",
+          sessionLimit: 536_870_912
+        })
+      )
+
+      # The switch to off cannot lift every limit.
+      File.chmod!(Path.join(unit, "memory.max"), 0o444)
+      on_exit(fn -> File.chmod(Path.join(unit, "memory.max"), 0o644) end)
+      assert {:error, {:not_applied, _}} = set_mode.("off")
+      read = MemoryGuard.read(@host)
+      assert read.mode == "watched"
+      assert read.notEnforcedReason =~ "off is not yet in effect"
+      assert read.notEnforcedReason =~ "still in force"
+      # No launch is admitted through the off bypass while it is incomplete.
+      refute Unguarded.mode_in_force(ctx.db, @host) == "off"
+
+      # The pre-off survivor keeps the replacement adapter refused (FS8).
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a new adapter")
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+      :ok = MemoryGuard.tick()
+
+      assert [%{"kind" => "custody", "episodeId" => id} = episode] =
+               Episodes.active(ctx.db, @host)
+
+      assert_received {:owner_alert, ^id}
+
+      # Root's recovery ends the survivor; the fence clears on proof.
+      File.mkdir_p!(RootActions.dir(ctx.base))
+
+      File.write!(
+        Path.join(RootActions.dir(ctx.base), "recovery.json"),
+        JSON.encode!(%{
+          v: 1,
+          action: "recovery",
+          episodeId: id,
+          host: @host,
+          kind: "custody",
+          key: episode["key"],
+          killedAt: System.system_time(:millisecond)
+        })
+      )
+
+      File.write!(Path.join(pre, "cgroup.events"), "populated 0\nfrozen 0\n")
+      gone!(ctx.root, 960)
+      stop_supervised!(MemoryGuard)
+
+      guard!(ctx,
+        probe: enforced_probe(),
+        cgroup_fs: Path.join(ctx.root, "sys/fs/cgroup"),
+        root_uid: File.stat!(ctx.root).uid
+      )
+
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+      assert %{"outcome" => "cleared"} = Episodes.recovery(ctx.db, id)
+      assert Episodes.active(ctx.db, @host) == []
+      assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
