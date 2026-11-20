@@ -295,15 +295,18 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Join the adapter unit named by `TIGHTBEAM_ADAPTER_CGROUP` (a cgroup
 /// directory) before the helper execs the adapter (R12c). A failure leaves the
-/// adapter where it is; the gateway checks membership and runs that tree
-/// `watched` when it is not in its unit (R12a).
+/// adapter where it is and is reported on the adapter's stderr; the gateway
+/// checks each adapter's membership and samples and limits one outside its
+/// unit as in watched mode, with a lifecycle record (R12a).
 pub fn join_adapter_cgroup() {
     if let Ok(dir) = std::env::var("TIGHTBEAM_ADAPTER_CGROUP") {
         if !dir.is_empty() {
-            let _ = fs::write(
+            if let Err(error) = fs::write(
                 Path::new(&dir).join("cgroup.procs"),
                 std::process::id().to_string(),
-            );
+            ) {
+                eprintln!("tightbeam: the adapter could not join its memory unit {dir}: {error}");
+            }
         }
     }
 }

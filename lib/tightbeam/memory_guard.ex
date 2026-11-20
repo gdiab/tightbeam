@@ -1367,6 +1367,7 @@ defmodule Tightbeam.MemoryGuard do
         state = budget_transition(state, host, measured.total, now)
         state = put_in(state.hosts[host].total, measured.total)
         state = put_in(state.hosts[host].available, available)
+        state = announce_unplaced(state, host, measured)
         state = watched_limits(state, host, measured, settings)
         state = observe_ended(state, host, measured)
         state = state |> shed(host) |> trim_to_cap(host)
@@ -1421,7 +1422,7 @@ defmodule Tightbeam.MemoryGuard do
     _ -> []
   end
 
-  defp measure_watched(state, adapters, launches) do
+  defp measure_watched(state, adapters, launches, exclude \\ nil) do
     case ProcTree.snapshot(state.root) do
       {:ok, table} ->
         sessions =
@@ -1430,7 +1431,14 @@ defmodule Tightbeam.MemoryGuard do
               do: record
 
         session_trees = ProcTree.trees(table, Enum.map(sessions, & &1["pid"]))
-        in_sessions = session_trees |> Map.values() |> Enum.reduce(MapSet.new(), &MapSet.union/2)
+
+        in_sessions =
+          (exclude || sessions)
+          |> Enum.filter(&alive?(table, &1))
+          |> Enum.map(& &1["pid"])
+          |> then(&ProcTree.trees(table, &1))
+          |> Map.values()
+          |> Enum.reduce(MapSet.new(), &MapSet.union/2)
 
         session_units =
           for record <- sessions do
@@ -1493,8 +1501,17 @@ defmodule Tightbeam.MemoryGuard do
                 record: record
               }
 
+        # R12a/R12c: an adapter is enforced only when it is a member of its
+        # unit. One that is not (its join failed, or it predates the mode) is
+        # sampled and limited as in watched mode, and the gap is recorded.
+        {placed, unplaced_adapters} =
+          Enum.split_with(
+            adapters,
+            &in_unit?(state.root, &1.os_pid, Cgroup.adapter_unit(layout, &1.launch_id))
+          )
+
         adapter_units =
-          for row <- adapters do
+          for row <- placed do
             unit = Cgroup.adapter_unit(layout, row.launch_id)
 
             %{
@@ -1509,14 +1526,14 @@ defmodule Tightbeam.MemoryGuard do
             }
           end
 
-        # A tree the kernel could not take (R12a: its cgroup failed) is
-        # sampled and limited as in watched mode.
+        # A session tree the kernel could not take (its cgroup failed) is
+        # sampled and limited as in watched mode too.
         unplaced = for {_id, r} <- state.launches, r["placement"] != "enforced", do: r
 
         watched =
-          case unplaced do
-            [] -> {:ok, %{units: []}}
-            records -> measure_watched(state, [], records)
+          case {unplaced, unplaced_adapters} do
+            {[], []} -> {:ok, %{units: []}}
+            {records, rows} -> measure_watched(state, rows, records, Map.values(state.launches))
           end
 
         case watched do
@@ -1532,6 +1549,19 @@ defmodule Tightbeam.MemoryGuard do
         :error
     end
   end
+
+  # Whether a process is a member of `unit`, from its own /proc/<pid>/cgroup.
+  defp in_unit?(root, pid, unit) when is_integer(pid) do
+    case File.read(Path.join([root, "proc", Integer.to_string(pid), "cgroup"])) do
+      {:ok, text} ->
+        String.contains?(text, "0::" <> unit <> "\n") or String.trim(text) == "0::" <> unit
+
+      _ ->
+        false
+    end
+  end
+
+  defp in_unit?(_root, _pid, _unit), do: false
 
   defp unit_bytes(_layout, nil), do: 0
 
@@ -1674,6 +1704,38 @@ defmodule Tightbeam.MemoryGuard do
     :ok
   end
 
+  # R12a: on an enforced host, an adapter outside its unit is recorded once.
+  defp announce_unplaced(state, host, measured) do
+    if state.hosts[host].mode == "enforced" do
+      Enum.reduce(measured.units, state, fn
+        %{scope: "adapter", pids: _, launch_id: launch} = unit, acc ->
+          if MapSet.member?(acc.announced, {:unplaced, launch}) do
+            acc
+          else
+            EventLog.lifecycle(
+              acc.db,
+              "memory_guard_launch_unplaced",
+              host,
+              JSON.encode!(%{
+                host: host,
+                launchId: launch,
+                error:
+                  "the adapter is not in its memory unit; it is sampled and limited every second instead",
+                unit: unit.id
+              })
+            )
+
+            %{acc | announced: MapSet.put(acc.announced, {:unplaced, launch})}
+          end
+
+        _unit, acc ->
+          acc
+      end)
+    else
+      state
+    end
+  end
+
   # R1 and R2 in watched mode (and for unplaced trees on an enforced host).
   defp watched_limits(state, host, measured, settings) do
     mode = state.hosts[host].mode
@@ -1689,10 +1751,13 @@ defmodule Tightbeam.MemoryGuard do
       over_session != nil ->
         kill_unit(state, host, over_session, "session", mode)
 
-      mode == "watched" and is_integer(settings.budget) and measured.total > settings.budget and
-          map_size(state.killing) == 0 ->
+      mode in ["watched", "enforced"] and is_integer(settings.budget) and
+        measured.total > settings.budget and map_size(state.killing) == 0 ->
+        # Watched: every unit is the gateway's to end. Enforced: the kernel
+        # ends placed units; the gateway ends only the ones it samples (R12a).
         victim =
           units
+          |> Enum.filter(&(mode == "watched" or Map.has_key?(&1, :pids)))
           |> Enum.reject(&Map.has_key?(state.killing, &1.id))
           |> Enum.max_by(&rank(&1, settings.budget), fn -> nil end)
 
