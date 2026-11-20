@@ -7,6 +7,7 @@ mod ceremonies;
 mod child_process;
 mod command_execution;
 mod contain;
+mod credential_health;
 mod cursor_execution_identity;
 mod cursor_rails;
 mod dispatch;
@@ -44,6 +45,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    if args.first().is_some_and(|arg| arg == "credential-health") {
+        std::process::exit(credential_health::run(&args[1..]));
     }
 
     if args.first().is_some_and(|arg| arg == "rail-exec") {
