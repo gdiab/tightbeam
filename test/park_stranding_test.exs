@@ -369,10 +369,11 @@ defmodule Tightbeam.ParkStrandingTest do
     # before limit-fallback, and no stranding wake (that build had no R11).
     {:ok, _} = DB.query(db, "DELETE FROM wakes WHERE consumer='park_stranding'")
     :ok = DB.execute(db, "ALTER TABLE harness_park_fences DROP COLUMN quotaIncidentId")
-    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='session-identity-v1-0114'")
+    # The stamp before 0.1.16's own limit-fallback step (contract v3.14 R7, LF_L).
+    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='user-removal-v1-016'")
 
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, [["limit-fallback-v1-0114"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["limit-fallback-v1-016"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     # The step marks the standing quota park from its key's open incident; a
     # fence with no open quota incident on its key stays unmarked.
