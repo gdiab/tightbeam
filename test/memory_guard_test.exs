@@ -584,8 +584,44 @@ defmodule Tightbeam.MemoryGuardTest do
              }
 
       assert read.residentCount == 1
+      # A set residentCap is honoured where the memory size is unknown (R17).
+      assert read.residentCapGap == nil
       # Counts and totals only (v3 R2): no process list, pid or command line.
       refute Enum.any?(Map.keys(read), &(&1 in [:pids, :processes, :commands]))
+    end
+
+    test "E5.absent (v1.14 erratum, R12a): with the memory size unknown and no residentCap set, R3 applies no cap and the read names the gap",
+         ctx do
+      guard!(ctx,
+        probe: %{mode: :count_only, reason: "no /proc/meminfo", mem_total: nil, cgroup: nil}
+      )
+
+      adapter = adapter!()
+      sids = for n <- 1..3, do: "sid-r#{n}"
+
+      for {sid, n} <- Enum.with_index(sids, 1) do
+        session!(ctx, "agent:r#{n}", sid)
+        queue!(ctx, "agent:r#{n}", "busy")
+      end
+
+      resident!(adapter, sids)
+      for n <- 1..3, do: :ok = MemoryGuard.admit("agent:r#{n}")
+
+      # Three resident and busy (more than the old floor of 2): a fourth that
+      # needs a launch is still admitted.
+      session!(ctx, "agent:new")
+      queue!(ctx, "agent:new", "needs a launch")
+      assert :ok = MemoryGuard.admit("agent:new")
+
+      read = MemoryGuard.read(@host)
+      assert read.mode == "count-only"
+      # The admitted launch counts from its decision (R3): four, no cap.
+      assert read.residentCount == 4
+      assert read.heldTurns["resident_cap"] == 0
+
+      assert read.residentCapGap ==
+               "no resident cap: this machine's memory size is unknown; set one with " <>
+                 "tightbeam host-memory set --host #{@host} residentCap <count>"
     end
 
     test "macOS and other systems read count-only", ctx do
@@ -5624,10 +5660,11 @@ defmodule Tightbeam.MemoryGuardTest do
       assert %{reason: nil, at: 1} = Records.refusal_for(ctx.base, "sid-x", 0)
     end
 
-    test "sweep (R3, R12 count-only): a host whose memory size is unknown keeps a resident cap of 2, never none",
+    test "F4 (v1.14 erratum): with the memory size unknown, no residentCap means no cap; a set one applies",
          _ctx do
-      assert %{resident_cap: 2, budget: nil} = Settings.effective(%{}, nil)
+      assert %{resident_cap: nil, budget: nil} = Settings.effective(%{}, nil)
       assert %{resident_cap: 5} = Settings.effective(%{"residentCap" => %{value: "5"}}, nil)
+      assert %{resident_cap: 8} = Settings.effective(%{}, 16 * @gib)
     end
 
     test "sweep (R7, M-V2): a held read that cannot be completed says unknown, never not held",

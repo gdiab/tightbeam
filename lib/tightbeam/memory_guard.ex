@@ -4126,6 +4126,13 @@ defmodule Tightbeam.MemoryGuard do
             host_state.available && Float.round(host_state.available * 1.0, 1),
           residentCount: resident_count(state, host, nil),
           reservedSlot: reserved_slot_read(state, host, host_state),
+          # v1.14 erratum: no cap because the memory size is unknown, said so.
+          residentCapGap:
+            if(is_nil(host_state.settings.resident_cap),
+              do:
+                "no resident cap: this machine's memory size is unknown; set one with " <>
+                  "tightbeam host-memory set --host #{host} residentCap <count>"
+            ),
           oomScoreAdj: oom_read(state, host_state),
           heldTurns: held,
           floorHolds: host_state.floor_held,

@@ -311,12 +311,13 @@ defmodule Tightbeam.MemoryGuard.Settings do
     end
   end
 
-  # max(2, ⌊budget / 1 GiB⌋); with the budget unknown (a `count-only` host,
-  # whose memory size cannot be read) the cap is its floor, 2: R3 still holds
-  # turns at a cap there (R12), never at none.
+  # max(2, ⌊budget / 1 GiB⌋) is defined only where the budget is, that is
+  # where MemTotal reads. With the size unknown and no residentCap set, R3
+  # applies no cap (v1.14 erratum, R12a: a missing mechanism never stops
+  # admitting work); the host read names the gap. A set residentCap applies.
   defp resident_cap(values, budget) do
     case Map.get(values, "residentCap") do
-      nil when is_nil(budget) -> {:ok, 2}
+      nil when is_nil(budget) -> {:ok, nil}
       nil -> {:ok, max(2, div(budget, @gib))}
       value -> integer_in(%{"residentCap" => value}, "residentCap", nil, 1, 256)
     end
