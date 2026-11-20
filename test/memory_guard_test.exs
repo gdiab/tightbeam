@@ -85,6 +85,24 @@ defmodule Tightbeam.MemoryGuardTest do
 
   defp gone!(root, pid), do: File.rm_rf!(Path.join([root, "proc", Integer.to_string(pid)]))
 
+  # A fake process in process group `pgrp` and session `sid` (the step's
+  # `setsid` leader's pid), for the whole-tree proof after the leader is gone.
+  defp proc_in!(root, pid, ppid, start, bytes, pgrp, sid) do
+    dir = Path.join([root, "proc", Integer.to_string(pid)])
+    File.mkdir_p!(dir)
+    zeros = Enum.map_join(1..15, " ", fn _ -> "0" end)
+
+    File.write!(
+      Path.join(dir, "stat"),
+      "#{pid} (fake proc) S #{ppid} #{pgrp} #{sid} #{zeros} #{start} 0 0\n"
+    )
+
+    File.write!(
+      Path.join(dir, "status"),
+      "Name:\tfake\nVmRSS:\t#{div(bytes, 1024)} kB\nVmSwap:\t0 kB\n"
+    )
+  end
+
   # The session process of `sid` has ended, as a close ends it: its fake
   # process goes, or, for a test that never recorded one, a launch record of an
   # already ended process is left for the close's confirmation (FS5).
@@ -3344,6 +3362,87 @@ defmodule Tightbeam.MemoryGuardTest do
 
       _ = Admission.run_deferred(ctx.db, @host)
       assert length(events(ctx.db, "memory_readmission_done")) == 1
+    end
+  end
+
+  ## Whole-tree proof after the leader has gone (matrix B2.stale, B6, D1.absent, D2, E2.absent)
+
+  describe "matrix B2 / B6 / D1 / D2 / E2: a dead root is not a dead tree (R2a, M-V7)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      # The leader 951 has gone; 960, reparented to init, is still in its
+      # process group and session.
+      launch!(ctx.base, "sl-a", "sid-a", 951, 951, 512 * @mib)
+      proc_in!(ctx.root, 960, 1, 960, 10 * @mib, 951, 951)
+      :ok
+    end
+
+    test "B2.stale / B6.absent: with the identity missing and the leader gone, a surviving group member keeps the record and refuses the replacement; it is never signalled",
+         ctx do
+      guard!(ctx, kill_result: {:error, :identity_missing})
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+
+      assert {:error, {:session_trees_survive, ["sl-a"]}} =
+               MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+
+      refute_received {:signalled, _}
+      assert Map.has_key?(elem(Records.read_all(ctx.base), 1), "sl-a")
+
+      gone!(ctx.root, 960)
+      assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      assert Records.read_all(ctx.base) == {:ok, %{}}
+    end
+
+    test "B6.stale: a helper that refuses a mismatched identity is a failure, never an end",
+         ctx do
+      guard!(ctx, kill_result: {:error, {:harness_group_failed, 1, "identity changed"}})
+      gone!(ctx.root, 960)
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+
+      assert {:error, {:session_trees_survive, ["sl-a"]}} =
+               MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+    end
+
+    test "D2.absent: an adapter's end with a session leader already gone but its group alive records the orphan and keeps custody",
+         ctx do
+      guard!(ctx, kill_result: {:error, :identity_missing})
+
+      assert {:error, {:session_trees_survive, ["sl-a"]}} =
+               MemoryGuard.adapter_ended({:claude, "shared", @host}, "adapter-launch-1")
+
+      assert [{@host, %{"survivors" => [%{"launchId" => "sl-a"}]}}] =
+               events(ctx.db, "memory_guard_orphans")
+    end
+
+    test "E2.absent: a session leader that ended naturally with its group alive is not an ended tree; custody stays until the group is gone",
+         ctx do
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert Map.has_key?(elem(Records.read_all(ctx.base), 1), "sl-a")
+
+      gone!(ctx.root, 960)
+      :ok = MemoryGuard.tick()
+      assert Records.read_all(ctx.base) == {:ok, %{}}
+    end
+
+    test "D1.absent: a kill target whose leader is gone before the kill is sent is not certified; its group keeps custody",
+         ctx do
+      # An over-limit tree whose leader goes just before the signal.
+      proc!(ctx.root, 971, 1, 971, 900 * @mib)
+      launch!(ctx.base, "sl-big", "sid-big", 971, 971, 512 * @mib)
+      proc_in!(ctx.root, 972, 1, 972, 10 * @mib, 971, 971)
+      guard!(ctx, before_kill_send: fn target -> gone!(ctx.root, target.pid) end)
+
+      :ok = MemoryGuard.tick()
+      settle_kills!()
+      assert events(ctx.db, "memory_tree_ended") == []
+      :ok = MemoryGuard.tick()
+      assert Map.has_key?(elem(Records.read_all(ctx.base), 1), "sl-big")
+
+      gone!(ctx.root, 972)
+      :ok = MemoryGuard.tick()
+      refute Map.has_key?(elem(Records.read_all(ctx.base), 1), "sl-big")
     end
   end
 
