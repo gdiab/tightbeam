@@ -3963,7 +3963,7 @@ defmodule Tightbeam.MemoryGuardTest do
                Episodes.judge(ctx.db, replay, "other-digest", @host)
     end
 
-    test "N5 (T35): an override whose statement is not exactly the one printed for its episode, survivors, operator and finding is refused",
+    test "N5.stale (T35, B5): an override whose statement is not exactly the one printed for its episode, survivors, operator and finding is refused",
          ctx do
       episode = custody_stuck!(ctx, finding: fn -> residual_finding() end)
 
@@ -4218,6 +4218,36 @@ defmodule Tightbeam.MemoryGuardTest do
       assert error =~ "recovery-1.json"
     end
 
+    test "N9.unreadable (FS7, sweep): an override whose effect cannot be recorded does not lift the fence; it is retried",
+         ctx do
+      episode = custody_stuck!(ctx)
+      id = episode["episodeId"]
+
+      root_record!(
+        ctx,
+        "recovery-1",
+        recovery_record(episode, System.system_time(:millisecond) - 61_000)
+      )
+
+      :ok = MemoryGuard.tick()
+      root_record!(ctx, "override-1", override_record(ctx, episode, strict_finding()))
+      :ok = MemoryGuard.tick()
+      assert %{"applied" => false} = Episodes.override(ctx.db, id)
+
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER fs9_applied_fails BEFORE UPDATE OF applied ON memory_guard_episodes
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      assert {:error, _} = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      assert %{"applied" => false} = Episodes.override(ctx.db, id)
+
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER fs9_applied_fails")
+      assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      assert %{"applied" => true} = Episodes.override(ctx.db, id)
+    end
+
     test "N10.unreadable: an episode read that cannot be completed says unknown, never none",
          _ctx do
       assert %{unknown: _} = Episodes.read(:no_such_db, @host)
@@ -4352,7 +4382,7 @@ defmodule Tightbeam.MemoryGuardTest do
                events(ctx.db, "memory_guard_episode_ended")
     end
 
-    test "N4 (guard): pending without a restart; the first start that finds it starts the 5-minute clock, then failed",
+    test "N4.absent / N4.unreadable / N4.timeout (guard, B2): pending without a restart; the first start that finds it starts the 5-minute clock",
          ctx do
       :ok = Watcher.tick(:mg_watcher_test)
       [episode] = Episodes.active(ctx.db, @host)
@@ -4391,7 +4421,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert %{"outcome" => "failed"} = Episodes.recovery(ctx.db, episode["episodeId"])
     end
 
-    test "N4 (guard, cleared): a pending guard recovery clears, ending its episode, once the guard answers",
+    test "N4.stale (guard): a pending guard recovery is cleared once, ending its episode, when the guard answers",
          ctx do
       :ok = Watcher.tick(:mg_watcher_test)
       [episode] = Episodes.active(ctx.db, @host)
@@ -5462,6 +5492,198 @@ defmodule Tightbeam.MemoryGuardTest do
                DB.transaction(ctx.db, &Admission.not_started_in_txn(&1, readmitted, @host))
 
       assert length(events(ctx.db, "memory_readmission_done")) == 1
+    end
+  end
+
+  ## The review's failure class, swept: a failure or an unreadable input never
+  ## reads as none, empty or done.
+
+  describe "sweep: failures never read as none (review class B3-B6)" do
+    alias Tightbeam.MemoryGuard.{RootPath, Unguarded}
+
+    test "sweep (FS1 A3, FS2): an adapter whose session processes cannot get the launch step does not launch, outside off",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      # The installed CLI is missing, so the step cannot be put in place.
+      empty = Path.join(ctx.root, "no-cli")
+      File.mkdir_p!(empty)
+      guard!(ctx, cli_bin: empty)
+
+      assert {:error, :memory_guard_unavailable} =
+               MemoryGuard.launch_env(
+                 {:claude, "shared", @host},
+                 "L-nostep",
+                 [
+                   cmd: ["/x/.bin/claude-agent-acp"],
+                   env: [{"CLAUDE_CODE_EXECUTABLE", "/x/claude"}]
+                 ],
+                 ctx.db
+               )
+
+      assert [{@host, %{"launchId" => "L-nostep", "error" => error}}] =
+               events(ctx.db, "memory_guard_launch_unplaced")
+
+      assert error =~ "launch step is not in place"
+
+      # A harness without session processes needs no step.
+      assert MemoryGuard.launch_env(
+               {:codex, "shared", @host},
+               "L-codex",
+               [cmd: ["/bin/codex-acp"], env: []],
+               ctx.db
+             ) == []
+    end
+
+    test "sweep (B2.unreadable): a launch record without its tree's pid is unreadable, not a record",
+         ctx do
+      dir = Path.join(Records.dir(ctx.base), "sessions")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "sl-nopid.json"), JSON.encode!(%{v: 1, launchId: "sl-nopid"}))
+      assert {:error, error} = Records.read_all(ctx.base)
+      assert error =~ "sl-nopid.json"
+    end
+
+    test "sweep (D1.absent, M-V7): a tree's unit is read even after the host left enforced; a populated one is not gone",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+      proc!(ctx.root, 951, 1, 951, 10 * @mib)
+      launch!(ctx.base, "sl-unit", "sid-unit", 951, 951, 512 * @mib)
+      unit = "/svc/tightbeam.service/harness/session-sid-unit"
+      path = Path.join(Records.dir(ctx.base), "sessions/sl-unit.json")
+
+      record =
+        path
+        |> File.read!()
+        |> JSON.decode!()
+        |> Map.merge(%{"placement" => "enforced", "unit" => unit})
+
+      File.write!(path, JSON.encode!(record))
+      events_file = Path.join([ctx.root, "sys/fs/cgroup", unit, "cgroup.events"])
+      File.mkdir_p!(Path.dirname(events_file))
+      File.write!(events_file, "populated 1\nfrozen 0\n")
+
+      # The host is watched now (it left enforced): no layout, the unit stays.
+      guard!(ctx)
+      key = {:claude, "shared", @host}
+      assert {:error, _} = MemoryGuard.ensure_no_orphans(key)
+      assert File.exists?(path), "custody kept: the unit still has processes"
+
+      File.write!(events_file, "populated 0\nfrozen 0\n")
+      assert :ok = MemoryGuard.ensure_no_orphans(key)
+    end
+
+    test "sweep (L1, R12): a session on a host the guard has not seen is decided, never admitted unchecked",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+
+      Org.create(ctx.db, %{
+        session_key: "agent:far",
+        display_name: "far",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "coder",
+        host: "farhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
+      })
+
+      queue!(ctx, "agent:far", "work")
+      result = MemoryGuard.admit("agent:far", ctx.db)
+
+      assert result == {:held, ["guard_unavailable"]} or
+               Map.has_key?(:sys.get_state(MemoryGuard).hosts, "farhost")
+    end
+
+    test "sweep (FS2): refusal records that cannot be read are an unknown refusal, and the step's prerequisites hold",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      oom = Path.join(ctx.root, "proc/self/oom_score_adj")
+      File.mkdir_p!(Path.dirname(oom))
+      File.write!(oom, "0\n")
+      File.mkdir_p!(Path.join(Records.dir(ctx.base), "sessions"))
+      assert :ok = Records.step_prerequisites(ctx.base, ctx.root)
+
+      refusals = Path.join(Records.dir(ctx.base), "refusals")
+      File.mkdir_p!(refusals)
+      bad = Path.join(refusals, "sl-x.json")
+      File.write!(bad, ~s({"v":1,"sessionId":"sid-x","at":1}))
+      File.chmod!(bad, 0o000)
+      on_exit(fn -> File.chmod(bad, 0o644) end)
+
+      assert {:error, error} = Records.refusal_for(ctx.base, "sid-other", 0)
+      assert error =~ "sl-x.json"
+      assert {:error, _} = Records.step_prerequisites(ctx.base, ctx.root)
+
+      File.chmod!(bad, 0o644)
+      assert Records.refusal_for(ctx.base, "sid-other", 0) == nil
+      assert %{reason: nil, at: 1} = Records.refusal_for(ctx.base, "sid-x", 0)
+    end
+
+    test "sweep (R3, R12 count-only): a host whose memory size is unknown keeps a resident cap of 2, never none",
+         _ctx do
+      assert %{resident_cap: 2, budget: nil} = Settings.effective(%{}, nil)
+      assert %{resident_cap: 5} = Settings.effective(%{"residentCap" => %{value: "5"}}, nil)
+    end
+
+    test "sweep (R7, M-V2): a held read that cannot be completed says unknown, never not held",
+         _ctx do
+      session = %{
+        session_key: "agent:x",
+        harness: "claude",
+        provider: "anthropic",
+        model: nil,
+        host: @host
+      }
+
+      assert %{reasonClass: "unknown", reasons: [%{condition: "unknown: " <> _}]} =
+               HeldState.read(:no_such_db, session)
+    end
+
+    test "sweep (F8.unreadable): a budget group that cannot be looked at is no evidence that off may take effect",
+         ctx do
+      fs = Path.join(ctx.root, "sys/fs/cgroup")
+      parent = Path.join(fs, "svc/tightbeam.service")
+      File.mkdir_p!(Path.join(parent, "harness"))
+      File.chmod!(parent, 0o000)
+      on_exit(fn -> File.chmod(parent, 0o755) end)
+
+      if match?({:error, _}, File.stat(Path.join(parent, "harness"))) do
+        assert {:not_applied, why} =
+                 Unguarded.bring_off_into_force(ctx.db, @host, ctx.base,
+                   cgroup_fs: fs,
+                   harness_candidates: fn -> {:ok, ["/svc/tightbeam.service/harness"]} end
+                 )
+
+        assert why =~ "cannot be looked at"
+      end
+    end
+
+    test "sweep (N5.unreadable): a control socket that cannot be looked at is unknown, never absent",
+         ctx do
+      dir = Path.join(ctx.root, "locked")
+      File.mkdir_p!(dir)
+      File.chmod!(dir, 0o000)
+      on_exit(fn -> File.chmod(dir, 0o755) end)
+      socket = Path.join(dir, "docker.sock")
+
+      if match?({:error, :eacces}, File.stat(socket)) do
+        finding =
+          RootPath.finding(
+            runner: fn
+              "id", _ -> {"gd\n", 0}
+              "sudo", _ -> {"sudo: a password is required", 1}
+            end,
+            sockets: [socket]
+          )
+
+        assert %{"result" => "unknown", "detail" => [^socket]} = finding["sockets"]
+        assert RootPath.kind(finding) == "residual"
+      end
     end
   end
 end
