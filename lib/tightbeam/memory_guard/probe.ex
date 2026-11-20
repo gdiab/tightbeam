@@ -135,6 +135,23 @@ defmodule Tightbeam.MemoryGuard.Probe do
     end
   end
 
+  @doc """
+  Where this contract's budget group could exist, read-only: `<delegated
+  root>/harness` for either delegation shape around the gateway's own cgroup.
+  `:error` when the gateway's own cgroup cannot be read.
+  """
+  @spec harness_candidates(String.t()) :: {:ok, [String.t()]} | :error
+  def harness_candidates(root \\ "/") do
+    case own_cgroup(root, "self") do
+      {:ok, own} ->
+        parents = if Path.basename(own) == "gateway", do: [Path.dirname(own), own], else: [own]
+        {:ok, Enum.map(parents, &Path.join(&1, "harness"))}
+
+      {:error, _} ->
+        :error
+    end
+  end
+
   defp no_v2,
     do:
       "per-agent memory limits are checked every second, not enforced by the kernel: " <>

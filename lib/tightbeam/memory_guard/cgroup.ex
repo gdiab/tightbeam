@@ -132,6 +132,23 @@ defmodule Tightbeam.MemoryGuard.Cgroup do
     |> Enum.find(:ok, &match?({:error, _}, &1))
   end
 
+  @doc """
+  Whether a cgroup carries none of this contract's limits: `memory.max` and
+  `memory.swap.max` read `max` and `memory.oom.group` reads 0. A file that
+  cannot be read is not evidence (v1.13 FS1).
+  """
+  @spec lifted?(String.t(), String.t()) :: boolean()
+  def lifted?(fs, cgroup) do
+    Enum.all?(
+      [{"memory.max", "max"}, {"memory.swap.max", "max"}, {"memory.oom.group", "0"}],
+      fn {file, value} -> match?({:ok, ^value}, read_trimmed(fs, cgroup, file)) end
+    )
+  end
+
+  defp read_trimmed(fs, cgroup, file) do
+    with {:ok, text} <- read(fs, cgroup, file), do: {:ok, String.trim(text)}
+  end
+
   @doc "The adapter unit path for `launch_id`."
   @spec adapter_unit(layout(), String.t()) :: String.t()
   def adapter_unit(%{harness: harness}, launch_id),

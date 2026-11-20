@@ -18,7 +18,7 @@ defmodule Tightbeam.MemoryGuard.HeldState do
   def read(db, session) do
     if queued?(db, session.session_key) do
       reasons =
-        MemoryGuard.hold_reasons(session.session_key)
+        MemoryGuard.hold_reasons(session.session_key, db)
         |> Enum.map(&Map.merge(&1, identity(session)))
 
       reasons = reasons ++ other_reasons(db, session)

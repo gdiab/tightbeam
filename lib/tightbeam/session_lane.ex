@@ -684,7 +684,7 @@ defmodule Tightbeam.SessionLane do
   # on its own (R6a): a memory release never lifts the park above, nor a park
   # release this hold. The guard nudges the lane when the turn can run.
   defp memory_held?(state) do
-    case Tightbeam.MemoryGuard.admit(state.session_key) do
+    case Tightbeam.MemoryGuard.admit(state.session_key, state.db) do
       :ok -> false
       # Asked before any turn was queued: claim nothing until the next nudge.
       :no_turn -> true

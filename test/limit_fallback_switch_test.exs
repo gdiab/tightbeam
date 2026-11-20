@@ -1639,10 +1639,16 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
   # Ending a tree on the fake host removes its fake process; nothing real is
   # signalled.
   defp memory_guard!(ctx, root) do
+    # The launch step is in place (v1.13 FS1 A3): a fake CLI file it links to.
+    cli_bin = Path.join(root, "cli-bin")
+    File.mkdir_p!(cli_bin)
+    File.write!(Path.join(cli_bin, "tightbeam"), "#!/bin/false\n")
+
     start_supervised!(
       {Tightbeam.MemoryGuard,
        db: ctx.db,
        base_dir: ctx.base,
+       cli_bin: cli_bin,
        local_host: "testhost",
        root: root,
        probe: fn -> %{mode: :watched, reason: "test", mem_total: 16 * @gib, cgroup: nil} end,

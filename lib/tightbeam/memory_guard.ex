@@ -35,10 +35,20 @@ defmodule Tightbeam.MemoryGuard do
   require Logger
 
   alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Org, Placement}
-  alias Tightbeam.MemoryGuard.{Admission, Cgroup, Priority, Probe, ProcTree, Records, Settings}
+
+  alias Tightbeam.MemoryGuard.{
+    Admission,
+    Cgroup,
+    Priority,
+    Probe,
+    ProcTree,
+    Records,
+    Settings,
+    Unguarded
+  }
 
   @table :tightbeam_memory_guard
-  @details ~w(resident_cap memory_floor memory_budget)
+  @details ~w(resident_cap memory_floor memory_budget guard_unavailable)
   @kill_retention_ms 15 * 60_000
   @gib 1024 * 1024 * 1024
 
@@ -324,16 +334,26 @@ defmodule Tightbeam.MemoryGuard do
   take now. A held turn stays `queued`; the guard nudges its lane when it can
   run. The call may wait for an idle session process to close first.
   """
-  @spec admit(String.t()) :: :ok | :no_turn | {:held, [String.t()]}
-  def admit(session_key) do
-    # A restarting guard is waited for. One that stays down admits as before:
-    # a hold would strand the turn with no guard left to release it.
+  @spec admit(String.t(), DB.server()) :: :ok | :no_turn | {:held, [String.t()]}
+  def admit(session_key, db \\ DB) do
+    # v1.13 FS1: a guard that is not running, or does not answer, holds every
+    # turn that needs a launch (`guard_unavailable`); there is no time-out
+    # admission. Only a runtime with no guard configured admits unguarded.
     case fence_guard() do
-      :running -> GenServer.call(__MODULE__, {:admit, session_key}, 120_000)
-      _ -> :ok
+      :running -> guarded_admit(session_key, db)
+      :not_configured -> :ok
+      :unavailable -> Unguarded.admit(db, session_key)
     end
+  end
+
+  defp guarded_admit(session_key, db) do
+    GenServer.call(
+      __MODULE__,
+      {:admit, session_key},
+      Application.get_env(:tightbeam, :memory_guard_admit_timeout_ms, 120_000)
+    )
   catch
-    :exit, _ -> :ok
+    :exit, _ -> Unguarded.admit(db, session_key)
   end
 
   @doc "A turn of `session_key` ended; its reservation, if unused, is released."
@@ -388,9 +408,12 @@ defmodule Tightbeam.MemoryGuard do
   @doc "A host's settings changed (R17): re-determine its mode and apply them."
   @spec settings_changed(String.t()) :: :ok | {:error, term()}
   def settings_changed(host) do
-    if running?(),
-      do: GenServer.call(__MODULE__, {:settings_changed, host}, call_timeout()),
-      else: :ok
+    case fence_guard() do
+      :running -> GenServer.call(__MODULE__, {:settings_changed, host}, call_timeout())
+      :not_configured -> :ok
+      # Stored, not applied: a down guard applies nothing (FS1, M-V2).
+      :unavailable -> {:error, {:memory_guard_unavailable, :not_running}}
+    end
   catch
     :exit, reason -> {:error, {:memory_guard_unavailable, reason}}
   end
@@ -399,11 +422,14 @@ defmodule Tightbeam.MemoryGuard do
   The host-capacity reasons that would hold `session_key`'s next turn now,
   for the held-state read (R7): `[%{detail, host, since, condition}]`.
   """
-  @spec hold_reasons(String.t()) :: [map()]
-  def hold_reasons(session_key) do
-    if running?(), do: GenServer.call(__MODULE__, {:hold_reasons, session_key}, 10_000), else: []
+  @spec hold_reasons(String.t(), DB.server()) :: [map()]
+  def hold_reasons(session_key, db \\ DB) do
+    if running?(),
+      do: GenServer.call(__MODULE__, {:hold_reasons, session_key}, 10_000),
+      else: Unguarded.hold_reasons(db, session_key)
   catch
-    :exit, _ -> []
+    # A guard that does not answer: its own hold is the one on record (FS1).
+    :exit, _ -> Unguarded.hold_reasons(db, session_key)
   end
 
   @doc "The supported host read (R12b)."
@@ -462,6 +488,9 @@ defmodule Tightbeam.MemoryGuard do
     state = state |> determine_all() |> publish_all()
     # Deferrals recorded before a restart are picked up by the first samples.
     note_deferred()
+    # v1.13 FS1: the guard answers again, so every `guard_unavailable` hold is
+    # released once init has returned (a nudged lane asks this guard).
+    send(self(), :release_unguarded)
 
     if state.sample_ms != :manual, do: Process.send_after(self(), :tick, state.sample_ms)
     {:ok, state}
@@ -563,6 +592,15 @@ defmodule Tightbeam.MemoryGuard do
     state = sample(%{state | unclosable: MapSet.new()})
     run_deferred(state)
     Process.send_after(self(), :tick, state.sample_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:release_unguarded, state) do
+    for {session_key, host} <- Unguarded.held_sessions(state.db) do
+      Unguarded.release(state.db, session_key, host, "guard_answers")
+      state.nudge.(session_key)
+    end
+
     {:noreply, state}
   end
 
@@ -760,6 +798,9 @@ defmodule Tightbeam.MemoryGuard do
       settings: settings,
       layout: layout,
       step: step,
+      # The step is in place only when it is installed and its configuration
+      # was published (FS1 A3, FS2).
+      step_ready: is_binary(step) and published == :ok,
       available: previous && previous.available,
       floor_held: (previous && previous.floor_held) || false,
       floor_since: previous && previous.floor_since,
@@ -772,7 +813,7 @@ defmodule Tightbeam.MemoryGuard do
 
     changed? =
       is_nil(previous) or previous.mode != mode or previous.reason != reason or
-        previous.settings != settings
+        previous.settings != settings or previous.transition_error != transition
 
     if changed? do
       EventLog.lifecycle(
@@ -783,6 +824,9 @@ defmodule Tightbeam.MemoryGuard do
           host: host,
           mode: mode,
           reason: reason,
+          # Not nil while the requested change is not yet in force (FS3); a
+          # down guard's admission reads the mode in force from this (FS1).
+          transition: transition,
           settings: settings_json(settings),
           invalid: settings.invalid
         })
@@ -902,12 +946,14 @@ defmodule Tightbeam.MemoryGuard do
           do: {nil, state},
           else: cap_decision(state, session, host_state, launch, seq, host_reasons)
 
+      step_reason = step_reason(host_state, launch)
+
       cond do
         match?({:closing, _}, cap_reason) ->
           {:closing, elem(cap_reason, 1), state}
 
-        host_reasons != [] or cap_reason != nil ->
-          details = host_reasons ++ List.wrap(cap_reason)
+        host_reasons != [] or cap_reason != nil or step_reason != nil ->
+          details = host_reasons ++ List.wrap(step_reason) ++ List.wrap(cap_reason)
           {:held, details, hold(state, session, seq, details)}
 
         true ->
@@ -1176,6 +1222,10 @@ defmodule Tightbeam.MemoryGuard do
         "memory_budget" ->
           "Waiting for Tightbeam's agents on #{host} to use less memory (now #{gib(host_state.total)} of a #{gib(host_state.settings.budget)} budget). " <>
             line
+
+        "guard_unavailable" ->
+          "Waiting for Tightbeam to be able to start agent processes on #{host} safely: " <>
+            "the memory guard's launch step is not ready. " <> line
       end
 
     EventLog.notice(
@@ -1273,6 +1323,7 @@ defmodule Tightbeam.MemoryGuard do
       # R3b/R7: the reserved Main is never held by the cap.
       details =
         host_level_reasons(host_state) ++
+          List.wrap(step_reason(host_state, launch)) ++
           if(
             match?({:session, _}, launch) and not reserved_main?(state, session) and
               cap_full?(state, session, host_state),
@@ -1300,6 +1351,15 @@ defmodule Tightbeam.MemoryGuard do
       _ -> []
     end
   end
+
+  # v1.13 FS1 A3 / FS2: a session process started without the launch step
+  # would have no launch record, no per-tree limit, no attribution and no
+  # +100, outside custody; it does not start. `off` uses no step.
+  defp step_reason(%{local: true, mode: mode, step_ready: false}, {:session, _})
+       when mode != "off",
+       do: "guard_unavailable"
+
+  defp step_reason(_host_state, _launch), do: nil
 
   defp cap_full?(state, session, host_state) do
     case host_state.settings.resident_cap do
@@ -1329,6 +1389,10 @@ defmodule Tightbeam.MemoryGuard do
 
       "resident_cap" ->
         "starts when one of #{host_state.settings.resident_cap} agent processes on #{host} becomes free"
+
+      "guard_unavailable" ->
+        "starts when Tightbeam's memory guard on #{host} can place new agent processes again " <>
+          "(its launch step is ready); an admin can also set the host's memory limits off"
     end
   end
 
