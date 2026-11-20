@@ -1245,7 +1245,8 @@ defmodule Tightbeam.OwnerAlertsMemoryPressureTest do
                "SELECT sql FROM sqlite_master WHERE type='table' AND name='owner_alerts'"
              )
 
-    assert sql =~ "CHECK (kind IN ('usage-limit','stall','model-fallback','memory-pressure'))"
+    assert sql =~
+             "CHECK (kind IN ('usage-limit','stall','model-fallback','memory-pressure','pairing-freeze-lifted','pairing-unfreeze-ignored','recovery-enrolled','admin-recovered','root-recovery-enroll','root-pairing-code','memory-guard-stuck'))"
 
     assert {:ok, [[0, "owner-alerts-v1-0114", _applied]]} =
              DB.query(ctx.db, "SELECT id, shape, appliedAt FROM owner_alert_migration")

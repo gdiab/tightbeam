@@ -4550,7 +4550,6 @@ defmodule Tightbeam.Schema do
     end
   end
 
-
   # These are the existing attribution clauses in the stamped predecessor.
   # Process actors are preserved by the existing event stream; typed user and
   # session fields remain empty. No record data is rewritten.
