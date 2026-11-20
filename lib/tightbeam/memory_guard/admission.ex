@@ -233,6 +233,111 @@ defmodule Tightbeam.MemoryGuard.Admission do
     end
   end
 
+  @doc """
+  v1.13 FS2: the launch step refused to start the session process of turn
+  `seq`. The turn was not dispatched, so it is re-admitted (R9's not-started
+  rule), on the same standing-reason terms. A second refusal for the session
+  also holds its launches `guard_unavailable` until the guard reports the
+  step's prerequisites healthy. Each refusal is recorded; none is harness
+  health, incident or quota evidence (as R8).
+  """
+  @spec step_refused_in_txn(Txn.t(), pos_integer(), String.t(), map()) :: :readmitted | :deferred
+  def step_refused_in_txn(%Txn{} = txn, seq, host, refusal) do
+    session_key = session_of(txn, seq)
+    earlier = step_refusals_in_txn(txn, session_key)
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "memory_guard_step_refused",
+      session_key,
+      JSON.encode!(%{
+        host: host,
+        sourceSeq: seq,
+        launchId: refusal.launch_id,
+        reason: refusal.reason
+      })
+    )
+
+    if earlier >= 1 and not step_hold_open_in_txn?(txn, session_key) do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "memory_guard_step_hold",
+        session_key,
+        JSON.encode!(%{host: host, detail: "guard_unavailable"})
+      )
+    end
+
+    if Tightbeam.MemoryGuard.host_reasons(host) != [] or
+         other_reasons_in_txn(txn, session_key) != [] do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "memory_readmission_pending",
+        session_key,
+        JSON.encode!(%{host: host, sourceSeq: seq})
+      )
+
+      Tightbeam.MemoryGuard.note_deferred()
+      :deferred
+    else
+      readmit_in_txn(txn, seq, host)
+      :readmitted
+    end
+  end
+
+  # Refusals since the session's last step release.
+  defp step_refusals_in_txn(txn, session_key) do
+    [[count]] =
+      Txn.q(
+        txn,
+        """
+        SELECT COUNT(*) FROM lifecycle_events r
+        WHERE r.kind='memory_guard_step_refused' AND r.subject=?1
+          AND r.id > COALESCE((SELECT MAX(id) FROM lifecycle_events
+                               WHERE kind='memory_guard_step_ready' AND subject=?1), 0)
+        """,
+        [session_key]
+      )
+
+    count
+  end
+
+  defp step_hold_open_in_txn?(txn, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM lifecycle_events h
+      WHERE h.kind='memory_guard_step_hold' AND h.subject=?1
+        AND NOT EXISTS (SELECT 1 FROM lifecycle_events r
+                        WHERE r.kind='memory_guard_step_ready' AND r.subject=?1 AND r.id>h.id)
+      LIMIT 1
+      """,
+      [session_key]
+    ) != []
+  end
+
+  @doc "Sessions whose launches the step refused twice and are held (FS2)."
+  @spec step_held_sessions(DB.server()) :: [String.t()]
+  def step_held_sessions(db) do
+    case DB.query(
+           db,
+           """
+           SELECT DISTINCT h.subject FROM lifecycle_events h
+           WHERE h.kind='memory_guard_step_hold'
+             AND NOT EXISTS (SELECT 1 FROM lifecycle_events r
+                             WHERE r.kind='memory_guard_step_ready' AND r.subject=h.subject
+                               AND r.id>h.id)
+           """,
+           []
+         ) do
+      {:ok, rows} -> Enum.map(rows, fn [key] -> key end)
+      _ -> []
+    end
+  end
+
+  @doc "Whether the step-refusal hold of `session_key` stands (FS2)."
+  @spec step_held?(DB.server(), String.t()) :: boolean()
+  def step_held?(db, session_key), do: session_key in step_held_sessions(db)
+
   @doc "Whether `seq` is the re-admission of a memory-killed not-started turn."
   @spec readmission?(Txn.t(), pos_integer()) :: boolean()
   def readmission?(%Txn{} = txn, seq) do

@@ -554,6 +554,7 @@ defmodule Tightbeam.MemoryGuard do
   def handle_call(:tick, _from, state) do
     state = sample(%{state | unclosable: MapSet.new()})
     run_deferred(state)
+    release_step_holds(state)
     {:reply, :ok, state}
   end
 
@@ -600,6 +601,7 @@ defmodule Tightbeam.MemoryGuard do
   def handle_info(:tick, state) do
     state = sample(%{state | unclosable: MapSet.new()})
     run_deferred(state)
+    release_step_holds(state)
     Process.send_after(self(), :tick, state.sample_ms)
     {:noreply, state}
   end
@@ -961,7 +963,9 @@ defmodule Tightbeam.MemoryGuard do
           do: {nil, state},
           else: cap_decision(state, session, host_state, launch, seq, host_reasons)
 
-      step_reason = step_reason(host_state, launch) || inventory_reason(state)
+      step_reason =
+        step_reason(host_state, launch) || inventory_reason(state) ||
+          step_hold_reason(state, session)
 
       cond do
         match?({:closing, _}, cap_reason) ->
@@ -1338,7 +1342,10 @@ defmodule Tightbeam.MemoryGuard do
       # R3b/R7: the reserved Main is never held by the cap.
       details =
         host_level_reasons(host_state) ++
-          List.wrap(step_reason(host_state, launch) || inventory_reason(state)) ++
+          List.wrap(
+            step_reason(host_state, launch) || inventory_reason(state) ||
+              step_hold_reason(state, session)
+          ) ++
           if(
             match?({:session, _}, launch) and not reserved_main?(state, session) and
               cap_full?(state, session, host_state),
@@ -1375,6 +1382,38 @@ defmodule Tightbeam.MemoryGuard do
        do: "guard_unavailable"
 
   defp step_reason(_host_state, _launch), do: nil
+
+  # FS2: the step refused this session's launch twice; it waits until the
+  # step's prerequisites are healthy again.
+  defp step_hold_reason(state, session) do
+    if Admission.step_held?(state.db, session.session_key), do: "guard_unavailable"
+  end
+
+  # FS2: once everything the step needs is in place, every step-refusal hold
+  # is released and its lane nudged.
+  defp release_step_holds(state) do
+    case Admission.step_held_sessions(state.db) do
+      [] ->
+        :ok
+
+      held ->
+        with %{step_ready: true} <- Map.get(state.hosts, state.local_host),
+             :ok <- Records.step_prerequisites(state.base_dir, state.root) do
+          for session_key <- held do
+            EventLog.lifecycle(
+              state.db,
+              "memory_guard_step_ready",
+              session_key,
+              JSON.encode!(%{host: state.local_host, detail: "guard_unavailable"})
+            )
+
+            state.nudge.(session_key)
+          end
+        end
+    end
+
+    :ok
+  end
 
   # FS4 scope: a launch is decided on Tightbeam's own inventories, read at the
   # decision; while either cannot be read the launch is held (FS1).
@@ -1812,6 +1851,7 @@ defmodule Tightbeam.MemoryGuard do
 
     state = put_in(state.hosts[host].total, if(total_ok?, do: measured.total))
     state = announce_unplaced(state, host, measured)
+    state = announce_unplaced_sessions(state, host)
     state = watched_limits(state, host, measured, state.hosts[host].settings)
     observe_ended(state, host, measured)
   end
@@ -2195,6 +2235,36 @@ defmodule Tightbeam.MemoryGuard do
     end
 
     :ok
+  end
+
+  # R12a / C8: on an enforced host, a session tree the step could not place in
+  # its unit runs watched, and that is recorded once per launch.
+  defp announce_unplaced_sessions(state, host) do
+    if state.hosts[host].mode == "enforced" do
+      Enum.reduce(state.launches, state, fn {launch, record}, acc ->
+        if record["placement"] != "enforced" and
+             not MapSet.member?(acc.announced, {:unplaced_session, launch}) do
+          EventLog.lifecycle(
+            acc.db,
+            "memory_guard_launch_unplaced",
+            host,
+            JSON.encode!(%{
+              host: host,
+              launchId: launch,
+              scope: "session",
+              sessionId: record["sessionId"],
+              error: Enum.join(List.wrap(record["errors"]), "; ")
+            })
+          )
+
+          %{acc | announced: MapSet.put(acc.announced, {:unplaced_session, launch})}
+        else
+          acc
+        end
+      end)
+    else
+      state
+    end
   end
 
   # R12a: on an enforced host, an adapter outside its unit is recorded once.

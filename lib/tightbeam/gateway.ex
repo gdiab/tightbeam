@@ -2422,6 +2422,24 @@ defmodule Tightbeam.Gateway do
 
   defp memory_kill_for(_db, _session, _turn), do: nil
 
+  # v1.13 FS2: the launch step's own refusal record for this turn's session
+  # process, made at or after the turn's claim.
+  defp step_refusal_for(config, db, %{session_key: session_key}, turn) do
+    case Org.current_pointer(db, session_key) do
+      %{harness_session_id: sid} when is_binary(sid) ->
+        Tightbeam.MemoryGuard.Records.refusal_for(
+          config.base_dir,
+          sid,
+          turn_started_at(db, turn.seq) || 0
+        )
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
+
   defp turn_started_at(db, seq) do
     case DB.query(db, "SELECT startedAt FROM turns WHERE seq=?1", [seq]) do
       {:ok, [[started]]} when is_integer(started) -> started
@@ -4249,6 +4267,13 @@ defmodule Tightbeam.Gateway do
             memory_kill = memory_kill_for(db, active_session, turn)
             dispatched? = memory_kill != nil and dispatched_turn?(db, turn.seq)
 
+            # Memory limits v1.13 FS2: the launch step refused to start the
+            # session process, so the harness never received the prompt. The
+            # turn is not started: re-admitted, never harness-health, incident
+            # or quota evidence.
+            step_refusal =
+              if is_nil(memory_kill), do: step_refusal_for(config, db, active_session, turn)
+
             unknown_cause =
               cond do
                 memory_kill != nil and dispatched? -> "memory_limit"
@@ -4271,9 +4296,17 @@ defmodule Tightbeam.Gateway do
               end
 
             reason =
-              if memory_kill != nil and not dispatched?,
-                do: Tightbeam.MemoryGuard.Settlement.not_started_reason(memory_kill),
-                else: reason
+              cond do
+                memory_kill != nil and not dispatched? ->
+                  Tightbeam.MemoryGuard.Settlement.not_started_reason(memory_kill)
+
+                step_refusal != nil ->
+                  "Tightbeam did not start this agent's process: its memory guard's launch step " <>
+                    "refused (#{step_refusal.reason}). Nothing ran; the turn is queued again."
+
+                true ->
+                  reason
+              end
 
             failure_publish = fn _terminal ->
               # THE ERROR MUST REACH THE CHAT. Every failed turn gets the marker
@@ -4355,11 +4388,20 @@ defmodule Tightbeam.Gateway do
                     active_session.host
                   )
 
+              if step_refusal != nil,
+                do:
+                  Tightbeam.MemoryGuard.Admission.step_refused_in_txn(
+                    txn,
+                    turn.seq,
+                    active_session.host,
+                    step_refusal
+                  )
+
               if prewrite_evidence do
                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, prewrite_evidence)
               end
 
-              memory_record_in_txn(txn, memory_kill, fn ->
+              memory_record_in_txn(txn, memory_kill || step_refusal, fn ->
                 # Contract c R4 T1 / R5: a typed usage limit on a session whose
                 # archetype declares `[limit_fallback]` holds the session's lane in
                 # this same transaction. The failed turn's replay vehicles are then
