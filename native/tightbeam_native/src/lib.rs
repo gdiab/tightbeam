@@ -29,11 +29,7 @@ mod atoms {
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn argon2id<'a>(
-    env: Env<'a>,
-    secret: Binary,
-    salt: Binary,
-) -> Result<Binary<'a>, rustler::Error> {
+fn argon2id<'a>(env: Env<'a>, secret: Binary, salt: Binary) -> Result<Binary<'a>, rustler::Error> {
     if salt.len() != 16 {
         return Err(rustler::Error::RaiseTerm(Box::new(atoms::bad_salt())));
     }

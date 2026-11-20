@@ -82,7 +82,10 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     # runs or delegates them, nor enters a code or secret.
     assert gates =~ "Issuing a pairing code (`/tightbeam approve-device`)"
     assert gates =~ "enrolling a recovery secret (`/tightbeam recovery-enroll`)"
-    assert gates =~ "Do not send or run any of these, and do not ask a session or another agent to."
+
+    assert gates =~
+             "Do not send or run any of these, and do not ask a session or another agent to."
+
     assert gates =~ "Never enter a pairing code or recovery secret anywhere"
     assert operator =~ "Never run `operator-rule` on an operator request yourself."
     refute operator =~ "tightbeam operator-rule"
