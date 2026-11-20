@@ -32,7 +32,7 @@ defmodule Tightbeam.OwnerAlerts do
   use GenServer
   require Logger
 
-  alias Tightbeam.{DB, EventLog, HarklightSend, Id, Org}
+  alias Tightbeam.{DB, EventLog, HarklightSend, Id, Org, UserAdmin}
   alias Tightbeam.DB.Txn
 
   @shape "owner-alerts-v1-0114"
@@ -242,13 +242,14 @@ defmodule Tightbeam.OwnerAlerts do
 
   @doc """
   The alert owner, or nil when alerts are off. A setting that no longer names
-  a user turns alerts off rather than addressing nobody.
+  an active user turns alerts off rather than addressing nobody: an unknown
+  user, or one removed since it was set (§7, #622), reads as unset.
   """
   @spec owner_in_txn(Txn.t()) :: String.t() | nil
   def owner_in_txn(%Txn{} = txn) do
     case Txn.q(txn, "SELECT value FROM org_settings WHERE key=?1", [@owner_setting]) do
       [[user_id]] when is_binary(user_id) and user_id != "" ->
-        if user_exists_in_txn?(txn, user_id), do: user_id, else: nil
+        if active_user_in_txn?(txn, user_id), do: user_id, else: nil
 
       _ ->
         nil
@@ -276,12 +277,20 @@ defmodule Tightbeam.OwnerAlerts do
   def validate_setting_in_txn(_txn, setting, "") when setting in [@owner_setting, @stall_setting],
     do: {:ok, nil}
 
+  # §7: the alert owner must be an existing user who is not removed; each is
+  # refused by its own name (#622's fixed refusal for a removed user).
   def validate_setting_in_txn(txn, @owner_setting, user_id) do
-    if is_binary(user_id) and user_id != "" and user_exists_in_txn?(txn, user_id) do
-      {:ok, user_id}
-    else
-      {:error, "unknown_owner_alerts_user",
-       "owner-alerts-user must name an existing user; no user #{inspect(user_id)}"}
+    cond do
+      not (is_binary(user_id) and user_id != "" and user_exists_in_txn?(txn, user_id)) ->
+        {:error, "unknown_owner_alerts_user",
+         "owner-alerts-user must name an existing user; no user #{inspect(user_id)}"}
+
+      UserAdmin.removed_in_txn?(txn, user_id) ->
+        %{code: code, message: message} = UserAdmin.removed_refusal(user_id)
+        {:error, code, message}
+
+      true ->
+        {:ok, user_id}
     end
   end
 
@@ -300,6 +309,9 @@ defmodule Tightbeam.OwnerAlerts do
 
   defp user_exists_in_txn?(txn, user_id),
     do: Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1", [user_id]) == [[1]]
+
+  defp active_user_in_txn?(txn, user_id),
+    do: user_exists_in_txn?(txn, user_id) and not UserAdmin.removed_in_txn?(txn, user_id)
 
   ## (b) usage-limit trigger
 
