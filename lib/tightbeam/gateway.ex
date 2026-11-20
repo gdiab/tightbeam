@@ -380,6 +380,10 @@ defmodule Tightbeam.Gateway do
          if(memory_guard?,
            do: {Tightbeam.MemoryGuard, db: db, base_dir: config.base_dir, cli_bin: cli_bin}
          ),
+         # v1.13 FS9: opens and serves stuck episodes while the guard is down.
+         if(memory_guard?,
+           do: {Tightbeam.MemoryGuard.Watcher, db: db, base_dir: config.base_dir}
+         ),
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
           adapter_sup: Tightbeam.AdapterSupervisor,

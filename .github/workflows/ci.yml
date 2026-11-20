@@ -213,10 +213,10 @@ jobs:
       # Memory limits v1.4 T10: the session launch step with real processes
       # (Linux only: /proc and oom_score_adj). These steps run even when an
       # earlier step failed, so a pre-existing suite failure cannot hide them.
-      - name: cargo test (memory guard launch step)
+      - name: cargo test (memory guard launch step and root commands)
         if: ${{ !cancelled() && env.FULL_SUITE == 'true' && matrix.name == 'linux' }}
         working-directory: cli
-        run: cargo test --test memory_guard_step
+        run: cargo test --test memory_guard_step --test memory_guard_root
 
       # Memory limits v1.4 §8 T1/T2/T15: a real runaway process, contained by
       # Tightbeam's own limits. Each run sits in a cgroup with a finite memory

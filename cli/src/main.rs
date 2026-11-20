@@ -16,6 +16,7 @@ mod harness_process;
 mod harnesses;
 mod lease;
 mod memory_guard;
+mod memory_guard_root;
 mod onboard_emit;
 mod preflight;
 mod probe;
@@ -146,6 +147,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Memory limits v1.13 FS9: root's recovery and override of a stuck
+    // episode, on the gateway's host; never a gateway call.
+    if memory_guard_root::is_root_command(&args) {
+        std::process::exit(memory_guard_root::run(&args));
     }
 
     if args.first().is_some_and(|arg| arg == "harness-group") {

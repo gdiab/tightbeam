@@ -85,6 +85,15 @@ defmodule Tightbeam.MemoryGuardTest do
 
   defp gone!(root, pid), do: File.rm_rf!(Path.join([root, "proc", Integer.to_string(pid)]))
 
+  defp strict_finding do
+    for m <- ["groups", "sudo", "sockets"],
+        into: %{},
+        do: {m, %{"result" => "absent", "detail" => []}}
+  end
+
+  defp residual_finding,
+    do: Map.put(strict_finding(), "groups", %{"result" => "present", "detail" => ["docker"]})
+
   # A fake process in process group `pgrp` and session `sid` (the step's
   # `setsid` leader's pid), for the whole-tree proof after the leader is gone.
   defp proc_in!(root, pid, ppid, start, bytes, pgrp, sid) do
@@ -222,6 +231,13 @@ defmodule Tightbeam.MemoryGuardTest do
       idle_check: Keyword.get(opts, :idle_check, &Tightbeam.Acp.Adapter.idle_session?/2),
       before_close_commit: Keyword.get(opts, :before_close_commit, fn _ -> :ok end),
       before_kill_send: Keyword.get(opts, :before_kill_send, fn _ -> :ok end),
+      root_uid: Keyword.get(opts, :root_uid, 0),
+      finding: Keyword.get(opts, :finding, fn -> strict_finding() end),
+      owner_alert:
+        Keyword.get(opts, :owner_alert, fn episode, _message ->
+          send(test, {:owner_alert, episode["episodeId"]})
+          :sent
+        end),
       close_confirm_ms: Keyword.get(opts, :close_confirm_ms, 300),
       killer: fn target, _host_state ->
         send(test, {:killed, target})
@@ -3531,6 +3547,500 @@ defmodule Tightbeam.MemoryGuardTest do
       refute_received {:killed, %{pid: 952}}
       assert Records.read_all(ctx.base) == {:ok, %{}}
       assert File.dir?(Path.join(ctx.root, "proc/952"))
+    end
+  end
+
+  ## v1.13 FS9: stuck episodes, alert, recovery and override (matrix N; T30–T36)
+
+  describe "matrix N: stuck episodes (FS9)" do
+    alias Tightbeam.MemoryGuard.{Episodes, RootActions, RootPath}
+
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      Application.put_env(:tightbeam, :memory_guard_stuck_ms, 0)
+      on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_stuck_ms) end)
+      # The founding user is strictly the earliest (setup may add both users
+      # in the same millisecond).
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE users SET createdAt=createdAt+1000 WHERE userId='guest'")
+
+      main!(ctx, "owner")
+      %{uid: File.stat!(ctx.root).uid}
+    end
+
+    # An ended adapter left a session tree (951) that its kill cannot end; a
+    # turn needing a new adapter for the key is held, so a replacement is
+    # refused (R2a). Returns the opened episode.
+    defp custody_stuck!(ctx, opts \\ []) do
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+      proc!(ctx.root, 951, 1, 951, 10 * @mib)
+      launch!(ctx.base, "sl-stuck", "sid-stuck", 951, 951, 512 * @mib)
+
+      guard!(
+        ctx,
+        opts ++
+          [kill_result: {:error, :harness_group_failed}, signal_works: false, root_uid: ctx.uid]
+      )
+
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a new adapter")
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+      :ok = MemoryGuard.tick()
+      Episodes.active(ctx.db, @host) |> List.first()
+    end
+
+    defp root_record!(ctx, name, record) do
+      dir = RootActions.dir(ctx.base)
+      File.mkdir_p!(dir)
+      path = Path.join(dir, name <> ".json")
+      File.write!(path, JSON.encode!(Map.put(record, "v", 1)))
+      path
+    end
+
+    defp recovery_record(episode, killed_at) do
+      %{
+        "action" => "recovery",
+        "episodeId" => episode["episodeId"],
+        "host" => @host,
+        "kind" => episode["kind"],
+        "key" => episode["key"],
+        "killedAt" => killed_at,
+        "operator" => %{"user" => "root", "sudoUser" => "unknown", "sudoUid" => "unknown"}
+      }
+    end
+
+    defp override_record(episode, statement_kind) do
+      %{
+        "action" => "override",
+        "episodeId" => episode["episodeId"],
+        "host" => @host,
+        "kind" => episode["kind"],
+        "key" => episode["key"],
+        "statementKind" => statement_kind,
+        "statement" => "as printed",
+        "operator" => %{"user" => "root", "sudoUser" => "george", "sudoUid" => "1000"},
+        "trees" => episode["trees"]
+      }
+    end
+
+    test "N1.absent (T30 b) / N2: a custody refusal held unbroken opens one episode, with exactly one owner alert and one Main notice",
+         ctx do
+      episode = custody_stuck!(ctx)
+
+      assert %{"kind" => "custody", "key" => "claude:shared@testhost", "trees" => [tree]} =
+               episode
+
+      assert tree["launchId"] == "sl-stuck"
+      id = episode["episodeId"]
+      assert_received {:owner_alert, ^id}
+
+      assert [{"agent:main:clawline:owner:main", %{"markerKey" => "memory-guard-stuck:" <> ^id}}] =
+               events(ctx.db, "memory_guard_stuck_notified")
+
+      # Nothing more while it is open; the guard keeps retrying the end.
+      :ok = MemoryGuard.tick()
+      refute_received {:owner_alert, _}
+      assert length(events(ctx.db, "memory_guard_stuck_notified")) == 1
+      assert length(Episodes.active(ctx.db, @host)) == 1
+      assert MemoryGuard.read(@host).stuckEpisodes |> hd() |> Map.get(:episodeId) == id
+    end
+
+    test "N1.unreadable: an episode whose record cannot be written is not opened; it is retried",
+         ctx do
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER fs9_fail_open BEFORE INSERT ON lifecycle_events
+        WHEN NEW.kind='memory_guard_episode_opened'
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      assert custody_stuck!(ctx) == nil
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER fs9_fail_open")
+      :ok = MemoryGuard.tick()
+      assert [%{"kind" => "custody"}] = Episodes.active(ctx.db, @host)
+    end
+
+    test "N1.stale: a refusal that clears before 15 minutes opens nothing", ctx do
+      Application.put_env(:tightbeam, :memory_guard_stuck_ms, 15 * 60_000)
+      assert custody_stuck!(ctx) == nil
+      gone!(ctx.root, 951)
+      :ok = MemoryGuard.tick()
+      assert Episodes.active(ctx.db, @host) == []
+      assert :sys.get_state(MemoryGuard).custody_refused == %{}
+    end
+
+    test "N2.absent (T30 c): with no owner-alerts route, the Main notice still goes", ctx do
+      custody_stuck!(ctx, owner_alert: fn _episode, _message -> :owner_alerts_route_absent end)
+      assert [_] = events(ctx.db, "memory_guard_stuck_notified")
+
+      assert [{@host, %{"route" => ":owner_alerts_route_absent"}}] =
+               events(ctx.db, "memory_guard_stuck_alert")
+    end
+
+    test "N2.unreadable / N2.partial: an alert that fails is retried until sent, once, while the Main notice is not sent twice",
+         ctx do
+      failures = :counters.new(1, [])
+      test = self()
+
+      custody_stuck!(ctx,
+        owner_alert: fn episode, _message ->
+          if :counters.get(failures, 1) == 0 do
+            :counters.add(failures, 1, 1)
+            {:error, :route_down}
+          else
+            send(test, {:owner_alert, episode["episodeId"]})
+            :sent
+          end
+        end
+      )
+
+      refute_received {:owner_alert, _}
+      :ok = MemoryGuard.tick()
+      assert_received {:owner_alert, _}
+      :ok = MemoryGuard.tick()
+      refute_received {:owner_alert, _}
+      assert length(events(ctx.db, "memory_guard_stuck_notified")) == 1
+    end
+
+    test "N3 (T36): a custody episode ends only when every named tree is shown gone, recorded once",
+         ctx do
+      %{"episodeId" => id} = custody_stuck!(ctx)
+      :ok = MemoryGuard.tick()
+      assert [_] = Episodes.active(ctx.db, @host)
+      gone!(ctx.root, 951)
+      :ok = MemoryGuard.tick()
+      assert Episodes.active(ctx.db, @host) == []
+      assert [{^id, %{"reason" => _}}] = events(ctx.db, "memory_guard_episode_ended")
+    end
+
+    test "N3 (reboot) / N3.unreadable: a start on a new boot identity ends every episode; an unreadable boot identity ends none",
+         ctx do
+      {:opened, episode} =
+        Episodes.open(ctx.db, %{host: @host, kind: "guard", since: 1, boot: "boot-a", why: "test"})
+
+      # Boot identity unreadable: nothing is inferred.
+      guard!(ctx)
+      _ = :sys.get_state(MemoryGuard)
+
+      assert [_] =
+               Episodes.active(ctx.db, @host)
+               |> Enum.filter(&(&1["episodeId"] == episode["episodeId"]))
+
+      stop_supervised!(MemoryGuard)
+
+      dir = Path.join(ctx.root, "proc/sys/kernel/random")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "boot_id"), "boot-b\n")
+      guard!(ctx)
+      _ = :sys.get_state(MemoryGuard)
+      id = episode["episodeId"]
+      assert [{^id, %{"reason" => "reboot"}}] = events(ctx.db, "memory_guard_episode_ended")
+    end
+
+    test "N4 / N11 (T31 2): a root recovery that ends the named tree clears the episode", ctx do
+      episode = custody_stuck!(ctx)
+      root_record!(ctx, "recovery-1", recovery_record(episode, System.system_time(:millisecond)))
+      gone!(ctx.root, 951)
+      :ok = MemoryGuard.tick()
+
+      assert %{"outcome" => "cleared"} = Episodes.recovery(ctx.db, episode["episodeId"])
+      assert Episodes.active(ctx.db, @host) == []
+    end
+
+    test "N4.unreadable (T31 3): a survivor still there 60 s after root's kill makes the recovery failed, with its state",
+         ctx do
+      episode = custody_stuck!(ctx)
+      killed_at = System.system_time(:millisecond) - 61_000
+      root_record!(ctx, "recovery-1", recovery_record(episode, killed_at))
+      :ok = MemoryGuard.tick()
+
+      assert %{
+               "outcome" => "failed",
+               "survivors" => [%{"launchId" => "sl-stuck", "state" => "S"}]
+             } =
+               Episodes.recovery(ctx.db, episode["episodeId"])
+
+      assert [_] = Episodes.active(ctx.db, @host)
+    end
+
+    test "N4.absent: a recovery before its kill time and 60 s have passed stays pending; a pending recovery permits no override",
+         ctx do
+      episode = custody_stuck!(ctx)
+      root_record!(ctx, "recovery-1", recovery_record(episode, System.system_time(:millisecond)))
+      :ok = MemoryGuard.tick()
+      assert %{"outcome" => "pending"} = Episodes.recovery(ctx.db, episode["episodeId"])
+      root_record!(ctx, "override-1", override_record(episode, "strict"))
+      :ok = MemoryGuard.tick()
+      assert Episodes.override(ctx.db, episode["episodeId"]) == nil
+
+      assert Enum.any?(events(ctx.db, "memory_guard_root_action_rejected"), fn {_, d} ->
+               d["reason"] =~ "needs a failed recovery"
+             end)
+    end
+
+    test "N11.unreadable / N11.absent / N11.stale (T34 c): records not written by root, malformed, naming no or another episode are rejected and recorded",
+         ctx do
+      episode = custody_stuck!(ctx, root_uid: 0)
+      root_record!(ctx, "by-agent", recovery_record(episode, 1))
+      root_record!(ctx, "garbage", %{"kind" => "custody", "action" => "dance"})
+      :ok = MemoryGuard.tick()
+
+      reasons = for {_, d} <- events(ctx.db, "memory_guard_root_action_rejected"), do: d["reason"]
+      assert "the record was not written by root" in reasons
+      assert Episodes.recovery(ctx.db, episode["episodeId"]) == nil
+    end
+
+    test "N11.stale (T34 a, b, d): one digest is judged once, concurrently and after a restart; a record naming an ended episode is rejected for its successor",
+         ctx do
+      episode = custody_stuck!(ctx)
+      record = recovery_record(episode, System.system_time(:millisecond))
+      bytes = JSON.encode!(record)
+      digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+      results =
+        1..4
+        |> Enum.map(fn _ ->
+          Task.async(fn -> Episodes.judge(ctx.db, record, digest, @host) end)
+        end)
+        |> Enum.map(&Task.await/1)
+
+      assert Enum.count(results, &match?({:accepted, _}, &1)) == 1
+
+      # After a restart the same record is still the one already judged.
+      stop_supervised!(MemoryGuard)
+
+      guard!(ctx,
+        root_uid: ctx.uid,
+        kill_result: {:error, :harness_group_failed},
+        signal_works: false
+      )
+
+      assert {:rejected, "this record was already judged"} =
+               Episodes.judge(ctx.db, record, digest, @host)
+
+      # The episode ends; a new one opens on the same key; the old record is
+      # rejected, because it names the ended episode.
+      Episodes.finish(ctx.db, episode["episodeId"], "test")
+
+      {:opened, _e2} =
+        Episodes.open(ctx.db, %{
+          host: @host,
+          kind: "custody",
+          key: episode["key"],
+          since: 1,
+          why: "t"
+        })
+
+      replay = Map.put(record, "note", "replayed")
+
+      assert {:rejected, "the episode has ended"} =
+               Episodes.judge(ctx.db, replay, "other-digest", @host)
+    end
+
+    test "N5 (T35): the root-path finding chooses the statement; an override whose printed statement does not match it is refused",
+         ctx do
+      episode = custody_stuck!(ctx, finding: fn -> residual_finding() end)
+
+      root_record!(
+        ctx,
+        "recovery-1",
+        recovery_record(episode, System.system_time(:millisecond) - 61_000)
+      )
+
+      :ok = MemoryGuard.tick()
+      assert %{"outcome" => "failed"} = Episodes.recovery(ctx.db, episode["episodeId"])
+
+      root_record!(ctx, "override-strict", override_record(episode, "strict"))
+      :ok = MemoryGuard.tick()
+      assert Episodes.override(ctx.db, episode["episodeId"]) == nil
+
+      root_record!(ctx, "override-residual", override_record(episode, "residual"))
+      :ok = MemoryGuard.tick()
+
+      assert %{
+               "finding" => %{"groups" => %{"result" => "present"}},
+               "statementKind" => "residual"
+             } =
+               Episodes.override(ctx.db, episode["episodeId"])
+
+      assert RootPath.kind(strict_finding()) == "strict"
+
+      assert RootPath.statement(residual_finding()) =~
+               "can gain root, here through groups (docker)"
+    end
+
+    test "N7.stale (T34 e) / N9 (T31 3, T36 a): an accepted custody override lifts the fence for the named tree only, once; the episode stays open with its risk",
+         ctx do
+      episode = custody_stuck!(ctx)
+      id = episode["episodeId"]
+
+      root_record!(
+        ctx,
+        "recovery-1",
+        recovery_record(episode, System.system_time(:millisecond) - 61_000)
+      )
+
+      :ok = MemoryGuard.tick()
+      root_record!(ctx, "override-1", override_record(episode, "strict"))
+      :ok = MemoryGuard.tick()
+      assert %{"operator" => %{"sudoUser" => "george"}} = Episodes.override(ctx.db, id)
+
+      # The replacement may launch: the fence no longer counts the named tree.
+      assert :ok = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+      assert %{"applied" => true} = Episodes.override(ctx.db, id)
+
+      # A second, different override for the same episode is rejected.
+      root_record!(
+        ctx,
+        "override-2",
+        Map.put(override_record(episode, "strict"), "note", "again")
+      )
+
+      :ok = MemoryGuard.tick()
+
+      assert Enum.any?(events(ctx.db, "memory_guard_root_action_rejected"), fn {_, d} ->
+               d["reason"] =~ "already accepted"
+             end)
+
+      # The episode stays open, its risk shown, until the tree is gone.
+      [shown] = MemoryGuard.read(@host).stuckEpisodes
+      assert shown.overridden and shown.risk =~ "outside every limit"
+      gone!(ctx.root, 951)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).stuckEpisodes == []
+    end
+
+    test "N10.unreadable: an episode read that cannot be completed says unknown, never none",
+         _ctx do
+      assert %{unknown: _} = Episodes.read(:no_such_db, @host)
+    end
+  end
+
+  describe "matrix N: the guard down (FS9, Watcher)" do
+    alias Tightbeam.MemoryGuard.{Episodes, RootActions, Watcher}
+
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      Application.put_env(:tightbeam, :memory_guard_stuck_ms, 0)
+      Application.put_env(:tightbeam, :memory_guard_restart_wait_ms, 20)
+
+      on_exit(fn ->
+        Application.delete_env(:tightbeam, :memory_guard_stuck_ms)
+        Application.delete_env(:tightbeam, :memory_guard_restart_wait_ms)
+        MemoryGuard.expect(false)
+      end)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE users SET createdAt=createdAt+1000 WHERE userId='guest'")
+
+      main!(ctx, "owner")
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a launch")
+      MemoryGuard.expect(true)
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+      test = self()
+      clock = :counters.new(1, [])
+      :counters.put(clock, 1, System.system_time(:millisecond))
+
+      watcher =
+        start_supervised!(
+          {Watcher,
+           db: ctx.db,
+           base_dir: ctx.base,
+           local_host: @host,
+           interval_ms: :manual,
+           name: :mg_watcher_test,
+           clock: fn -> :counters.get(clock, 1) end,
+           guard_running?: fn -> Process.whereis(MemoryGuard) != nil end,
+           root_uid: File.stat!(ctx.root).uid,
+           finding: fn -> strict_finding() end,
+           owner_alert: fn episode, _message ->
+             send(test, {:owner_alert, episode["episodeId"]})
+           end}
+        )
+
+      %{watcher: watcher, clock: clock}
+    end
+
+    defp guard_record!(ctx, episode, action, extra \\ %{}) do
+      dir = RootActions.dir(ctx.base)
+      File.mkdir_p!(dir)
+
+      record =
+        Map.merge(
+          %{
+            "v" => 1,
+            "action" => action,
+            "episodeId" => episode["episodeId"],
+            "host" => @host,
+            "kind" => "guard",
+            "key" => nil,
+            "operator" => %{"user" => "root", "sudoUser" => "unknown", "sudoUid" => "unknown"}
+          },
+          extra
+        )
+
+      File.write!(
+        Path.join(dir, action <> "-" <> episode["episodeId"] <> ".json"),
+        JSON.encode!(record)
+      )
+    end
+
+    test "N1.absent (T30 a): launches held because the guard is down for 15 minutes open one guard episode, with one alert and one Main notice; it ends when the guard answers",
+         ctx do
+      :ok = Watcher.tick(:mg_watcher_test)
+      assert [%{"kind" => "guard", "episodeId" => id}] = Episodes.active(ctx.db, @host)
+      assert_received {:owner_alert, ^id}
+      assert [_] = events(ctx.db, "memory_guard_stuck_notified")
+
+      :ok = Watcher.tick(:mg_watcher_test)
+      refute_received {:owner_alert, _}
+
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert Episodes.active(ctx.db, @host) == []
+
+      assert [{^id, %{"reason" => "the memory guard answers"}}] =
+               events(ctx.db, "memory_guard_episode_ended")
+    end
+
+    test "N4 (guard): a guard recovery is failed 5 minutes after the start that found it if the guard has not answered; cleared once it answers",
+         ctx do
+      :ok = Watcher.tick(:mg_watcher_test)
+      [episode] = Episodes.active(ctx.db, @host)
+      guard_record!(ctx, episode, "recovery")
+      :ok = Watcher.tick(:mg_watcher_test)
+      assert %{"outcome" => "pending"} = Episodes.recovery(ctx.db, episode["episodeId"])
+
+      :counters.add(ctx.clock, 1, 6 * 60_000)
+      :ok = Watcher.tick(:mg_watcher_test)
+      assert %{"outcome" => "failed"} = Episodes.recovery(ctx.db, episode["episodeId"])
+    end
+
+    test "N9 (guard) / T36 b: after a failed recovery, a root override admits the held launches without the guard; the risk stays shown until it answers",
+         ctx do
+      :ok = Watcher.tick(:mg_watcher_test)
+      [episode] = Episodes.active(ctx.db, @host)
+      guard_record!(ctx, episode, "recovery")
+      :ok = Watcher.tick(:mg_watcher_test)
+      :counters.add(ctx.clock, 1, 6 * 60_000)
+      :ok = Watcher.tick(:mg_watcher_test)
+
+      guard_record!(ctx, episode, "override", %{
+        "statementKind" => "strict",
+        "statement" => "as printed"
+      })
+
+      :ok = Watcher.tick(:mg_watcher_test)
+      assert %{"applied" => false} = Episodes.override(ctx.db, episode["episodeId"])
+
+      assert :ok = MemoryGuard.admit("agent:new", ctx.db)
+      assert %{"applied" => true} = Episodes.override(ctx.db, episode["episodeId"])
+
+      assert [%{overridden: true, risk: risk}] = Episodes.read(ctx.db, @host)
+      assert risk =~ "without the memory guard"
+      assert [_] = Episodes.active(ctx.db, @host)
     end
   end
 
