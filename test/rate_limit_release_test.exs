@@ -960,6 +960,47 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert [_] = lifecycle(db, "quota_readmission_resumed")
     end
 
+    test "G1.unreadable / G2.unreadable / G4.timeout / G1.timeout / G2.timeout: a standing reason that cannot be read in the hook's transaction runs no hook; retried, it runs once",
+         %{db: db, root: root} do
+      {first, second} = parked_with_two_quota_failed_turns!(db)
+      release_at_reset!(db)
+      assert queued_messages(db) == []
+
+      {:ok, _} = DB.query(db, "ALTER TABLE limit_fallback_evaluations RENAME TO lfe_hidden")
+
+      try do
+        meminfo!(root, 50)
+        :ok = Tightbeam.MemoryGuard.tick()
+        assert queued_messages(db) == []
+        assert lifecycle(db, "quota_readmission_resumed") == []
+      after
+        {:ok, _} = DB.query(db, "ALTER TABLE lfe_hidden RENAME TO limit_fallback_evaluations")
+      end
+
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+    end
+
+    test "G1.stale: a key parked again after the deferral waits for that park's own release",
+         %{db: db, root: root} do
+      {first, second} = parked_with_two_quota_failed_turns!(db)
+      release_at_reset!(db)
+
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT INTO harness_park_fences (adapterKey, requestedAt, generation) VALUES ('codex:shared@testhost', 1, 9)"
+        )
+
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == []
+
+      {:ok, _} = DB.query(db, "DELETE FROM harness_park_fences")
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
+    end
+
     test "G4.unreadable / G4 (R6a, companion C1): a harness-process row still parking holds the quota hook until it is resolved",
          %{db: db, root: root} do
       {first, second} = parked_with_two_quota_failed_turns!(db)
