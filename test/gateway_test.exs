@@ -284,6 +284,12 @@ defmodule Tightbeam.GatewayTest do
     def start_link(conn), do: GenServer.start_link(__MODULE__, conn)
     def init(conn), do: {:ok, conn}
     def handle_call(:conn, _from, conn), do: {:reply, conn, conn}
+
+    # Adapter.cancel_prompt/2: the real adapter sends the cancel and waits G.
+    def handle_call({:cancel_prompt, sid}, _from, conn) do
+      Tightbeam.Acp.Conn.notify(conn, "session/cancel", %{sessionId: sid})
+      {:reply, {:ok, :settling}, conn}
+    end
   end
 
   defmodule CancelConnStub do
@@ -513,6 +519,17 @@ defmodule Tightbeam.GatewayTest do
 
       receive do
         :release_cancel_conn -> GenServer.reply(from, parent)
+      end
+
+      {:noreply, parent}
+    end
+
+    # The cancel now goes through Adapter.cancel_prompt/2 (stale-turn R7).
+    def handle_call({:cancel_prompt, _sid}, from, parent) do
+      send(parent, {:cancel_conn_waiting, self()})
+
+      receive do
+        :release_cancel_conn -> GenServer.reply(from, {:ok, :settling})
       end
 
       {:noreply, parent}

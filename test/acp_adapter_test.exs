@@ -222,6 +222,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   // be timed from here; timing it from before the spawn bills `node` startup to it.
   fs.writeFileSync(capturePath + ".boot", String(Date.now()));
   let newCalls = 0;
+  let sessionClosed = false;
   let forkCalls = 0;
   const models = {};
   const efforts = {};
@@ -318,6 +319,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/new": {
         newCalls += 1;
         capture(m);
+        // Stale-turn v1.3 R7: the fresh session's creation after a close goes unanswered.
+        if (failMode === "close-ok-new-silent" && sessionClosed) return;
         const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
         offeredModels[sid] = [...offeredModelMenu];
@@ -346,7 +349,11 @@ defmodule Tightbeam.Acp.AdapterTest do
         offeredModels[sid] = [...offeredModelMenu];
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
-      case "session/close": capture(m); return send({ id: m.id, result: {} });
+      case "session/close":
+        capture(m);
+        sessionClosed = true;
+        if (failMode === "close-silent") return;
+        return send({ id: m.id, result: {} });
       case "session/set_config_option": {
         capture(m);
         if (gateMode === "delay-setup") {
@@ -530,6 +537,13 @@ defmodule Tightbeam.Acp.AdapterTest do
           stalledPrompts.set(sid, m.id);
           return;
         }
+        if (gateMode === "folded-turn") {
+          // P folded into a harness turn already running: that turn's activity
+          // and its turn-end report arrive, then the adapter answers P (R2).
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "folded " + text } } } });
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "usage_update", used: 120, size: 200000, cost: { amount: 0.01, currency: "USD" } } } });
+          return setTimeout(() => send({ id: m.id, result: { stopReason: "end_turn" } }), 150);
+        }
         if (gateMode === "delay-turn") {
           return setTimeout(() => {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "delayed" } } } });
@@ -634,6 +648,454 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  describe "stale-turn v1.1 liveness and settle (R3, R6 answer, R7, R8)" do
+    test "R3/R8: a quiet prompt is not live; its settle sends one cancel and ends unknown_effect" do
+      {adapter, capture} =
+        start_adapter(
+          gate_mode: "stall-turn",
+          probe: false,
+          quiet_bound_ms: 200,
+          settle_grace_ms: 5_000
+        )
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      # Within W of dispatch the prompt is live.
+      assert {:ok, %{live: true, settling: false}} =
+               Adapter.prompt_liveness(adapter, sid, request_id)
+
+      assert s1_until(fn ->
+               match?({:ok, %{live: false}}, Adapter.prompt_liveness(adapter, sid, request_id))
+             end)
+
+      # A genuine chunk is turn activity: live again. A non-advancing status is not.
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "agent_message_chunk", %{
+           "content" => %{"type" => "text", "text" => "progress"}
+         })}
+      )
+
+      assert {:ok, %{live: true}} = Adapter.prompt_liveness(adapter, sid, request_id)
+
+      assert s1_until(fn ->
+               send(
+                 adapter,
+                 {:acp_notification, "session/update",
+                  s1_update(sid, "session_info_update", %{"title" => "same"})}
+               )
+
+               match?({:ok, %{live: false}}, Adapter.prompt_liveness(adapter, sid, request_id))
+             end)
+
+      detail = %{principal: "user:op", reason: "stale"}
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, sid, request_id, "operator_settle", detail)
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, sid, request_id, "operator_settle", detail)
+
+      assert {:error, {:unknown_effect, "operator_settle", ^detail}} = Task.await(caller, 5_000)
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+      assert {:error, :not_pending} = Adapter.prompt_liveness(adapter, sid, request_id)
+    end
+
+    test "R6: a normal stop answering the cancel settles the turn by that answer" do
+      {adapter, _capture} = start_adapter(gate_mode: "late-success-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, sid, request_id, "response_missing")
+
+      assert {:ok, %{stop_reason: "end_turn"}} = Task.await(caller, 5_000)
+    end
+
+    test "R7: a cancel unanswered within G ends the prompt as unknown_effect and is reported" do
+      parent = self()
+
+      {adapter, capture} =
+        start_adapter(
+          gate_mode: "ignore-cancel-turn",
+          probe: false,
+          settle_grace_ms: 200,
+          on_cancel_unanswered: fn sid, cause -> send(parent, {:unanswered, sid, cause}) end
+        )
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, sid, request_id, "response_missing")
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(caller, 5_000)
+      assert_receive {:unanswered, ^sid, "response_missing"}, 2_000
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) >= 1
+      assert {:error, :not_pending} = Adapter.prompt_liveness(adapter, sid, request_id)
+    end
+  end
+
+  describe "stale-turn v1.1 R4 harness killed" do
+    test "SIGKILL of the harness mid-turn ends the dispatched prompt at once with transport loss" do
+      {adapter, _capture} = start_adapter(gate_mode: "stall-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      monitor = Process.monitor(adapter)
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "agent_message_chunk", %{"content" => %{"text" => "working"}})}
+      )
+
+      {:os_pid, os_pid} = Port.info(:sys.get_state(Adapter.conn(adapter)).port, :os_pid)
+      killed_at = System.monotonic_time(:millisecond)
+      {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(os_pid)])
+
+      # Both are the transport-loss forms the gateway settles as harness_exited.
+      assert {:error, reason} = Task.await(caller, 30_000)
+      assert reason == :closed or match?({:adapter_unavailable, _}, reason), inspect(reason)
+      assert System.monotonic_time(:millisecond) - killed_at < 30_000
+      assert {:acp_exit, _status} = assert_down(adapter, monitor)
+    end
+  end
+
+  describe "stale-turn v1.1 R2 folded prompt" do
+    test "activity and a turn-end report, then end_turn: delivered, and the next prompt starts" do
+      {adapter, capture} = start_adapter(gate_mode: "folded-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+      first = Task.async(fn -> Adapter.prompt(adapter, sid, "one") end)
+      _request_id = s1_request_id(adapter, sid)
+      second = Task.async(fn -> Adapter.prompt(adapter, sid, "two") end)
+
+      assert {:ok, %{stop_reason: "end_turn", text: "folded one"}} = Task.await(first, 5_000)
+      assert {:ok, %{stop_reason: "end_turn", text: "folded two"}} = Task.await(second, 5_000)
+
+      requests = captured_requests(capture)
+      assert Enum.count(requests, &(&1["method"] == "session/prompt")) == 2
+      refute Enum.any?(requests, &(&1["method"] == "session/cancel"))
+    end
+  end
+
+  describe "stale-turn v1.1 R7 no collateral" do
+    test "an unanswered settle of one session leaves a peer's prompt on the same adapter to complete" do
+      {adapter, _capture} =
+        start_adapter(gate_mode: "ignore-cancel-turn", probe: false, settle_grace_ms: 200)
+
+      conn = Adapter.conn(adapter)
+      stuck = Task.async(fn -> Adapter.prompt(adapter, "stuck", "stall") end)
+      peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "work") end)
+      stuck_id = s1_request_id(adapter, "stuck")
+      _peer_id = s1_request_id(adapter, "peer")
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, "stuck", stuck_id, "response_missing")
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(stuck, 5_000)
+
+      # The stuck prompt stays in Conn only as an orphan; the peer is untouched.
+      assert Process.alive?(conn)
+      assert Map.keys(:sys.get_state(adapter).prompts) == ["peer"]
+      Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "peer"})
+      assert {:ok, %{stop_reason: "end_turn"}} = Task.await(peer, 5_000)
+    end
+  end
+
+  describe "stale-turn v1.3 R7 fence" do
+    test "session fence: the unanswered session is closed and replaced; the peer completes, no relaunch" do
+      {adapter, capture} =
+        start_adapter(gate_mode: "ignore-cancel-turn", probe: false, settle_grace_ms: 200)
+
+      assert {:ok, s1} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      conn = Adapter.conn(adapter)
+      stuck = Task.async(fn -> Adapter.prompt(adapter, s1, "stall") end)
+      peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "work") end)
+      stuck_id = s1_request_id(adapter, s1)
+      _peer_id = s1_request_id(adapter, "peer")
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, s1, stuck_id, "response_missing")
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(stuck, 5_000)
+
+      assert s1_until(fn ->
+               Enum.any?(
+                 captured_requests(capture),
+                 &(&1["method"] == "session/close" and &1["sessionId"] == s1)
+               )
+             end)
+
+      # S1's harness session serves no other turn: not resident, not loadable,
+      # no prompt; its next turn gets a fresh harness session on this adapter.
+      refute Adapter.knows_session?(adapter, s1)
+
+      assert {:error, {:harness_session_fenced, ^s1}} =
+               Adapter.load_session(adapter, s1, Model.new("haiku"), "/tmp", [], "guidance")
+
+      assert {:error, {:acp_request_not_dispatched, {:harness_session_fenced, ^s1}}} =
+               Adapter.prompt(adapter, s1, "next")
+
+      assert {:ok, fresh} =
+               Adapter.new_fenced_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+      assert fresh != s1
+
+      Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "peer"})
+      assert {:ok, %{stop_reason: "end_turn"}} = Task.await(peer, 5_000)
+      assert Process.alive?(adapter)
+      assert is_nil(:sys.get_state(adapter).unresponsive)
+    end
+
+    test "creation-only timeout: a fresh session unanswered within G makes the adapter unresponsive" do
+      parent = self()
+
+      {adapter, _capture} =
+        start_adapter(
+          gate_mode: "ignore-cancel-turn",
+          fail_mode: "close-ok-new-silent",
+          probe: false,
+          settle_grace_ms: 200,
+          on_unresponsive: fn why -> send(parent, {:unresponsive, why}) end
+        )
+
+      assert {:ok, s1} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      monitor = Process.monitor(adapter)
+      stuck = Task.async(fn -> Adapter.prompt(adapter, s1, "stall") end)
+      stuck_id = s1_request_id(adapter, s1)
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, s1, stuck_id, "response_missing")
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(stuck, 5_000)
+
+      # The close is answered; the creation is not.
+      assert {:error, _timeout} =
+               Adapter.new_fenced_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+      assert_receive {:unresponsive, :creation_unanswered}, 2_000
+
+      # Nothing is pending, so it is replaced at once: it stops for a fresh launch.
+      assert {:shutdown, {:adapter_unresponsive, :creation_unanswered}} =
+               assert_down(adapter, monitor)
+    end
+
+    test "unresponsive adapter: no new turn; a live peer completes, a quiet one settles, then it is replaced" do
+      parent = self()
+
+      {adapter, capture} =
+        start_adapter(
+          gate_mode: "ignore-cancel-turn",
+          fail_mode: "close-silent",
+          probe: false,
+          settle_grace_ms: 200,
+          quiet_bound_ms: 1_500,
+          on_unresponsive: fn why -> send(parent, {:unresponsive, why}) end
+        )
+
+      assert {:ok, s1} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      conn = Adapter.conn(adapter)
+      monitor = Process.monitor(adapter)
+      stuck = Task.async(fn -> Adapter.prompt(adapter, s1, "stall") end)
+      live = Task.async(fn -> Adapter.prompt(adapter, "live", "work") end)
+      quiet = Task.async(fn -> Adapter.prompt(adapter, "quiet", "work") end)
+      stuck_id = s1_request_id(adapter, s1)
+      _ = s1_request_id(adapter, "live")
+      _ = s1_request_id(adapter, "quiet")
+
+      assert {:ok, :settling} =
+               Adapter.settle_prompt_unknown(adapter, s1, stuck_id, "response_missing")
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(stuck, 5_000)
+
+      # The close goes unanswered: the adapter takes no new turn on any session.
+      assert_receive {:unresponsive, {:close_unanswered, ^s1}}, 2_000
+
+      assert {:error, {:acp_request_not_dispatched, :adapter_unresponsive}} =
+               Adapter.prompt(adapter, "other", "new work")
+
+      # The live peer streams turn activity and completes on this adapter.
+      for n <- 1..4 do
+        send(
+          adapter,
+          {:acp_notification, "session/update",
+           s1_update("live", "agent_message_chunk", %{"content" => %{"text" => "chunk #{n}"}})}
+        )
+
+        Process.sleep(300)
+      end
+
+      Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "live"})
+      assert {:ok, %{stop_reason: "end_turn"}} = Task.await(live, 5_000)
+
+      # The quiet peer is cancelled once quiet for W, and settles at G.
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(quiet, 5_000)
+
+      assert Enum.any?(
+               captured_requests(capture),
+               &(&1["method"] == "session/cancel" and &1["sessionId"] == "quiet")
+             )
+
+      # Nothing pending: it stops, so one fresh launch replaces it.
+      assert {:shutdown, {:adapter_unresponsive, {:close_unanswered, ^s1}}} =
+               assert_down(adapter, monitor)
+    end
+  end
+
+  describe "stale-turn v1.1 R7 assignment stop" do
+    test "an unanswered stop cancel ends the prompt call within G; the adapter keeps serving" do
+      {adapter, capture} =
+        start_adapter(gate_mode: "ignore-cancel-turn", probe: false, settle_grace_ms: 200)
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+
+      cancels = fn ->
+        Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel"))
+      end
+
+      # A repeated stop while settling sends no second cancel.
+      assert {:ok, :settling} = Adapter.cancel_prompt(adapter, sid)
+      assert {:ok, :settling} = Adapter.cancel_prompt(adapter, sid)
+      assert s1_until(fn -> cancels.() == 1 end)
+
+      assert {:error, {:prompt_interrupted, {:cancel_unacknowledged, ^sid}}} =
+               Task.await(caller, 5_000)
+
+      # At G the prompt's worker stops; Conn's requester-death handling may send
+      # its own cancel for the orphaned request.
+      assert cancels.() >= 1
+      assert Process.alive?(adapter)
+      assert {:ok, :sent} = Adapter.cancel_prompt(adapter, sid)
+    end
+
+    test "an answered stop cancel passes the answer through as it is" do
+      {adapter, _capture} = start_adapter(gate_mode: "stall-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+
+      # The fake answers the cancel with a JSON-RPC error; it is not judged.
+      assert {:ok, :settling} = Adapter.cancel_prompt(adapter, sid)
+      assert {:error, %{"code" => -32_800}} = Task.await(caller, 5_000)
+    end
+  end
+
+  describe "stale-turn v1.1 R6 missing response" do
+    @s1_turn_end %{
+      "used" => 120,
+      "size" => 200_000,
+      "cost" => %{"amount" => 0.01, "currency" => "USD"}
+    }
+
+    test "a turn-end report then W of quiet cancels P; cancelled ends it response_missing" do
+      {adapter, capture} =
+        start_adapter(gate_mode: "stall-turn", probe: false, quiet_bound_ms: 300)
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      send(
+        adapter,
+        {:acp_notification, "session/update", s1_update(sid, "usage_update", @s1_turn_end)}
+      )
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(caller, 5_000)
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+      assert {:error, :not_pending} = Adapter.prompt_liveness(adapter, sid, request_id)
+    end
+
+    test "a non-cancelled answer within G settles the turn normally" do
+      {adapter, _capture} =
+        start_adapter(gate_mode: "late-success-turn", probe: false, quiet_bound_ms: 300)
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+
+      send(
+        adapter,
+        {:acp_notification, "session/update", s1_update(sid, "usage_update", @s1_turn_end)}
+      )
+
+      assert {:ok, %{stop_reason: "end_turn"}} = Task.await(caller, 5_000)
+    end
+
+    test "an open tool call or later turn activity defers it; no turn-end report never starts it" do
+      {adapter, capture} =
+        start_adapter(gate_mode: "stall-turn", probe: false, quiet_bound_ms: 300)
+
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      request_id = s1_request_id(adapter, sid)
+
+      # Quiet well past W, but no turn-end report: R6 does not apply.
+      Process.sleep(900)
+      refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/cancel"))
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "tool_call", %{"toolCallId" => "t1", "status" => "in_progress"})}
+      )
+
+      send(
+        adapter,
+        {:acp_notification, "session/update", s1_update(sid, "usage_update", @s1_turn_end)}
+      )
+
+      # The open tool call holds the turn live past W.
+      Process.sleep(900)
+      refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/cancel"))
+
+      assert {:ok, %{live: true, settling: false, open_tool_calls: 1}} =
+               Adapter.prompt_liveness(adapter, sid, request_id)
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(sid, "tool_call_update", %{"toolCallId" => "t1", "status" => "completed"})}
+      )
+
+      assert {:error, {:unknown_effect, "response_missing", %{}}} = Task.await(caller, 5_000)
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+    end
+  end
+
+  defp s1_update(sid, kind, fields),
+    do: %{"sessionId" => sid, "update" => Map.put(fields, "sessionUpdate", kind)}
+
+  defp s1_request_id(adapter, sid) do
+    assert s1_until(fn ->
+             is_integer(get_in(:sys.get_state(adapter), [Access.key(:prompts), sid, :request_id]))
+           end)
+
+    get_in(:sys.get_state(adapter), [Access.key(:prompts), sid, :request_id])
+  end
+
+  defp s1_until(fun, attempts \\ 100) do
+    cond do
+      fun.() ->
+        true
+
+      attempts == 0 ->
+        false
+
+      true ->
+        Process.sleep(50)
+        s1_until(fun, attempts - 1)
+    end
+  end
+
   defp start_adapter(opts \\ []) do
     # Per-run private dir: unique_integer resets across VM restarts, so
     # bare /tmp names collide with stale files from prior/concurrent runs.
@@ -689,6 +1151,14 @@ defmodule Tightbeam.Acp.AdapterTest do
           adapter_opts
         end
       end)
+      |> Keyword.merge(
+        Keyword.take(opts, [
+          :quiet_bound_ms,
+          :settle_grace_ms,
+          :on_cancel_unanswered,
+          :on_unresponsive
+        ])
+      )
       |> then(fn adapter_opts ->
         case Keyword.get(opts, :on_ready) do
           nil -> adapter_opts

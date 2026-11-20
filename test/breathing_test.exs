@@ -11,6 +11,34 @@ defmodule Tightbeam.BreathingTest do
     %{db: db}
   end
 
+  test "stale-turn R10: an unknown-effect terminal shows its cause; any other turn has no cause key",
+       %{db: db} do
+    insert_turn!(db, 30, "active", "failed_unknown", error: "usageLimitExceeded")
+
+    assert %{reason: "latest_terminal_failed", evidence: %{turn: plain}} =
+             Breathing.query(db, "session", "active")
+
+    refute Map.has_key?(plain, :cause)
+
+    insert_turn!(db, 31, "active", "failed_unknown", error: "unknown_effect")
+
+    Tightbeam.TurnLifecycle.append(db, 31, %{
+      event_key: "terminal:committed",
+      producer_event_id: "breathing-test:31",
+      kind: "terminal_committed",
+      outcome: "failed_unknown",
+      cause: "operator_settle",
+      principal: "user:owner",
+      detail: %{v: 1, status: "failed_unknown"}
+    })
+
+    assert %{reason: "latest_terminal_failed", evidence: %{turn: turn}} =
+             Breathing.query(db, "session", "active")
+
+    assert %{seq: 31, status: "failed_unknown", error: "unknown_effect", cause: "operator_settle"} =
+             turn
+  end
+
   test "A1 and A5: missing and retired session gates beat physical paths", %{db: db} do
     assert %{breathing: false, reason: "session_missing", evidence: %{}} =
              Breathing.query(db, "session", "missing")

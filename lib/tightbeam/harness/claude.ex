@@ -35,6 +35,26 @@ defmodule Tightbeam.Harness.Claude do
   @impl true
   def records_tool_calls?, do: true
 
+  # claude-agent-acp 0.81.0 rejects every open turn when the Claude Agent
+  # process dies: RequestError.internalError(undefined, "The Claude Agent
+  # process exited unexpectedly. Please start a new session.")
+  # (dist/acp-agent.js:4537), i.e. code -32603 with that message after
+  # "Internal error: ".
+  @impl true
+  def harness_exit_error?(%{"code" => -32_603, "message" => message}) when is_binary(message),
+    do: String.contains?(message, "The Claude Agent process exited unexpectedly")
+
+  def harness_exit_error?(_reason), do: false
+
+  # claude-agent-acp 0.81.0 sends one usage_update per SDK result, and only
+  # that one carries `cost` (dist/acp-agent.js:3621-3640, with
+  # `_meta["_claude/origin"]` for an autonomous result). Its other
+  # usage_updates (per assistant message :4062, compaction :2809, rate-limit
+  # events :4461) carry no cost and are not turn ends.
+  @impl true
+  def turn_end_report?(%{"sessionUpdate" => "usage_update", "cost" => %{}}), do: true
+  def turn_end_report?(_update), do: false
+
   @impl true
   def accepts_inline_images?, do: true
 

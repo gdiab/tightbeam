@@ -116,6 +116,26 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     %{db: db, base: base, handlers: handlers, adapter: adapter}
   end
 
+  test "stale-turn v1.3 R7: an unresponsive adapter takes no new turn until its replacement wakes the lanes",
+       ctx do
+    key = {:claude, "shared", "testhost"}
+    refute AdapterCoordinator.unresponsive?(key)
+
+    # What the adapter's on_unresponsive callback sends its coordinator.
+    send(Tightbeam.AdapterCoordinator, {:adapter_unresponsive, key, ctx.adapter, :test})
+    assert eventually(fn -> AdapterCoordinator.unresponsive?(key) end)
+
+    held = enqueue!(ctx.db, "k1", "held while unresponsive")
+    :ok = LaneManager.ensure_lane(Tightbeam.LaneManager, "k1")
+    refute_receive {:runner_started, ^held}, 300
+    assert turn_status(ctx.db, held) == "queued"
+
+    # Drained, it stops; its death clears the hold and wakes the held lane.
+    Process.exit(ctx.adapter, :kill)
+    assert_receive {:runner_started, ^held}, 5_000
+    refute AdapterCoordinator.unresponsive?(key)
+  end
+
   test "authorized cancel is atomic, replay-safe, private, and releases queued work", ctx do
     target = stale_turn!(ctx.db, "k1", "phantom", 42)
     successor = enqueue!(ctx.db, "k1", "successor")
@@ -242,13 +262,16 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     refute Tightbeam.Idempotency.settlement(ctx.db, "user:mike", "process-key")
   end
 
-  test "lane-live, provider-live, and uncorrelatable targets are zero-mutation refusals", ctx do
+  test "lane-held, Conn-pending and uncorrelatable targets follow stale-turn v1.1 R8", ctx do
     lane_live = enqueue!(ctx.db, "k1", "hold live")
     :ok = LaneManager.ensure_lane(Tightbeam.LaneManager, "k1")
     assert_receive {:runner_started, ^lane_live}
     before_lane = mutation_snapshot(ctx.db, lane_live)
 
-    assert {:error, %{code: "turn_live"}} =
+    # R8: a lane task is never itself the reason for turn_live. This lane's
+    # turn has no dispatched prompt to judge (R3), so it is ambiguous, with
+    # no mutation.
+    assert {:error, %{code: "turn_status_ambiguous"}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
@@ -290,9 +313,12 @@ defmodule Tightbeam.StaleTurnSettlementTest do
       end)
 
     assert eventually(fn -> Conn.probe_request(conn, 2, "hs-2", 1, 1_000) == {:live, 2} end)
-    before_provider = mutation_snapshot(ctx.db, provider_live)
 
-    assert {:error, %{code: "turn_live"}} =
+    # R8: a pending Conn entry is not liveness either. The adapter tracks no
+    # turn activity for this request, so the turn is not live (R3): it is
+    # cancelled at the harness and settled as an unknown effect.
+    assert {:ok,
+            %{session_key: "k2", turn_seq: ^provider_live, status: "failed_unknown", won: true}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
@@ -305,7 +331,16 @@ defmodule Tightbeam.StaleTurnSettlementTest do
                )
              )
 
-    assert mutation_snapshot(ctx.db, provider_live) == before_provider
+    assert {:ok, [["failed_unknown", "unknown_effect"]]} =
+             DB.query(ctx.db, "SELECT status,error FROM turns WHERE seq=?1", [provider_live])
+
+    assert {:ok, [["operator_settle"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cause FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed'",
+               [provider_live]
+             )
+
     Task.shutdown(pending, :brutal_kill)
 
     ambiguous = stale_turn!(ctx.db, "k1", "uncorrelatable", nil)

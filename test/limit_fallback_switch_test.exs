@@ -115,10 +115,25 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
 
     def init(opts),
-      do: {:ok, Map.merge(%{sessions: %{}, prompts: 0, candidate: :ok}, opts)}
+      do:
+        {:ok, Map.merge(%{sessions: %{}, prompts: 0, candidate: :ok, fenced: MapSet.new()}, opts)}
 
     def handle_call({:knows_session?, sid}, _from, state),
-      do: {:reply, Map.has_key?(state.sessions, sid), state}
+      do: {:reply, Map.has_key?(state.sessions, sid) and sid not in state.fenced, state}
+
+    # Stale-turn v1.3 R7, as the real adapter: a fenced harness session cannot
+    # be loaded; its replacement is created with new_fenced_session.
+    def handle_call({:load_session, sid, _model, _cwd, _mcp, _guidance, _timeout}, _from, state) do
+      if sid in state.fenced,
+        do: {:reply, {:error, {:harness_session_fenced, sid}}, state},
+        else: {:reply, {:error, {:unsupported_in_test, "load_session"}}, state}
+    end
+
+    def handle_call({:new_fenced_session, model, _cwd, _mcp, guidance}, _from, state) do
+      sid = "#{state.name}-fresh-#{map_size(state.sessions) + 1}"
+      send(state.parent, {:new_fenced_session, state.name, sid, guidance})
+      {:reply, {:ok, sid}, put_in(state.sessions[sid], model)}
+    end
 
     def handle_call({:new_session, model, _cwd, _mcp, _guidance}, _from, state) do
       sid = "#{state.name}-session-#{map_size(state.sessions) + 1}"
@@ -155,10 +170,22 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
     def handle_call({:apply_model, sid, model, _timeout}, from, state),
       do: handle_call({:apply_model, sid, model}, from, state)
 
-    def handle_call({:prompt, _sid, text, opts}, _from, state) do
+    def handle_call({:prompt, sid, text, opts}, _from, state) do
       n = state.prompts + 1
       send(state.parent, {:prompted, state.name, n, text})
-      {:reply, state.prompt.(n, text, opts), %{state | prompts: n}}
+      reply = state.prompt.(n, text, opts)
+
+      # The real adapter refuses this only for a session it has fenced.
+      state =
+        case reply do
+          {:error, {:acp_request_not_dispatched, {:harness_session_fenced, ^sid}}} ->
+            %{state | fenced: MapSet.put(state.fenced, sid)}
+
+          _ ->
+            state
+        end
+
+      {:reply, reply, %{state | prompts: n}}
     end
 
     def handle_call({:close_session, _sid}, _from, state), do: {:reply, :ok, state}
@@ -1225,6 +1252,231 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
       claude: claude,
       parent: parent
     })
+  end
+
+  ## Stale-turn settlement v1.1 R4/R5/R9 through the real turn runner. These
+  ## reuse this module's gateway harness; they involve no limit or fallback.
+
+  describe "stale-turn v1.1 R4/R5/R9" do
+    @claude_process_exit %{
+      "code" => -32_603,
+      "message" =>
+        "Internal error: The Claude Agent process exited unexpectedly. Please start a new session."
+    }
+
+    for {label, harness, failure, cause} <- [
+          {"the adapter process dies (R4, transport loss)", :codex,
+           Macro.escape({:adapter_unavailable, "acp exited with status 137"}), "harness_exited"},
+          {"the harness answers with its process-exit error (R4)", :claude,
+           Macro.escape(@claude_process_exit), "harness_exited"},
+          {"the harness never answered after its turn-end report (R6, R7)", :claude,
+           Macro.escape({:unknown_effect, "response_missing", %{}}), "response_missing"},
+          {"settle-turn settled the quiet held turn (R8)", :codex,
+           Macro.escape(
+             {:unknown_effect, "operator_settle", %{principal: "user:op", reason: "stale"}}
+           ), "operator_settle"}
+        ] do
+      test "a dispatched turn ended because #{label} settles unknown_effect, is surfaced once and never replayed" do
+        failure = unquote(failure)
+        harness = unquote(harness)
+        cause = unquote(cause)
+        held_state = if cause == "harness_exited", do: "harness_exited"
+
+        with_gateway(fn ctx ->
+          key = "s1-exit-#{harness}"
+          s1_session!(ctx, key, harness)
+          lane!(ctx, key)
+
+          :ok =
+            GenServer.call(
+              Map.fetch!(ctx, harness),
+              {:set, :prompt,
+               fn
+                 1, _text, opts ->
+                   # The prompt reached the adapter transport, then the
+                   # harness went away.
+                   Keyword.fetch!(opts, :trace_dispatch).(101)
+                   {:error, failure}
+
+                 n, _text, _opts ->
+                   ok_reply(n)
+               end}
+            )
+
+          seq = deliver!(ctx, key, "s1-killed-prompt")
+          await_turns_settled!(ctx.db, key)
+
+          assert turn_status(ctx.db, seq) == "failed_unknown"
+          assert turn_error(ctx.db, seq) == "unknown_effect"
+          assert terminal_cause(ctx.db, seq) == cause
+
+          # R8 records the requesting principal on the terminal.
+          if cause == "operator_settle",
+            do: assert(terminal_principal(ctx.db, seq) == "user:op")
+
+          assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
+
+          # R10: the reads show the terminal, its cause and the held state.
+          # (The R9 notice to the holder is itself a later turn, so the
+          # settled turn is read by its seq.)
+          assert %{turnSeq: ^seq, cause: ^cause, heldState: ^held_state} =
+                   Tightbeam.TurnSettlementView.settlement(
+                     Tightbeam.TurnSettlementView.turn(ctx.db, seq)
+                   )
+
+          # R5: no replay vehicle, and a later delivered turn on the same
+          # harness and host (today's redelivery trigger) re-sends nothing.
+          assert redelivery_rows(ctx.db, seq) == 0
+          # The R9 notice may still hold the lane; the next prompt then waits
+          # behind it as a pending wake.
+          assert post(ctx, key, "s1-next-prompt") in [:appended, :queued]
+          next = await_turn_seq!(ctx.db, key, "s1-next-prompt")
+          await_turns_settled!(ctx.db, key)
+          assert turn_status(ctx.db, next) == "delivered"
+          assert same_message_turns(ctx.db, seq) == [seq]
+          assert unknown_effect_notices(ctx.db) == Enum.sort([key, @main])
+        end)
+      end
+    end
+
+    test "R7: a prompt refused on its fenced harness session runs on a fresh one with the durable handoff" do
+      with_gateway(fn ctx ->
+        key = "s1-fenced"
+        s1_session!(ctx, key, :claude)
+        lane!(ctx, key)
+
+        first = deliver!(ctx, key, "s1-before-the-fence")
+        await_turns_settled!(ctx.db, key)
+        assert turn_status(ctx.db, first) == "delivered"
+        fenced_sid = Org.current_pointer(ctx.db, key).harness_session_id
+
+        :ok =
+          GenServer.call(
+            ctx.claude,
+            {:set, :prompt,
+             fn
+               2, _text, _opts ->
+                 {:error, {:acp_request_not_dispatched, {:harness_session_fenced, fenced_sid}}}
+
+               n, _text, _opts ->
+                 ok_reply(n)
+             end}
+          )
+
+        next = deliver!(ctx, key, "s1-after-the-fence")
+        await_turns_settled!(ctx.db, key)
+
+        # Not queued behind the old prompt and not failed: delivered on a new
+        # harness session that carries the session's history.
+        assert turn_status(ctx.db, next) == "delivered"
+        assert_receive {:new_fenced_session, :claude, fresh_sid, guidance}
+        assert fresh_sid != fenced_sid
+        assert guidance =~ "stopped answering"
+        assert guidance =~ "s1-before-the-fence"
+        refute guidance =~ "s1-after-the-fence"
+        assert Org.current_pointer(ctx.db, key).harness_session_id == fresh_sid
+        assert_receive {:prompted, :claude, 3, _text}
+
+        assert Enum.any?(
+                 Tightbeam.EventLog.lifecycle_events(ctx.db),
+                 &(&1.kind == "pointer_fallback" and &1.detail =~ "harness_session_fenced")
+               )
+      end)
+    end
+
+    test "R4: a turn whose prompt was never dispatched keeps its known failure" do
+      with_gateway(fn ctx ->
+        key = "s1-undispatched"
+        session!(ctx, key)
+        lane!(ctx, key)
+
+        :ok =
+          GenServer.call(
+            ctx.codex,
+            {:set, :prompt,
+             fn _n, _text, _opts ->
+               {:error, {:adapter_unavailable, "acp exited with status 137"}}
+             end}
+          )
+
+        seq = deliver!(ctx, key, "s1-not-dispatched")
+        await_turns_settled!(ctx.db, key)
+        assert turn_status(ctx.db, seq) == "failed"
+        refute turn_error(ctx.db, seq) == "unknown_effect"
+        assert unknown_effect_notices(ctx.db) == []
+      end)
+    end
+  end
+
+  defp s1_session!(ctx, key, :codex), do: session!(ctx, key)
+
+  defp s1_session!(ctx, key, :claude) do
+    Org.create(ctx.db, %{
+      session_key: key,
+      display_name: "S1 " <> key,
+      owner_user_id: @owner,
+      origin: "user:" <> @owner,
+      archetype: @archetype,
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: fallback_model()
+    })
+  end
+
+  defp turn_error(db, seq) do
+    {:ok, [[error]]} = DB.query(db, "SELECT error FROM turns WHERE seq=?1", [seq])
+    error
+  end
+
+  defp terminal_principal(db, seq) do
+    {:ok, [[principal]]} =
+      DB.query(
+        db,
+        "SELECT principal FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed'",
+        [seq]
+      )
+
+    principal
+  end
+
+  defp terminal_cause(db, seq) do
+    {:ok, [[cause]]} =
+      DB.query(
+        db,
+        "SELECT cause FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed'",
+        [seq]
+      )
+
+    cause
+  end
+
+  defp unknown_effect_notices(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT sessionKey FROM wakes WHERE wakeId LIKE 'w_turn_unknown_effect_%' ORDER BY sessionKey"
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
+  defp redelivery_rows(db, seq) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT COUNT(*) FROM health_redelivery_attempts WHERE sourceTurnSeq=?1", [seq])
+
+    count
+  end
+
+  defp same_message_turns(db, seq) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT t.seq FROM turns t JOIN turns s ON s.messageId=t.messageId WHERE s.seq=?1 ORDER BY t.seq",
+        [seq]
+      )
+
+    Enum.map(rows, &hd/1)
   end
 
   defp extract_runner!(config) do
