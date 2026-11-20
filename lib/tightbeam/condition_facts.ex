@@ -30,6 +30,7 @@ defmodule Tightbeam.ConditionFacts do
     catalog-terminal-credential-failure catalog-terminal-credential-restored
     cli-incompatible cli-compatible
     session-model-fallback-applied session-model-fallback-withheld
+    host-memory-pressure host-memory-pressure-cleared
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
@@ -49,7 +50,8 @@ defmodule Tightbeam.ConditionFacts do
     "harness-interrupted-outcome-unknown" => "harness-interrupted-outcome-reconciled",
     "harness-other-unavailable" => "harness-other-restored",
     "catalog-terminal-credential-failure" => "catalog-terminal-credential-restored",
-    "cli-incompatible" => "cli-compatible"
+    "cli-incompatible" => "cli-compatible",
+    "host-memory-pressure" => "host-memory-pressure-cleared"
   }
 
   @harness_health_kinds %{
