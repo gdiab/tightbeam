@@ -65,9 +65,17 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
 
   defp own_uid do
     case File.stat("/proc/self") do
-      {:ok, %File.Stat{uid: uid}} -> uid
-      _ -> nil
+      {:ok, %File.Stat{uid: uid}} ->
+        uid
+
+      _ ->
+        case System.cmd("id", ["-u"], stderr_to_stdout: true) do
+          {out, 0} -> String.to_integer(String.trim(out))
+          _ -> nil
+        end
     end
+  rescue
+    _ -> nil
   end
 
   @doc """

@@ -142,6 +142,16 @@ defmodule Tightbeam.MemoryGuard.Probe do
   """
   @spec harness_candidates(String.t()) :: {:ok, [String.t()]} | :error
   def harness_candidates(root \\ "/") do
+    # No cgroup v2 at all: no limit of this contract can exist (FS1 / F8).
+    if not File.exists?(Path.join(root, "sys/fs/cgroup/cgroup.controllers")) and
+         not File.exists?(Path.join(root, "proc/self/cgroup")) do
+      {:ok, []}
+    else
+      own_harness_candidates(root)
+    end
+  end
+
+  defp own_harness_candidates(root) do
     case own_cgroup(root, "self") do
       {:ok, own} ->
         parents = if Path.basename(own) == "gateway", do: [Path.dirname(own), own], else: [own]
