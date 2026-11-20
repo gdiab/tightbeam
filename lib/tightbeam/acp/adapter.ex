@@ -744,6 +744,18 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @doc """
+  Whether `sid`'s session process is resident on this adapter (memory limits
+  v1.13 FS1: a resident session's turn needs no launch, so it is never held
+  while the guard is down). An adapter that cannot answer is not shown resident.
+  """
+  @spec resident?(adapter(), String.t()) :: boolean()
+  def resident?(adapter, sid) do
+    GenServer.call(adapter, {:resident?, sid}, 10_000) == true
+  catch
+    :exit, _ -> false
+  end
+
+  @doc """
   Memory limits v1.1 R11a: the session's process ended other than by a
   Tightbeam close; forget its residency so its next turn starts a fresh one.
   """
@@ -1096,6 +1108,9 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp session_call({:knows_session?, sid}, _from, state),
+    do: {:reply, MapSet.member?(state.known, sid), state}
+
+  defp session_call({:resident?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
 
   defp session_call({:idle_session?, sid}, _from, state) do

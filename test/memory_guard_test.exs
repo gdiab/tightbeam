@@ -8,8 +8,17 @@ defmodule Tightbeam.MemoryGuardTest do
   # memory_guard_containment_test.exs and cli/tests/memory_guard_step.rs.
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices, Gateway, Ledger, MemoryGuard, Org, Schema}
-  alias Tightbeam.MemoryGuard.{Admission, Cgroup, HeldState, Probe, Records, Settings}
+  alias Tightbeam.{DB, Devices, EventLog, Gateway, Ledger, MemoryGuard, Org, Schema}
+
+  alias Tightbeam.MemoryGuard.{
+    Unguarded,
+    Admission,
+    Cgroup,
+    HeldState,
+    Probe,
+    Records,
+    Settings
+  }
 
   @gib 1024 * 1024 * 1024
   @mib 1024 * 1024
@@ -129,12 +138,23 @@ defmodule Tightbeam.MemoryGuardTest do
         cgroup: nil
       })
 
+    # The launch step is in place unless a test says otherwise (v1.13 FS1 A3):
+    # a fake CLI file it links to; nothing executes it.
+    cli_bin =
+      Keyword.get_lazy(opts, :cli_bin, fn ->
+        dir = Path.join(ctx.root, "cli-bin")
+        File.mkdir_p!(dir)
+        File.write!(Path.join(dir, "tightbeam"), "#!/bin/false\n")
+        dir
+      end)
+
     start_supervised!({
       MemoryGuard,
       # A kill on the fake host removes the fake processes it ends (unless
       # the test says the kill fails); nothing real is ever signalled.
       db: ctx.db,
       base_dir: ctx.base,
+      cli_bin: cli_bin,
       local_host: @host,
       root: ctx.root,
       cgroup_fs: Keyword.get(opts, :cgroup_fs, Path.join(ctx.root, "sys/fs/cgroup")),
@@ -471,7 +491,14 @@ defmodule Tightbeam.MemoryGuardTest do
       read = MemoryGuard.read(@host)
       assert read.mode == "count-only"
       assert read.notEnforcedReason == reason
-      assert read.heldTurns == %{"memory_budget" => 0, "memory_floor" => 0, "resident_cap" => 1}
+
+      assert read.heldTurns == %{
+               "guard_unavailable" => 0,
+               "memory_budget" => 0,
+               "memory_floor" => 0,
+               "resident_cap" => 1
+             }
+
       assert read.residentCount == 1
       # Counts and totals only (v3 R2): no process list, pid or command line.
       refute Enum.any?(Map.keys(read), &(&1 in [:pids, :processes, :commands]))
@@ -911,10 +938,17 @@ defmodule Tightbeam.MemoryGuardTest do
       assert :ok = MemoryGuard.admit("agent:off")
       assert MemoryGuard.read(@host).mode == "off"
 
-      assert MemoryGuard.launch_env({:claude, "shared", @host}, "L",
-               cmd: ["/x/.bin/claude-agent-acp"],
-               env: []
-             ) == []
+      # The step stays installed under `off` and passes the harness through
+      # untouched (FS2); nothing places the adapter in a unit.
+      env =
+        MemoryGuard.launch_env(
+          {:claude, "shared", @host},
+          "L",
+          [cmd: ["/x/.bin/claude-agent-acp"], env: []],
+          ctx.db
+        )
+
+      refute List.keymember?(env, "TIGHTBEAM_ADAPTER_CGROUP", 0)
 
       assert HeldState.read(ctx.db, Org.get(ctx.db, "agent:off")) == nil
       refute_received {:closed, _, _}
@@ -2122,6 +2156,247 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## v1.13 §6.1 FS1 cells (matrix v4 group A, row F8)
+
+  describe "matrix A / F8: the guard down (FS1)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      Application.put_env(:tightbeam, :memory_guard_restart_wait_ms, 50)
+
+      on_exit(fn ->
+        Application.delete_env(:tightbeam, :memory_guard_restart_wait_ms)
+        Application.delete_env(:tightbeam, :memory_guard_admit_timeout_ms)
+        MemoryGuard.expect(false)
+      end)
+
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a launch")
+      :ok
+    end
+
+    defp guard_down!, do: MemoryGuard.expect(true)
+
+    defp holds(ctx, key) do
+      for {^key, detail} <- events(ctx.db, "memory_guard_hold"), do: detail
+    end
+
+    test "A1.unreadable (T22): a non-resident turn is held guard_unavailable, shown, and never admitted by a time-out",
+         ctx do
+      guard_down!()
+
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+      Process.sleep(120)
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+
+      # One hold, recorded once (FS7), and shown on the held-state read (R7).
+      assert [%{"detail" => "guard_unavailable", "host" => @host}] = holds(ctx, "agent:new")
+
+      assert %{reasons: [%{reasonClass: "host_capacity", detail: "guard_unavailable"} = reason]} =
+               HeldState.read(ctx.db, Org.get(ctx.db, "agent:new"))
+
+      assert reason.condition =~ "memory guard"
+    end
+
+    test "A1.unreadable (T22): a resident session's turn runs while the guard is down", ctx do
+      guard_down!()
+
+      assert :ok =
+               Unguarded.admit(ctx.db, "agent:new",
+                 live_adapter: fn _key -> self() end,
+                 resident?: fn _adapter, "sid-new" -> true end
+               )
+
+      assert holds(ctx, "agent:new") == []
+    end
+
+    test "A1.timeout: a guard that does not answer the admission check holds the launch", ctx do
+      guard!(ctx)
+      Application.put_env(:tightbeam, :memory_guard_admit_timeout_ms, 200)
+      :sys.suspend(MemoryGuard)
+
+      try do
+        assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+      after
+        :sys.resume(MemoryGuard)
+      end
+    end
+
+    test "A1 release (T22): when the guard answers again, every guard_unavailable hold is released and its lane nudged",
+         ctx do
+      guard_down!()
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+
+      guard!(ctx)
+      assert_receive {:nudged, "agent:new"}
+
+      assert [{"agent:new", %{"detail" => "guard_unavailable", "because" => "guard_answers"}}] =
+               events(ctx.db, "memory_guard_release")
+
+      assert Unguarded.open_hold(ctx.db, "agent:new") == nil
+    end
+
+    test "A1 / F8.absent (T22 B): on a host with no kernel limit, off comes into force without the guard; a launch onto a live adapter runs, a new adapter stays held",
+         ctx do
+      guard_down!()
+      assert {:held, _} = MemoryGuard.admit("agent:new", ctx.db)
+      fs = Path.join(ctx.root, "sys/fs/cgroup")
+      File.mkdir_p!(fs)
+
+      assert :in_force =
+               Unguarded.bring_off_into_force(ctx.db, @host, ctx.base,
+                 cgroup_fs: fs,
+                 harness_candidates: fn -> {:ok, ["/svc/tightbeam.service/harness"]} end
+               )
+
+      assert Unguarded.mode_in_force(ctx.db, @host) == "off"
+
+      assert %{"mode" => "off"} =
+               JSON.decode!(File.read!(Path.join(Records.dir(ctx.base), "launch.json")))
+
+      # A new adapter is still not launched while the guard is down (R2a).
+      assert {:held, ["guard_unavailable"]} =
+               Unguarded.admit(ctx.db, "agent:new", live_adapter: fn _ -> nil end)
+
+      assert :ok =
+               Unguarded.admit(ctx.db, "agent:new",
+                 live_adapter: fn _ -> self() end,
+                 resident?: fn _, _ -> false end
+               )
+
+      assert [{"agent:new", %{"because" => "off"}}] = events(ctx.db, "memory_guard_release")
+    end
+
+    defp limited_harness!(ctx, unit_values) do
+      fs = Path.join(ctx.root, "sys/fs/cgroup")
+      harness = Path.join(fs, "svc/tightbeam.service/harness")
+      File.mkdir_p!(harness)
+
+      for {f, v} <- [{"memory.max", "max"}, {"memory.swap.max", "max"}, {"memory.oom.group", "0"}],
+          do: File.write!(Path.join(harness, f), v)
+
+      unit = Path.join(harness, "session-x")
+      File.mkdir_p!(unit)
+      for {f, v} <- unit_values, do: File.write!(Path.join(unit, f), v)
+      {fs, unit}
+    end
+
+    defp off_without_guard(ctx, fs) do
+      Unguarded.bring_off_into_force(ctx.db, @host, ctx.base,
+        cgroup_fs: fs,
+        harness_candidates: fn -> {:ok, ["/svc/tightbeam.service/harness"]} end
+      )
+    end
+
+    test "A1 (T22 A) / F8.partial: kernel limits still on a unit: off is requested, not applied, and the launch stays held",
+         ctx do
+      guard_down!()
+
+      {fs, _unit} =
+        limited_harness!(ctx, [
+          {"memory.max", "536870912"},
+          {"memory.swap.max", "0"},
+          {"memory.oom.group", "1"}
+        ])
+
+      assert {:not_applied, why} = off_without_guard(ctx, fs)
+      assert why =~ "session-x"
+      assert Unguarded.mode_in_force(ctx.db, @host) == nil
+
+      assert {:held, ["guard_unavailable"]} =
+               Unguarded.admit(ctx.db, "agent:new",
+                 live_adapter: fn _ -> self() end,
+                 resident?: fn _, _ -> false end
+               )
+    end
+
+    test "F8.unreadable: a unit file that cannot be read, or an unreadable own cgroup, is no evidence",
+         ctx do
+      {fs, unit} =
+        limited_harness!(ctx, [
+          {"memory.max", "max"},
+          {"memory.swap.max", "max"},
+          {"memory.oom.group", "0"}
+        ])
+
+      file = Path.join(unit, "memory.max")
+      File.chmod!(file, 0o000)
+      on_exit(fn -> File.chmod(file, 0o644) end)
+      assert {:not_applied, _} = off_without_guard(ctx, fs)
+
+      assert {:not_applied, why} =
+               Unguarded.bring_off_into_force(ctx.db, @host, ctx.base,
+                 cgroup_fs: fs,
+                 harness_candidates: fn -> :error end
+               )
+
+      assert why =~ "own cgroup"
+    end
+
+    test "F8.stale (T22 C): a transition recorded incomplete is no evidence, whatever the files read",
+         ctx do
+      fs = Path.join(ctx.root, "sys/fs/cgroup")
+      File.mkdir_p!(fs)
+
+      EventLog.lifecycle(
+        ctx.db,
+        "memory_guard_mode",
+        @host,
+        JSON.encode!(%{
+          host: @host,
+          mode: "watched",
+          transition: "the session limits could not all be restored"
+        })
+      )
+
+      assert {:not_applied, why} = off_without_guard(ctx, fs)
+      assert why =~ "still incomplete"
+      assert Unguarded.mode_in_force(ctx.db, @host) == nil
+    end
+
+    test "A3.unreadable / F6.absent: a session launch whose launch step is not in place is held guard_unavailable; under off it runs",
+         ctx do
+      guard!(ctx, cli_bin: nil)
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+
+      assert %{reasons: [%{detail: "guard_unavailable"}]} =
+               HeldState.read(ctx.db, Org.get(ctx.db, "agent:new"))
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "mode", "off", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+      assert :ok = MemoryGuard.admit("agent:new", ctx.db)
+    end
+
+    test "A6.unreadable: the host read says the guard is not running, never a mode", ctx do
+      guard_down!()
+
+      assert %{code: "memory_guard_unavailable"} =
+               Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})["host-memory"].(%{
+                 origin: "user:owner",
+                 params: %{host: @host}
+               })
+    end
+
+    test "A7.unreadable: a setting stored while the guard is down says it is not yet applied; off on a host with no kernel limit comes into force",
+         ctx do
+      guard_down!()
+      session!(ctx, "agent:admin-session")
+      set = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})["host-memory-set"]
+      call = &%{origin: "user:owner", principal: {:session, "agent:admin-session"}, params: &1}
+
+      assert set.(call.(%{host: @host, name: "residentCap", value: "4"})).effect =~
+               "NOT yet applied"
+
+      # The test host is not the gateway's own, so it can carry no kernel limit.
+      assert set.(call.(%{host: @host, name: "mode", value: "off"})).effect =~ "in force"
+      assert Unguarded.mode_in_force(ctx.db, @host) == "off"
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
@@ -2151,7 +2426,7 @@ defmodule Tightbeam.MemoryGuardTest do
 
     test "a host whose launch step is unavailable says sessions are not limited one by one",
          ctx do
-      guard!(ctx)
+      guard!(ctx, cli_bin: nil)
       read = MemoryGuard.read(@host)
       assert read.mode == "watched"
       assert read.notEnforcedReason =~ "session processes are not limited one by one"

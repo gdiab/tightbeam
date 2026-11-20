@@ -5761,6 +5761,25 @@ defmodule Tightbeam.Gateway do
               {:error, {:not_applied, reason}} ->
                 "stored, but NOT yet applied: #{reason}"
 
+              {:error, {:memory_guard_unavailable, _} = reason}
+              when name == "mode" and value == "off" ->
+                # v1.13 FS1 / F8: without the guard, `off` comes into force
+                # only on positive evidence that no kernel limit remains.
+                case Tightbeam.MemoryGuard.Unguarded.bring_off_into_force(
+                       db,
+                       host,
+                       config.base_dir,
+                       local?: host == Placement.local_host_name()
+                     ) do
+                  :in_force ->
+                    "in force on #{host} without the memory guard: no memory limit of " <>
+                      "Tightbeam's remains there; sessions on a running adapter start again"
+
+                  {:not_applied, why} ->
+                    "stored, but NOT yet applied: the memory guard did not answer " <>
+                      "(#{inspect(reason)}), and off cannot take effect without it: #{why}"
+                end
+
               {:error, reason} ->
                 "stored, but NOT yet applied: the memory guard did not answer " <>
                   "(#{inspect(reason)}); it applies when the guard next reads its settings"
