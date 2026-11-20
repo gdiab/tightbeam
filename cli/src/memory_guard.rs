@@ -64,11 +64,38 @@ pub fn session_step(args: &[String]) -> i32 {
         }
     };
 
-    if let (Some(sid), Ok(dir)) = (session_id(args), std::env::var(DIR_ENV)) {
-        let adapter_launch = std::env::var(ADAPTER_LAUNCH_ENV).unwrap_or_default();
-        if let Err(refusal) = prepare(Path::new(&dir), &sid, &adapter_launch) {
-            return refuse(Path::new(&dir), &sid, &adapter_launch, &refusal);
+    // A session process (one named by a session flag) starts only recorded.
+    // Without the guard's directory, or with a session id or adapter launch
+    // that cannot be recorded, it does not start (FS2): it would run outside
+    // custody. Auth probes carry no session flag and are not session processes.
+    match (session_id(args), session_flag(args)) {
+        (Some(sid), _) => {
+            let Some(dir) = std::env::var(DIR_ENV).ok().filter(|dir| !dir.is_empty()) else {
+                eprintln!(
+                    "{STEP_NAME}: REFUSED to start the session process: {DIR_ENV} is not set"
+                );
+                return REFUSED_EXIT;
+            };
+            let adapter_launch = std::env::var(ADAPTER_LAUNCH_ENV).unwrap_or_default();
+            let prepared = if adapter_launch.is_empty() {
+                Err(Refusal {
+                    launch: launch_id(&sid),
+                    reason: format!("{ADAPTER_LAUNCH_ENV} is not set"),
+                })
+            } else {
+                prepare(Path::new(&dir), &sid, &adapter_launch)
+            };
+            if let Err(refusal) = prepared {
+                return refuse(Path::new(&dir), &sid, &adapter_launch, &refusal);
+            }
         }
+        (None, true) => {
+            eprintln!(
+                "{STEP_NAME}: REFUSED to start the session process: its session id is not valid"
+            );
+            return REFUSED_EXIT;
+        }
+        (None, false) => {}
     }
 
     let mut command = Command::new(&target);
@@ -100,6 +127,15 @@ pub fn session_id(args: &[String]) -> Option<String> {
     value("--session-id")
         .or_else(|| value("--resume"))
         .filter(|sid| valid_id(sid))
+}
+
+/// Whether the arguments carry a session flag at all.
+fn session_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        ["--session-id", "--resume"]
+            .iter()
+            .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+    })
 }
 
 fn valid_id(sid: &str) -> bool {
@@ -162,9 +198,16 @@ fn prepare(dir: &Path, sid: &str, adapter_launch: &str) -> Result<(), Refusal> {
     let config = read_config(dir).map_err(&refuse)?;
 
     // `off` (an admin turned the guard off) launches the harness untouched,
-    // and so does `count-only`, a host without the mechanisms (R12a).
-    if config.mode != "watched" && config.mode != "enforced" {
-        return Ok(());
+    // and so does `count-only`, a host without the mechanisms (R12a). A mode
+    // this step does not know is a fault, never "no contract".
+    match config.mode.as_str() {
+        "off" | "count-only" => return Ok(()),
+        "watched" | "enforced" => {}
+        other => {
+            return Err(refuse(format!(
+                "launch.json names an unknown mode {other:?}"
+            )));
+        }
     }
 
     // R14: the session tree runs at the value inherited from the adapter (the
@@ -211,12 +254,20 @@ fn prepare(dir: &Path, sid: &str, adapter_launch: &str) -> Result<(), Refusal> {
     };
 
     let pid = std::process::id();
+    // The start time is the tree's identity against pid reuse (D2.stale).
+    let start = proc_start(pid);
+    if cfg!(target_os = "linux") && start.is_none() {
+        let _ = fs::remove_file(&identity_path);
+        return Err(refuse(
+            "the session process's start time could not be read".into(),
+        ));
+    }
     let mut record = BTreeMap::new();
     record.insert("v", serde_json::json!(1));
     record.insert("launchId", serde_json::json!(launch));
     record.insert("sessionId", serde_json::json!(sid));
     record.insert("pid", serde_json::json!(pid));
-    record.insert("start", serde_json::json!(proc_start(pid)));
+    record.insert("start", serde_json::json!(start));
     record.insert("adapterLaunchId", serde_json::json!(adapter_launch));
     record.insert("placement", serde_json::json!(placement));
     record.insert("unit", serde_json::json!(unit));
@@ -229,7 +280,10 @@ fn prepare(dir: &Path, sid: &str, adapter_launch: &str) -> Result<(), Refusal> {
     record.insert("errors", serde_json::json!(errors));
     record.insert("launchedAt", serde_json::json!(now_ms()));
 
-    let body = serde_json::to_vec(&record).unwrap_or_default();
+    let body = serde_json::to_vec(&record).map_err(|error| {
+        let _ = fs::remove_file(&identity_path);
+        refuse(format!("launch record could not be encoded: {error}"))
+    })?;
     atomic_write(&sessions.join(format!("{launch}.json")), &body).map_err(|error| {
         let _ = fs::remove_file(&identity_path);
         refuse(format!("launch record could not be written: {error}"))

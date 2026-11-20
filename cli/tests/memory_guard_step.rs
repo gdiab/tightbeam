@@ -276,7 +276,8 @@ fn run_step(guard_dir: &Path, sid: &str, env: &[(&str, &str)]) -> std::process::
     command
         .arg(format!("--session-id={sid}"))
         .env("TIGHTBEAM_SESSION_EXEC_TARGET", "/bin/echo")
-        .env("TIGHTBEAM_MEMORY_GUARD_DIR", guard_dir);
+        .env("TIGHTBEAM_MEMORY_GUARD_DIR", guard_dir)
+        .env("TIGHTBEAM_ADAPTER_LAUNCH_ID", "adapter-launch-1");
     for (name, value) in env {
         command.env(name, value);
     }
@@ -427,6 +428,71 @@ fn j2_unreadable_an_oom_score_adj_that_cannot_be_raised_refuses() {
         "sess-7",
         &output,
         "oom_score_adj could not be raised",
+    );
+}
+
+#[test]
+fn b5_partial_an_unknown_mode_refuses() {
+    let fixture = start("unknownmode", 0, "watched");
+    fs::write(
+        fixture.guard_dir.join("launch.json"),
+        r#"{"v":1,"mode":"sometimes","sessionLimit":536870912}"#,
+    )
+    .unwrap();
+    let output = run_step(&fixture.guard_dir, "sess-m", &[]);
+    assert_refused(&fixture.guard_dir, "sess-m", &output, "unknown mode");
+}
+
+#[test]
+fn r2a_absent_a_session_without_its_adapter_launch_refuses() {
+    let fixture = start("noadapter", 0, "watched");
+    let output = run_step(
+        &fixture.guard_dir,
+        "sess-a",
+        &[("TIGHTBEAM_ADAPTER_LAUNCH_ID", "")],
+    );
+    assert_refused(
+        &fixture.guard_dir,
+        "sess-a",
+        &output,
+        "TIGHTBEAM_ADAPTER_LAUNCH_ID is not set",
+    );
+}
+
+#[test]
+fn b1_absent_a_session_process_without_the_guard_directory_or_a_valid_id_never_starts() {
+    let fixture = start("noguarddir", 0, "watched");
+    let step = fixture.guard_dir.join("bin/tightbeam-session-exec");
+    let run = |args: &[&str], dir: Option<&Path>| {
+        let mut command = Command::new(&step);
+        command
+            .args(args)
+            .env("TIGHTBEAM_SESSION_EXEC_TARGET", "/bin/echo")
+            .env("TIGHTBEAM_ADAPTER_LAUNCH_ID", "adapter-launch-1")
+            .env_remove("TIGHTBEAM_MEMORY_GUARD_DIR");
+        if let Some(dir) = dir {
+            command.env("TIGHTBEAM_MEMORY_GUARD_DIR", dir);
+        }
+        command.output().unwrap()
+    };
+
+    // A session process with no guard directory to record it in.
+    let output = run(&["--session-id=sess-d"], None);
+    assert_eq!(output.status.code(), Some(75));
+    assert!(output.stdout.is_empty(), "the harness never ran");
+
+    // A session flag whose id cannot be recorded.
+    let output = run(&["--resume", "../../etc"], Some(&fixture.guard_dir));
+    assert_eq!(output.status.code(), Some(75));
+    assert!(output.stdout.is_empty(), "the harness never ran");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not valid"));
+
+    // No session flag at all (an auth probe): not a session process.
+    let output = run(&["auth", "status"], None);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "auth status"
     );
 }
 
