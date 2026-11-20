@@ -311,9 +311,9 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
              )
   end
 
-  # ── Core fix (A), review B1 — rpc/remote reach no live node ─────────────────
+  # ── Core fix (A), C21.2 — no release debug entry in the launcher ────────────
 
-  test "rpc and remote are refused outright and never reach the release, whatever the env" do
+  test "C21.2/K24: rpc, remote and eval are refused and never reach the release, whatever the env" do
     shim = faked_release_shim!()
 
     base = Path.join(System.tmp_dir!(), "tb-rpc-#{System.unique_integer([:positive])}")
@@ -329,7 +329,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
       ownedCommand: "x"
     })
 
-    for args <- [["rpc", "Foo.bar()"], ["remote"]] do
+    for args <- [["rpc", "Foo.bar()"], ["remote"], ["eval", "Foo.bar()"]] do
       {out, status} =
         System.cmd(shim, args,
           env: [
@@ -342,7 +342,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
         )
 
       assert status == 64, out
-      assert out =~ "without Erlang"
+      assert out =~ "is not available (C21.2)"
       # The fake release never ran: nothing was forwarded to a node.
       refute out =~ "REL_NODE="
       refute out =~ "ARG="

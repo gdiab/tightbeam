@@ -33,9 +33,18 @@ defmodule Tightbeam.MixProject do
       tightbeam_gateway: [
         include_erts: true,
         include_executables_for: [:unix],
-        strip_beams: true
+        strip_beams: true,
+        steps: [:assemble, &drop_release_cookie/1]
       ]
     ]
+  end
+
+  # Core fix (A), C21.1 (ii)-(iii): no package carries an Erlang cookie. Mix always
+  # writes releases/COOKIE; the gateway runs without distribution (rel/env.sh.eex), and
+  # a hand-enabled debug distribution uses its own per-install cookie instead.
+  defp drop_release_cookie(release) do
+    File.rm!(Path.join(release.path, "releases/COOKIE"))
+    release
   end
 
   def application do
