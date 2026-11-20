@@ -46,6 +46,10 @@ defmodule Tightbeam.OwnerAlerts do
   its `dedupeKey` (`memory-pressure:<host>:<episodeOpenedAt>` or
   `memory-pressure-restart:<host>:<runStartedAt>`) identifies it.
 
+  A `memory-guard-stuck` alert (G2/G3 FS9) is created when the memory guard's
+  stuck episode opens, in the transaction that records the alert on the
+  episode; its `dedupeKey` is `memory-guard-stuck:<episodeId>`.
+
   Each row of every kind records its owner at creation. Before any new
   operation, the owner setting is read again in the transaction that records
   the attempt: if it is cleared, names no user, or names a different user, the
@@ -1484,6 +1488,41 @@ defmodule Tightbeam.OwnerAlerts do
   defp population_text(_populations), do: []
 
   defp gib(amount, unit), do: :erlang.float_to_binary(amount / unit, decimals: 1)
+
+  ## G2/G3 FS9: a stuck memory-guard hold
+
+  @doc """
+  FS9 (memory limits v1.13, amendment A-OA): create the one
+  `memory-guard-stuck` alert of a stuck episode, inside the transaction that
+  records it. Its `dedupeKey` is `memory-guard-stuck:<episodeId>`; like
+  `memory-pressure` it names no session, turn or work item. Returns
+  `{:created, alertId}`, `:exists` (already created), or `:off` when owner
+  alerts are off ([G1] §7.1), in which case nothing is written. The shared
+  creation path, sender, retry, undelivered and `off` rules apply unchanged.
+  """
+  @spec memory_guard_stuck_in_txn(Txn.t(), %{
+          required(:episode_id) => String.t(),
+          required(:host) => String.t(),
+          required(:title) => String.t(),
+          required(:body) => String.t(),
+          optional(atom()) => term()
+        }) :: {:created, String.t()} | :exists | :off
+  def memory_guard_stuck_in_txn(%Txn{} = txn, %{episode_id: id} = input) do
+    case owner_in_txn(txn) do
+      nil ->
+        :off
+
+      owner ->
+        create_in_txn(txn, %{
+          kind: "memory-guard-stuck",
+          dedupe_key: "memory-guard-stuck:" <> id,
+          owner: owner,
+          title: input.title,
+          body: input.body,
+          lifecycle: %{host: input.host, episodeId: id}
+        })
+    end
+  end
 
   ## Shared record
 

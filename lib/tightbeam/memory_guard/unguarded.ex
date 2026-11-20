@@ -16,9 +16,12 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
   """
 
   alias Tightbeam.{DB, EventLog, Harness, Org}
-  alias Tightbeam.MemoryGuard.{Cgroup, Probe, Records}
+  alias Tightbeam.DB.Txn
+  alias Tightbeam.MemoryGuard.{Cgroup, Probe, Records, State}
 
   @detail "guard_unavailable"
+  # The open hold's kind in `memory_guard_open` (one per session).
+  @open_kind "unguarded_hold"
 
   @doc "The detail this module holds with."
   def detail, do: @detail
@@ -51,8 +54,10 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
 
           # FS9: a root override of the host's guard episode admits held
           # launches without the guard; the risk stays shown until it answers.
-          (episode = overridden_guard_episode(db, session.host)) != nil ->
-            Tightbeam.MemoryGuard.Episodes.applied(db, episode["episodeId"])
+          # The override's effect is recorded first; a record that fails
+          # leaves the launch held, and the next ask retries it (FS7).
+          (episode = overridden_guard_episode(db, session.host)) != nil and
+              Tightbeam.MemoryGuard.Episodes.applied(db, episode["episodeId"]) == :ok ->
             release(db, session_key, session.host, "root override #{episode["episodeId"]}")
             :ok
 
@@ -88,8 +93,7 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
 
   defp overridden_guard_episode(db, host) do
     Enum.find(Tightbeam.MemoryGuard.Episodes.active(db, host), fn episode ->
-      episode["kind"] == "guard" and
-        Tightbeam.MemoryGuard.Episodes.override(db, episode["episodeId"]) != nil
+      episode["kind"] == "guard" and episode["override"] != nil
     end)
   end
 
@@ -106,49 +110,48 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
     :exit, _ -> nil
   end
 
-  @doc "The open `guard_unavailable` hold of a session: `%{host, since}` or nil."
+  @doc """
+  The open `guard_unavailable` hold of a session: `%{host, since}` or nil.
+  Raises when it cannot be read: an unread hold is not an absent one.
+  """
   @spec open_hold(DB.server(), String.t()) :: map() | nil
   def open_hold(db, session_key) do
-    case DB.query(
-           db,
-           """
-           SELECT h.ts, json_extract(h.detail,'$.host') FROM lifecycle_events h
-           WHERE h.kind='memory_guard_hold' AND h.subject=?1
-             AND json_extract(h.detail,'$.detail')=?2
-             AND NOT EXISTS (
-               SELECT 1 FROM lifecycle_events r
-               WHERE r.kind='memory_guard_release' AND r.subject=?1 AND r.id>h.id
-                 AND json_extract(r.detail,'$.detail')=?2)
-           ORDER BY h.id DESC LIMIT 1
-           """,
-           [session_key, @detail]
-         ) do
-      {:ok, [[since, host]]} -> %{since: since, host: host}
-      _ -> nil
+    case DB.transaction(db, &open_hold_in_txn(&1, session_key)) do
+      {:ok, hold} ->
+        hold
+
+      {:error, error} ->
+        raise "the guard_unavailable hold cannot be read: #{Exception.message(error)}"
     end
   end
 
-  @doc "Every session with an open `guard_unavailable` hold: `[{session_key, host}]`."
-  @spec held_sessions(DB.server()) :: [{String.t(), String.t()}]
+  defp open_hold_in_txn(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT host, openedAt FROM memory_guard_open WHERE kind=?1 AND ref=?2",
+           [@open_kind, session_key]
+         ) do
+      [[host, since]] -> %{since: since, host: host}
+      [] -> nil
+    end
+  end
+
+  @doc """
+  Every session with an open `guard_unavailable` hold, `{:ok, [{session_key,
+  host}]}`, or `{:error, message}` when they cannot be read. The open holds
+  are current state (`Tightbeam.MemoryGuard.State`), so this costs the holds
+  open now, never the history (review B7).
+  """
+  @spec held_sessions(DB.server()) :: {:ok, [{String.t(), String.t()}]} | {:error, String.t()}
   def held_sessions(db) do
-    case DB.query(
-           db,
-           """
-           SELECT DISTINCT h.subject, json_extract(h.detail,'$.host') FROM lifecycle_events h
-           WHERE h.kind='memory_guard_hold' AND json_extract(h.detail,'$.detail')=?1
-             AND NOT EXISTS (
-               SELECT 1 FROM lifecycle_events r
-               WHERE r.kind='memory_guard_release' AND r.subject=h.subject AND r.id>h.id
-                 AND json_extract(r.detail,'$.detail')=?1)
-           """,
-           [@detail]
-         ) do
-      {:ok, rows} -> Enum.map(rows, fn [key, host] -> {key, host} end)
-      _ -> []
-    end
+    with {:ok, holds} <- State.list(db, @open_kind),
+         do: {:ok, Enum.map(holds, &{&1.subject, &1.host})}
   end
 
-  @doc "The held-state reasons (R7) of an open `guard_unavailable` hold."
+  @doc """
+  The held-state reasons (R7) of an open `guard_unavailable` hold. A hold that
+  cannot be read is shown as a reason whose state is unknown, never as none.
+  """
   @spec hold_reasons(DB.server(), String.t()) :: [map()]
   def hold_reasons(db, session_key) do
     case open_hold(db, session_key) do
@@ -168,33 +171,60 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
           }
         ]
     end
+  rescue
+    error ->
+      [
+        %{
+          reasonClass: "host_capacity",
+          detail: @detail,
+          condition: "unknown: #{Exception.message(error)}"
+        }
+      ]
   end
 
-  # One hold row per hold: the record is the hold's state (FS7).
+  # One hold per session at a time: its open row and its record are one
+  # transaction (FS7).
   defp hold(db, session_key, host) do
-    if is_nil(open_hold(db, session_key)) do
-      EventLog.lifecycle(
-        db,
-        "memory_guard_hold",
-        session_key,
-        JSON.encode!(%{host: host, detail: @detail})
-      )
-    end
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        if is_nil(open_hold_in_txn(txn, session_key)) do
+          State.open_in_txn(txn, @open_kind, session_key, session_key, host, nil)
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "memory_guard_hold",
+            session_key,
+            JSON.encode!(%{host: host, detail: @detail})
+          )
+        end
+      end)
   end
 
-  @doc "End an open `guard_unavailable` hold, recording why."
-  @spec release(DB.server(), String.t(), String.t(), String.t()) :: :ok
+  @doc """
+  End an open `guard_unavailable` hold, recording why. `:ok`, or
+  `{:error, message}` when the release could not be recorded (the hold stands
+  and the release is retried).
+  """
+  @spec release(DB.server(), String.t(), String.t(), String.t()) :: :ok | {:error, String.t()}
   def release(db, session_key, host, because) do
-    if open_hold(db, session_key) do
-      EventLog.lifecycle(
-        db,
-        "memory_guard_release",
-        session_key,
-        JSON.encode!(%{host: host, detail: @detail, because: because})
-      )
-    end
+    DB.transaction(db, fn txn ->
+      if open_hold_in_txn(txn, session_key) do
+        State.close_in_txn(txn, @open_kind, session_key)
 
-    :ok
+        EventLog.lifecycle_in_txn(
+          txn,
+          "memory_guard_release",
+          session_key,
+          JSON.encode!(%{host: host, detail: @detail, because: because})
+        )
+      end
+    end)
+    |> case do
+      {:ok, _} -> :ok
+      {:error, error} -> {:error, Exception.message(error)}
+    end
+  catch
+    :exit, reason -> {:error, inspect(reason)}
   end
 
   @doc """
@@ -269,7 +299,11 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
           end
         end)
 
-      for {session_key, ^host} <- held_sessions(db), do: nudge(session_key)
+      # The change is in force; a nudge that cannot be planned now is made by
+      # the guard's next pass over the holds.
+      with {:ok, held} <- held_sessions(db),
+           do: for({session_key, ^host} <- held, do: nudge(session_key))
+
       :in_force
     end
   rescue
@@ -314,22 +348,30 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
 
   # No budget group at all, or every cgroup in it lifted.
   defp lifted?(fs, harness) do
-    if File.dir?(Cgroup.dir(fs, harness)) do
-      case Cgroup.units(%{fs: fs, harness: harness}) do
-        {:ok, units} ->
-          Enum.reduce_while([harness | units], :ok, fn cgroup, :ok ->
-            if Cgroup.lifted?(fs, cgroup),
-              do: {:cont, :ok},
-              else:
-                {:halt,
-                 {:not_applied, "#{cgroup} still carries a memory limit, or cannot be read"}}
-          end)
+    case Cgroup.exists?(Cgroup.dir(fs, harness)) do
+      false ->
+        :ok
 
-        {:error, error} ->
-          {:not_applied, error}
-      end
-    else
-      :ok
+      :unknown ->
+        {:not_applied, "#{harness} cannot be looked at, so no evidence that it carries no limit"}
+
+      true ->
+        lifted_units(fs, harness)
+    end
+  end
+
+  defp lifted_units(fs, harness) do
+    case Cgroup.units(%{fs: fs, harness: harness}) do
+      {:ok, units} ->
+        Enum.reduce_while([harness | units], :ok, fn cgroup, :ok ->
+          if Cgroup.lifted?(fs, cgroup),
+            do: {:cont, :ok},
+            else:
+              {:halt, {:not_applied, "#{cgroup} still carries a memory limit, or cannot be read"}}
+        end)
+
+      {:error, error} ->
+        {:not_applied, error}
     end
   end
 

@@ -17,6 +17,7 @@ defmodule Tightbeam.MemoryGuard.Priority do
 
   alias Tightbeam.{DB, EventLog, NoticeBatcher, Org}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.MemoryGuard.State
 
   @classes %{"main" => 0, "user-facing" => 1, "worker" => 2}
 
@@ -92,26 +93,39 @@ defmodule Tightbeam.MemoryGuard.Priority do
   end
 
   # The founding user, recorded the first time a user exists; never re-derived.
+  # Kept in `memory_guard_open` (one row), so finding it costs one key lookup,
+  # never a scan of the lifecycle history (review B7).
   defp founder(db) do
-    case DB.query(
-           db,
-           "SELECT subject FROM lifecycle_events WHERE kind='memory_guard_founder' ORDER BY id LIMIT 1"
-         ) do
-      {:ok, [[user]]} ->
-        user
-
-      {:ok, []} ->
-        case DB.query(db, "SELECT userId FROM users ORDER BY createdAt, userId LIMIT 1") do
-          {:ok, [[user]]} ->
-            EventLog.lifecycle(db, "memory_guard_founder", user, JSON.encode!(%{user: user}))
+    {:ok, founder} =
+      DB.transaction(db, fn txn ->
+        case Txn.q(
+               txn,
+               "SELECT subject FROM memory_guard_open WHERE kind='founder' AND ref='founder'",
+               []
+             ) do
+          [[user]] ->
             user
 
-          {:ok, []} ->
-            nil
+          [] ->
+            case Txn.q(txn, "SELECT userId FROM users ORDER BY createdAt, userId LIMIT 1", []) do
+              [[user]] ->
+                State.open_in_txn(txn, "founder", "founder", user, nil, nil)
 
-          {:error, error} ->
-            raise "the users cannot be read: #{inspect(error)}"
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "memory_guard_founder",
+                  user,
+                  JSON.encode!(%{user: user})
+                )
+
+                user
+
+              [] ->
+                nil
+            end
         end
-    end
+      end)
+
+    founder
   end
 end

@@ -45,6 +45,10 @@ defmodule Tightbeam.MemoryGuardTest do
   end
 
   setup do
+    # A fake kill ends its fake processes at once; a tree a test keeps alive is
+    # given up on sooner than a real one.
+    Application.put_env(:tightbeam, :memory_guard_kill_wait_ms, 300)
+    on_exit(fn -> Application.delete_env(:tightbeam, :memory_guard_kill_wait_ms) end)
     root = Path.join(System.tmp_dir!(), "tb-mg-#{System.unique_integer([:positive])}")
     base = Path.join(root, "base")
     File.mkdir_p!(Path.join(root, "proc"))
@@ -210,6 +214,8 @@ defmodule Tightbeam.MemoryGuardTest do
       MemoryGuard,
       # A kill on the fake host removes the fake processes it ends (unless
       # the test says the kill fails); nothing real is ever signalled.
+      # FS9: the real owner-alerts route; the test is told when it created
+      # an alert row.
       db: ctx.db,
       base_dir: ctx.base,
       cli_bin: cli_bin,
@@ -234,9 +240,10 @@ defmodule Tightbeam.MemoryGuardTest do
       root_uid: Keyword.get(opts, :root_uid, 0),
       finding: Keyword.get(opts, :finding, fn -> strict_finding() end),
       owner_alert:
-        Keyword.get(opts, :owner_alert, fn episode, _message ->
-          send(test, {:owner_alert, episode["episodeId"]})
-          :sent
+        Keyword.get(opts, :owner_alert, fn txn, input ->
+          result = Tightbeam.OwnerAlerts.memory_guard_stuck_in_txn(txn, input)
+          if match?({:created, _}, result), do: send(test, {:owner_alert, input.episode_id})
+          result
         end),
       close_confirm_ms: Keyword.get(opts, :close_confirm_ms, 300),
       killer: fn target, _host_state ->
@@ -3351,13 +3358,7 @@ defmodule Tightbeam.MemoryGuardTest do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       guard!(ctx)
 
-      EventLog.lifecycle(
-        ctx.db,
-        "memory_readmission_pending",
-        "agent:a",
-        JSON.encode!(%{host: @host, sourceSeq: 999_999})
-      )
-
+      pending_readmission!(ctx, "agent:a", 999_999)
       assert Admission.pending?(ctx.db)
       _ = Admission.run_deferred(ctx.db, @host)
 
@@ -3374,18 +3375,31 @@ defmodule Tightbeam.MemoryGuardTest do
       {:ok, :readmitted} = DB.transaction(ctx.db, &Admission.not_started_in_txn(&1, seq, @host))
 
       # The same source again (a replayed settlement): no second turn.
-      {:ok, _} =
-        DB.transaction(ctx.db, fn txn ->
-          EventLog.lifecycle_in_txn(
-            txn,
-            "memory_readmission_pending",
-            "agent:a",
-            JSON.encode!(%{host: @host, sourceSeq: seq})
-          )
-        end)
-
+      pending_readmission!(ctx, "agent:a", seq)
+      assert Admission.pending?(ctx.db)
       _ = Admission.run_deferred(ctx.db, @host)
       assert length(events(ctx.db, "memory_readmission_done")) == 1
+      refute Admission.pending?(ctx.db)
+    end
+
+    # A not-started re-admission deferred as `not_started_in_txn` records it:
+    # its open item and its record in one transaction.
+    defp pending_readmission!(ctx, session_key, seq) do
+      detail = JSON.encode!(%{host: @host, sourceSeq: seq})
+
+      {:ok, _} =
+        DB.transaction(ctx.db, fn txn ->
+          Tightbeam.MemoryGuard.State.open_in_txn(
+            txn,
+            "memory_readmission",
+            Integer.to_string(seq),
+            session_key,
+            @host,
+            detail
+          )
+
+          EventLog.lifecycle_in_txn(txn, "memory_readmission_pending", session_key, detail)
+        end)
     end
   end
 
@@ -3577,6 +3591,8 @@ defmodule Tightbeam.MemoryGuardTest do
         DB.query(ctx.db, "UPDATE users SET createdAt=createdAt+1000 WHERE userId='guest'")
 
       main!(ctx, "owner")
+      # Owner alerts are on, owned by the founding user ([G1] §7.1).
+      :ok = Org.put_setting(ctx.db, "owner-alerts-user", "owner")
       %{uid: File.stat!(ctx.root).uid}
     end
 
@@ -3622,18 +3638,52 @@ defmodule Tightbeam.MemoryGuardTest do
       }
     end
 
-    defp override_record(episode, statement_kind) do
-      %{
-        "action" => "override",
-        "episodeId" => episode["episodeId"],
-        "host" => @host,
-        "kind" => episode["kind"],
-        "key" => episode["key"],
-        "statementKind" => statement_kind,
-        "statement" => "as printed",
-        "operator" => %{"user" => "root", "sudoUser" => "george", "sudoUid" => "1000"},
-        "trees" => episode["trees"]
-      }
+    # An override as `tightbeam memory-guard-override` writes it: the
+    # statement it prints for this episode's failed recovery, operator and
+    # `finding` (the text is pinned against the CLI's own in the golden test).
+    defp override_record(ctx, episode, finding, extra \\ %{}) do
+      stored = Episodes.get(ctx.db, episode["episodeId"])
+      survivors = get_in(stored, ["recovery", "survivors"]) || []
+      operator = %{"user" => "root", "sudoUser" => "george", "sudoUid" => "1000"}
+
+      Map.merge(
+        %{
+          "action" => "override",
+          "episodeId" => episode["episodeId"],
+          "host" => @host,
+          "kind" => episode["kind"],
+          "key" => episode["key"],
+          "statementKind" => RootPath.kind(finding),
+          "statement" => RootActions.statement(stored, survivors, operator, finding),
+          "finding" => finding,
+          "operator" => operator,
+          "trees" => survivors,
+          "at" => System.system_time(:millisecond)
+        },
+        extra
+      )
+    end
+
+    defp alert_rows(db) do
+      {:ok, rows} =
+        DB.query(
+          db,
+          "SELECT dedupeKey, title, body FROM owner_alerts WHERE kind='memory-guard-stuck' ORDER BY createdAt",
+          []
+        )
+
+      rows
+    end
+
+    defp main_texts(db) do
+      {:ok, rows} =
+        DB.query(
+          db,
+          "SELECT content FROM messages WHERE sessionKey=?1 AND content LIKE '%memory-guard-recover%' ORDER BY seq",
+          ["agent:main:clawline:owner:main"]
+        )
+
+      Enum.map(rows, &hd/1)
     end
 
     test "N1.absent (T30 b) / N2: a custody refusal held unbroken opens one episode, with exactly one owner alert and one Main notice",
@@ -3649,6 +3699,25 @@ defmodule Tightbeam.MemoryGuardTest do
 
       assert [{"agent:main:clawline:owner:main", %{"markerKey" => "memory-guard-stuck:" <> ^id}}] =
                events(ctx.db, "memory_guard_stuck_notified")
+
+      # T30 (b): one owner alert row through the owner-alerts route, recorded
+      # as created; it and the Main notice say, in plain words, the host,
+      # what is held, why, the root recovery, the override and the current
+      # root-path finding.
+      sentence = RootPath.statement(strict_finding())
+      assert [["memory-guard-stuck:" <> ^id, title, body]] = alert_rows(ctx.db)
+      assert title =~ "testhost"
+
+      for text <- [body | main_texts(ctx.db)] do
+        assert text =~ "Tightbeam on testhost has held the replacement of the"
+        assert text =~ "could not be confirmed stopped"
+        assert text =~ "tightbeam memory-guard-recover --base #{ctx.base} #{id}"
+        assert text =~ "An override exists only after a recovery has failed"
+        assert text =~ "Root-path check now: " <> sentence
+      end
+
+      assert [{@host, %{"outcome" => "created", "alertId" => "oal_" <> _}}] =
+               events(ctx.db, "memory_guard_stuck_alert")
 
       # Nothing more while it is open; the guard keeps retrying the end.
       :ok = MemoryGuard.tick()
@@ -3682,36 +3751,49 @@ defmodule Tightbeam.MemoryGuardTest do
       assert :sys.get_state(MemoryGuard).custody_refused == %{}
     end
 
-    test "N2.absent (T30 c): with no owner-alerts route, the Main notice still goes", ctx do
-      custody_stuck!(ctx, owner_alert: fn _episode, _message -> :owner_alerts_route_absent end)
+    test "N2.absent (T30 c): with owner alerts off, the Main notice still goes and no alert is made",
+         ctx do
+      {:ok, _} = DB.query(ctx.db, "DELETE FROM org_settings WHERE key='owner-alerts-user'")
+      %{"episodeId" => id} = custody_stuck!(ctx)
       assert [_] = events(ctx.db, "memory_guard_stuck_notified")
-
-      assert [{@host, %{"route" => ":owner_alerts_route_absent"}}] =
-               events(ctx.db, "memory_guard_stuck_alert")
+      assert [text] = main_texts(ctx.db)
+      assert text =~ "Root-path check now: "
+      assert alert_rows(ctx.db) == []
+      refute_received {:owner_alert, _}
+      assert [{@host, %{"outcome" => "off"}}] = events(ctx.db, "memory_guard_stuck_alert")
+      assert [%{alert: "off", noticeSent: true, episodeId: ^id}] = Episodes.read(ctx.db, @host)
     end
 
-    test "N2.unreadable / N2.partial / N2.timeout: an alert that fails is retried until sent, once, while the Main notice is not sent twice",
+    test "N2.unreadable / N2.partial / N2.timeout (T30 c): a broken or absent alert route is not alerts off: retried until made, once; one Main notice",
          ctx do
-      failures = :counters.new(1, [])
-      test = self()
+      # The route is broken: its table refuses the alert row.
+      {:ok, _} =
+        DB.query(ctx.db, """
+        CREATE TRIGGER fs9_route_broken BEFORE INSERT ON owner_alerts
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
 
-      custody_stuck!(ctx,
-        owner_alert: fn episode, _message ->
-          if :counters.get(failures, 1) == 0 do
-            :counters.add(failures, 1, 1)
-            {:error, :route_down}
-          else
-            send(test, {:owner_alert, episode["episodeId"]})
-            :sent
-          end
-        end
-      )
+      %{"episodeId" => id} = custody_stuck!(ctx)
+      refute_received {:owner_alert, _}
+      assert events(ctx.db, "memory_guard_stuck_alert") == []
+      assert [%{alert: nil, noticeSent: true}] = Episodes.read(ctx.db, @host)
+      :ok = MemoryGuard.tick()
+      assert events(ctx.db, "memory_guard_stuck_alert") == []
 
-      refute_received {:owner_alert, _}
+      # The route is absent altogether: still not sent, still retried.
+      {:ok, _} = DB.query(ctx.db, "DROP TRIGGER fs9_route_broken")
+      {:ok, _} = DB.query(ctx.db, "ALTER TABLE owner_alerts RENAME TO owner_alerts_away")
       :ok = MemoryGuard.tick()
-      assert_received {:owner_alert, _}
+      assert events(ctx.db, "memory_guard_stuck_alert") == []
+      {:ok, _} = DB.query(ctx.db, "ALTER TABLE owner_alerts_away RENAME TO owner_alerts")
+
+      :ok = MemoryGuard.tick()
+      assert_received {:owner_alert, ^id}
       :ok = MemoryGuard.tick()
       refute_received {:owner_alert, _}
+      assert [[_, _, body]] = alert_rows(ctx.db)
+      assert body =~ "Root-path check now: "
+      assert [{@host, %{"outcome" => "created"}}] = events(ctx.db, "memory_guard_stuck_alert")
       assert length(events(ctx.db, "memory_guard_stuck_notified")) == 1
     end
 
@@ -3782,7 +3864,7 @@ defmodule Tightbeam.MemoryGuardTest do
       root_record!(ctx, "recovery-1", recovery_record(episode, System.system_time(:millisecond)))
       :ok = MemoryGuard.tick()
       assert %{"outcome" => "pending"} = Episodes.recovery(ctx.db, episode["episodeId"])
-      root_record!(ctx, "override-1", override_record(episode, "strict"))
+      root_record!(ctx, "override-1", override_record(ctx, episode, strict_finding()))
       :ok = MemoryGuard.tick()
       assert Episodes.override(ctx.db, episode["episodeId"]) == nil
 
@@ -3791,16 +3873,47 @@ defmodule Tightbeam.MemoryGuardTest do
              end)
     end
 
-    test "N11.unreadable / N11.absent / N11.stale (T34 c): records not written by root, malformed, naming no or another episode are rejected and recorded",
+    test "N11.unreadable / N11.absent / N11.stale (T34 c): records not root's, malformed, kindless, unreadable or not files are rejected, recorded once",
          ctx do
       episode = custody_stuck!(ctx, root_uid: 0)
       root_record!(ctx, "by-agent", recovery_record(episode, 1))
-      root_record!(ctx, "garbage", %{"kind" => "custody", "action" => "dance"})
+      root_record!(ctx, "dance", %{"kind" => "custody", "action" => "dance"})
+      dir = RootActions.dir(ctx.base)
+      File.write!(Path.join(dir, "malformed.json"), "{\"action\": \"recovery\", ")
+      File.write!(Path.join(dir, "no-kind.json"), ~s({"action": "recovery", "episodeId": "x"}))
+      File.write!(Path.join(dir, "array.json"), "[1, 2]")
+      unreadable = Path.join(dir, "unreadable.json")
+      File.write!(unreadable, JSON.encode!(recovery_record(episode, 1)))
+      File.chmod!(unreadable, 0o000)
+      on_exit(fn -> File.chmod(unreadable, 0o644) end)
+      {_, 0} = System.cmd("mkfifo", [Path.join(dir, "fifo.json")])
       :ok = MemoryGuard.tick()
 
       reasons = for {_, d} <- events(ctx.db, "memory_guard_root_action_rejected"), do: d["reason"]
       assert "the record was not written by root" in reasons
+      assert "the record is not valid JSON" in reasons
+      assert "the record names no kind" in reasons
+      assert "the record is not a JSON object" in reasons
+      assert Enum.any?(reasons, &(&1 =~ "it is not a regular file (other)"))
+
+      # Running as root, chmod 000 does not stop a read: then it is judged as
+      # the agent-written record it is.
+      if match?({:error, _}, File.read(unreadable)),
+        do: assert(Enum.any?(reasons, &(&1 =~ "it cannot be read: eacces")))
+
       assert Episodes.recovery(ctx.db, episode["episodeId"]) == nil
+      assert MemoryGuard.read(@host).rootActionsUnavailable == nil
+
+      # Each is judged once: a later sample records nothing more.
+      count = length(reasons)
+      :ok = MemoryGuard.tick()
+      assert length(events(ctx.db, "memory_guard_root_action_rejected")) == count
+
+      # And root's next command run is told which records it may move aside.
+      assert {:ok, listed} = File.read(RootActions.judged_list(ctx.base))
+
+      assert %{"judged" => judged} = JSON.decode!(listed)
+      assert "malformed.json" in judged and "fifo.json" in judged
     end
 
     test "N11.stale (T34 a, b, d): one digest is judged once, concurrently and after a restart; a record naming an ended episode is rejected for its successor",
@@ -3850,7 +3963,7 @@ defmodule Tightbeam.MemoryGuardTest do
                Episodes.judge(ctx.db, replay, "other-digest", @host)
     end
 
-    test "N5 (T35): the root-path finding chooses the statement; an override whose printed statement does not match it is refused",
+    test "N5 (T35): an override whose statement is not exactly the one printed for its episode, survivors, operator and finding is refused",
          ctx do
       episode = custody_stuck!(ctx, finding: fn -> residual_finding() end)
 
@@ -3863,23 +3976,109 @@ defmodule Tightbeam.MemoryGuardTest do
       :ok = MemoryGuard.tick()
       assert %{"outcome" => "failed"} = Episodes.recovery(ctx.db, episode["episodeId"])
 
-      root_record!(ctx, "override-strict", override_record(episode, "strict"))
+      rejected = fn ->
+        for {_, d} <- events(ctx.db, "memory_guard_root_action_rejected"), do: d["reason"]
+      end
+
+      # The statement the strict finding selects, on a residual host.
+      root_record!(ctx, "override-strict", override_record(ctx, episode, strict_finding()))
       :ok = MemoryGuard.tick()
       assert Episodes.override(ctx.db, episode["episodeId"]) == nil
+      assert Enum.any?(rejected.(), &(&1 =~ "does not match the root-path finding"))
 
-      root_record!(ctx, "override-residual", override_record(episode, "residual"))
+      # Forged same-kind bodies: a placeholder, and the real text with a tree
+      # line changed, are refused.
+      for {name, statement} <- [
+            {"override-placeholder", "as printed"},
+            {"override-edited",
+             String.replace(
+               override_record(ctx, episode, residual_finding())["statement"],
+               "launch record sl-stuck",
+               "launch record sl-other"
+             )}
+          ] do
+        record =
+          override_record(ctx, episode, residual_finding(), %{
+            "statement" => statement,
+            "note" => name
+          })
+
+        root_record!(ctx, name, record)
+        :ok = MemoryGuard.tick()
+        assert Episodes.override(ctx.db, episode["episodeId"]) == nil
+      end
+
+      assert Enum.count(rejected.(), &(&1 =~ "printed statement is not the one")) == 2
+
+      # Trees that are not the failed recovery's survivors are refused.
+      root_record!(
+        ctx,
+        "override-trees",
+        override_record(ctx, episode, residual_finding(), %{"trees" => []})
+      )
+
+      :ok = MemoryGuard.tick()
+      assert Enum.any?(rejected.(), &(&1 =~ "not the survivors"))
+
+      # The exact statement is accepted, with the gateway's own finding.
+      root_record!(ctx, "override-residual", override_record(ctx, episode, residual_finding()))
       :ok = MemoryGuard.tick()
 
       assert %{
                "finding" => %{"groups" => %{"result" => "present"}},
-               "statementKind" => "residual"
+               "statementKind" => "residual",
+               "statement" => statement
              } =
                Episodes.override(ctx.db, episode["episodeId"])
 
+      assert statement =~ "launch record sl-stuck, process 951"
+      assert statement =~ "Recorded as: root, invoked by george (uid 1000)."
+      assert statement =~ "can gain root, here through groups (docker)"
       assert RootPath.kind(strict_finding()) == "strict"
+    end
 
-      assert RootPath.statement(residual_finding()) =~
-               "can gain root, here through groups (docker)"
+    test "N5 golden: the gateway's override statement is byte for byte the CLI's (same fixture)",
+         _ctx do
+      episode = %{
+        "episodeId" => "ep_golden",
+        "host" => "sirius",
+        "kind" => "custody",
+        "key" => "claude:shared@sirius",
+        "why" => "1 agent processes could not be confirmed stopped"
+      }
+
+      survivors = [
+        %{
+          "launchId" => "sl-9",
+          "pid" => 4242,
+          "start" => 7,
+          "unit" => "/tightbeam.slice/harness/session-sl-9",
+          "state" => "D"
+        }
+      ]
+
+      operator = %{"user" => "root", "sudoUser" => "george", "sudoUid" => "1000"}
+
+      finding = %{
+        "groups" => %{"result" => "present", "detail" => ["docker", "lxd"]},
+        "sudo" => %{"result" => "unknown", "detail" => "no tty"},
+        "sockets" => %{"result" => "absent", "detail" => []}
+      }
+
+      assert RootActions.statement(episode, survivors, operator, finding) ==
+               "Episode ep_golden on sirius: Tightbeam holds the replacement of the " <>
+                 "claude:shared@sirius adapter because 1 agent processes could not be " <>
+                 "confirmed stopped.\n" <>
+                 "  - launch record sl-9, process 4242 started at 7, unit " <>
+                 "/tightbeam.slice/harness/session-sl-9, state D\n" <>
+                 "Risk accepted: 1 agent processes could not be stopped, even by root. " <>
+                 "Launching a replacement means they may keep using memory outside every " <>
+                 "limit until they end or the machine reboots.\n" <>
+                 "Recorded as: root, invoked by george (uid 1000).\n" <>
+                 "This machine's agents run as a user that can gain root, here through " <>
+                 "groups (docker, lxd); a path that could not be checked (sudo). So a " <>
+                 "process with that access, including an agent breaking its rules, could " <>
+                 "also run this override.\n"
     end
 
     test "N7.stale / N9.unreadable / N3.stale / N10.stale (T34 e, T31 3, T36 a): an accepted custody override lifts the fence for the named tree only, once; the episode stays open with its risk",
@@ -3894,7 +4093,7 @@ defmodule Tightbeam.MemoryGuardTest do
       )
 
       :ok = MemoryGuard.tick()
-      root_record!(ctx, "override-1", override_record(episode, "strict"))
+      root_record!(ctx, "override-1", override_record(ctx, episode, strict_finding()))
       :ok = MemoryGuard.tick()
       assert %{"operator" => %{"sudoUser" => "george"}} = Episodes.override(ctx.db, id)
 
@@ -3906,7 +4105,7 @@ defmodule Tightbeam.MemoryGuardTest do
       root_record!(
         ctx,
         "override-2",
-        Map.put(override_record(episode, "strict"), "note", "again")
+        override_record(ctx, episode, strict_finding(), %{"note" => "again"})
       )
 
       :ok = MemoryGuard.tick()
@@ -3923,6 +4122,102 @@ defmodule Tightbeam.MemoryGuardTest do
       assert MemoryGuard.read(@host).stuckEpisodes == []
     end
 
+    test "N3.unreadable (B6): unlisted trees are unknown, never proof: the episode stays open until they are known and shown gone",
+         ctx do
+      insert_adapter_row!(ctx.db, "adapter-launch-1", 950)
+      {:ok, _} = DB.query(ctx.db, "UPDATE harness_processes SET state='exited'")
+      proc!(ctx.root, 951, 1, 951, 10 * @mib)
+      launch!(ctx.base, "sl-stuck", "sid-stuck", 951, 951, 512 * @mib)
+      # Tightbeam's own launch-record inventory cannot be read.
+      bad = Path.join([Records.dir(ctx.base), "sessions", "sl-bad.json"])
+      File.write!(bad, "{not json")
+
+      guard!(ctx,
+        kill_result: {:error, :harness_group_failed},
+        signal_works: false,
+        root_uid: ctx.uid
+      )
+
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a new adapter")
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+
+      # Sustained: many samples, one episode, never ended on an empty set.
+      for _ <- 1..5, do: :ok = MemoryGuard.tick()
+
+      assert [%{"episodeId" => id, "trees" => nil, "treesUnknown" => unknown}] =
+               Enum.filter(Episodes.active(ctx.db, @host), &(&1["kind"] == "custody"))
+
+      assert unknown =~ "sl-bad.json"
+      assert events(ctx.db, "memory_guard_episode_ended") == []
+
+      assert length(
+               for {_, %{"kind" => "custody"}} <- events(ctx.db, "memory_guard_episode_opened"),
+                   do: 1
+             ) == 1
+
+      assert [%{trees: "unknown: " <> _}] =
+               Enum.filter(MemoryGuard.read(@host).stuckEpisodes, &(&1.kind == "custody"))
+
+      # Root cannot recover unknown trees: the episode it publishes names none.
+      assert {:ok, published} =
+               File.read(Path.join([Records.dir(ctx.base), "episodes", id <> ".json"]))
+
+      assert %{"trees" => nil} = JSON.decode!(published)
+
+      # The inventory reads again: the trees are named, and still not gone.
+      File.rm!(bad)
+      :ok = MemoryGuard.tick()
+
+      assert [%{"trees" => [%{"launchId" => "sl-stuck"}]}] =
+               Enum.filter(Episodes.active(ctx.db, @host), &(&1["kind"] == "custody"))
+
+      assert events(ctx.db, "memory_guard_episode_ended")
+             |> Enum.filter(fn {subject, _} -> subject == id end) == []
+
+      gone!(ctx.root, 951)
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+
+      assert [{^id, %{"reason" => "every named tree is shown gone"}}] =
+               events(ctx.db, "memory_guard_episode_ended")
+               |> Enum.filter(fn {subject, _} -> subject == id end)
+    end
+
+    test "B7: an already judged root record costs no read or lookup; many records are judged once",
+         ctx do
+      episode = custody_stuck!(ctx)
+      dir = RootActions.dir(ctx.base)
+      File.mkdir_p!(dir)
+
+      for n <- 1..2_000 do
+        File.write!(
+          Path.join(dir, "recovery-#{n}.json"),
+          JSON.encode!(Map.put(recovery_record(episode, 1), "host", "elsewhere-#{n}"))
+        )
+      end
+
+      :ok = MemoryGuard.tick()
+      seen = :sys.get_state(MemoryGuard).root_seen
+      assert MapSet.size(seen) == 2_000
+      assert length(events(ctx.db, "memory_guard_root_action_rejected")) == 2_000
+
+      # With the judged set, a pass needs no database at all: an unreachable
+      # one is never asked.
+      assert %{seen: ^seen, error: nil} =
+               RootActions.intake(:no_such_db, ctx.base, @host, root_uid: ctx.uid, seen: seen)
+
+      # A record changed in place is a new record.
+      changed = Path.join(dir, "recovery-1.json")
+      File.write!(changed, JSON.encode!(Map.put(recovery_record(episode, 1), "host", "other")))
+      File.touch!(changed, System.os_time(:second) + 5)
+
+      assert %{error: error} =
+               RootActions.intake(:no_such_db, ctx.base, @host, root_uid: ctx.uid, seen: seen)
+
+      assert error =~ "recovery-1.json"
+    end
+
     test "N10.unreadable: an episode read that cannot be completed says unknown, never none",
          _ctx do
       assert %{unknown: _} = Episodes.read(:no_such_db, @host)
@@ -3930,7 +4225,7 @@ defmodule Tightbeam.MemoryGuardTest do
   end
 
   describe "matrix N: the guard down (FS9, Watcher)" do
-    alias Tightbeam.MemoryGuard.{Episodes, RootActions, Watcher}
+    alias Tightbeam.MemoryGuard.{Episodes, RootActions, RootPath, Watcher}
 
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
@@ -3967,12 +4262,40 @@ defmodule Tightbeam.MemoryGuardTest do
            guard_running?: fn -> Process.whereis(MemoryGuard) != nil end,
            root_uid: File.stat!(ctx.root).uid,
            finding: fn -> strict_finding() end,
-           owner_alert: fn episode, _message ->
-             send(test, {:owner_alert, episode["episodeId"]})
+           started: :counters.get(clock, 1),
+           owner_alert: fn txn, input ->
+             result = Tightbeam.OwnerAlerts.memory_guard_stuck_in_txn(txn, input)
+             if match?({:created, _}, result), do: send(test, {:owner_alert, input.episode_id})
+             result
            end}
         )
 
       %{watcher: watcher, clock: clock}
+    end
+
+    # The gateway service restarts: a new watcher whose start is now.
+    defp restart_watcher!(ctx) do
+      test = self()
+      stop_supervised!(Watcher)
+
+      start_supervised!(
+        {Watcher,
+         db: ctx.db,
+         base_dir: ctx.base,
+         local_host: @host,
+         interval_ms: :manual,
+         name: :mg_watcher_test,
+         clock: fn -> :counters.get(ctx.clock, 1) end,
+         guard_running?: fn -> Process.whereis(MemoryGuard) != nil end,
+         root_uid: File.stat!(ctx.root).uid,
+         finding: fn -> strict_finding() end,
+         started: :counters.get(ctx.clock, 1),
+         owner_alert: fn txn, input ->
+           result = Tightbeam.OwnerAlerts.memory_guard_stuck_in_txn(txn, input)
+           if match?({:created, _}, result), do: send(test, {:owner_alert, input.episode_id})
+           result
+         end}
+      )
     end
 
     defp guard_record!(ctx, episode, action, extra \\ %{}) do
@@ -3988,7 +4311,9 @@ defmodule Tightbeam.MemoryGuardTest do
             "host" => @host,
             "kind" => "guard",
             "key" => nil,
-            "operator" => %{"user" => "root", "sudoUser" => "unknown", "sudoUid" => "unknown"}
+            "operator" => %{"user" => "root", "sudoUser" => "unknown", "sudoUid" => "unknown"},
+            # Root wrote it now.
+            "at" => :counters.get(ctx.clock, 1)
           },
           extra
         )
@@ -4001,10 +4326,20 @@ defmodule Tightbeam.MemoryGuardTest do
 
     test "N1.absent (T30 a): launches held because the guard is down for 15 minutes open one guard episode, with one alert and one Main notice; it ends when the guard answers",
          ctx do
+      Org.put_setting(ctx.db, "owner-alerts-user", "owner")
       :ok = Watcher.tick(:mg_watcher_test)
       assert [%{"kind" => "guard", "episodeId" => id}] = Episodes.active(ctx.db, @host)
       assert_received {:owner_alert, ^id}
       assert [_] = events(ctx.db, "memory_guard_stuck_notified")
+
+      {:ok, [[body]]} =
+        DB.query(ctx.db, "SELECT body FROM owner_alerts WHERE dedupeKey=?1", [
+          "memory-guard-stuck:" <> id
+        ])
+
+      assert body =~ "has held new agent launches"
+      assert body =~ "because the memory guard is not running"
+      assert body =~ "Root-path check now: " <> RootPath.statement(strict_finding())
 
       :ok = Watcher.tick(:mg_watcher_test)
       refute_received {:owner_alert, _}
@@ -4017,17 +4352,55 @@ defmodule Tightbeam.MemoryGuardTest do
                events(ctx.db, "memory_guard_episode_ended")
     end
 
-    test "N4 (guard): a guard recovery is failed 5 minutes after the start that found it if the guard has not answered; cleared once it answers",
+    test "N4 (guard): pending without a restart; the first start that finds it starts the 5-minute clock, then failed",
          ctx do
       :ok = Watcher.tick(:mg_watcher_test)
       [episode] = Episodes.active(ctx.db, @host)
       guard_record!(ctx, episode, "recovery")
       :ok = Watcher.tick(:mg_watcher_test)
+
+      assert %{"outcome" => "pending", "startedAt" => nil} =
+               Episodes.recovery(ctx.db, episode["episodeId"])
+
+      # No restart: still pending long after.
+      :counters.add(ctx.clock, 1, 60 * 60_000)
+      :ok = Watcher.tick(:mg_watcher_test)
+
+      assert %{"outcome" => "pending", "startedAt" => nil} =
+               Episodes.recovery(ctx.db, episode["episodeId"])
+
+      # Root restarts the service; the new start finds the pending recovery.
+      :counters.add(ctx.clock, 1, 1_000)
+      restart_watcher!(ctx)
+      started = :counters.get(ctx.clock, 1)
+      :ok = Watcher.tick(:mg_watcher_test)
+
+      assert %{"outcome" => "pending", "startedAt" => ^started} =
+               Episodes.recovery(ctx.db, episode["episodeId"])
+
+      assert [{_, %{"startedAt" => ^started}}] = events(ctx.db, "memory_guard_recovery_started")
+
+      :counters.add(ctx.clock, 1, 5 * 60_000 - 1)
+      :ok = Watcher.tick(:mg_watcher_test)
       assert %{"outcome" => "pending"} = Episodes.recovery(ctx.db, episode["episodeId"])
 
-      :counters.add(ctx.clock, 1, 6 * 60_000)
+      # A second restart does not move the clock.
+      restart_watcher!(ctx)
+      :counters.add(ctx.clock, 1, 1)
       :ok = Watcher.tick(:mg_watcher_test)
       assert %{"outcome" => "failed"} = Episodes.recovery(ctx.db, episode["episodeId"])
+    end
+
+    test "N4 (guard, cleared): a pending guard recovery clears, ending its episode, once the guard answers",
+         ctx do
+      :ok = Watcher.tick(:mg_watcher_test)
+      [episode] = Episodes.active(ctx.db, @host)
+      guard_record!(ctx, episode, "recovery")
+      :ok = Watcher.tick(:mg_watcher_test)
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert %{"outcome" => "cleared"} = Episodes.recovery(ctx.db, episode["episodeId"])
+      assert Episodes.active(ctx.db, @host) == []
     end
 
     test "N9 (guard) / T36 b: after a failed recovery, a root override admits the held launches without the guard; the risk stays shown until it answers",
@@ -4036,12 +4409,20 @@ defmodule Tightbeam.MemoryGuardTest do
       [episode] = Episodes.active(ctx.db, @host)
       guard_record!(ctx, episode, "recovery")
       :ok = Watcher.tick(:mg_watcher_test)
+      :counters.add(ctx.clock, 1, 1_000)
+      restart_watcher!(ctx)
+      :ok = Watcher.tick(:mg_watcher_test)
       :counters.add(ctx.clock, 1, 6 * 60_000)
       :ok = Watcher.tick(:mg_watcher_test)
+      assert %{"outcome" => "failed"} = Episodes.recovery(ctx.db, episode["episodeId"])
+
+      stored = Episodes.get(ctx.db, episode["episodeId"])
+      operator = %{"user" => "root", "sudoUser" => "unknown", "sudoUid" => "unknown"}
 
       guard_record!(ctx, episode, "override", %{
         "statementKind" => "strict",
-        "statement" => "as printed"
+        "statement" => RootActions.statement(stored, [], operator, strict_finding()),
+        "trees" => []
       })
 
       :ok = Watcher.tick(:mg_watcher_test)
@@ -4158,6 +4539,7 @@ defmodule Tightbeam.MemoryGuardTest do
         DB.query(ctx.db, "UPDATE users SET createdAt=createdAt+1000 WHERE userId='guest'")
 
       main!(ctx, "owner")
+      :ok = Org.put_setting(ctx.db, "owner-alerts-user", "owner")
       {harness, unit, set_mode} = enforced_with_unit!(ctx)
 
       # A session tree launched before the switch, of an adapter that has
@@ -4695,6 +5077,10 @@ defmodule Tightbeam.MemoryGuardTest do
       dir = RootActions.dir(ctx.base)
       File.mkdir_p!(dir)
 
+      # No operator and no time in the record: as printed, the statement says
+      # the operator is unknown.
+      stored = Episodes.get(ctx.db, episode["episodeId"])
+
       File.write!(
         Path.join(dir, "override.json"),
         JSON.encode!(%{
@@ -4702,7 +5088,9 @@ defmodule Tightbeam.MemoryGuardTest do
           episodeId: episode["episodeId"],
           host: @host,
           kind: "guard",
-          statementKind: "strict"
+          statementKind: "strict",
+          statement: RootActions.statement(stored, [], %{}, strict_finding()),
+          trees: []
         })
       )
 
@@ -4713,11 +5101,13 @@ defmodule Tightbeam.MemoryGuardTest do
 
       assert %{
                "operator" => %{"user" => "root", "sudoUser" => "unknown", "sudoUid" => "unknown"},
-               "statement" => "unknown",
-               "trees" => "unknown",
+               "statement" => statement,
+               "trees" => [],
                "at" => "unknown",
                "finding" => %{}
              } = Episodes.override(ctx.db, episode["episodeId"])
+
+      assert statement =~ "Recorded as: root, invoked by unknown (uid unknown)."
     end
   end
 
@@ -4813,11 +5203,27 @@ defmodule Tightbeam.MemoryGuardTest do
       dir = RootActions.dir(ctx.base)
       File.mkdir_p!(dir)
 
-      for {name, record} <- [
-            {"recovery",
-             %{action: "recovery", killedAt: System.system_time(:millisecond) - 61_000}},
-            {"override", %{action: "override", statementKind: "strict", statement: "s"}}
-          ] do
+      for name <- ["recovery", "override"] do
+        record =
+          if name == "recovery" do
+            %{action: "recovery", killedAt: System.system_time(:millisecond) - 61_000}
+          else
+            stored = Episodes.get(ctx.db, episode["episodeId"])
+            survivors = stored["recovery"]["survivors"]
+            finding = %{"groups" => %{"result" => "absent", "detail" => []}}
+
+            finding =
+              Map.merge(finding, %{"sudo" => finding["groups"], "sockets" => finding["groups"]})
+
+            %{
+              action: "override",
+              statementKind: "strict",
+              statement:
+                Tightbeam.MemoryGuard.RootActions.statement(stored, survivors, %{}, finding),
+              trees: survivors
+            }
+          end
+
         File.write!(
           Path.join(dir, name <> ".json"),
           JSON.encode!(

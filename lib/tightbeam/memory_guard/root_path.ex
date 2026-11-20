@@ -80,9 +80,14 @@ defmodule Tightbeam.MemoryGuard.RootPath do
   defp sockets(runner, sockets) do
     results =
       for path <- sockets do
-        cond do
-          not File.exists?(path) ->
+        # Only a socket that is not there is absent; one that cannot be looked
+        # at is unknown.
+        case Tightbeam.MemoryGuard.Cgroup.exists?(path) do
+          false ->
             {path, "absent"}
+
+          :unknown ->
+            {path, "unknown"}
 
           true ->
             case safe(runner, "test", ["-w", path]) do

@@ -2442,21 +2442,46 @@ defmodule Tightbeam.Gateway do
 
   # v1.13 FS2: the launch step's own refusal record for this turn's session
   # process, made at or after the turn's claim.
-  defp step_refusal_for(config, db, %{session_key: session_key}, turn) do
-    case Org.current_pointer(db, session_key) do
+  # When the refusals cannot be read, whether the step refused is unknown: the
+  # turn is settled as a refusal of unknown reason, never as harness-health
+  # evidence, and the step's prerequisites hold further launches until they
+  # read again.
+  defp step_refusal_for(config, db, %{session_key: session_key} = session, turn) do
+    case step_session?(session) && Org.current_pointer(db, session_key) do
       %{harness_session_id: sid} when is_binary(sid) ->
-        Tightbeam.MemoryGuard.Records.refusal_for(
-          config.base_dir,
-          sid,
-          turn_started_at(db, turn.seq) || 0
-        )
+        case Tightbeam.MemoryGuard.Records.refusal_for(
+               config.base_dir,
+               sid,
+               turn_started_at(db, turn.seq) || 0
+             ) do
+          {:error, reason} -> unknown_step_refusal(reason)
+          refusal -> refusal
+        end
 
       _ ->
         nil
     end
   rescue
-    _ -> nil
+    error -> unknown_step_refusal(Exception.message(error))
   end
+
+  # Only a local session process of a harness that launches them goes
+  # through the launch step.
+  defp step_session?(%{host: host, harness: harness}) when is_binary(harness) do
+    host == Tightbeam.Placement.local_host_name() and
+      Tightbeam.Harness.session_processes?(Tightbeam.Harness.parse!(harness))
+  rescue
+    _ -> false
+  end
+
+  defp step_session?(_session), do: false
+
+  defp unknown_step_refusal(reason),
+    do: %{
+      launch_id: nil,
+      reason: "unknown: the launch step's refusal records cannot be read (#{reason})",
+      at: nil
+    }
 
   defp turn_started_at(db, seq) do
     case DB.query(db, "SELECT startedAt FROM turns WHERE seq=?1", [seq]) do

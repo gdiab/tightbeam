@@ -235,15 +235,33 @@ defmodule Tightbeam.MemoryGuard.Cgroup do
     end
   end
 
+  @doc """
+  Whether `path` exists: `true`, `false` (absent) or `:unknown` when it cannot
+  be looked at. Only absence is evidence of absence.
+  """
+  @spec exists?(String.t()) :: boolean() | :unknown
+  def exists?(path) do
+    case File.stat(path) do
+      {:ok, _} -> true
+      {:error, reason} when reason in [:enoent, :enotdir] -> false
+      {:error, _} -> :unknown
+    end
+  end
+
   @doc "The units directly under the budget group; a listing failure is an error."
   @spec units(layout()) :: {:ok, [String.t()]} | {:error, String.t()}
   def units(%{fs: fs, harness: harness}) do
     case File.ls(dir(fs, harness)) do
       {:ok, entries} ->
+        # An entry that cannot be looked at may be a unit: it is listed, and
+        # whoever reads it finds it unreadable.
         units =
           for entry <- entries,
               String.starts_with?(entry, "adapter-") or String.starts_with?(entry, "session-"),
-              File.dir?(Path.join(dir(fs, harness), entry)),
+              (case File.stat(Path.join(dir(fs, harness), entry)) do
+                 {:ok, %File.Stat{type: type}} -> type == :directory
+                 {:error, reason} -> reason not in [:enoent, :enotdir]
+               end),
               do: Path.join(harness, entry)
 
         {:ok, units}

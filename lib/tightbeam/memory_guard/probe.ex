@@ -15,6 +15,8 @@ defmodule Tightbeam.MemoryGuard.Probe do
   Every path is read under `:root` (default `/`), so tests use a fake tree.
   """
 
+  alias Tightbeam.MemoryGuard.Cgroup
+
   @type mode :: :enforced | :watched | :count_only
   @type result :: %{
           mode: mode(),
@@ -143,11 +145,13 @@ defmodule Tightbeam.MemoryGuard.Probe do
   @spec harness_candidates(String.t()) :: {:ok, [String.t()]} | :error
   def harness_candidates(root \\ "/") do
     # No cgroup v2 at all: no limit of this contract can exist (FS1 / F8).
-    if not File.exists?(Path.join(root, "sys/fs/cgroup/cgroup.controllers")) and
-         not File.exists?(Path.join(root, "proc/self/cgroup")) do
-      {:ok, []}
-    else
-      own_harness_candidates(root)
+    # Only absence shows that; what cannot be looked at is not absent.
+    case {Cgroup.exists?(Path.join(root, "sys/fs/cgroup/cgroup.controllers")),
+          Cgroup.exists?(Path.join(root, "proc/self/cgroup"))} do
+      {false, false} -> {:ok, []}
+      {:unknown, _} -> :error
+      {_, :unknown} -> :error
+      _ -> own_harness_candidates(root)
     end
   end
 

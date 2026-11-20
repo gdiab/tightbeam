@@ -42,12 +42,17 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
   users' processes cannot be in a Tightbeam tree unless it changed user, and
   are not counted here.
   """
-  @spec unreadable_own(String.t(), table()) :: [pos_integer()]
+  @spec unreadable_own(String.t(), table()) :: [pos_integer()] | :error
   def unreadable_own(root, table) do
     proc = Path.join(root, "proc")
     own = own_uid()
 
-    case File.ls(proc) do
+    # Without our own uid, or without the process list, which processes are
+    # ours and unreadable is unknown: never "none".
+    case own && File.ls(proc) do
+      nil ->
+        :error
+
       {:ok, entries} ->
         for entry <- entries,
             {pid, ""} <- [Integer.parse(entry)],
@@ -59,7 +64,7 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
             do: pid
 
       {:error, _} ->
-        []
+        :error
     end
   end
 

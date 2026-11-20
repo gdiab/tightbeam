@@ -13,7 +13,10 @@ defmodule Tightbeam.MemoryGuard.HeldState do
 
   alias Tightbeam.{DB, Harness, HarnessProcess, LimitFallback, MemoryGuard}
 
-  @doc "The held state of `session`, or nil when nothing holds its next turn."
+  @doc """
+  The held state of `session`, or nil when nothing holds its next turn. A
+  read that cannot be completed says the state is unknown, never "not held".
+  """
   @spec read(DB.server(), map()) :: map() | nil
   def read(db, session) do
     if queued?(db, session.session_key) do
@@ -37,6 +40,23 @@ defmodule Tightbeam.MemoryGuard.HeldState do
             else: held
       end
     end
+  rescue
+    error -> unknown(session, Exception.message(error))
+  catch
+    :exit, reason -> unknown(session, inspect(reason))
+  end
+
+  defp unknown(session, why) do
+    reason =
+      Map.merge(identity(session), %{
+        reasonClass: "unknown",
+        detail: "unknown",
+        host: session.host,
+        since: nil,
+        condition: "unknown: the held state cannot be read (#{why})"
+      })
+
+    %{reasonClass: "unknown", reasons: [reason]}
   end
 
   @doc "The sender's result for a wake to a held recipient (R7)."
@@ -45,12 +65,13 @@ defmodule Tightbeam.MemoryGuard.HeldState do
   def sender_result(_held), do: nil
 
   defp queued?(db, session_key) do
-    match?(
-      {:ok, [[1]]},
-      DB.query(db, "SELECT 1 FROM turns WHERE sessionKey=?1 AND status='queued' LIMIT 1", [
-        session_key
-      ])
-    )
+    case DB.query(db, "SELECT 1 FROM turns WHERE sessionKey=?1 AND status='queued' LIMIT 1", [
+           session_key
+         ]) do
+      {:ok, [[1]]} -> true
+      {:ok, []} -> false
+      {:error, error} -> raise "the queued turns cannot be read: #{inspect(error)}"
+    end
   end
 
   defp identity(session) do
@@ -79,8 +100,11 @@ defmodule Tightbeam.MemoryGuard.HeldState do
             })
           ]
 
-        _ ->
+        {:ok, []} ->
           []
+
+        {:error, error} ->
+          raise "the park fences cannot be read: #{inspect(error)}"
       end
 
     fallback =

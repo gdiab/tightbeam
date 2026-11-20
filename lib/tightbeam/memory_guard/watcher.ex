@@ -8,7 +8,8 @@ defmodule Tightbeam.MemoryGuard.Watcher do
     `guard_unavailable` (FS1) for 15 minutes without a break, and sends its
     one alert and Main notice (retried until delivered);
   - judges `guard` recovery records root wrote (B4) and their outcome:
-    `failed` 5 minutes after the gateway start that found the record, if the
+    `failed` 5 minutes after the first gateway start that found the record
+    (a record written during this run waits for root's restart), if the
     guard has still not answered;
   - publishes the active episodes for the root commands.
 
@@ -33,18 +34,29 @@ defmodule Tightbeam.MemoryGuard.Watcher do
       db: Keyword.fetch!(opts, :db),
       base_dir: Keyword.fetch!(opts, :base_dir),
       host: Keyword.get(opts, :local_host, Tightbeam.Placement.local_host_name()),
-      started: System.system_time(:millisecond),
+      # This gateway's start: the runtime's, not this process's, so a restart
+      # of the watcher alone is not a service restart (FS9 Step 1, B2).
+      started: Keyword.get_lazy(opts, :started, &gateway_started/0),
       clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
       interval: Keyword.get(opts, :interval_ms, 30_000),
       guard_running?: Keyword.get(opts, :guard_running?, &MemoryGuard.running?/0),
       owner_alert:
-        Keyword.get(opts, :owner_alert, fn _episode, _message -> :owner_alerts_route_absent end),
+        Keyword.get(opts, :owner_alert, &Tightbeam.OwnerAlerts.memory_guard_stuck_in_txn/2),
       root_uid: Keyword.get(opts, :root_uid, 0),
-      finding: Keyword.get(opts, :finding, fn -> Tightbeam.MemoryGuard.RootPath.finding() end)
+      finding: Keyword.get(opts, :finding, fn -> Tightbeam.MemoryGuard.RootPath.finding() end),
+      root_seen: MapSet.new(),
+      # Each episode's alert text, with the root-path finding taken when it
+      # was first sent; a retry sends the same text.
+      messages: %{}
     }
 
     if state.interval != :manual, do: Process.send_after(self(), :tick, state.interval)
     {:ok, state}
+  end
+
+  defp gateway_started do
+    {since_start, _} = :erlang.statistics(:wall_clock)
+    System.system_time(:millisecond) - since_start
   end
 
   @impl true
@@ -60,58 +72,98 @@ defmodule Tightbeam.MemoryGuard.Watcher do
   def handle_info(_message, state), do: {:noreply, state}
 
   defp pass(state) do
-    unless state.guard_running?.() do
+    if state.guard_running?.() do
+      state
+    else
       now = state.clock.()
-      open_guard_episode(state, now)
+      state = open_guard_episode(state, now)
 
-      RootActions.intake(state.db, state.base_dir, state.host,
-        root_uid: state.root_uid,
-        kinds: ["guard"],
-        finding: state.finding
-      )
+      %{seen: seen, error: error} =
+        RootActions.intake(state.db, state.base_dir, state.host,
+          root_uid: state.root_uid,
+          kinds: ["guard"],
+          finding: state.finding,
+          seen: state.root_seen
+        )
+
+      if error, do: Logger.warning("memory guard watcher: root actions: #{error}")
+      state = %{state | root_seen: seen}
 
       RootActions.guard_outcomes(state.db, state.host, false, state.started, now)
-      Episodes.publish(state.db, state.base_dir, state.host)
 
-      # Alerts and notices not yet delivered are retried (idempotent).
-      for episode <- Episodes.active(state.db, state.host),
-          do: Episodes.notify(state.db, episode, state.owner_alert)
+      with {:error, message} <- Episodes.publish(state.db, state.base_dir, state.host),
+           do: Logger.warning("memory guard watcher: episodes not published: #{message}")
+
+      # Alerts and notices not yet recorded are retried (idempotent).
+      Enum.reduce(Episodes.active(state.db, state.host), state, &notify(&2, &1))
     end
-
-    state
   rescue
     error ->
       Logger.warning("memory guard watcher: #{Exception.message(error)}")
       state
   end
 
+  defp notify(state, episode) do
+    id = episode["episodeId"]
+
+    message = fn episode ->
+      Map.get_lazy(state.messages, id, fn -> Episodes.message(episode, state.finding.()) end)
+    end
+
+    if episode["alert"] != nil and episode["notified"] do
+      %{state | messages: Map.delete(state.messages, id)}
+    else
+      text = message.(episode)
+
+      case Episodes.notify(state.db, episode,
+             route: state.owner_alert,
+             message: fn _ -> text end
+           ) do
+        :ok ->
+          %{state | messages: Map.delete(state.messages, id)}
+
+        {:error, reason} ->
+          Logger.warning("memory guard watcher: episode #{id} alert not sent: #{inspect(reason)}")
+          %{state | messages: Map.put(state.messages, id, text)}
+      end
+    end
+  end
+
   # The oldest `guard_unavailable` hold still open on the host: launches have
-  # been held, without a break, since then.
+  # been held, without a break, since then. Holds that cannot be read open
+  # nothing now and are read again on the next pass.
   defp open_guard_episode(state, now) do
-    since =
-      for {session_key, host} <- Unguarded.held_sessions(state.db),
-          host == state.host,
-          %{since: since} <- [Unguarded.open_hold(state.db, session_key)],
-          do: since
+    case Unguarded.held_sessions(state.db) do
+      {:error, reason} ->
+        Logger.warning("memory guard watcher: holds cannot be read: #{reason}")
+        state
 
-    case since do
-      [] ->
-        :ok
+      {:ok, held} ->
+        since =
+          for {session_key, host} <- held,
+              host == state.host,
+              %{since: since} <- [Unguarded.open_hold(state.db, session_key)],
+              do: since
 
-      list ->
-        oldest = Enum.min(list)
-
-        if now - oldest >= Episodes.stuck_ms() do
-          case Episodes.open(state.db, %{
+        with [_ | _] <- since,
+             oldest = Enum.min(since),
+             true <- now - oldest >= Episodes.stuck_ms(),
+             {:opened, episode} <-
+               Episodes.open(state.db, %{
                  host: state.host,
                  kind: "guard",
                  since: oldest,
                  base: state.base_dir,
                  why: "the memory guard is not running"
                }) do
-            {:opened, episode} -> Episodes.notify(state.db, episode, state.owner_alert)
-            _ -> :ok
-          end
+          notify(state, episode)
+        else
+          {:error, reason} ->
+            Logger.warning("memory guard watcher: episode not opened, retried: #{reason}")
+            state
+
+          _ ->
+            state
         end
     end
   end

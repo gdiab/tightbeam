@@ -18,6 +18,17 @@ defmodule Tightbeam.MemoryGuard.Admission do
 
   alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Ledger, LimitFallback, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.MemoryGuard.State
+
+  # Current state in `memory_guard_open` (review B7): what is pending or held
+  # now, and the done markers looked up by turn, so no sample or admission
+  # reads the lifecycle history.
+  @quota_pending "quota_readmission"
+  @memory_pending "memory_readmission"
+  @step_hold "step_hold"
+  @readmitted "readmitted_queued"
+  @readmitted_seq "readmitted_seq"
+  @readmitted_source "readmitted_source"
 
   @doc """
   The standing reasons other than this contract's that hold `session_key`
@@ -124,16 +135,16 @@ defmodule Tightbeam.MemoryGuard.Admission do
           })
         )
 
-        EventLog.lifecycle_in_txn(
-          txn,
-          "quota_readmission_deferred",
-          incident_id,
-          JSON.encode!(%{host: host, harness: harness, incidentId: incident_id})
-        )
-
+        quota_deferred_in_txn(txn, incident_id, harness, host)
         Tightbeam.MemoryGuard.note_deferred()
         :deferred
     end
+  end
+
+  defp quota_deferred_in_txn(txn, incident_id, harness, host) do
+    detail = JSON.encode!(%{host: host, harness: harness, incidentId: incident_id})
+    State.open_in_txn(txn, @quota_pending, incident_id, incident_id, host, detail)
+    EventLog.lifecycle_in_txn(txn, "quota_readmission_deferred", incident_id, detail)
   end
 
   # The quota hook (companion B5) is one hook covering every session of the
@@ -164,14 +175,16 @@ defmodule Tightbeam.MemoryGuard.Admission do
       held == [] ->
         Wakes.readmit_released_quota_intents_in_txn(txn, incident_id)
 
-        if deferred?,
-          do:
-            EventLog.lifecycle_in_txn(
-              txn,
-              "quota_readmission_resumed",
-              incident_id,
-              JSON.encode!(%{host: host, harness: harness})
-            )
+        if deferred? do
+          State.close_in_txn(txn, @quota_pending, incident_id)
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "quota_readmission_resumed",
+            incident_id,
+            JSON.encode!(%{host: host, harness: harness})
+          )
+        end
 
         resumed_in_txn(txn, incident_id, host, last_released(txn, incident_id, released))
         :resumed
@@ -193,14 +206,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
           })
         )
 
-        unless deferred?,
-          do:
-            EventLog.lifecycle_in_txn(
-              txn,
-              "quota_readmission_deferred",
-              incident_id,
-              JSON.encode!(%{host: host, harness: harness, incidentId: incident_id})
-            )
+        unless deferred?, do: quota_deferred_in_txn(txn, incident_id, harness, host)
 
         Tightbeam.MemoryGuard.note_deferred()
         :deferred
@@ -254,12 +260,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
 
       Tightbeam.MemoryGuard.host_reasons(host) != [] or
           other_reasons_in_txn(txn, session_of(txn, seq)) != [] ->
-        EventLog.lifecycle_in_txn(
-          txn,
-          "memory_readmission_pending",
-          session_of(txn, seq),
-          JSON.encode!(%{host: host, sourceSeq: seq})
-        )
+        memory_pending_in_txn(txn, session_of(txn, seq), seq, host)
 
         Tightbeam.MemoryGuard.note_deferred()
         :deferred
@@ -295,23 +296,15 @@ defmodule Tightbeam.MemoryGuard.Admission do
       })
     )
 
-    if earlier >= 1 and not step_hold_open_in_txn?(txn, session_key) do
-      EventLog.lifecycle_in_txn(
-        txn,
-        "memory_guard_step_hold",
-        session_key,
-        JSON.encode!(%{host: host, detail: "guard_unavailable"})
-      )
+    if earlier >= 1 and not State.open_in_txn?(txn, @step_hold, session_key) do
+      detail = JSON.encode!(%{host: host, detail: "guard_unavailable"})
+      State.open_in_txn(txn, @step_hold, session_key, session_key, host, detail)
+      EventLog.lifecycle_in_txn(txn, "memory_guard_step_hold", session_key, detail)
     end
 
     if Tightbeam.MemoryGuard.host_reasons(host) != [] or
          other_reasons_in_txn(txn, session_key) != [] do
-      EventLog.lifecycle_in_txn(
-        txn,
-        "memory_readmission_pending",
-        session_key,
-        JSON.encode!(%{host: host, sourceSeq: seq})
-      )
+      memory_pending_in_txn(txn, session_key, seq, host)
 
       Tightbeam.MemoryGuard.note_deferred()
       :deferred
@@ -338,56 +331,58 @@ defmodule Tightbeam.MemoryGuard.Admission do
     count
   end
 
-  defp step_hold_open_in_txn?(txn, session_key) do
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM lifecycle_events h
-      WHERE h.kind='memory_guard_step_hold' AND h.subject=?1
-        AND NOT EXISTS (SELECT 1 FROM lifecycle_events r
-                        WHERE r.kind='memory_guard_step_ready' AND r.subject=?1 AND r.id>h.id)
-      LIMIT 1
-      """,
-      [session_key]
-    ) != []
+  defp memory_pending_in_txn(txn, session_key, seq, host) do
+    detail = JSON.encode!(%{host: host, sourceSeq: seq})
+    State.open_in_txn(txn, @memory_pending, Integer.to_string(seq), session_key, host, detail)
+    EventLog.lifecycle_in_txn(txn, "memory_readmission_pending", session_key, detail)
   end
 
-  @doc "Sessions whose launches the step refused twice and are held (FS2)."
-  @spec step_held_sessions(DB.server()) :: [String.t()]
+  @doc """
+  Sessions whose launches the step refused twice and are held (FS2):
+  `{:ok, sessions}` or `{:error, message}`.
+  """
+  @spec step_held_sessions(DB.server()) :: {:ok, [String.t()]} | {:error, String.t()}
   def step_held_sessions(db) do
-    case DB.query(
-           db,
-           """
-           SELECT DISTINCT h.subject FROM lifecycle_events h
-           WHERE h.kind='memory_guard_step_hold'
-             AND NOT EXISTS (SELECT 1 FROM lifecycle_events r
-                             WHERE r.kind='memory_guard_step_ready' AND r.subject=h.subject
-                               AND r.id>h.id)
-           """,
-           []
-         ) do
-      {:ok, rows} -> Enum.map(rows, fn [key] -> key end)
-      _ -> []
+    with {:ok, holds} <- State.list(db, @step_hold), do: {:ok, Enum.map(holds, & &1.subject)}
+  end
+
+  @doc """
+  Whether the step-refusal hold of `session_key` stands (FS2). Raises when it
+  cannot be read: an unread hold is not an absent one.
+  """
+  @spec step_held?(DB.server(), String.t()) :: boolean()
+  def step_held?(db, session_key) do
+    case DB.transaction(db, &State.open_in_txn?(&1, @step_hold, session_key)) do
+      {:ok, held?} -> held?
+      {:error, error} -> raise "the step hold cannot be read: #{Exception.message(error)}"
     end
   end
 
-  @doc "Whether the step-refusal hold of `session_key` stands (FS2)."
-  @spec step_held?(DB.server(), String.t()) :: boolean()
-  def step_held?(db, session_key), do: session_key in step_held_sessions(db)
+  @doc "End the step-refusal hold of `session_key`: its record and its state in one step."
+  @spec step_ready(DB.server(), String.t(), String.t()) :: :ok | {:error, String.t()}
+  def step_ready(db, session_key, host) do
+    DB.transaction(db, fn txn ->
+      State.close_in_txn(txn, @step_hold, session_key)
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        "memory_guard_step_ready",
+        session_key,
+        JSON.encode!(%{host: host, detail: "guard_unavailable"})
+      )
+    end)
+    |> case do
+      {:ok, _} -> :ok
+      {:error, error} -> {:error, Exception.message(error)}
+    end
+  catch
+    :exit, reason -> {:error, inspect(reason)}
+  end
 
   @doc "Whether `seq` is the re-admission of a memory-killed not-started turn."
   @spec readmission?(Txn.t(), pos_integer()) :: boolean()
-  def readmission?(%Txn{} = txn, seq) do
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM lifecycle_events
-      WHERE kind='memory_readmission_done' AND json_extract(detail,'$.readmittedSeq')=?1
-      LIMIT 1
-      """,
-      [seq]
-    ) != []
-  end
+  def readmission?(%Txn{} = txn, seq),
+    do: State.open_in_txn?(txn, @readmitted_seq, Integer.to_string(seq))
 
   defp readmit_in_txn(txn, seq, host) do
     case Txn.q(
@@ -411,15 +406,15 @@ defmodule Tightbeam.MemoryGuard.Admission do
           request_ref
         ]
       ] ->
-        if Txn.q(
-             txn,
-             """
-             SELECT 1 FROM lifecycle_events
-             WHERE kind='memory_readmission_done' AND json_extract(detail,'$.sourceSeq')=?1
-             LIMIT 1
-             """,
-             [seq]
-           ) == [] and Ledger.enqueueable_in_txn?(txn, session_key) do
+        ref = Integer.to_string(seq)
+
+        # A source already re-admitted is never enqueued again; a replayed
+        # deferral of it is done.
+        if State.open_in_txn?(txn, @readmitted_source, ref),
+          do: State.close_in_txn(txn, @memory_pending, ref)
+
+        if not State.open_in_txn?(txn, @readmitted_source, ref) and
+             Ledger.enqueueable_in_txn?(txn, session_key) do
           {:ok, readmitted} =
             Ledger.enqueue_in_txn(txn, %{
               session_key: session_key,
@@ -433,12 +428,12 @@ defmodule Tightbeam.MemoryGuard.Admission do
               request_ref: request_ref
             })
 
-          EventLog.lifecycle_in_txn(
-            txn,
-            "memory_readmission_done",
-            session_key,
-            JSON.encode!(%{host: host, sourceSeq: seq, readmittedSeq: readmitted})
-          )
+          detail = JSON.encode!(%{host: host, sourceSeq: seq, readmittedSeq: readmitted})
+          done_in_txn(txn, seq, session_key, host, detail)
+          readmitted_ref = Integer.to_string(readmitted)
+          State.open_in_txn(txn, @readmitted_seq, readmitted_ref, session_key, host, detail)
+          State.open_in_txn(txn, @readmitted, readmitted_ref, session_key, host, detail)
+          EventLog.lifecycle_in_txn(txn, "memory_readmission_done", session_key, detail)
 
           Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
         end
@@ -446,13 +441,18 @@ defmodule Tightbeam.MemoryGuard.Admission do
       # M2: the source turn is gone; nothing to enqueue. The done record is
       # still written, so the hook is not pending forever.
       [] ->
-        EventLog.lifecycle_in_txn(
-          txn,
-          "memory_readmission_done",
-          "turn:#{seq}",
-          JSON.encode!(%{host: host, sourceSeq: seq, readmittedSeq: nil, sourceGone: true})
-        )
+        detail = JSON.encode!(%{host: host, sourceSeq: seq, readmittedSeq: nil, sourceGone: true})
+        done_in_txn(txn, seq, "turn:#{seq}", host, detail)
+        EventLog.lifecycle_in_txn(txn, "memory_readmission_done", "turn:#{seq}", detail)
     end
+  end
+
+  # The source turn's re-admission is done: it is no longer pending, and it is
+  # never re-admitted again.
+  defp done_in_txn(txn, seq, subject, host, detail) do
+    ref = Integer.to_string(seq)
+    State.close_in_txn(txn, @memory_pending, ref)
+    State.open_in_txn(txn, @readmitted_source, ref, subject, host, detail)
   end
 
   @doc """
@@ -460,22 +460,32 @@ defmodule Tightbeam.MemoryGuard.Admission do
   queued in the last hour: their lanes are nudged each sample, in case the
   handoff after the re-admission's commit never reached them (matrix M3).
   """
-  @spec readmitted_queued(DB.server()) :: [String.t()]
+  @spec readmitted_queued(DB.server()) :: {:ok, [String.t()]} | {:error, String.t()}
   def readmitted_queued(db) do
     since = System.system_time(:millisecond) - 3_600_000
 
-    case DB.query(
-           db,
-           """
-           SELECT DISTINCT t.sessionKey FROM lifecycle_events d
-           JOIN turns t ON t.seq = json_extract(d.detail,'$.readmittedSeq')
-           WHERE d.kind='memory_readmission_done' AND d.ts >= ?1 AND t.status='queued'
-           """,
-           [since]
-         ) do
-      {:ok, rows} -> Enum.map(rows, &hd/1)
-      _ -> []
+    DB.transaction(db, fn txn ->
+      # A re-admission whose turn left the queue, or that is older than the
+      # hour, needs no further nudge.
+      Txn.q(
+        txn,
+        """
+        DELETE FROM memory_guard_open
+        WHERE kind=?1 AND (openedAt < ?2 OR NOT EXISTS (
+          SELECT 1 FROM turns t WHERE t.seq = CAST(memory_guard_open.ref AS INTEGER)
+            AND t.status='queued'))
+        """,
+        [@readmitted, since]
+      )
+
+      txn |> State.list_in_txn(@readmitted) |> Enum.map(& &1.subject) |> Enum.uniq()
+    end)
+    |> case do
+      {:ok, sessions} -> {:ok, sessions}
+      {:error, error} -> {:error, Exception.message(error)}
     end
+  catch
+    :exit, reason -> {:error, inspect(reason)}
   end
 
   defp session_of(txn, seq) do
@@ -494,8 +504,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
   @spec run_deferred(DB.server(), String.t()) :: :ok | :pending
   def run_deferred(db, host) do
     DB.transaction(db, fn txn ->
-      for [subject, detail] <-
-            pending_in_txn(txn, "quota_readmission_deferred", "quota_readmission_resumed", host) do
+      for %{subject: subject, detail: detail} <- State.list_in_txn(txn, @quota_pending, host) do
         %{"harness" => harness} = JSON.decode!(detail)
         key = {Harness.parse!(harness).id(), "shared", host}
 
@@ -505,17 +514,15 @@ defmodule Tightbeam.MemoryGuard.Admission do
 
       # A not-started re-admission runs only when no reason of any kind
       # still holds its session (R6a); otherwise it stays pending.
-      for [session_key, detail] <-
-            pending_in_txn(txn, "memory_readmission_pending", "memory_readmission_done", host),
+      for %{subject: session_key, detail: detail} <-
+            State.list_in_txn(txn, @memory_pending, host),
           other_reasons_in_txn(txn, session_key) == [] do
         %{"sourceSeq" => seq} = JSON.decode!(detail)
         readmit_in_txn(txn, seq, host)
       end
 
-      pending_in_txn(txn, "quota_readmission_deferred", "quota_readmission_resumed", host) !=
-        [] or
-        pending_in_txn(txn, "memory_readmission_pending", "memory_readmission_done", host) !=
-          []
+      State.list_in_txn(txn, @quota_pending, host) != [] or
+        State.list_in_txn(txn, @memory_pending, host) != []
     end)
     |> case do
       {:ok, true} -> :pending
@@ -526,47 +533,13 @@ defmodule Tightbeam.MemoryGuard.Admission do
     end
   end
 
-  # Rows of `pending_kind` on `host` with no matching `done_kind` row (matched
-  # by subject for the quota hook, by source turn for the not-started one).
-  @doc "Whether any deferred hook, on any host, has not yet run."
+  @doc "Whether any deferred hook, on any host, has not yet run (unknown is pending)."
   @spec pending?(DB.server()) :: boolean()
   def pending?(db) do
-    case DB.query(
-           db,
-           """
-           SELECT 1 FROM lifecycle_events p
-           WHERE (p.kind='quota_readmission_deferred' AND NOT EXISTS (
-                    SELECT 1 FROM lifecycle_events d
-                    WHERE d.kind='quota_readmission_resumed' AND d.subject=p.subject))
-              OR (p.kind='memory_readmission_pending' AND NOT EXISTS (
-                    SELECT 1 FROM lifecycle_events d
-                    WHERE d.kind='memory_readmission_done'
-                      AND json_extract(d.detail,'$.sourceSeq')=json_extract(p.detail,'$.sourceSeq')))
-           LIMIT 1
-           """,
-           []
-         ) do
-      {:ok, []} -> false
+    case {State.list(db, @quota_pending), State.list(db, @memory_pending)} do
+      {{:ok, []}, {:ok, []}} -> false
       # Unknown is pending: the next pass looks again.
       _ -> true
     end
-  end
-
-  defp pending_in_txn(txn, pending_kind, done_kind, host) do
-    match =
-      if pending_kind == "memory_readmission_pending",
-        do: "json_extract(d.detail,'$.sourceSeq')=json_extract(p.detail,'$.sourceSeq')",
-        else: "d.subject=p.subject"
-
-    Txn.q(
-      txn,
-      """
-      SELECT p.subject,p.detail FROM lifecycle_events p
-      WHERE p.kind=?1 AND json_extract(p.detail,'$.host')=?3
-        AND NOT EXISTS (SELECT 1 FROM lifecycle_events d WHERE d.kind=?2 AND #{match})
-      ORDER BY p.id
-      """,
-      [pending_kind, done_kind, host]
-    )
   end
 end

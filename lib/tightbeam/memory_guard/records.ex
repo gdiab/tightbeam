@@ -124,36 +124,65 @@ defmodule Tightbeam.MemoryGuard.Records do
 
   @doc """
   The launch step's refusal for harness session `sid` at or after `since`
-  (ms), from `<dir>/refusals` (v1.13 FS2): `%{launch_id, reason, at}` or nil.
+  (ms), from `<dir>/refusals` (v1.13 FS2): `%{launch_id, reason, at}`, nil
+  when there is none, or `{:error, message}` when the refusals cannot be
+  read: then whether the step refused is unknown, never "it did not".
   """
-  @spec refusal_for(String.t(), String.t() | nil, integer()) :: map() | nil
+  @spec refusal_for(String.t(), String.t() | nil, integer()) ::
+          map() | nil | {:error, String.t()}
   def refusal_for(_base_dir, nil, _since), do: nil
 
   def refusal_for(base_dir, sid, since) do
     refusals = Path.join(dir(base_dir), "refusals")
 
-    with {:ok, entries} <- File.ls(refusals) do
-      entries
-      |> Enum.filter(&String.ends_with?(&1, ".json"))
-      |> Enum.flat_map(fn entry ->
-        with {:ok, text} <- File.read(Path.join(refusals, entry)),
-             {:ok, %{"sessionId" => ^sid, "at" => at} = record} when at >= since <-
-               JSON.decode(text) do
-          [%{launch_id: record["launchId"], reason: record["reason"], at: at}]
-        else
-          _ -> []
+    case File.ls(refusals) do
+      {:ok, entries} ->
+        entries
+        |> Enum.filter(&(String.ends_with?(&1, ".json") and not String.starts_with?(&1, ".")))
+        |> Enum.reduce_while([], fn entry, found ->
+          case read_refusal(Path.join(refusals, entry)) do
+            {:ok, %{"sessionId" => ^sid, "at" => at} = record}
+            when is_integer(at) and at >= since ->
+              {:cont,
+               [%{launch_id: record["launchId"], reason: record["reason"], at: at} | found]}
+
+            {:ok, _other} ->
+              {:cont, found}
+
+            {:error, reason} ->
+              {:halt, {:error, "refusal record #{entry} cannot be read: #{reason}"}}
+          end
+        end)
+        |> case do
+          {:error, _} = error -> error
+          found -> Enum.max_by(found, & &1.at, fn -> nil end)
         end
-      end)
-      |> Enum.max_by(& &1.at, fn -> nil end)
+
+      {:error, :enoent} ->
+        nil
+
+      {:error, reason} ->
+        {:error, "the refusal records cannot be listed: #{reason}"}
+    end
+  end
+
+  defp read_refusal(path) do
+    with {:ok, text} <- File.read(path),
+         {:ok, %{} = record} <- JSON.decode(text) do
+      {:ok, record}
     else
-      _ -> nil
+      {:error, :enoent} -> {:ok, %{}}
+      {:error, reason} when is_atom(reason) -> {:error, reason}
+      _ -> {:error, "malformed"}
     end
   end
 
   @doc """
   Whether everything the launch step needs is in place (v1.13 FS2): its
-  configuration reads, the launch-record directory takes a write, and the
-  process's own `oom_score_adj` reads. `:ok` or `{:error, message}`.
+  configuration reads, the launch-record directory takes a write, its refusal
+  records can be read (else a refusal could not be told from a harness
+  failure), and the process's own `oom_score_adj` reads. `:ok` or
+  `{:error, message}`.
   """
   @spec step_prerequisites(String.t(), String.t()) :: :ok | {:error, String.t()}
   def step_prerequisites(base_dir, root) do
@@ -161,6 +190,8 @@ defmodule Tightbeam.MemoryGuard.Records do
     probe = Path.join(sessions, ".probe-#{System.unique_integer([:positive])}")
 
     with {:ok, text} <- File.read(Path.join(dir(base_dir), "launch.json")),
+         refusals when not is_tuple(refusals) or elem(refusals, 0) != :error <-
+           refusal_for(base_dir, "", 0),
          {:ok, %{"v" => 1, "mode" => mode}} when is_binary(mode) <- JSON.decode(text),
          :ok <- File.write(probe, ""),
          :ok <- File.rm(probe),
@@ -234,8 +265,11 @@ defmodule Tightbeam.MemoryGuard.Records do
         |> Enum.reduce_while({:ok, %{}}, fn entry, {:ok, acc} ->
           path = Path.join(sessions, entry)
 
+          # A record without its tree's identity (an integer pid) names no
+          # tree that can be found or shown gone: it is unreadable, not empty.
           with {:ok, text} <- File.read(path),
-               {:ok, %{"v" => 1, "launchId" => launch} = record} <- JSON.decode(text) do
+               {:ok, %{"v" => 1, "launchId" => launch, "pid" => pid} = record}
+               when is_binary(launch) and is_integer(pid) and pid > 0 <- JSON.decode(text) do
             {:cont, {:ok, Map.put(acc, launch, record)}}
           else
             {:error, :enoent} -> {:cont, {:ok, acc}}

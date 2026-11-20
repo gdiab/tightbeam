@@ -64,6 +64,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
     Tightbeam.MemoryGuard.Settings,
+    Tightbeam.MemoryGuard.State,
     Tightbeam.RecurrenceSuppression,
     Tightbeam.RailRemedy,
     Tightbeam.Supervision,
@@ -5736,6 +5737,10 @@ defmodule Tightbeam.Schema do
   # Memory-guard host settings are additive current-build storage (memory
   # limits v1.1 R17); the final schema pass installs them after migrations.
   defp bootstrap_module(_db, Tightbeam.MemoryGuard.Settings, _current?), do: :ok
+
+  # The memory guard's current state (episodes, judged root records, open
+  # holds) is additive like its settings (review B7).
+  defp bootstrap_module(_db, Tightbeam.MemoryGuard.State, _current?), do: :ok
 
   defp bootstrap_module(db, Tightbeam.Toplines, _current?),
     do: Tightbeam.Toplines.ensure_historical_schema(db)
