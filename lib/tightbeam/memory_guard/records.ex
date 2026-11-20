@@ -13,6 +13,115 @@ defmodule Tightbeam.MemoryGuard.Records do
     `harness-group` identity `sessions/<launchId>.identity`.
   """
 
+  @marker ".generation"
+
+  @doc """
+  Initialize the launch-record inventory for this boot (v1.13 FS4 scope,
+  matrix B2–B4): the inventory counts as empty only when its initialization
+  is durably recorded. The database keeps a `memory_guard_inventory` record
+  (path, boot identity, generation), written in one step with the
+  directory's own generation marker.
+
+  - No record yet: create the directory, the marker and the record.
+  - Same boot: the directory and a matching marker must exist; otherwise the
+    inventory was lost, which is an error, never an empty host.
+  - A new boot identity: re-initialize. A reboot ends every process (FS9).
+  - Boot identity unknown: only a matching marker is accepted.
+
+  Returns `{:ok, generation}` or `{:error, message}`.
+  """
+  @spec init_inventory(Tightbeam.DB.server(), String.t(), String.t() | nil) ::
+          {:ok, String.t()} | {:error, String.t()}
+  def init_inventory(db, base_dir, boot) do
+    sessions = Path.join(dir(base_dir), "sessions")
+
+    case last_inventory(db, sessions) do
+      {:ok, nil} ->
+        create_inventory(db, sessions, boot)
+
+      {:ok, %{"boot" => recorded_boot, "generation" => generation}}
+      when is_binary(boot) and recorded_boot != boot ->
+        _ = generation
+        create_inventory(db, sessions, boot)
+
+      {:ok, %{"generation" => generation}} ->
+        with :ok <- check_inventory(base_dir, generation), do: {:ok, generation}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  @doc """
+  Whether the inventory of `generation` is still in place: its directory
+  exists with a matching marker. A missing directory or marker is an error
+  (the inventory was lost), never "no records".
+  """
+  @spec check_inventory(String.t(), String.t()) :: :ok | {:error, String.t()}
+  def check_inventory(base_dir, generation) do
+    marker = Path.join([dir(base_dir), "sessions", @marker])
+
+    case File.read(marker) do
+      {:ok, text} ->
+        if String.trim(text) == generation,
+          do: :ok,
+          else: {:error, "the launch-record inventory was replaced (generation marker differs)"}
+
+      {:error, :enoent} ->
+        {:error, "the launch-record inventory is missing (no directory or generation marker)"}
+
+      {:error, reason} ->
+        {:error, "the launch-record inventory cannot be read: #{reason}"}
+    end
+  end
+
+  defp last_inventory(db, sessions) do
+    case Tightbeam.DB.query(
+           db,
+           """
+           SELECT detail FROM lifecycle_events
+           WHERE kind='memory_guard_inventory' AND subject=?1 ORDER BY id DESC LIMIT 1
+           """,
+           [sessions]
+         ) do
+      {:ok, []} -> {:ok, nil}
+      {:ok, [[detail]]} -> {:ok, JSON.decode!(detail)}
+      {:error, error} -> {:error, "the inventory record cannot be read: #{inspect(error)}"}
+    end
+  rescue
+    error -> {:error, "the inventory record cannot be read: #{Exception.message(error)}"}
+  end
+
+  defp create_inventory(db, sessions, boot) do
+    generation = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+
+    Tightbeam.DB.transaction(db, fn txn ->
+      Tightbeam.EventLog.lifecycle_in_txn(
+        txn,
+        "memory_guard_inventory",
+        sessions,
+        JSON.encode!(%{boot: boot, generation: generation})
+      )
+
+      # The marker and the record are one step: a failed write rolls back.
+      with :ok <- File.mkdir_p(sessions),
+           :ok <- File.write(Path.join(sessions, @marker), generation) do
+        :ok
+      else
+        {:error, reason} -> raise "the launch-record inventory cannot be created: #{reason}"
+      end
+    end)
+    |> case do
+      {:ok, :ok} ->
+        {:ok, generation}
+
+      {:error, error} ->
+        {:error, "the launch-record inventory cannot be created: #{inspect(error)}"}
+    end
+  rescue
+    error -> {:error, Exception.message(error)}
+  end
+
   @doc "The memory-guard runtime directory of a base."
   def dir(base_dir), do: Path.join([base_dir, "run", "memory-guard"])
 
