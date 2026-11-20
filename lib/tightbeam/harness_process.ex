@@ -161,7 +161,14 @@ defmodule Tightbeam.HarnessProcess do
 
     # Memory limits v1.1 R2a: no session tree of an earlier launch of this
     # key survives into this one.
-    :ok = Tightbeam.MemoryGuard.ensure_no_orphans(key)
+    case Tightbeam.MemoryGuard.ensure_no_orphans(key) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise "adapter launch refused for #{key_name(key)}: session processes of an " <>
+                "earlier launch could not be shown ended (#{inspect(reason)})"
+    end
 
     case DB.transaction(db, fn txn ->
            case DB.Txn.q(
@@ -1865,7 +1872,9 @@ defmodule Tightbeam.HarnessProcess do
         {output, status} -> {:error, {:harness_group_failed, status, one_line(output)}}
       end
     else
-      {:error, :enoent} -> :ok
+      # A missing identity proves nothing: the caller checks the recorded
+      # process and ends it another way.
+      {:error, :enoent} -> {:error, :identity_missing}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :identity_malformed}
     end

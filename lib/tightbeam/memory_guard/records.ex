@@ -7,7 +7,7 @@ defmodule Tightbeam.MemoryGuard.Records do
 
   Layout under `<base>/run/memory-guard`:
 
-  - `launch.json`: `{v: 1, mode, fs, harness, sessionLimit, oomScoreAdj}`;
+  - `launch.json`: `{v: 1, mode, fs, harness, sessionLimit}`;
   - `bin/tightbeam-session-exec`: a link to the gateway's CLI binary;
   - `sessions/<launchId>.json`: one record per session process, and its
     `harness-group` identity `sessions/<launchId>.identity`.

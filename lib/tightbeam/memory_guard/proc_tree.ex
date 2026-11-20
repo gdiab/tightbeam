@@ -39,9 +39,9 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
   @spec read(String.t(), pos_integer()) :: {:ok, proc()} | :error
   def read(proc, pid) do
     with {:ok, stat} <- File.read(Path.join([proc, Integer.to_string(pid), "stat"])),
-         {:ok, ppid, start} <- parse_stat(stat),
+         {:ok, state, ppid, start} <- parse_stat(stat),
          {:ok, status} <- File.read(Path.join([proc, Integer.to_string(pid), "status"])) do
-      {:ok, %{pid: pid, ppid: ppid, start: start, bytes: status_bytes(status)}}
+      {:ok, %{pid: pid, ppid: ppid, start: start, state: state, bytes: status_bytes(status)}}
     else
       _ -> :error
     end
@@ -59,10 +59,10 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
         rest = binary_part(stat, position + 1, byte_size(stat) - position - 1)
 
         case String.split(rest) do
-          [_state, ppid | fields] when length(fields) >= 18 ->
+          [state, ppid | fields] when length(fields) >= 18 ->
             with {ppid, ""} <- Integer.parse(ppid),
                  {start, ""} <- Integer.parse(Enum.at(fields, 17)) do
-              {:ok, ppid, start}
+              {:ok, state, ppid, start}
             else
               _ -> :error
             end

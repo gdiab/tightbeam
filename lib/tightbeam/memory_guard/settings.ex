@@ -1,8 +1,8 @@
 defmodule Tightbeam.MemoryGuard.Settings do
   @moduledoc """
-  Per-host memory-guard settings (memory limits v1.1 R17, R17a; build rulings
-  NB-1 and NB-3: the resident cap and the session `oom_score_adj` are host
-  configuration, not code).
+  Per-host memory-guard settings (memory limits v1.4 R17, R17a): exactly the
+  six settings of the R17 table. The session `oom_score_adj` raise is fixed at
+  +100 (R14, NB-3 ruled); the reserved slot is fixed at one (R3b).
 
   One row per (host, setting) in `host_memory_settings`, written only by an
   admin through `host-memory-set`, with actor and time. A host with no row for
@@ -17,11 +17,6 @@ defmodule Tightbeam.MemoryGuard.Settings do
   | `residentCap`        | max(2, ⌊budget / 1 GiB⌋)             | 1–256                        |
   | `floorHold`          | 12 (%)                               | 3–50                         |
   | `floorRelease`       | 15 (%)                               | above `floorHold`, ≤ 60      |
-  | `sessionOomScoreAdj` | 100                                  | 0–1000                       |
-
-  `sessionOomScoreAdj` is the amount a session process raises its own
-  `oom_score_adj` above the value it inherits from the gateway (v1.4 R14:
-  +100; the shared adapter is never written).
 
   `budget` and `sessionLimit` are stored either as a percentage of MemTotal
   (`"50%"`) or as bytes (`"17179869184"`, written from `16G`). The effective
@@ -37,7 +32,7 @@ defmodule Tightbeam.MemoryGuard.Settings do
   CREATE TABLE IF NOT EXISTS host_memory_settings (
     host  TEXT NOT NULL CHECK(length(trim(host)) > 0),
     name  TEXT NOT NULL CHECK(name IN ('mode','budget','sessionLimit','residentCap',
-                                       'floorHold','floorRelease','sessionOomScoreAdj')),
+                                       'floorHold','floorRelease')),
     value TEXT NOT NULL,
     setBy TEXT NOT NULL,
     setAt INTEGER NOT NULL,
@@ -45,7 +40,7 @@ defmodule Tightbeam.MemoryGuard.Settings do
   )
   """
 
-  @names ~w(mode budget sessionLimit residentCap floorHold floorRelease sessionOomScoreAdj)
+  @names ~w(mode budget sessionLimit residentCap floorHold floorRelease)
   @gib 1024 * 1024 * 1024
   @mib 1024 * 1024
   @min_session_limit 512 * @mib
@@ -57,7 +52,6 @@ defmodule Tightbeam.MemoryGuard.Settings do
           resident_cap: pos_integer() | nil,
           floor_hold: number(),
           floor_release: number(),
-          session_oom_score_adj: 0..1000,
           mem_total: non_neg_integer() | nil,
           explicit: [String.t()],
           invalid: [%{name: String.t(), value: String.t(), reason: String.t()}]
@@ -181,7 +175,6 @@ defmodule Tightbeam.MemoryGuard.Settings do
       "mode" -> {:error, "must be auto or off"}
       size when size in ["budget", "sessionLimit"] -> canonical_size(value)
       "residentCap" -> canonical_integer(value)
-      "sessionOomScoreAdj" -> canonical_integer(value)
       percent when percent in ["floorHold", "floorRelease"] -> canonical_percent(value)
       _ -> {:error, "unknown setting; one of #{Enum.join(@names, ", ")}"}
     end
@@ -249,8 +242,7 @@ defmodule Tightbeam.MemoryGuard.Settings do
          {:ok, session_limit} <- session_limit(values, mem_total, budget),
          {:ok, resident_cap} <- resident_cap(values, budget),
          {:ok, floor_hold} <- percent_in(values, "floorHold", 12, 3, 50),
-         {:ok, floor_release} <- floor_release(values, floor_hold),
-         {:ok, oom} <- integer_in(values, "sessionOomScoreAdj", 100, 0, 1000) do
+         {:ok, floor_release} <- floor_release(values, floor_hold) do
       {:ok,
        %{
          mode: Map.get(values, "mode", "auto"),
@@ -259,7 +251,6 @@ defmodule Tightbeam.MemoryGuard.Settings do
          resident_cap: resident_cap,
          floor_hold: floor_hold,
          floor_release: floor_release,
-         session_oom_score_adj: oom,
          mem_total: mem_total
        }}
     end

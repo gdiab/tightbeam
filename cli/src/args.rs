@@ -1241,8 +1241,8 @@ COMMANDS:
       Tightbeam's agents hold, the resident count and held turns (counts only).
   host-memory set --host <host> NAME VALUE
       Set one memory-limit setting (admin): mode auto|off, budget and
-      sessionLimit (50% or 16G), residentCap, floorHold, floorRelease,
-      sessionOomScoreAdj. Applies without a restart.
+      sessionLimit (50% or 16G), residentCap, floorHold, floorRelease.
+      Applies without a restart.
 
   session-diagnose --session EXACT [--as <role> | --as-user USER | --as-process <name>] [--json]
       Read a session's process metadata without querying or changing the database.
