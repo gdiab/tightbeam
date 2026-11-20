@@ -314,10 +314,27 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
       refute consumed?(ctx.db)
     end
 
-    # A complete run afterwards still succeeds with the same secret.
+    # A killed ceremony's CLI exits on its terminal's hangup, shortly after its pipeline
+    # dies; it must not keep the lock. Then a complete run still succeeds with the same
+    # secret.
+    await_lock_free(Path.join(ctx.base, "gateway.lock"), 100)
     {out, 0} = on_tty(ctx, ["recover-admin", "--user", "george"], ctx.secret)
     code = code_in(out)
     assert {:paired, _} = TestDevices.coded_pair(ctx.db, "after", "After", code, ctx.admission)
+  end
+
+  defp await_lock_free(path, tries) do
+    case try_hold_lock(path) do
+      {:locked, holder} ->
+        release_lock(holder)
+
+      :refused when tries > 0 ->
+        Process.sleep(100)
+        await_lock_free(path, tries - 1)
+
+      :refused ->
+        flunk("a killed ceremony still holds the base-directory lock after 10 seconds")
+    end
   end
 
   # The base-directory lock held by its own process, as the gateway holds it, and
