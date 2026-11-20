@@ -101,8 +101,9 @@ defmodule Tightbeam.Acp.Adapter do
   ## Client
 
   # What this client declares at `initialize`. It has no async-tasks entry
-  # (claude-agent-acp's AIR async-tasks capability, acp-agent.js:1885), so the
-  # Claude adapter sends no `async_task_*` updates.
+  # (the AIR async-tasks client capability), so an adapter that reports
+  # background tasks only to clients declaring it sends no `async_task_*`
+  # updates (memory limits v1.6 AS4).
   @client_capabilities %{fs: %{readTextFile: false, writeTextFile: false}, subagents: %{}}
 
   @doc """
