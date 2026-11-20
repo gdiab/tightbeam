@@ -796,6 +796,41 @@ defmodule Tightbeam.Acp.AdapterTest do
       assert Adapter.idle_session?(adapter, sid) == :busy
     end
 
+    test "K8 / K3.stale: close-if-idle refuses a session with a prompt pending, a reported subagent, and closes an idle one" do
+      {adapter, _capture} = start_adapter(gate_mode: "stall-turn", probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+      assert {:ok, other} =
+               Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+      # A prompt the adapter took after an idle answer: the close is refused.
+      assert Adapter.idle_session?(adapter, sid) == :idle
+      _caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+      _request_id = s1_request_id(adapter, sid)
+      assert {:error, :not_idle} = Adapter.close_if_idle(adapter, sid)
+      assert Adapter.knows_session?(adapter, sid)
+
+      # A subagent update ingested after an idle answer: refused too.
+      assert Adapter.idle_session?(adapter, other) == :idle
+
+      send(
+        adapter,
+        {:acp_notification, "session/update",
+         s1_update(other, "subagent_spawned", %{"subagentSessionId" => "child-k8"})}
+      )
+
+      assert {:error, :not_idle} = Adapter.close_if_idle(adapter, other)
+      assert Adapter.knows_session?(adapter, other)
+    end
+
+    test "K6: an idle session closes through close-if-idle and is no longer resident" do
+      {adapter, _capture} = start_adapter(probe: false)
+      assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+      assert :ok = Adapter.close_if_idle(adapter, sid)
+      refute Adapter.knows_session?(adapter, sid)
+      refute Adapter.resident?(adapter, sid)
+    end
+
     test "a subagent the harness reported starting and not stopping keeps its root busy (R4, AS4)" do
       {adapter, _capture} = start_adapter(probe: false)
       assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")

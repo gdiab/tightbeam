@@ -85,6 +85,37 @@ defmodule Tightbeam.MemoryGuardTest do
 
   defp gone!(root, pid), do: File.rm_rf!(Path.join([root, "proc", Integer.to_string(pid)]))
 
+  # The session process of `sid` has ended, as a close ends it: its fake
+  # process goes, or, for a test that never recorded one, a launch record of an
+  # already ended process is left for the close's confirmation (FS5).
+  defp closed_process!(ctx, sid) do
+    dir = Path.join(Records.dir(ctx.base), "sessions")
+
+    records =
+      case File.ls(dir) do
+        {:ok, entries} ->
+          for entry <- entries,
+              String.ends_with?(entry, ".json"),
+              {:ok, %{"sessionId" => ^sid} = record} <-
+                [JSON.decode(File.read!(Path.join(dir, entry)))],
+              do: record
+
+        _ ->
+          []
+      end
+
+    case records do
+      [] ->
+        pid = 900_000 + :erlang.phash2(sid, 50_000)
+        launch!(ctx.base, "sl-closed-" <> sid, sid, pid, pid, 512 * @mib)
+
+      records ->
+        for record <- records, do: gone!(ctx.root, record["pid"])
+    end
+
+    :ok
+  end
+
   defp target_pids(%{scope: "session", pid: pid}) when is_integer(pid), do: [pid]
   defp target_pids(%{scope: "adapter", row: %{os_pid: pid}}) when is_integer(pid), do: [pid]
   defp target_pids(_target), do: []
@@ -160,10 +191,19 @@ defmodule Tightbeam.MemoryGuardTest do
       cgroup_fs: Keyword.get(opts, :cgroup_fs, Path.join(ctx.root, "sys/fs/cgroup")),
       probe: fn -> probe end,
       sample_ms: :manual,
-      closer: fn _adapter, sid, reason ->
-        send(test, {:closed, sid, reason})
-        Keyword.get(opts, :close_result, :ok)
-      end,
+      closer:
+        Keyword.get(opts, :closer, fn _adapter, sid, reason ->
+          send(test, {:closed, sid, reason})
+
+          case Keyword.get(opts, :close_result, :ok) do
+            # A close ends the session process (FS5 shows it gone).
+            :ok -> closed_process!(ctx, sid)
+            other -> other
+          end
+        end),
+      idle_check: Keyword.get(opts, :idle_check, &Tightbeam.Acp.Adapter.idle_session?/2),
+      before_close_commit: Keyword.get(opts, :before_close_commit, fn _ -> :ok end),
+      close_confirm_ms: Keyword.get(opts, :close_confirm_ms, 300),
       killer: fn target, _host_state ->
         send(test, {:killed, target})
 
@@ -2678,6 +2718,216 @@ defmodule Tightbeam.MemoryGuardTest do
                gatewayAndAdapters: 950,
                sessionProcesses: 1000
              }
+    end
+  end
+
+  ## v1.13 R4 / FS5: the idle proof and the conditional close (matrix K, D3; T26)
+
+  describe "matrix K / D3: idle close (R4, FS5, T26)" do
+    setup ctx do
+      # The floor holds, so the guard sheds idle session processes one at a time.
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      adapter = adapter!()
+      session!(ctx, "agent:idle", "sid-idle")
+      %{adapter: adapter, test_pid: self()}
+    end
+
+    defp shed!(ctx, opts \\ []) do
+      guard!(ctx, opts)
+      resident!(ctx.adapter, ["sid-idle"])
+      :ok = MemoryGuard.tick()
+      _ = :sys.get_state(MemoryGuard)
+    end
+
+    test "K1.unreadable: turns that cannot be read are not idle; no close, recorded", ctx do
+      {:ok, _} = DB.query(ctx.db, "ALTER TABLE turns RENAME TO turns_hidden")
+
+      try do
+        shed!(ctx)
+        refute_received {:closed, _, _}
+
+        assert [{@host, %{"sessionId" => "sid-idle", "why" => why}}] =
+                 events(ctx.db, "memory_guard_idle_unproven")
+
+        assert why =~ "turns cannot be read"
+      after
+        {:ok, _} = DB.query(ctx.db, "ALTER TABLE turns_hidden RENAME TO turns")
+      end
+    end
+
+    test "K2.absent: a resident process with no session for it is not idle; no close, recorded",
+         ctx do
+      {:ok, _} =
+        DB.query(ctx.db, "DELETE FROM harness_pointers WHERE harnessSessionId='sid-idle'")
+
+      shed!(ctx)
+      refute_received {:closed, _, _}
+
+      assert [{_, %{"why" => "no session for the harness session"}}] =
+               events(ctx.db, "memory_guard_idle_unproven")
+    end
+
+    test "K2.unreadable: an unreadable session pointer is not idle", ctx do
+      {:ok, _} = DB.query(ctx.db, "ALTER TABLE harness_pointers RENAME TO hp_hidden")
+
+      try do
+        shed!(ctx)
+        refute_received {:closed, _, _}
+        assert [{_, %{"why" => why}}] = events(ctx.db, "memory_guard_idle_unproven")
+        assert why =~ "pointer cannot be read"
+      after
+        {:ok, _} = DB.query(ctx.db, "ALTER TABLE hp_hidden RENAME TO harness_pointers")
+      end
+    end
+
+    test "K4.unreadable: a session whose priority class cannot be read is not closed", ctx do
+      {:ok, _} = DB.query(ctx.db, "ALTER TABLE wakes RENAME TO wakes_hidden")
+
+      try do
+        shed!(ctx)
+        refute_received {:closed, _, _}
+        assert [{_, %{"why" => why}}] = events(ctx.db, "memory_guard_idle_unproven")
+        assert why =~ "priority cannot be read"
+      after
+        {:ok, _} = DB.query(ctx.db, "ALTER TABLE wakes_hidden RENAME TO wakes")
+      end
+    end
+
+    test "K3.unreadable / K3.timeout: an adapter that cannot answer is not idle; nothing closes, nothing is a failure",
+         ctx do
+      shed!(ctx, idle_check: fn _adapter, _sid -> {:error, {:adapter_unavailable, :timeout}} end)
+      settle_closes!()
+      refute_received {:closed, _, _}
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+      assert events(ctx.db, "memory_guard_close_failed") == []
+    end
+
+    test "K7 (before the commit): a turn enqueued after the idle read and before the closing transaction commits stops the close",
+         ctx do
+      test = self()
+
+      shed!(ctx,
+        before_close_commit: fn "agent:idle" ->
+          seq = queue!(ctx, "agent:idle", "arrived just now")
+          send(test, {:enqueued, seq})
+        end
+      )
+
+      assert_received {:enqueued, _}
+      settle_closes!()
+      refute_received {:closed, _, _}
+      assert events(ctx.db, "memory_guard_closing") == []
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+    end
+
+    test "K7 (after the commit) / K6: a turn enqueued after the closing transaction waits for the close, then starts fresh",
+         ctx do
+      test = self()
+
+      shed!(ctx,
+        closer: fn _adapter, sid, reason ->
+          # The close has been decided; new work arrives before it is written.
+          send(test, {:enqueued, queue!(ctx, "agent:idle", "arrived after the mark")})
+          send(test, {:closed, sid, reason})
+          closed_process!(ctx, sid)
+        end
+      )
+
+      assert_receive {:closed, "sid-idle", "memory_floor"}
+      assert_received {:enqueued, _}
+      settle_closes!()
+      assert [{"agent:idle", _}] = events(ctx.db, "memory_guard_closing")
+      assert [{"agent:idle", _}] = events(ctx.db, "memory_guard_idle_closed")
+      # Its next turn needs a fresh process, held now only by the floor.
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:idle", ctx.db)
+    end
+
+    test "K8 / K3.stale: a prompt the adapter takes after the guard's idle read makes its close-if-idle refuse; no close, no event, no marker",
+         ctx do
+      shed!(ctx,
+        closer: fn _adapter, sid, reason ->
+          send(ctx.test_pid, {:asked, sid, reason})
+          {:error, {:not_idle, :busy}}
+        end
+      )
+
+      assert_receive {:asked, "sid-idle", "memory_floor"}
+      settle_closes!()
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+      assert events(ctx.db, "memory_guard_idle_closed_marker") == []
+      assert events(ctx.db, "memory_guard_close_failed") == []
+      assert MemoryGuard.read(@host).residentCount == 1
+    end
+
+    test "K5.unreadable / D3.partial (T26): a close acknowledged while the process lives leaves it resident and counted, recorded, and retried until it is gone",
+         ctx do
+      proc!(ctx.root, 990, 1, 990, 100 * @mib)
+      launch!(ctx.base, "sl-idle", "sid-idle", 990, 990, 512 * @mib)
+
+      shed!(ctx,
+        closer: fn _adapter, sid, reason ->
+          send(ctx.test_pid, {:closed, sid, reason})
+          :ok
+        end
+      )
+
+      assert_receive {:closed, "sid-idle", _}
+      settle_closes!()
+
+      assert [{"agent:idle", %{"error" => error}}] = events(ctx.db, "memory_guard_close_failed")
+      assert error =~ "still running"
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+      assert events(ctx.db, "memory_guard_idle_closed_marker") == []
+
+      # The adapter forgot it, but it still counts as resident (R3).
+      resident!(ctx.adapter, [])
+      assert MemoryGuard.read(@host).residentCount == 1
+
+      # Retried on a later decision; once the process is gone it counts no more.
+      :ok = MemoryGuard.tick()
+      assert_receive {:closed, "sid-idle", _}
+      settle_closes!()
+      gone!(ctx.root, 990)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).residentCount == 0
+    end
+
+    test "D3.unreadable (T26): a close that errors stays resident and counted, is recorded, the next candidate closes, and it is retried later",
+         ctx do
+      session!(ctx, "agent:other", "sid-other")
+
+      shed!(ctx,
+        closer: fn _adapter, sid, reason ->
+          send(ctx.test_pid, {:closed, sid, reason})
+
+          if sid == "sid-idle",
+            do: {:error, :close_timed_out},
+            else: closed_process!(ctx, sid)
+        end
+      )
+
+      resident!(ctx.adapter, ["sid-idle", "sid-other"])
+      settle_closes!()
+      :ok = MemoryGuard.tick()
+      settle_closes!()
+
+      assert [{"agent:idle", %{"error" => error}}] = events(ctx.db, "memory_guard_close_failed")
+      assert error =~ "close_timed_out"
+      assert [{"agent:other", _}] = events(ctx.db, "memory_guard_idle_closed")
+
+      # The failed one is tried again on a later decision.
+      :ok = MemoryGuard.tick()
+      settle_closes!()
+      closes = for {:closed, "sid-idle", _} <- flush_messages(), do: :retried
+      assert length(closes) >= 1
+    end
+  end
+
+  defp flush_messages(acc \\ []) do
+    receive do
+      message -> flush_messages([message | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 

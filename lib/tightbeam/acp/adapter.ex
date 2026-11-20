@@ -694,6 +694,13 @@ defmodule Tightbeam.Acp.Adapter do
         refusal = fence_refusal(state, message) ->
           {:reply, refusal, state}
 
+        match?({:close_if_idle, _sid, _opts}, message) ->
+          {:close_if_idle, sid, opts} = message
+
+          if session_busy?(state, sid),
+            do: {:reply, {:error, :not_idle}, state},
+            else: enqueue_operation(state, {:close_session, sid, opts}, from)
+
         session_operation?(message) ->
           enqueue_operation(state, message, from)
 
@@ -741,6 +748,21 @@ defmodule Tightbeam.Acp.Adapter do
     GenServer.call(adapter, {:idle_session?, sid}, 10_000)
   catch
     :exit, reason -> {:error, {:adapter_unavailable, reason}}
+  end
+
+  @doc """
+  Memory limits v1.13 R4/FS5 (matrix K3, K8): close `sid`'s session process
+  only if it is idle by what this adapter has observed. The check and the
+  queuing of the close happen in one callback of this process, the one that
+  also sends every prompt and ingests every session update, so no observed
+  prompt or update can fall between them; a prompt arriving later waits behind
+  the close. `{:error, :not_idle}` when the session is not idle.
+  """
+  @spec close_if_idle(adapter(), String.t(), keyword()) :: :ok | {:error, term()}
+  def close_if_idle(adapter, session_id, opts \\ []) do
+    call(adapter, {:close_if_idle, session_id, opts}, 65_000)
+  rescue
+    reason -> {:error, {:adapter_unavailable, reason}}
   end
 
   @doc """
@@ -794,6 +816,15 @@ defmodule Tightbeam.Acp.Adapter do
 
       {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
     end
+  end
+
+  # A pending or queued prompt, a pending session operation, or an observed
+  # background task (memory limits §1 idle; AS4 says what this line observes).
+  defp session_busy?(state, sid) do
+    Map.has_key?(state.prompts, sid) or
+      Enum.any?(state.queued_prompts, &(&1.sid == sid)) or
+      pending_session_operation?(state, sid) or
+      MapSet.size(Map.get(state.background, sid, MapSet.new())) > 0
   end
 
   defp pending_session_operation?(state, sid) do
@@ -1113,15 +1144,8 @@ defmodule Tightbeam.Acp.Adapter do
   defp session_call({:resident?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
 
-  defp session_call({:idle_session?, sid}, _from, state) do
-    busy? =
-      Map.has_key?(state.prompts, sid) or
-        Enum.any?(state.queued_prompts, &(&1.sid == sid)) or
-        pending_session_operation?(state, sid) or
-        MapSet.size(Map.get(state.background, sid, MapSet.new())) > 0
-
-    {:reply, if(busy?, do: :busy, else: :idle), state}
-  end
+  defp session_call({:idle_session?, sid}, _from, state),
+    do: {:reply, if(session_busy?(state, sid), do: :busy, else: :idle), state}
 
   defp session_call({:forget_session_residency, sid}, _from, state) do
     if Map.has_key?(state.prompts, sid) do

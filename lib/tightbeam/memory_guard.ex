@@ -466,6 +466,8 @@ defmodule Tightbeam.MemoryGuard do
       clock: Keyword.get(opts, :clock, fn -> System.system_time(:millisecond) end),
       closer: Keyword.get(opts, :closer, &default_close/3),
       idle_check: Keyword.get(opts, :idle_check, &default_idle_check/2),
+      # R4/FS5 (K3, K8): the adapter's own close-if-idle, atomic with its
+      # observation of the session.
       killer: Keyword.get(opts, :killer, &default_kill/2),
       # SIGKILL for the parent-chain fallback; tests with a fake /proc inject one.
       signaller: Keyword.get(opts, :signaller, &default_signal/1),
@@ -491,7 +493,17 @@ defmodule Tightbeam.MemoryGuard do
       # cannot be read: launches are held `guard_unavailable` (FS1, FS4 scope).
       inventory_error: nil,
       # What this gateway run has already recorded once (FS4, R12a).
-      recorded: MapSet.new()
+      recorded: MapSet.new(),
+      # FS5: closes acknowledged while the session process lives: still
+      # resident and counted under R3, and retried. {host, sid} => entry.
+      lingering: %{},
+      # FS5: closes that failed go after every other candidate and are
+      # retried on a later decision.
+      close_failed: MapSet.new(),
+      # Test seam (matrix K7): runs between choosing a close candidate and the
+      # conditional `closing` transaction.
+      before_close_commit: Keyword.get(opts, :before_close_commit, fn _session_key -> :ok end),
+      close_confirm_ms: Keyword.get(opts, :close_confirm_ms, 5_000)
     }
 
     state = state |> determine_all() |> publish_all()
@@ -946,44 +958,63 @@ defmodule Tightbeam.MemoryGuard do
     launch = launch_needed(state, session)
     reserved? = reserved_main?(state, session)
 
-    if launch == :none do
-      state =
-        state
-        |> resume_if_held(session.session_key)
-        |> mark_busy(session.session_key, session.host)
+    closing_ref = closing_ref(state, session)
 
-      {:ok, state}
-    else
-      host_reasons = host_level_reasons(host_state)
+    cond do
+      # R4 (K6, K7): a session whose close has been decided waits for it, then
+      # starts a fresh process; it never runs on a process being closed.
+      closing_ref != nil ->
+        {:closing, closing_ref, state}
 
-      # R3b: the reserved Main takes its reserved slot; R3 never holds it. The
-      # floor and the budget still do.
-      {cap_reason, state} =
-        if reserved? and match?({:session, _}, launch),
-          do: {nil, state},
-          else: cap_decision(state, session, host_state, launch, seq, host_reasons)
+      launch == :none ->
+        state =
+          state
+          |> resume_if_held(session.session_key)
+          |> mark_busy(session.session_key, session.host)
 
-      step_reason =
-        step_reason(host_state, launch) || inventory_reason(state) ||
-          step_hold_reason(state, session)
+        {:ok, state}
 
-      cond do
-        match?({:closing, _}, cap_reason) ->
-          {:closing, elem(cap_reason, 1), state}
+      true ->
+        decide_launch(state, session, host_state, seq, launch, reserved?)
+    end
+  end
 
-        host_reasons != [] or cap_reason != nil or step_reason != nil ->
-          details = host_reasons ++ List.wrap(step_reason) ++ List.wrap(cap_reason)
-          {:held, details, hold(state, session, seq, details)}
+  defp closing_ref(state, session) do
+    Enum.find_value(state.closing, fn {ref, closing} ->
+      if closing.session_key == session.session_key and closing.host == session.host, do: ref
+    end)
+  end
 
-        true ->
-          state =
-            state
-            |> reserve(session, launch, reserved?)
-            |> resume_if_held(session.session_key)
-            |> mark_busy(session.session_key, session.host)
+  defp decide_launch(state, session, host_state, seq, launch, reserved?) do
+    host_reasons = host_level_reasons(host_state)
 
-          {:ok, state}
-      end
+    # R3b: the reserved Main takes its reserved slot; R3 never holds it. The
+    # floor and the budget still do.
+    {cap_reason, state} =
+      if reserved? and match?({:session, _}, launch),
+        do: {nil, state},
+        else: cap_decision(state, session, host_state, launch, seq, host_reasons)
+
+    step_reason =
+      step_reason(host_state, launch) || inventory_reason(state) ||
+        step_hold_reason(state, session)
+
+    cond do
+      match?({:closing, _}, cap_reason) ->
+        {:closing, elem(cap_reason, 1), state}
+
+      host_reasons != [] or cap_reason != nil or step_reason != nil ->
+        details = host_reasons ++ List.wrap(step_reason) ++ List.wrap(cap_reason)
+        {:held, details, hold(state, session, seq, details)}
+
+      true ->
+        state =
+          state
+          |> reserve(session, launch, reserved?)
+          |> resume_if_held(session.session_key)
+          |> mark_busy(session.session_key, session.host)
+
+        {:ok, state}
     end
   end
 
@@ -1053,7 +1084,7 @@ defmodule Tightbeam.MemoryGuard do
           true ->
             case start_close(state, session.host, "resident_cap") do
               {:ok, ref, state} -> {{:closing, ref}, state}
-              :none -> {"resident_cap", state}
+              {:none, state} -> {"resident_cap", state}
             end
         end
     end
@@ -1099,10 +1130,13 @@ defmodule Tightbeam.MemoryGuard do
     do: is_binary(session.session_key) and session.session_key == reserved_main_key(state)
 
   defp resident_sids(state, host) do
+    lingering = for {{^host, sid}, _entry} <- state.lingering, do: sid
+
     state.adapters
     |> Map.values()
     |> Enum.filter(&(&1.host == host and Harness.session_processes?(harness_module(&1.key))))
     |> Enum.flat_map(&MapSet.to_list(&1.sids))
+    |> Kernel.++(lingering)
     |> MapSet.new()
   end
 
@@ -1433,7 +1467,7 @@ defmodule Tightbeam.MemoryGuard do
 
       cap ->
         resident_count(state, session.host, session.session_key) >= cap and
-          idle_candidates(state, session.host, "resident_cap") == []
+          elem(idle_candidates(state, session.host, "resident_cap"), 0) == []
     end
   end
 
@@ -1474,34 +1508,78 @@ defmodule Tightbeam.MemoryGuard do
   # R3a: idle workers first (least recently used first), then idle
   # user-facing processes, an idle Main last. R3 never closes the reserved
   # Main in its slot: that frees no slot under the cap (R3b).
+  # R4 / §1: a candidate is idle only when every part of the proof reads and
+  # says idle (matrix K1, K2, K4); a part that cannot be read is not idle, and
+  # that is recorded once per run.
   defp idle_candidates(state, host, reason) do
     closing = MapSet.new(Map.values(state.closing), &{&1.host, &1.sid})
     reserved = if reason == "resident_cap", do: reserved_sid(state, host)
 
-    for {adapter, entry} <- state.adapters,
-        entry.host == host,
-        Harness.session_processes?(harness_module(entry.key)),
-        sid <- entry.sids,
-        not MapSet.member?(closing, {host, sid}),
-        not MapSet.member?(state.unclosable, {host, sid}),
-        sid != reserved,
-        session_key <- [session_for_sid(state.db, sid)],
-        not Map.has_key?(state.busy, session_key),
-        not Map.has_key?(state.reservations, session_key),
-        is_nil(session_key) or not turn_pending?(state.db, session_key) do
-      {close_rank(state, session_key), Map.get(state.last_used, {host, sid}, 0), adapter, sid,
-       session_key}
-    end
-    |> Enum.sort()
+    resident =
+      for {adapter, entry} <- state.adapters,
+          entry.host == host,
+          Harness.session_processes?(harness_module(entry.key)),
+          sid <- entry.sids,
+          do: {adapter, sid}
+
+    lingering = for {{^host, sid}, entry} <- state.lingering, do: {entry.adapter, sid}
+
+    candidates =
+      for {adapter, sid} <- Enum.uniq(resident ++ lingering),
+          not MapSet.member?(closing, {host, sid}),
+          not MapSet.member?(state.unclosable, {host, sid}),
+          sid != reserved do
+        {adapter, sid, idle_proof(state, sid)}
+      end
+
+    state =
+      Enum.reduce(candidates, state, fn
+        {_adapter, sid, {:unproven, why}}, acc -> idle_unproven(acc, host, sid, why)
+        _candidate, acc -> acc
+      end)
+
+    ready =
+      for {adapter, sid, {:idle, session_key, rank}} <- candidates do
+        {{MapSet.member?(state.close_failed, {host, sid}), rank},
+         Map.get(state.last_used, {host, sid}, 0), adapter, sid, session_key}
+      end
+
+    {Enum.sort(ready), state}
   end
 
-  defp close_rank(_state, nil), do: 0
+  # {:idle, session_key, close_rank} | :busy | {:unproven, why}
+  defp idle_proof(state, sid) do
+    with {:ok, session_key} <- session_for_sid(state.db, sid),
+         false <- Map.has_key?(state.busy, session_key),
+         false <- Map.has_key?(state.reservations, session_key),
+         {:ok, false} <- turn_pending(state.db, session_key),
+         {:ok, rank} <- close_rank(state, session_key) do
+      {:idle, session_key, rank}
+    else
+      true -> :busy
+      {:ok, true} -> :busy
+      {:error, why} -> {:unproven, why}
+    end
+  end
+
+  defp idle_unproven(state, host, sid, why) do
+    once(state, {:idle_unproven, host, sid, why}, fn ->
+      EventLog.lifecycle(
+        state.db,
+        "memory_guard_idle_unproven",
+        host,
+        JSON.encode!(%{host: host, sessionId: sid, why: why})
+      )
+    end)
+  end
 
   defp close_rank(state, session_key) do
     case Org.get(state.db, session_key) do
-      nil -> 0
-      session -> 2 - Priority.rank(Priority.class(state.db, session))
+      nil -> {:error, "the session cannot be read"}
+      session -> {:ok, 2 - Priority.rank(Priority.class(state.db, session))}
     end
+  rescue
+    error -> {:error, "the session's priority cannot be read: #{Exception.message(error)}"}
   end
 
   defp session_for_sid(db, sid) do
@@ -1514,42 +1592,67 @@ defmodule Tightbeam.MemoryGuard do
            """,
            [sid]
          ) do
-      {:ok, [[key]]} -> key
-      _ -> nil
+      {:ok, [[key]]} -> {:ok, key}
+      {:ok, []} -> {:error, "no session for the harness session"}
+      {:error, error} -> {:error, "the session pointer cannot be read: #{inspect(error)}"}
     end
   rescue
-    _ -> nil
+    error -> {:error, "the session pointer cannot be read: #{Exception.message(error)}"}
   end
 
-  defp turn_pending?(db, session_key) do
+  defp turn_pending(db, session_key) do
     case DB.query(
            db,
            "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('queued','running') LIMIT 1",
            [session_key]
          ) do
-      {:ok, [[1]]} -> true
-      _ -> false
+      {:ok, [[1]]} -> {:ok, true}
+      {:ok, []} -> {:ok, false}
+      {:error, error} -> {:error, "the session's turns cannot be read: #{inspect(error)}"}
     end
+  rescue
+    error -> {:error, "the session's turns cannot be read: #{Exception.message(error)}"}
   end
 
   # Start closing the least recently used idle session process. Returns :none
   # when no session process is idle.
+  #
+  # R4 serialization (matrix K6–K8): the close is issued only after one
+  # database transaction sets the session's `closing` mark on the condition
+  # that no turn of the session is queued or running; every enqueue or claim
+  # commits before or after it. Admission is serialized in this process, so a
+  # turn arriving after the mark waits for the close. The adapter then closes
+  # only if idle by its own observation, in the callback that also orders
+  # every prompt it sends.
   defp start_close(state, host, reason) do
-    case idle_candidates(state, host, reason) do
-      [] ->
-        :none
+    {candidates, state} = idle_candidates(state, host, reason)
+    try_close(state, host, reason, candidates)
+  end
 
-      [{_rank, _used, adapter, sid, session_key} | _] ->
+  defp try_close(state, _host, _reason, []), do: {:none, state}
+
+  defp try_close(state, host, reason, [{_rank, _used, adapter, sid, session_key} | rest]) do
+    state.before_close_commit.(session_key)
+
+    case closing_mark(state, host, sid, session_key, reason) do
+      :ok ->
         guard = self()
         ref = make_ref()
         closer = state.closer
         idle_check = state.idle_check
+        confirm = fn -> close_shown_complete(state, sid) end
 
         Task.start(fn ->
           result =
             case idle_check.(adapter, sid) do
-              :idle -> closer.(adapter, sid, reason)
-              other -> {:error, {:not_idle, other}}
+              :idle ->
+                case closer.(adapter, sid, reason) do
+                  :ok -> confirm.()
+                  other -> other
+                end
+
+              other ->
+                {:error, {:not_idle, other}}
             end
 
           send(guard, {:closed, ref, result})
@@ -1565,6 +1668,71 @@ defmodule Tightbeam.MemoryGuard do
         }
 
         {:ok, ref, %{state | closing: Map.put(state.closing, ref, closing)}}
+
+      {:not_idle, _why} ->
+        try_close(state, host, reason, rest)
+    end
+  end
+
+  # The conditional `closing` transaction (K1, K6, K7).
+  defp closing_mark(state, host, sid, session_key, reason) do
+    DB.transaction(state.db, fn txn ->
+      pending =
+        DB.Txn.q(
+          txn,
+          "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('queued','running') LIMIT 1",
+          [session_key]
+        )
+
+      if pending == [] do
+        EventLog.lifecycle_in_txn(
+          txn,
+          "memory_guard_closing",
+          session_key,
+          JSON.encode!(%{host: host, sessionId: sid, reason: reason})
+        )
+
+        :ok
+      else
+        {:not_idle, "a turn of the session is queued or running"}
+      end
+    end)
+    |> case do
+      {:ok, result} -> result
+      {:error, error} -> {:not_idle, "the closing transaction failed: #{inspect(error)}"}
+    end
+  end
+
+  # FS5 / K5: a close is complete only when the session process is shown
+  # gone (its recorded process and, enforced, its unit).
+  defp close_shown_complete(state, sid) do
+    records =
+      case Records.read_all(state.base_dir) do
+        {:ok, launches} -> launches |> Map.values() |> Enum.filter(&(&1["sessionId"] == sid))
+        {:error, _} -> []
+      end
+
+    case records do
+      [] ->
+        {:error, {:close_unconfirmed, "no readable launch record for the session process"}}
+
+      records ->
+        record = Enum.max_by(records, &(&1["launchedAt"] || 0))
+
+        target = %{
+          scope: "session",
+          pid: record["pid"],
+          start: record["start"],
+          unit: if(record["placement"] == "enforced", do: record["unit"]),
+          members: []
+        }
+
+        host_state = Map.get(state.hosts, state.local_host)
+
+        case await_gone(state, host_state, target, state.close_confirm_ms) do
+          :ok -> :ok
+          :alive -> {:error, {:close_unconfirmed, "the session process is still running"}}
+        end
     end
   end
 
@@ -1603,11 +1771,45 @@ defmodule Tightbeam.MemoryGuard do
           # The close cleared the adapter's residency; reflect it now rather
           # than waiting for the adapter's own residency report.
           adapters =
-            Map.update!(state.adapters, closing.adapter, fn entry ->
+            Map.update(state.adapters, closing.adapter, nil, fn entry ->
               %{entry | sids: MapSet.delete(entry.sids, closing.sid)}
             end)
+            |> Enum.reject(fn {_adapter, entry} -> is_nil(entry) end)
+            |> Map.new()
 
-          %{state | adapters: adapters}
+          %{
+            state
+            | adapters: adapters,
+              lingering: Map.delete(state.lingering, {closing.host, closing.sid}),
+              close_failed: MapSet.delete(state.close_failed, {closing.host, closing.sid})
+          }
+
+        {:error, {:close_unconfirmed, why}} ->
+          # FS5: acknowledged while the process lives: it stays resident and
+          # counted under R3, with no close event or marker; recorded, and
+          # retried on a later decision.
+          EventLog.lifecycle(
+            state.db,
+            "memory_guard_close_failed",
+            closing.session_key || closing.sid,
+            JSON.encode!(%{
+              host: closing.host,
+              sessionId: closing.sid,
+              reason: closing.reason,
+              error: "close acknowledged, but " <> why
+            })
+          )
+
+          %{
+            state
+            | lingering:
+                Map.put(state.lingering, {closing.host, closing.sid}, %{
+                  adapter: closing.adapter,
+                  session_key: closing.session_key
+                }),
+              unclosable: MapSet.put(state.unclosable, {closing.host, closing.sid}),
+              close_failed: MapSet.put(state.close_failed, {closing.host, closing.sid})
+          }
 
         result ->
           # Not idle after all (an observed background task, a prompt that
@@ -1628,7 +1830,14 @@ defmodule Tightbeam.MemoryGuard do
             )
           end
 
-          %{state | unclosable: MapSet.put(state.unclosable, {closing.host, closing.sid})}
+          state = %{state | unclosable: MapSet.put(state.unclosable, {closing.host, closing.sid})}
+
+          if match?({:error, {:not_idle, _}}, result),
+            do: state,
+            else: %{
+              state
+              | close_failed: MapSet.put(state.close_failed, {closing.host, closing.sid})
+            }
       end
 
     Enum.reduce(closing.waiters, state, fn {session_key, from}, acc ->
@@ -1685,8 +1894,9 @@ defmodule Tightbeam.MemoryGuard do
   defp default_idle_check(adapter, sid), do: Tightbeam.Acp.Adapter.idle_session?(adapter, sid)
 
   defp default_close(adapter, sid, _reason) do
-    case Tightbeam.Acp.Adapter.close_session(adapter, sid) do
+    case Tightbeam.Acp.Adapter.close_if_idle(adapter, sid) do
       :ok -> :ok
+      {:error, :not_idle} -> {:error, {:not_idle, :busy}}
       other -> other
     end
   end
@@ -2404,7 +2614,11 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   defp record_ended(state, host, kill) do
-    session_key = if kill.sid, do: session_for_sid(state.db, kill.sid)
+    session_key =
+      with sid when is_binary(sid) <- kill.sid,
+           {:ok, key} <- session_for_sid(state.db, sid),
+           do: key,
+           else: (_ -> nil)
 
     EventLog.lifecycle(
       state.db,
@@ -2468,6 +2682,9 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   defp session_process_ended(state, host, record) do
+    # FS5: a lingering process is gone now; it no longer counts.
+    state = %{state | lingering: Map.delete(state.lingering, {host, record["sessionId"]})}
+
     layout = state.hosts[host].layout
     id = "session:" <> record["launchId"]
 
@@ -2582,9 +2799,11 @@ defmodule Tightbeam.MemoryGuard do
     with %{mode: mode, settings: %{resident_cap: cap}} when mode != "off" and is_integer(cap) <-
            host_state,
          true <- resident_count(state, host, nil) > cap,
-         false <- Enum.any?(state.closing, fn {_ref, c} -> c.host == host end),
-         {:ok, _ref, state} <- start_close(state, host, "resident_cap") do
-      state
+         false <- Enum.any?(state.closing, fn {_ref, c} -> c.host == host end) do
+      case start_close(state, host, "resident_cap") do
+        {:ok, _ref, state} -> state
+        {:none, state} -> state
+      end
     else
       _ -> state
     end
@@ -2605,7 +2824,7 @@ defmodule Tightbeam.MemoryGuard do
 
       case start_close(state, host, reason) do
         {:ok, _ref, state} -> state
-        :none -> state
+        {:none, state} -> state
       end
     else
       state
