@@ -51,9 +51,11 @@ defmodule Tightbeam.MemoryGuard do
   def running?, do: is_pid(Process.whereis(__MODULE__))
 
   @doc """
-  Whether this runtime runs a guard (set by the gateway's supervision tree).
-  An expected guard that is not running is restarting, not absent: R2a's
-  launch fence waits for it or fails, never passes.
+  Whether this runtime runs a guard: set when the guard is started (before
+  its init, so one that fails to start is still expected) and cleared only on
+  its orderly shutdown. An expected guard that is not running is restarting
+  or failed, not absent: R2a's launch fence waits for it or fails, never
+  passes.
   """
   @spec expect(boolean()) :: :ok
   def expect(expected?), do: :persistent_term.put({__MODULE__, :expected}, expected? == true)
@@ -308,7 +310,10 @@ defmodule Tightbeam.MemoryGuard do
 
   ## Server API
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  def start_link(opts) do
+    expect(true)
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
 
   def child_spec(opts),
     do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, restart: :permanent}
@@ -416,6 +421,8 @@ defmodule Tightbeam.MemoryGuard do
 
   @impl true
   def init(opts) do
+    # Orderly shutdown runs terminate/2, which clears the expectation.
+    Process.flag(:trap_exit, true)
     ensure_table()
     db = Keyword.get(opts, :db, DB)
     base_dir = Keyword.fetch!(opts, :base_dir)
@@ -622,6 +629,12 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   def handle_info(_message, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(reason, _state) do
+    if reason in [:normal, :shutdown] or match?({:shutdown, _}, reason), do: expect(false)
+    :ok
+  end
 
   ## Modes and settings
 
