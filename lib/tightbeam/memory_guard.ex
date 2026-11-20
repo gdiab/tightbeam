@@ -739,8 +739,22 @@ defmodule Tightbeam.MemoryGuard do
 
   defp determine(state, host) do
     local? = host == state.local_host
-    stored = Settings.stored(state.db, host)
     previous = Map.get(state.hosts, host)
+
+    # FS7 (F4): stored settings that cannot be read keep the last effective
+    # settings, and the read says so; never defaults silently.
+    {stored, settings_gap} =
+      try do
+        {Settings.stored(state.db, host), nil}
+      rescue
+        error ->
+          {nil,
+           "the stored memory settings cannot be read (#{Exception.message(error)}); " <>
+             if(previous,
+               do: "the last effective settings stay in use",
+               else: "the defaults are in use"
+             )}
+      end
 
     probe =
       cond do
@@ -760,7 +774,13 @@ defmodule Tightbeam.MemoryGuard do
           state.probe.()
       end
 
-    settings = Settings.effective(stored, probe.mem_total)
+    settings =
+      cond do
+        stored != nil -> Settings.effective(stored, probe.mem_total)
+        previous != nil -> previous.settings
+        true -> Settings.effective(%{}, probe.mem_total)
+      end
+
     previous_layout = previous && previous.layout
 
     # A transition is effective only once the kernel's state matches it (R12,
@@ -791,7 +811,10 @@ defmodule Tightbeam.MemoryGuard do
       case lift && Cgroup.relax(lift) do
         {:error, error} ->
           gap =
-            "the kernel's earlier memory limits could not all be lifted (#{error}); they still act alongside the guard's own checks, retried every sample"
+            "the kernel's earlier memory limits could not all be lifted (#{error}); " <>
+              "still in force: the budget group's memory.max#{in_force_budget(previous)}, " <>
+              "swap 0, and each session unit's own memory.max; they act alongside the guard's " <>
+              "own checks, retried every sample"
 
           gap = if mode == "watched", do: gap, else: "#{mode} is not yet in effect: " <> gap
 
@@ -801,6 +824,14 @@ defmodule Tightbeam.MemoryGuard do
         _ ->
           {mode, reason, layout, transition}
       end
+
+    # FS3 (F3): a budget the kernel did not take is not the effective one; the
+    # read shows the budget that acts (R12b).
+    settings =
+      if mode == "enforced" and is_binary(transition) and previous != nil and
+           layout != nil and layout == previous.layout,
+         do: %{settings | budget: previous.settings.budget},
+         else: settings
 
     step =
       if local? do
@@ -830,6 +861,7 @@ defmodule Tightbeam.MemoryGuard do
     gaps =
       Enum.reject(
         [
+          settings_gap,
           (match?({:unavailable, _}, step) and mode in ["watched", "enforced"]) &&
             "session processes are not limited one by one: the launch step is unavailable (#{elem(step, 1)})",
           match?({:error, _}, published) &&
@@ -868,23 +900,45 @@ defmodule Tightbeam.MemoryGuard do
       is_nil(previous) or previous.mode != mode or previous.reason != reason or
         previous.settings != settings or previous.transition_error != transition
 
-    if changed? do
-      EventLog.lifecycle(
-        state.db,
-        "memory_guard_mode",
-        host,
-        JSON.encode!(%{
-          host: host,
-          mode: mode,
-          reason: reason,
-          # Not nil while the requested change is not yet in force (FS3); a
-          # down guard's admission reads the mode in force from this (FS1).
-          transition: transition,
-          settings: settings_json(settings),
-          invalid: settings.invalid
-        })
-      )
-    end
+    # FS7 (F7): a mode change and its record are one step. When the record
+    # cannot be written the change is not established: the gateway's own host
+    # reads `watched` (every tree sampled; FS3's reading of an unsettled
+    # kernel state), and the change is retried every sample.
+    host_state =
+      if changed? do
+        try do
+          EventLog.lifecycle(
+            state.db,
+            "memory_guard_mode",
+            host,
+            JSON.encode!(%{
+              host: host,
+              mode: mode,
+              reason: reason,
+              # Not nil while the requested change is not yet in force (FS3); a
+              # down guard's admission reads the mode in force from this (FS1).
+              transition: transition,
+              settings: settings_json(settings),
+              invalid: settings.invalid
+            })
+          )
+
+          host_state
+        rescue
+          error ->
+            gap =
+              "the change of memory limits mode could not be recorded (#{Exception.message(error)}); retried every sample"
+
+            %{
+              host_state
+              | mode: if(local? and mode in ["enforced", "off"], do: "watched", else: mode),
+                reason: Enum.join(Enum.reject([host_state.reason, gap], &is_nil/1), "; "),
+                transition_error: host_state.transition_error || gap
+            }
+        end
+      else
+        host_state
+      end
 
     %{state | hosts: Map.put(state.hosts, host, host_state)}
   end
@@ -947,6 +1001,11 @@ defmodule Tightbeam.MemoryGuard do
       {:ok, limits}
     end
   end
+
+  defp in_force_budget(%{settings: %{budget: budget}}) when is_integer(budget),
+    do: " (#{gib(budget)})"
+
+  defp in_force_budget(_previous), do: ""
 
   defp settings_json(settings) do
     %{
