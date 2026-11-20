@@ -405,54 +405,83 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     )
   end
 
-  test "P5: across 200 races, exactly one of a real gateway start and the ceremony proceeds",
+  test "P5: across 200 races, a real gateway start and the ceremony never both hold the base",
        ctx do
-    ceremony = fn ->
-      on_tty(ctx, ["recover-admin", "--user", "george"], "TBR-AAAAA-BBBBB-CCCCC-DDDDD",
-        delay: "0.15",
-        linger: "0.4"
+    # The ceremony leaves a marker when its CLI exits, which releases the lock.
+    ceremony = fn marker ->
+      command =
+        "#{shell_quote(@cli)} recover-admin --user george; touch #{shell_quote(marker)}"
+
+      System.cmd(
+        "sh",
+        ["-c", tty_pipeline(command, "TBR-AAAAA-BBBBB-CCCCC-DDDDD", "0.15", "0.4")],
+        cd: ctx.base,
+        env: env(ctx),
+        stderr_to_stdout: true
       )
+    end
+
+    # The gateway's start is the production database owner: it admits the base, then
+    # takes the lock before it opens state.db for writing. A start that succeeds notes
+    # whether the ceremony had already exited by then.
+    gateway = fn marker ->
+      case start_gateway_db(ctx) do
+        {:ok, pid} -> {:started, pid, File.exists?(marker)}
+        {:error, {:base_dir_locked, _}} -> :refused
+      end
     end
 
     outcomes =
       for n <- 1..200 do
-        # The gateway's start is the production database owner, which admits the base
-        # and then takes the lock before it opens state.db for writing. Even rounds
-        # start the ceremony first, odd rounds the gateway, each at a varying offset.
-        {gateway, {output, _status}} =
+        marker = Path.join(ctx.base, "ceremony-#{n}.done")
+
+        # Even rounds start the ceremony first, odd rounds the gateway, each at a varying
+        # offset, so either can find the other holding the lock.
+        {started, {output, _status}} =
           if rem(n, 2) == 0 do
-            task = Task.async(ceremony)
+            task = Task.async(fn -> ceremony.(marker) end)
             Process.sleep(rem(n * 7, 40))
-            gateway = start_gateway_db(ctx)
-            {gateway, Task.await(task, 30_000)}
+            started = gateway.(marker)
+            {started, Task.await(task, 30_000)}
           else
-            task = Task.async(fn -> start_gateway_db(ctx) end)
-            Process.sleep(rem(n * 13, 200))
-            result = ceremony.()
+            task = Task.async(fn -> gateway.(marker) end)
+            Process.sleep(rem(n * 37, 1_500))
+            result = ceremony.(marker)
             {Task.await(task, 30_000), result}
           end
 
-        ceremony = if output =~ "base-directory lock is held", do: :refused, else: :proceeded
+        ceremony_outcome =
+          if output =~ "base-directory lock is held", do: :refused, else: :proceeded
 
-        outcome =
-          case gateway do
-            {:ok, pid} ->
-              GenServer.stop(pid)
-              :started
+        case started do
+          {:started, pid, ceremony_done?} ->
+            GenServer.stop(pid)
 
-            {:error, {:base_dir_locked, _}} ->
-              :refused
-          end
+            cond do
+              ceremony_outcome == :refused -> {:gateway_held, :ceremony_refused}
+              ceremony_done? -> {:ceremony_then_gateway, :sequential}
+              true -> {:both_held, n}
+            end
 
-        {outcome, ceremony}
+          :refused ->
+            {:ceremony_held, ceremony_outcome}
+        end
       end
 
+    # Never both: a gateway that started while the ceremony still ran would be a
+    # {:both_held, round}; a refused gateway means the ceremony held the lock.
     for outcome <- outcomes do
-      assert outcome in [{:started, :refused}, {:refused, :proceeded}], inspect(outcome)
+      assert outcome in [
+               {:gateway_held, :ceremony_refused},
+               {:ceremony_held, :proceeded},
+               {:ceremony_then_gateway, :sequential}
+             ],
+             inspect(outcome)
     end
 
-    assert Enum.any?(outcomes, &match?({:started, _}, &1))
-    assert Enum.any?(outcomes, &match?({:refused, _}, &1))
+    # Both directions of real contention occurred.
+    assert {:gateway_held, :ceremony_refused} in outcomes
+    assert {:ceremony_held, :proceeded} in outcomes
   end
 
   test "S1.2: a real gateway start takes the lock before opening state.db, and a second instance refuses",
