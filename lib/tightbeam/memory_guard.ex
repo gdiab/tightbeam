@@ -182,11 +182,15 @@ defmodule Tightbeam.MemoryGuard do
   @doc """
   The environment a local adapter launch of `key` needs so its session
   processes start through the launch step (AS2), and, in `enforced` mode, the
-  adapter's own unit (R12c). Empty when the guard does not apply.
+  adapter's own unit (R12c). The step is installed in every mode of the
+  gateway's own host: under `off` or `count-only` it execs the harness
+  untouched (it reads the mode at each launch), so a later change to
+  `watched` or `enforced` reaches the sessions of adapters already running
+  (R17: applied without a restart). Empty for a remote host.
   """
   @spec launch_env(tuple(), String.t(), keyword(), DB.server()) :: [{String.t(), String.t()}]
   def launch_env({harness, _preset, host}, launch_id, opts, db \\ DB) do
-    with %{local: true, mode: mode} = view when mode in ["watched", "enforced"] <- host_view(host),
+    with %{local: true, mode: mode} = view <- host_view(host),
          nil <- Keyword.get(opts, :process_ssh) do
       module = Harness.module!(harness)
       env = Keyword.get(opts, :env, [])
@@ -577,6 +581,7 @@ defmodule Tightbeam.MemoryGuard do
       end
 
     settings = Settings.effective(stored, probe.mem_total)
+    previous_layout = previous && previous.layout
 
     {mode, reason, layout} =
       cond do
@@ -589,7 +594,12 @@ defmodule Tightbeam.MemoryGuard do
           result =
             if existing,
               do: with(:ok <- Cgroup.set_budget(existing, settings.budget), do: {:ok, existing}),
-              else: Cgroup.setup(state.fs, probe.cgroup, settings.budget)
+              else:
+                with(
+                  {:ok, layout} <- Cgroup.setup(state.fs, probe.cgroup, settings.budget),
+                  :ok <- Cgroup.restore_units(layout, session_limits(state)),
+                  do: {:ok, layout}
+                )
 
           case result do
             {:ok, layout} ->
@@ -613,8 +623,26 @@ defmodule Tightbeam.MemoryGuard do
         do: "count-only",
         else: mode
 
+    # R12/R17: leaving `enforced` lifts the kernel's limits on the units that
+    # remain (processes stay where they are), so nothing acts once the read
+    # says the host is not enforced.
+    if previous_layout && is_nil(layout) do
+      case Cgroup.relax(previous_layout) do
+        :ok ->
+          :ok
+
+        {:error, error} ->
+          EventLog.lifecycle(
+            state.db,
+            "memory_guard_relax_failed",
+            host,
+            JSON.encode!(%{host: host, error: error})
+          )
+      end
+    end
+
     step =
-      if local? and mode in ["watched", "enforced"] do
+      if local? do
         case Records.install_step(state.base_dir, state.cli_bin) do
           {:ok, link} ->
             link
@@ -673,6 +701,14 @@ defmodule Tightbeam.MemoryGuard do
     end
 
     %{state | hosts: Map.put(state.hosts, host, host_state)}
+  end
+
+  # The sessionLimit each recorded session process was launched with (R17a).
+  defp session_limits(state) do
+    for {_id, record} <- Records.read_all(state.base_dir),
+        is_binary(record["unit"]),
+        into: %{},
+        do: {record["unit"], record["sessionLimit"]}
   end
 
   defp settings_json(settings) do
