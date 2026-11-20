@@ -482,7 +482,16 @@ defmodule Tightbeam.MemoryGuard do
       # Sessions found busy at close time; skipped until their state changes.
       unclosable: MapSet.new(),
       killing: %{},
-      announced: MapSet.new()
+      announced: MapSet.new(),
+      # The boot identity, for the launch-record inventory's per-boot
+      # initialization (FS4 scope): nil when it cannot be read.
+      boot: read_boot(root),
+      inventory_generation: nil,
+      # Tightbeam's own inventory (launch records, harness-process table)
+      # cannot be read: launches are held `guard_unavailable` (FS1, FS4 scope).
+      inventory_error: nil,
+      # What this gateway run has already recorded once (FS4, R12a).
+      recorded: MapSet.new()
     }
 
     state = state |> determine_all() |> publish_all()
@@ -674,6 +683,13 @@ defmodule Tightbeam.MemoryGuard do
     :ok
   end
 
+  defp read_boot(root) do
+    case File.read(Path.join(root, "proc/sys/kernel/random/boot_id")) do
+      {:ok, text} -> String.trim(text)
+      {:error, _} -> nil
+    end
+  end
+
   ## Modes and settings
 
   defp determine_all(state) do
@@ -746,11 +762,6 @@ defmodule Tightbeam.MemoryGuard do
           {mode, reason, layout, transition}
       end
 
-    mode =
-      if previous != nil and previous.sampling_failed and mode in ["watched", "enforced"],
-        do: "count-only",
-        else: mode
-
     step =
       if local? do
         case Records.install_step(state.base_dir, state.cli_bin) do
@@ -807,7 +818,9 @@ defmodule Tightbeam.MemoryGuard do
       total: previous && previous.total,
       budget_held: (previous && previous.budget_held) || false,
       budget_since: previous && previous.budget_since,
-      sampling_failed: (previous && previous.sampling_failed) || false,
+      # v1.13 FS4: host readings that failed, each disabling only the guard
+      # that needs it: %{reading => %{disables: [..], since: ms}}.
+      unavailable: (previous && previous.unavailable) || %{},
       transition_error: transition
     }
 
@@ -882,7 +895,9 @@ defmodule Tightbeam.MemoryGuard do
 
   # The sessionLimit each recorded session process was launched with (R17a).
   defp session_limits(state) do
-    with {:ok, records} <- Records.read_all(state.base_dir) do
+    # B4: limits restored from a lost inventory would be no limits at all.
+    with {:ok, state} <- ensure_inventory(state),
+         {:ok, records} <- Records.read_all(state.base_dir) do
       limits =
         for {_id, record} <- records,
             is_binary(record["unit"]),
@@ -946,7 +961,7 @@ defmodule Tightbeam.MemoryGuard do
           do: {nil, state},
           else: cap_decision(state, session, host_state, launch, seq, host_reasons)
 
-      step_reason = step_reason(host_state, launch)
+      step_reason = step_reason(host_state, launch) || inventory_reason(state)
 
       cond do
         match?({:closing, _}, cap_reason) ->
@@ -1323,7 +1338,7 @@ defmodule Tightbeam.MemoryGuard do
       # R3b/R7: the reserved Main is never held by the cap.
       details =
         host_level_reasons(host_state) ++
-          List.wrap(step_reason(host_state, launch)) ++
+          List.wrap(step_reason(host_state, launch) || inventory_reason(state)) ++
           if(
             match?({:session, _}, launch) and not reserved_main?(state, session) and
               cap_full?(state, session, host_state),
@@ -1361,6 +1376,17 @@ defmodule Tightbeam.MemoryGuard do
 
   defp step_reason(_host_state, _launch), do: nil
 
+  # FS4 scope: a launch is decided on Tightbeam's own inventories, read at the
+  # decision; while either cannot be read the launch is held (FS1).
+  defp inventory_reason(state) do
+    if state.local_host in Map.keys(state.hosts) do
+      case inventory(state, state.local_host) do
+        {:ok, _adapters, _state} -> nil
+        {:error, _error, _state} -> "guard_unavailable"
+      end
+    end
+  end
+
   defp cap_full?(state, session, host_state) do
     case host_state.settings.resident_cap do
       nil ->
@@ -1392,7 +1418,8 @@ defmodule Tightbeam.MemoryGuard do
 
       "guard_unavailable" ->
         "starts when Tightbeam's memory guard on #{host} can place new agent processes again " <>
-          "(its launch step is ready); an admin can also set the host's memory limits off"
+          "(its launch step and its own records are ready); an admin can also set the host's " <>
+          "memory limits off"
     end
   end
 
@@ -1639,29 +1666,11 @@ defmodule Tightbeam.MemoryGuard do
     state = retry_transition(state, host)
 
     case Map.get(state.hosts, host) do
-      %{mode: mode} = host_state when mode in ["watched", "enforced"] ->
-        case refresh_launches(state) do
-          {:ok, state} ->
-            state
-            |> sample_host(host, host_state)
-            |> expire_kills()
-            |> publish_all()
-
-          # Launch records that cannot be read leave trees unseen: a failed
-          # sample (R12a).
-          {:error, _} ->
-            state |> sampling_failed(host, host_state) |> publish_all()
-        end
-
-      %{mode: "count-only", sampling_failed: true} ->
-        # R12a: retry the read; the host returns to its mode once it succeeds.
-        with {:ok, state} <- refresh_launches(state),
-             {:ok, _} <- measure(state, host, %{Map.get(state.hosts, host) | mode: "watched"}) do
-          state = put_in(state.hosts[host].sampling_failed, false)
-          state |> determine(host) |> publish_all()
-        else
-          _ -> state
-        end
+      %{mode: mode} when mode in ["watched", "enforced"] ->
+        state
+        |> sample_host(host)
+        |> expire_kills()
+        |> publish_all()
 
       _ ->
         state
@@ -1679,71 +1688,184 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
+  # v1.13 FS4 scope: the launch records and the harness-process table are
+  # Tightbeam's own inventories. While either cannot be read, or the launch
+  # records' durably initialized inventory is missing, nothing is counted or
+  # ended from them and launches are held `guard_unavailable` (FS1); the R2a
+  # fence counts as unresolved (FS8).
   defp refresh_launches(state) do
-    with {:ok, launches} <- Records.read_all(state.base_dir),
-         do: {:ok, %{state | launches: launches}}
-  end
-
-  defp sample_host(state, host, host_state) do
-    settings = host_state.settings
-
-    available =
-      case Probe.available_percent(state.root) do
-        {:ok, percent} -> percent
-        :error -> nil
-      end
-
-    case measure(state, host, host_state) do
-      {:ok, measured} ->
-        now = state.clock.()
-        state = floor_transition(state, host, available, now)
-        state = budget_transition(state, host, measured.total, now)
-        state = put_in(state.hosts[host].total, measured.total)
-        state = put_in(state.hosts[host].available, available)
-        state = announce_unplaced(state, host, measured)
-        state = watched_limits(state, host, measured, settings)
-        state = observe_ended(state, host, measured)
-        state |> shed(host) |> trim_to_cap(host)
-
-      :error ->
-        sampling_failed(state, host, host_state)
+    with {:ok, state} <- ensure_inventory(state),
+         {:ok, launches} <- Records.read_all(state.base_dir) do
+      {:ok, %{state | launches: launches}}
     end
   end
 
-  defp sampling_failed(state, host, host_state) do
-    if host_state.sampling_failed do
+  defp ensure_inventory(%{inventory_generation: nil} = state) do
+    case Records.init_inventory(state.db, state.base_dir, state.boot) do
+      {:ok, generation} -> {:ok, %{state | inventory_generation: generation}}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp ensure_inventory(state) do
+    with :ok <- Records.check_inventory(state.base_dir, state.inventory_generation),
+         do: {:ok, state}
+  end
+
+  defp inventory(state, host) do
+    with {:ok, state} <- refresh_launches(state),
+         {:ok, adapters} <- local_adapters(state, host) do
+      {:ok, adapters, inventory_ok(state)}
+    else
+      {:error, error} -> {:error, error, state}
+      :error -> {:error, "the harness-process table cannot be read", state}
+    end
+  end
+
+  defp inventory_ok(state), do: %{state | inventory_error: nil}
+
+  defp inventory_failed(state, host, error) do
+    state =
+      once(state, {:inventory, host}, fn ->
+        EventLog.lifecycle(
+          state.db,
+          "memory_guard_inventory_failed",
+          host,
+          JSON.encode!(%{host: host, error: error})
+        )
+      end)
+
+    %{state | inventory_error: error}
+  end
+
+  # One record per host per gateway run (FS4, R12a).
+  defp once(state, key, record) do
+    if MapSet.member?(state.recorded, key) do
       state
     else
-      EventLog.lifecycle(
-        state.db,
-        "memory_guard_sampling_failed",
-        host,
-        JSON.encode!(%{host: host, mode: host_state.mode})
-      )
-
-      state = put_in(state.hosts[host].sampling_failed, true)
-      state = put_in(state.hosts[host].mode, "count-only")
-
-      put_in(
-        state.hosts[host].reason,
-        "tree memory cannot be read; only the resident cap applies until a read succeeds"
-      )
+      record.()
+      %{state | recorded: MapSet.put(state.recorded, key)}
     end
   end
 
-  # Per unit: %{id, scope, sid?, key?, launch_id, bytes, limit_bytes, pids?, unit?}
-  defp measure(state, host, host_state) do
-    # The adapters cannot be listed: this is a failed sample (R12a), never an
-    # empty host that would undercount the Tightbeam total.
-    case local_adapters(state, host) do
-      {:ok, adapters} ->
-        case host_state.mode do
-          "enforced" -> measure_enforced(state, host_state, adapters)
-          "watched" -> measure_watched(state, adapters, Map.values(state.launches))
-        end
+  defp sample_host(state, host) do
+    now = state.clock.()
+    state = sample_floor(state, host, now)
+
+    case inventory(state, host) do
+      {:ok, adapters, state} ->
+        measured = measure(state, state.hosts[host], adapters)
+        state = apply_measurement(state, host, measured, now)
+        state |> shed(host) |> trim_to_cap(host)
+
+      {:error, error, state} ->
+        state |> inventory_failed(host, error) |> shed(host)
+    end
+  end
+
+  # FS4: a runtime `/proc/meminfo` failure disables R5 only, and its
+  # `memory_floor` reason counts as clear.
+  defp sample_floor(state, host, now) do
+    case Probe.available_percent(state.root) do
+      {:ok, available} ->
+        state = reading_ok(state, host, "meminfo")
+        state = put_in(state.hosts[host].available, available)
+        floor_transition(state, host, available, now)
 
       :error ->
-        :error
+        state = reading_failed(state, host, "meminfo", ["R5"])
+        state = put_in(state.hosts[host].available, nil)
+
+        if state.hosts[host].floor_held do
+          state
+          |> put_in([:hosts, host, :floor_held], false)
+          |> put_in([:hosts, host, :floor_since], nil)
+          |> host_released(host, "memory_floor", %{because: "host memory cannot be read"})
+        else
+          state
+        end
+    end
+  end
+
+  defp apply_measurement(state, host, measured, now) do
+    trees_ok? = measured.trees == :ok
+    total_ok? = is_integer(measured.total)
+
+    state =
+      if trees_ok?,
+        do: reading_ok(state, host, "tree"),
+        else: reading_failed(state, host, "tree", ["R1", "R2"])
+
+    state =
+      case Map.get(measured, :total_read) do
+        nil -> state
+        :ok -> reading_ok(state, host, "budget_total")
+        :unreadable -> reading_failed(state, host, "budget_total", ["R2 approach"])
+      end
+
+    # R2's approach needs the total and, in watched mode, every tree; without
+    # them it is unavailable and its hold counts as clear (FS4).
+    state =
+      if trees_ok? and total_ok?,
+        do: budget_transition(state, host, measured.total, now),
+        else: clear_budget_hold(state, host)
+
+    state = put_in(state.hosts[host].total, if(total_ok?, do: measured.total))
+    state = announce_unplaced(state, host, measured)
+    state = watched_limits(state, host, measured, state.hosts[host].settings)
+    observe_ended(state, host, measured)
+  end
+
+  defp clear_budget_hold(state, host) do
+    if state.hosts[host].budget_held do
+      state
+      |> put_in([:hosts, host, :budget_held], false)
+      |> put_in([:hosts, host, :budget_since], nil)
+      |> host_released(host, "memory_budget", %{
+        because: "Tightbeam's memory total cannot be read"
+      })
+    else
+      state
+    end
+  end
+
+  defp reading_failed(state, host, reading, disables) do
+    state =
+      once(state, {:reading, host, reading}, fn ->
+        EventLog.lifecycle(
+          state.db,
+          "memory_guard_sampling_failed",
+          host,
+          JSON.encode!(%{
+            host: host,
+            mode: state.hosts[host].mode,
+            reading: reading,
+            disables: disables
+          })
+        )
+      end)
+
+    update_in(state.hosts[host].unavailable, fn unavailable ->
+      Map.put_new(unavailable, reading, %{disables: disables, since: state.clock.()})
+    end)
+  end
+
+  defp reading_ok(state, host, reading),
+    do: update_in(state.hosts[host].unavailable, &Map.delete(&1, reading))
+
+  # Per unit: %{id, scope, sid?, key?, launch_id, bytes, limit_bytes, pids?, unit?}.
+  # The result also says whether every tree was read (`trees`) and carries the
+  # Tightbeam total, or nil when it cannot be read (FS4).
+  defp measure(state, host_state, adapters) do
+    case host_state.mode do
+      "enforced" ->
+        measure_enforced(state, host_state, adapters)
+
+      "watched" ->
+        case measure_watched(state, adapters, Map.values(state.launches)) do
+          {:ok, measured} -> Map.put(measured, :trees, :ok)
+          :error -> %{units: [], total: nil, trees: :unreadable, table: nil}
+        end
     end
   end
 
@@ -1765,8 +1887,12 @@ defmodule Tightbeam.MemoryGuard do
 
   defp measure_watched(state, adapters, launches, exclude \\ nil) do
     with {:ok, table} <- ProcTree.snapshot(state.root),
-         :ok <- roots_readable(state, table, adapters, launches) do
+         :ok <- roots_readable(state, table, adapters, launches),
+         # E3: a process of ours that cannot be read may be any tree's member.
+         [] <- ProcTree.unreadable_own(state.root, table) do
       measure_trees(table, adapters, launches, exclude)
+    else
+      _ -> :error
     end
   end
 
@@ -1838,72 +1964,79 @@ defmodule Tightbeam.MemoryGuard do
   defp measure_enforced(state, host_state, adapters) do
     layout = host_state.layout
 
-    case Cgroup.current(layout.fs, layout.harness) do
-      {:ok, total} ->
-        enforced_sessions =
-          for {_id, record} <- state.launches,
-              record["placement"] == "enforced",
-              do: %{
-                id: "session:" <> record["launchId"],
-                scope: "session",
-                sid: record["sessionId"],
-                launch_id: record["launchId"],
-                adapter_launch_id: record["adapterLaunchId"],
-                unit: record["unit"],
-                bytes: unit_bytes(layout, record["unit"]),
-                limit_bytes: record["sessionLimit"],
-                record: record
-              }
+    enforced_sessions =
+      for {_id, record} <- state.launches,
+          record["placement"] == "enforced",
+          do: %{
+            id: "session:" <> record["launchId"],
+            scope: "session",
+            sid: record["sessionId"],
+            launch_id: record["launchId"],
+            adapter_launch_id: record["adapterLaunchId"],
+            unit: record["unit"],
+            bytes: unit_bytes(layout, record["unit"]),
+            limit_bytes: record["sessionLimit"],
+            record: record
+          }
 
-        # R12a/R12c: an adapter is enforced only when it is a member of its
-        # unit. One that is not (its join failed, or it predates the mode) is
-        # sampled and limited as in watched mode, and the gap is recorded.
-        {placed, unplaced_adapters} =
-          Enum.split_with(
-            adapters,
-            &in_unit?(state.root, &1.os_pid, Cgroup.adapter_unit(layout, &1.launch_id))
-          )
+    # R12a/R12c: an adapter is enforced only when it is a member of its
+    # unit. One that is not (its join failed, or it predates the mode) is
+    # sampled and limited as in watched mode, and the gap is recorded.
+    {placed, unplaced_adapters} =
+      Enum.split_with(
+        adapters,
+        &in_unit?(state.root, &1.os_pid, Cgroup.adapter_unit(layout, &1.launch_id))
+      )
 
-        adapter_units =
-          for row <- placed do
-            unit = Cgroup.adapter_unit(layout, row.launch_id)
+    adapter_units =
+      for row <- placed do
+        unit = Cgroup.adapter_unit(layout, row.launch_id)
 
-            %{
-              id: "adapter:" <> row.launch_id,
-              scope: "adapter",
-              key: parse_key(row.adapter_key),
-              launch_id: row.launch_id,
-              unit: unit,
-              bytes: unit_bytes(layout, unit),
-              limit_bytes: nil,
-              row: row
-            }
-          end
+        %{
+          id: "adapter:" <> row.launch_id,
+          scope: "adapter",
+          key: parse_key(row.adapter_key),
+          launch_id: row.launch_id,
+          unit: unit,
+          bytes: unit_bytes(layout, unit),
+          limit_bytes: nil,
+          row: row
+        }
+      end
 
-        # A session tree the kernel could not take (its cgroup failed) is
-        # sampled and limited as in watched mode too.
-        unplaced = for {_id, r} <- state.launches, r["placement"] != "enforced", do: r
+    # A session tree the kernel could not take (its cgroup failed) is
+    # sampled and limited as in watched mode too.
+    unplaced = for {_id, r} <- state.launches, r["placement"] != "enforced", do: r
 
-        watched =
-          case {unplaced, unplaced_adapters} do
-            {[], []} -> {:ok, %{units: []}}
-            {records, rows} -> measure_watched(state, rows, records, Map.values(state.launches))
-          end
+    watched =
+      case {unplaced, unplaced_adapters} do
+        {[], []} -> {:ok, %{units: []}}
+        {records, rows} -> measure_watched(state, rows, records, Map.values(state.launches))
+      end
 
-        case watched do
-          {:ok, %{units: watched_units}} ->
-            units = enforced_sessions ++ adapter_units ++ watched_units
-            {:ok, %{units: units, total: total + Enum.sum(Enum.map(watched_units, & &1.bytes))}}
+    # FS4: the budget group's total and the unplaced trees are separate host
+    # readings. An unplaced tree's memory is outside the budget group's count,
+    # so without its read the total is unknown too, never a smaller one.
+    {watched_units, trees} =
+      case watched do
+        {:ok, %{units: units}} -> {units, :ok}
+        :error -> {[], :unreadable}
+      end
 
-          # The unplaced trees are outside the budget group's count: without
-          # their read the sample is failed (R12a), never a smaller total.
-          :error ->
-            :error
-        end
+    harness_total = Cgroup.current(layout.fs, layout.harness)
 
-      :error ->
-        :error
-    end
+    total =
+      case {harness_total, trees} do
+        {{:ok, bytes}, :ok} -> bytes + Enum.sum(Enum.map(watched_units, & &1.bytes))
+        _ -> nil
+      end
+
+    %{
+      units: enforced_sessions ++ adapter_units ++ watched_units,
+      total: total,
+      trees: trees,
+      total_read: if(match?({:ok, _}, harness_total), do: :ok, else: :unreadable)
+    }
   end
 
   # Whether a process is a member of `unit`, from its own /proc/<pid>/cgroup.
@@ -1919,12 +2052,14 @@ defmodule Tightbeam.MemoryGuard do
 
   defp in_unit?(_root, _pid, _unit), do: false
 
-  defp unit_bytes(_layout, nil), do: 0
+  # C3: a unit's own counter is shown unknown (nil) when it cannot be read,
+  # never 0; the kernel enforces the unit's limit either way.
+  defp unit_bytes(_layout, nil), do: nil
 
   defp unit_bytes(layout, unit) do
     case Cgroup.current(layout.fs, unit) do
       {:ok, bytes} -> bytes
-      :error -> 0
+      :error -> nil
     end
   end
 
@@ -1951,8 +2086,6 @@ defmodule Tightbeam.MemoryGuard do
   defp parse_key(key), do: key
 
   # R5: hold below floorHold, release at floorRelease (hysteresis).
-  defp floor_transition(state, _host, nil, _now), do: state
-
   defp floor_transition(state, host, available, now) do
     host_state = state.hosts[host]
     settings = host_state.settings
@@ -2103,8 +2236,9 @@ defmodule Tightbeam.MemoryGuard do
 
     over_session =
       Enum.find(units, fn unit ->
-        unit.scope == "session" and is_integer(unit.limit_bytes) and unit.bytes > unit.limit_bytes and
-          Map.has_key?(unit, :pids) and not Map.has_key?(state.killing, unit.id)
+        Map.has_key?(unit, :pids) and unit.scope == "session" and is_integer(unit.limit_bytes) and
+          is_integer(unit.bytes) and unit.bytes > unit.limit_bytes and
+          not Map.has_key?(state.killing, unit.id)
       end)
 
     cond do
@@ -2112,7 +2246,8 @@ defmodule Tightbeam.MemoryGuard do
         kill_unit(state, host, over_session, "session", mode)
 
       mode in ["watched", "enforced"] and is_integer(settings.budget) and
-        measured.total > settings.budget and map_size(state.killing) == 0 ->
+        is_integer(measured.total) and measured.total > settings.budget and
+          map_size(state.killing) == 0 ->
         # Watched: every unit is the gateway's to end. Enforced: the kernel
         # ends placed units; the gateway ends only the ones it samples (R12a).
         victim =
@@ -2236,6 +2371,7 @@ defmodule Tightbeam.MemoryGuard do
   defp observe_ended(state, host, measured) do
     live = MapSet.new(for unit <- measured.units, unit.scope == "session", do: unit.launch_id)
     table = Map.get(measured, :table)
+    trees_read? = Map.get(measured, :trees, :ok) == :ok
 
     Enum.reduce(state.launches, state, fn {launch_id, record}, acc ->
       gone? =
@@ -2248,6 +2384,10 @@ defmodule Tightbeam.MemoryGuard do
           table ->
             not alive?(table, record) and
               not (is_integer(record["pid"]) and ProcTree.unreadable?(state.root, record["pid"]))
+
+          # Trees that could not be read are not trees that ended (FS4).
+          not trees_read? ->
+            false
 
           true ->
             not MapSet.member?(live, launch_id)
@@ -2752,7 +2892,14 @@ defmodule Tightbeam.MemoryGuard do
           oomScoreAdj: oom_read(state, host_state),
           heldTurns: held,
           floorHolds: host_state.floor_held,
-          budgetHolds: host_state.budget_held
+          budgetHolds: host_state.budget_held,
+          # FS4: each host reading that failed and the guards it disables, named
+          # until a read succeeds; FS1: Tightbeam's own records unreadable.
+          unavailable:
+            for {reading, %{disables: disables, since: since}} <- host_state.unavailable do
+              %{reading: reading, disables: disables, since: since}
+            end,
+          recordsUnreadable: if(host_state.local, do: state.inventory_error)
         }
     end
   end

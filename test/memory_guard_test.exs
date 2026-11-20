@@ -716,7 +716,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert :ok = MemoryGuard.end_tree(state, %{layout: %{fs: fs}}, target)
     end
 
-    test "(review R3) an unplaced adapter whose tree cannot be read fails the sample, never drops out",
+    test "E2.unreadable / E1.unreadable (enforced, T25 c): an unplaced adapter whose tree cannot be read disables R1 and R2 and leaves the total unknown, never a smaller one",
          ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
@@ -751,25 +751,38 @@ defmodule Tightbeam.MemoryGuardTest do
       # The known root exists but cannot be read.
       File.chmod!(stat, 0o000)
       :ok = MemoryGuard.tick()
-      assert MemoryGuard.read(@host).mode == "count-only"
-      assert [_] = events(ctx.db, "memory_guard_sampling_failed")
+      read = MemoryGuard.read(@host)
+      assert read.mode == "enforced"
+      assert [%{reading: "tree", disables: ["R1", "R2"]}] = read.unavailable
+      assert read.tightbeamTotalBytes == nil
+      assert [{@host, %{"reading" => "tree"}}] = events(ctx.db, "memory_guard_sampling_failed")
 
       File.chmod!(stat, 0o644)
       :ok = MemoryGuard.tick()
-      assert MemoryGuard.read(@host).mode == "enforced"
+      read = MemoryGuard.read(@host)
+      assert read.mode == "enforced"
+      assert read.unavailable == []
+      assert read.tightbeamTotalBytes == 200 * @mib
 
-      # The whole process table cannot be read.
+      # The whole process table cannot be read: the tree reading is recorded
+      # once per run already; meminfo, under /proc here, is recorded now.
       File.chmod!(proc_dir, 0o000)
       :ok = MemoryGuard.tick()
-      assert MemoryGuard.read(@host).mode == "count-only"
-      assert [_, _] = events(ctx.db, "memory_guard_sampling_failed")
+      read = MemoryGuard.read(@host)
+      assert read.mode == "enforced"
+      assert Enum.sort(Enum.map(read.unavailable, & &1.reading)) == ["meminfo", "tree"]
+
+      assert Enum.sort(
+               for {_, d} <- events(ctx.db, "memory_guard_sampling_failed"), do: d["reading"]
+             ) ==
+               ["meminfo", "tree"]
 
       File.chmod!(proc_dir, 0o755)
       :ok = MemoryGuard.tick()
-      assert MemoryGuard.read(@host).mode == "enforced"
+      assert MemoryGuard.read(@host).unavailable == []
     end
 
-    test "(review R3) in watched mode a known session root that cannot be read fails the sample",
+    test "E2.unreadable (watched): a known session root that cannot be read disables R1 and R2 and is not mistaken for its end",
          ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       guard!(ctx)
@@ -783,7 +796,9 @@ defmodule Tightbeam.MemoryGuardTest do
 
       File.chmod!(stat, 0o000)
       :ok = MemoryGuard.tick()
-      assert MemoryGuard.read(@host).mode == "count-only"
+      read = MemoryGuard.read(@host)
+      assert read.mode == "watched"
+      assert [%{reading: "tree", disables: ["R1", "R2"]}] = read.unavailable
       # Not mistaken for its end: custody stays.
       assert Map.has_key?(elem(Records.read_all(ctx.base), 1), "sl-r")
     end
@@ -955,22 +970,32 @@ defmodule Tightbeam.MemoryGuardTest do
       refute_received {:killed, _}
     end
 
-    test "R12a: an unreadable tree sample degrades the host to count-only, once, until a read succeeds",
+    test "E1.absent (T25 c, R12a as amended): an unreadable process table disables R1 and R2 only, once per run, never count-only; meminfo going too disables R5",
          ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       guard!(ctx)
       File.rm_rf!(Path.join(ctx.root, "proc"))
       File.mkdir_p!(ctx.root)
-      # meminfo is gone with /proc; the tree read fails.
+      # meminfo is gone with /proc; the tree read fails too.
       :ok = MemoryGuard.tick()
       :ok = MemoryGuard.tick()
-      assert MemoryGuard.read(@host).mode == "count-only"
-      assert length(events(ctx.db, "memory_guard_sampling_failed")) == 1
+      read = MemoryGuard.read(@host)
+      assert read.mode == "watched"
+
+      assert Enum.sort(Enum.map(read.unavailable, &{&1.reading, &1.disables})) == [
+               {"meminfo", ["R5"]},
+               {"tree", ["R1", "R2"]}
+             ]
+
+      failed = events(ctx.db, "memory_guard_sampling_failed")
+      assert Enum.sort(for {_, d} <- failed, do: d["reading"]) == ["meminfo", "tree"]
 
       File.mkdir_p!(Path.join(ctx.root, "proc"))
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
       :ok = MemoryGuard.tick()
-      assert MemoryGuard.read(@host).mode == "watched"
+      read = MemoryGuard.read(@host)
+      assert read.mode == "watched"
+      assert read.unavailable == []
     end
   end
 
@@ -2106,7 +2131,7 @@ defmodule Tightbeam.MemoryGuardTest do
                events(ctx.db, "admission_hold_remaining")
     end
 
-    test "(review R1) a launch record that cannot be read or listed keeps the fence and fails the sample",
+    test "B2.partial / B3.partial / B2.unreadable / B3.unreadable (T33): a launch record that cannot be read or listed keeps the fence and holds launches guard_unavailable",
          ctx do
       guard!(ctx)
       key = {:claude, "shared", @host}
@@ -2126,19 +2151,29 @@ defmodule Tightbeam.MemoryGuardTest do
       assert {:error, {:custody_unreadable, _}} = MemoryGuard.ensure_no_orphans(key)
 
       :ok = MemoryGuard.tick()
-      assert MemoryGuard.read(@host).mode == "count-only"
-      assert [_] = events(ctx.db, "memory_guard_sampling_failed")
+      read = MemoryGuard.read(@host)
+      # Tightbeam's own records are not a host reading: no degradation, a hold.
+      assert read.mode == "watched"
+      assert read.unavailable == []
+      assert read.recordsUnreadable =~ "sl-bad.json"
+      assert [{@host, %{"error" => _}}] = events(ctx.db, "memory_guard_inventory_failed")
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a launch")
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
 
       File.rm!(bad)
       File.chmod!(dir, 0o000)
       assert {:error, {:custody_unreadable, error}} = MemoryGuard.ensure_no_orphans(key)
-      assert error =~ "cannot be listed"
+      assert error =~ "inventory cannot be read"
       refute_received {:killed, _}
+
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
 
       File.chmod!(dir, 0o755)
       assert :ok = MemoryGuard.ensure_no_orphans(key)
       assert_received {:killed, %{scope: "session", pid: 951}}
       assert Records.read_all(ctx.base) == {:ok, %{}}
+      assert :ok = MemoryGuard.admit("agent:new", ctx.db)
     end
 
     test "a guard that cannot answer refuses the launch rather than allowing it", ctx do
@@ -2397,6 +2432,183 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
+  ## v1.13 FS4 scope: Tightbeam's own inventories (matrix B2–B4, E4; T33)
+
+  describe "matrix B: owned inventories (FS4 scope, T33)" do
+    setup ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a launch")
+      %{sessions: Path.join(Records.dir(ctx.base), "sessions")}
+    end
+
+    defp boot!(ctx, id) do
+      dir = Path.join(ctx.root, "proc/sys/kernel/random")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "boot_id"), id <> "\n")
+    end
+
+    test "B2.absent (first start): no inventory yet is an empty one, durably initialized", ctx do
+      boot!(ctx, "boot-a")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+
+      assert [{_, %{"boot" => "boot-a", "generation" => generation}}] =
+               events(ctx.db, "memory_guard_inventory")
+
+      assert File.read!(Path.join(ctx.sessions, ".generation")) == generation
+      assert MemoryGuard.read(@host).recordsUnreadable == nil
+      assert :ok = MemoryGuard.adapter_ended({:claude, "shared", @host}, "L")
+      assert :ok = MemoryGuard.admit("agent:new", ctx.db)
+    end
+
+    test "B2.absent / B3.absent (T33): an inventory lost on this boot holds launches and leaves the R2a fence unresolved",
+         ctx do
+      boot!(ctx, "boot-a")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      File.rm_rf!(ctx.sessions)
+      :ok = MemoryGuard.tick()
+
+      assert MemoryGuard.read(@host).recordsUnreadable =~ "missing"
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+
+      assert {:error, {:custody_unreadable, _}} =
+               MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
+
+      # An empty directory without its generation marker is not the inventory.
+      File.mkdir_p!(ctx.sessions)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).recordsUnreadable =~ "missing"
+      assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
+      assert [_] = events(ctx.db, "memory_guard_inventory_failed")
+    end
+
+    test "B2.absent after a reboot: a new boot identity re-initializes the inventory as empty (FS9: a reboot ends every process)",
+         ctx do
+      boot!(ctx, "boot-a")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      stop_supervised!(MemoryGuard)
+      File.rm_rf!(ctx.sessions)
+
+      boot!(ctx, "boot-b")
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+
+      assert MemoryGuard.read(@host).recordsUnreadable == nil
+      assert [_, {_, %{"boot" => "boot-b"}}] = events(ctx.db, "memory_guard_inventory")
+      assert :ok = MemoryGuard.admit("agent:new", ctx.db)
+    end
+
+    test "B4.absent: returning to enforced with the inventory lost is not applied", ctx do
+      {_harness, _unit, set_mode} = enforced_with_unit!(ctx)
+      :ok = MemoryGuard.tick()
+      assert :ok = set_mode.("off")
+      File.rm_rf!(ctx.sessions)
+
+      assert {:error, {:not_applied, error}} = set_mode.("auto")
+      assert error =~ "inventory"
+      assert MemoryGuard.read(@host).mode == "watched"
+    end
+  end
+
+  ## v1.13 FS4: one failed host reading disables only what needs it (T25)
+
+  describe "matrix C2 / C3 / E3 / E5: host readings (FS4, T25)" do
+    test "E3.unreadable (T25 c): an unreadable process of ours inside a tree disables R1 and R2, nothing else",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      proc!(ctx.root, 981, 1, 981, 100 * @mib)
+      proc!(ctx.root, 982, 981, 982, 100 * @mib)
+      launch!(ctx.base, "sl-r", "sid-r", 981, 981, 512 * @mib)
+      stat = Path.join(ctx.root, "proc/982/stat")
+      on_exit(fn -> File.chmod(stat, 0o644) end)
+
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).unavailable == []
+
+      File.chmod!(stat, 0o000)
+      :ok = MemoryGuard.tick()
+      read = MemoryGuard.read(@host)
+      assert read.mode == "watched"
+      assert [%{reading: "tree", disables: ["R1", "R2"]}] = read.unavailable
+      assert read.hostAvailablePercent == 75.0
+    end
+
+    test "C2.unreadable (T25 a): an unreadable budget-group total disables R2's approach only; its hold clears, the kernel budget stays",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      fs = cgroup_tree!(ctx.root, "/svc/tightbeam.service/gateway", [])
+      guard!(ctx, probe: enforced_probe(), cgroup_fs: fs)
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "budget", "2G", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+      harness = Path.join(fs, "svc/tightbeam.service/harness")
+      current = Path.join(harness, "memory.current")
+      File.write!(current, Integer.to_string(1900 * @mib))
+      on_exit(fn -> File.chmod(current, 0o644) end)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.host_reasons(@host) == ["memory_budget"]
+
+      File.chmod!(current, 0o000)
+      :ok = MemoryGuard.tick()
+      read = MemoryGuard.read(@host)
+      assert read.mode == "enforced"
+      assert [%{reading: "budget_total", disables: ["R2 approach"]}] = read.unavailable
+      assert read.budgetHolds == false
+      assert MemoryGuard.host_reasons(@host) == []
+
+      assert [{@host, %{"detail" => "memory_budget", "because" => _}}] =
+               events(ctx.db, "memory_guard_release")
+
+      # The kernel's budget is untouched.
+      assert File.read!(Path.join(harness, "memory.max")) == Integer.to_string(2 * @gib)
+    end
+
+    test "E5.unreadable (T25 b): meminfo failing at runtime disables R5 and its floor reason counts as clear",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.host_reasons(@host) == ["memory_floor"]
+
+      File.rm!(Path.join(ctx.root, "proc/meminfo"))
+      :ok = MemoryGuard.tick()
+      read = MemoryGuard.read(@host)
+      assert read.mode == "watched"
+      assert [%{reading: "meminfo", disables: ["R5"]}] = read.unavailable
+      assert read.floorHolds == false
+      assert read.hostAvailablePercent == nil
+      assert MemoryGuard.host_reasons(@host) == []
+
+      assert [{@host, %{"detail" => "memory_floor", "because" => _}}] =
+               events(ctx.db, "memory_guard_release")
+    end
+
+    test "C3.unreadable: an enforced unit's own counter that cannot be read fails nothing and is never counted 0",
+         ctx do
+      {harness, unit, _set_mode} = enforced_with_unit!(ctx)
+      File.write!(Path.join(harness, "memory.current"), Integer.to_string(300 * @mib))
+      counter = Path.join(unit, "memory.current")
+      File.chmod!(counter, 0o000)
+      on_exit(fn -> File.chmod(counter, 0o644) end)
+
+      :ok = MemoryGuard.tick()
+      read = MemoryGuard.read(@host)
+      assert read.mode == "enforced"
+      assert read.unavailable == []
+      assert read.tightbeamTotalBytes == 300 * @mib
+      assert events(ctx.db, "memory_guard_sampling_failed") == []
+    end
+  end
+
   describe "sibling failures (review family: failures never read as success)" do
     setup ctx do
       meminfo!(ctx.root, 16 * @gib, 12 * @gib)
@@ -2456,9 +2668,11 @@ defmodule Tightbeam.MemoryGuardTest do
       assert events(ctx.db, "memory_guard_idle_closed") == []
     end
 
-    test "an unreadable launch table is never 'nothing to end' (R2a) nor an empty host (sampling)",
+    test "E4.absent / E4.unreadable (T33): a missing harness-process table is never 'nothing to end' (R2a) nor an empty host; launches are held guard_unavailable",
          ctx do
       guard!(ctx)
+      session!(ctx, "agent:new", "sid-new")
+      queue!(ctx, "agent:new", "needs a launch")
 
       {:ok, _} =
         DB.query(ctx.db, "ALTER TABLE harness_processes RENAME TO harness_processes_hidden")
@@ -2470,12 +2684,19 @@ defmodule Tightbeam.MemoryGuardTest do
         assert {:error, _} = MemoryGuard.ensure_no_orphans({:claude, "shared", @host})
 
         :ok = MemoryGuard.tick()
-        assert MemoryGuard.read(@host).mode == "count-only"
-        assert [_] = events(ctx.db, "memory_guard_sampling_failed")
+        read = MemoryGuard.read(@host)
+        assert read.mode == "watched"
+        assert read.recordsUnreadable =~ "harness-process table"
+        assert [_] = events(ctx.db, "memory_guard_inventory_failed")
+        assert {:held, ["guard_unavailable"]} = MemoryGuard.admit("agent:new", ctx.db)
       after
         {:ok, _} =
           DB.query(ctx.db, "ALTER TABLE harness_processes_hidden RENAME TO harness_processes")
       end
+
+      :ok = MemoryGuard.tick()
+      assert MemoryGuard.read(@host).recordsUnreadable == nil
+      assert :ok = MemoryGuard.admit("agent:new", ctx.db)
     end
   end
 

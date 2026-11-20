@@ -36,6 +36,41 @@ defmodule Tightbeam.MemoryGuard.ProcTree do
   end
 
   @doc """
+  The processes under `<root>/proc` that exist, run as this gateway's own user,
+  and cannot be read. Any of them may belong to a Tightbeam tree, so a tree's
+  memory cannot be shown complete while one exists (v1.13 FS4, R12a). Other
+  users' processes cannot be in a Tightbeam tree unless it changed user, and
+  are not counted here.
+  """
+  @spec unreadable_own(String.t(), table()) :: [pos_integer()]
+  def unreadable_own(root, table) do
+    proc = Path.join(root, "proc")
+    own = own_uid()
+
+    case File.ls(proc) do
+      {:ok, entries} ->
+        for entry <- entries,
+            {pid, ""} <- [Integer.parse(entry)],
+            not Map.has_key?(table, pid),
+            {:ok, %File.Stat{uid: uid}} <- [File.stat(Path.join(proc, entry))],
+            uid == own,
+            read(proc, pid) == :error,
+            File.dir?(Path.join(proc, entry)),
+            do: pid
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  defp own_uid do
+    case File.stat("/proc/self") do
+      {:ok, %File.Stat{uid: uid}} -> uid
+      _ -> nil
+    end
+  end
+
+  @doc """
   Whether `pid` exists under `<root>/proc` but cannot be read: a failed read
   of a known process, never mistaken for its end.
   """
