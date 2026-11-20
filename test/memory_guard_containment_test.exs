@@ -296,8 +296,9 @@ defmodule Tightbeam.MemoryGuardContainmentTest do
   end
 
   defp record_of(ctx, sid) do
-    ctx.base
-    |> Records.read_all()
+    {:ok, records} = Records.read_all(ctx.base)
+
+    records
     |> Map.values()
     |> Enum.find(&(&1["sessionId"] == sid))
   end
@@ -434,7 +435,7 @@ defmodule Tightbeam.MemoryGuardContainmentTest do
                since: started
              })
 
-    assert Records.read_all(ctx.base) == %{}
+    assert Records.read_all(ctx.base) == {:ok, %{}}
   end
 
   test "T15 (outside kill): a SIGKILLed adapter's session trees are ended before any replacement",

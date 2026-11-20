@@ -117,17 +117,11 @@ defmodule Tightbeam.QuotaRelease do
     # a later success already redelivers them from that success.
     #
     # Memory limits v1.1 R6a: a release ends only the quota reason. While a
-    # memory reason still stands on the host the re-admission is deferred and
-    # runs once, when the last one clears (`MemoryGuard.Admission`).
+    # memory reason still stands on the host, or a limit-fallback evaluation on
+    # an affected session, that re-admission is deferred and runs once, when
+    # the last one clears (`MemoryGuard.Admission`).
     if Keyword.get(opts, :readmit, false) do
-      case Tightbeam.MemoryGuard.Admission.quota_released_in_txn(txn, incident_id, harness, host) do
-        :resume ->
-          Wakes.readmit_released_quota_intents_in_txn(txn, incident_id)
-          Tightbeam.MemoryGuard.Admission.resumed_in_txn(txn, incident_id, host, "quota_park")
-
-        :deferred ->
-          :ok
-      end
+      _ = Tightbeam.MemoryGuard.Admission.quota_released_in_txn(txn, incident_id, harness, host)
     end
 
     Txn.q(
