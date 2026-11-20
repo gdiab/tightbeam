@@ -546,7 +546,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert File.read!(Path.join(Cgroup.dir(fs, unit), "memory.swap.max")) == "0"
     end
 
-    test "E5.absent (T11 c): no /proc/meminfo reads count-only and R3 still holds turns at the cap",
+    test "E5.absent (T11 c2, v1.15): no /proc/meminfo reads count-only; with an admin-set residentCap, R3 holds turns at it",
          ctx do
       assert %{mode: :count_only, reason: reason} =
                Probe.probe(root: ctx.root, os: {:unix, :linux})
@@ -590,11 +590,12 @@ defmodule Tightbeam.MemoryGuardTest do
       refute Enum.any?(Map.keys(read), &(&1 in [:pids, :processes, :commands]))
     end
 
-    test "E5.absent (v1.14 erratum, R12a): with the memory size unknown and no residentCap set, R3 applies no cap and the read names the gap",
+    test "E5.absent (T11 c, v1.15, R12a): no /proc/meminfo reads count-only; with no residentCap, R3 applies no cap and the read names the gap",
          ctx do
-      guard!(ctx,
-        probe: %{mode: :count_only, reason: "no /proc/meminfo", mem_total: nil, cgroup: nil}
-      )
+      assert %{mode: :count_only, reason: reason, mem_total: nil} =
+               Probe.probe(root: ctx.root, os: {:unix, :linux})
+
+      guard!(ctx, probe: %{mode: :count_only, reason: reason, mem_total: nil, cgroup: nil})
 
       adapter = adapter!()
       sids = for n <- 1..3, do: "sid-r#{n}"
@@ -5933,7 +5934,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert %{reason: nil, at: 1} = Records.refusal_for(ctx.base, "sid-x", 0)
     end
 
-    test "F4 (v1.14 erratum): with the memory size unknown, no residentCap means no cap; a set one applies",
+    test "F4 (v1.15 §7): with the memory size unknown, no residentCap means no cap; a set one applies",
          _ctx do
       assert %{resident_cap: nil, budget: nil} = Settings.effective(%{}, nil)
       assert %{resident_cap: 5} = Settings.effective(%{"residentCap" => %{value: "5"}}, nil)
