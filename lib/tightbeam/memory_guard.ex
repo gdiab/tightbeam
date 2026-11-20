@@ -1099,20 +1099,24 @@ defmodule Tightbeam.MemoryGuard do
   defp safe_admission(state, session_key) do
     admission(state, session_key)
   rescue
-    error ->
-      message = Exception.message(error)
+    error -> admission_unreadable(state, session_key, Exception.message(error))
+  catch
+    # L*.timeout: a read that does not answer is one that failed.
+    :exit, reason -> admission_unreadable(state, session_key, inspect(reason))
+  end
 
-      state =
-        once(state, {:admission_unreadable, session_key}, fn ->
-          record(
-            state,
-            "memory_guard_admission_unreadable",
-            session_key,
-            JSON.encode!(%{error: message})
-          )
-        end)
+  defp admission_unreadable(state, session_key, message) do
+    state =
+      once(state, {:admission_unreadable, session_key}, fn ->
+        record(
+          state,
+          "memory_guard_admission_unreadable",
+          session_key,
+          JSON.encode!(%{error: message})
+        )
+      end)
 
-      {:held, ["guard_unavailable"], %{state | renudge: MapSet.put(state.renudge, session_key)}}
+    {:held, ["guard_unavailable"], %{state | renudge: MapSet.put(state.renudge, session_key)}}
   end
 
   defp admission(state, session_key) do
@@ -2745,6 +2749,9 @@ defmodule Tightbeam.MemoryGuard do
     {:ok, adapters}
   rescue
     _ -> :error
+  catch
+    # E4.timeout: a table read that does not answer is unreadable.
+    :exit, _ -> :error
   end
 
   defp measure_watched(state, adapters, launches, exclude \\ nil) do
@@ -3618,7 +3625,16 @@ defmodule Tightbeam.MemoryGuard do
   # pass: it captures escaped descendants this read cannot see. A killer that
   # could not run (for example the identity file is missing) killed nothing;
   # the captured tree is ended by its parent chain instead.
-  @helper_not_run [:identity_missing, :identity_malformed, :not_a_group_leader, :no_identity]
+  # The helper never ran: no identity, or one that cannot be read (B6).
+  @helper_not_run [
+    :identity_missing,
+    :identity_malformed,
+    :not_a_group_leader,
+    :no_identity,
+    :eacces,
+    :eisdir,
+    :enotdir
+  ]
 
   @doc false
   def end_tree(state, host_state, target) do

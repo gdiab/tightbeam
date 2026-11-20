@@ -358,6 +358,25 @@ fn b1_unreadable_a_launch_record_that_cannot_be_written_refuses() {
 }
 
 #[test]
+fn b1_absent_a_launch_record_directory_that_cannot_be_created_refuses() {
+    let fixture = start("nodir", 0, "watched");
+    let _ = record(&fixture);
+    let sessions = fixture.guard_dir.join("sessions");
+    fs::remove_dir_all(&sessions).unwrap();
+    // A file where the directory should be: it cannot be created.
+    fs::write(&sessions, "not a directory").unwrap();
+    let output = run_step(&fixture.guard_dir, "sess-8", &[]);
+    fs::remove_file(&sessions).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    assert_refused(
+        &fixture.guard_dir,
+        "sess-8",
+        &output,
+        "launch records directory could not be created",
+    );
+}
+
+#[test]
 fn j1_unreadable_and_absent_an_oom_score_adj_that_cannot_be_read_refuses() {
     let fixture = start("oomread", 0, "watched");
     let missing = fixture.dir.join("no-such-oom");

@@ -155,7 +155,7 @@ fn n7_absent_t31_4_an_override_without_a_failed_recovery_is_refused() {
 }
 
 #[test]
-fn n6_t31_5_the_statement_is_printed_first_and_only_the_typed_episode_id_confirms() {
+fn n6_timeout_t31_5_the_statement_is_printed_first_and_only_the_typed_episode_id_confirms() {
     let failed = serde_json::json!({
         "outcome": "failed",
         "survivors": [{"launchId": "sl-9", "pid": 4242, "start": 7, "unit": null, "state": "D"}]
@@ -203,4 +203,32 @@ fn n6_t31_5_the_statement_is_printed_first_and_only_the_typed_episode_id_confirm
             .unwrap()
             .contains("launch record sl-9")
     );
+}
+
+#[test]
+fn n6_unreadable_a_statement_that_cannot_be_printed_writes_nothing() {
+    let failed = serde_json::json!({"outcome": "failed", "survivors": []});
+    let base = base("noprint", custody("ep_7", serde_json::json!([]), failed));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+        .args([
+            "memory-guard-override",
+            "--base",
+            base.0.to_str().unwrap(),
+            "ep_7",
+        ])
+        .env("TIGHTBEAM_TEST_ASSUME_ROOT", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Nobody reads the statement: the output closes before it is printed.
+    drop(child.stdout.take());
+    let _ = child.stdin.take().unwrap().write_all(b"ep_7\n");
+    let status = child.wait().unwrap();
+    assert!(
+        !status.success(),
+        "it does not proceed without its statement"
+    );
+    assert!(records(&base.0).is_empty(), "nothing is written");
 }

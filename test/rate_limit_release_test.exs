@@ -703,7 +703,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       Enum.map(rows, fn [subject, detail] -> {subject, JSON.decode!(detail)} end)
     end
 
-    test "(b) the quota park releases first: nothing re-admitted while the floor stands; at the floor's release, once, in order",
+    test "G1.absent / G3.absent (b): the quota park releases first: nothing re-admitted while the floor stands; at the floor's release, once, in order",
          %{db: db, root: root} do
       {first, second} = parked_with_two_quota_failed_turns!(db)
       release_at_reset!(db)
@@ -759,7 +759,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
             )
     end
 
-    test "(review R5) quota releases, then memory while a limit-fallback evaluation stands: the hook runs once, after the evaluation",
+    test "G2.absent (review R5): quota releases, then memory while a limit-fallback evaluation stands: the hook runs once, after the evaluation",
          %{db: db, root: root} do
       {first, second} = parked_with_two_quota_failed_turns!(db)
       release_at_reset!(db)
@@ -844,7 +844,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert length(queued_messages(db)) == 2
     end
 
-    test "G5.unreadable: a re-admission whose record cannot be written does not happen; retried, it runs once",
+    test "G5.unreadable / M2.unreadable: a re-admission whose record cannot be written does not happen; retried, it runs once",
          %{db: db, root: root} do
       {first, second} = parked_with_two_quota_failed_turns!(db)
       release_at_reset!(db)
@@ -912,7 +912,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
     end
 
-    test "G4.unreadable / G4 (R6a, companion C1): a harness-process row still parking holds the quota hook until it is resolved",
+    test "G4.unreadable / G4.absent (R6a, companion C1): a harness-process row still parking holds the quota hook until it is resolved",
          %{db: db, root: root} do
       {first, second} = parked_with_two_quota_failed_turns!(db)
       meminfo!(root, 50)
