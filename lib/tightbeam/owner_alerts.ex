@@ -88,7 +88,7 @@ defmodule Tightbeam.OwnerAlerts do
   @owner_alerts_table_ddl """
   CREATE TABLE owner_alerts (
     alertId           TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback','memory-pressure','pairing-freeze-lifted')),
+    kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback','memory-pressure','pairing-freeze-lifted','pairing-unfreeze-ignored','recovery-enrolled','admin-recovered','root-recovery-enroll','root-pairing-code','memory-guard-stuck')),
     dedupeKey         TEXT NOT NULL,
     ownerUserId       TEXT NOT NULL,
     originSessionKey  TEXT NOT NULL,
