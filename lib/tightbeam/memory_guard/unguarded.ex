@@ -49,6 +49,13 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
             release(db, session_key, session.host, "off")
             :ok
 
+          # FS9: a root override of the host's guard episode admits held
+          # launches without the guard; the risk stays shown until it answers.
+          (episode = overridden_guard_episode(db, session.host)) != nil ->
+            Tightbeam.MemoryGuard.Episodes.applied(db, episode["episodeId"])
+            release(db, session_key, session.host, "root override #{episode["episodeId"]}")
+            :ok
+
           true ->
             hold(db, session_key, session.host)
             {:held, [@detail]}
@@ -77,6 +84,13 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
     end
   rescue
     _ -> false
+  end
+
+  defp overridden_guard_episode(db, host) do
+    Enum.find(Tightbeam.MemoryGuard.Episodes.active(db, host), fn episode ->
+      episode["kind"] == "guard" and
+        Tightbeam.MemoryGuard.Episodes.override(db, episode["episodeId"]) != nil
+    end)
   end
 
   # The live adapter for a key, without starting one.

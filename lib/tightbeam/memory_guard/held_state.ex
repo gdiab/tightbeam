@@ -24,8 +24,17 @@ defmodule Tightbeam.MemoryGuard.HeldState do
       reasons = reasons ++ other_reasons(db, session)
 
       case reasons do
-        [] -> nil
-        [first | _] -> %{reasonClass: first.reasonClass, reasons: reasons}
+        [] ->
+          nil
+
+        [first | _] ->
+          held = %{reasonClass: first.reasonClass, reasons: reasons}
+
+          # FS9: an open stuck episode on the session's host is shown on its
+          # read too, while the session is held by it.
+          if Enum.any?(reasons, &(&1[:detail] == "guard_unavailable")),
+            do: Map.put(held, :stuckEpisodes, MemoryGuard.Episodes.read(db, session.host)),
+            else: held
       end
     end
   end
