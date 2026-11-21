@@ -13,6 +13,19 @@ defmodule Tightbeam.PackagingTest do
     Path.join(@repo_root, "docs/ONBOARDING.md")
   ]
 
+  test "option 2: the gateway and its rpc/remote clients listen for distribution on loopback only" do
+    for template <- ["rel/vm.args.eex", "rel/remote.vm.args.eex"] do
+      lines =
+        @repo_root
+        |> Path.join(template)
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.reject(&String.starts_with?(&1, "#"))
+
+      assert lines == ["-kernel inet_dist_use_interface {127,0,1,1}"], template
+    end
+  end
+
   test "option 2: the release step makes the build's own Erlang cookie owner-only" do
     release = Path.join(System.tmp_dir!(), "tb-cookie-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(release) end)
