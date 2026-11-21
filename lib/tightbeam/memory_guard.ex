@@ -1672,7 +1672,7 @@ defmodule Tightbeam.MemoryGuard do
             {ok, [{ref, :gone} | stale]}
 
           (reasons = Admission.other_reasons(state.db, ref)) != [] ->
-            {ok, [{ref, hd(reasons)} | stale]}
+            {ok, [{ref, reasons} | stale]}
 
           true ->
             {[ref | ok], stale}
@@ -1685,10 +1685,14 @@ defmodule Tightbeam.MemoryGuard do
           if why == :gone,
             do: drop_hold_in_txn(txn, ref),
             else:
-              Txn.q(txn, "UPDATE memory_guard_open SET blocked=?2 WHERE kind='hold' AND ref=?1", [
-                ref,
-                why
-              ])
+              Txn.q(
+                txn,
+                """
+                UPDATE memory_guard_open SET blocked=?2, detail=json_set(detail, '$.other', json(?3))
+                WHERE kind='hold' AND ref=?1
+                """,
+                [ref, hd(why), JSON.encode!(why)]
+              )
         end
       end)
     end
@@ -1880,7 +1884,11 @@ defmodule Tightbeam.MemoryGuard do
       for detail <- details, into: %{}, do: {detail, Map.get(previous.details, detail, now)}
 
     order_key = order_key(state, session, seq)
-    blocked = blocked_reason(state, session.session_key)
+    # Re-review att_660ea131 B2: the hold keeps its other standing reasons
+    # (quota park, harness parking, limit fallback) in its detail, so a
+    # tombstone still has them for a release note owed its record.
+    other = other_reasons_of(state, session.session_key)
+    blocked = List.first(other)
     adapter_key = adapter_key_of(session)
 
     result =
@@ -1904,7 +1912,16 @@ defmodule Tightbeam.MemoryGuard do
           drop_hold_in_txn(txn, session.session_key)
           nil
         else
-          put_hold_in_txn(txn, session, held_details, seq, order_key, blocked, adapter_key, now)
+          put_hold_in_txn(
+            txn,
+            session,
+            {held_details, other},
+            seq,
+            order_key,
+            blocked,
+            adapter_key,
+            now
+          )
         end
       end)
 
@@ -1932,8 +1949,8 @@ defmodule Tightbeam.MemoryGuard do
   # Returns the hold's durable start (`openedAt`), kept across updates. A
   # new hold lifetime takes a generation (bounded-continuations rev 2 D1);
   # an update of the same lifetime keeps it.
-  defp put_hold_in_txn(txn, session, details, seq, order_key, blocked, adapter_key, now) do
-    detail = JSON.encode!(%{details: details, seq: seq})
+  defp put_hold_in_txn(txn, session, {details, other}, seq, order_key, blocked, adapter_key, now) do
+    detail = JSON.encode!(%{details: details, seq: seq, other: other})
 
     case Txn.q(txn, "SELECT 1 FROM memory_guard_open WHERE kind='hold' AND ref=?1", [
            session.session_key
@@ -2053,13 +2070,10 @@ defmodule Tightbeam.MemoryGuard do
       ":" <> String.pad_leading(Integer.to_string(seq), 20, "0")
   end
 
-  defp blocked_reason(state, session_key) do
-    case Admission.other_reasons(state.db, session_key) do
-      [] -> nil
-      [reason | _] -> reason
-    end
+  defp other_reasons_of(state, session_key) do
+    Admission.other_reasons(state.db, session_key)
   rescue
-    _ -> "unknown"
+    _ -> ["unknown"]
   end
 
   defp adapter_key_of(session) do
@@ -2541,7 +2555,11 @@ defmodule Tightbeam.MemoryGuard do
          _now
        ) do
     if dropped > note_gen do
-      remaining = Enum.uniq(note["remaining"] ++ session_details(detail))
+      remaining =
+        Enum.uniq(
+          note["remaining"] ++ session_details(detail) ++ (JSON.decode!(detail)["other"] || [])
+        )
+
       resumed_at = JSON.decode!(detail)["droppedAt"]
       note_record_in_txn(txn, note, session_key, remaining, %{resumedAt: resumed_at})
     end

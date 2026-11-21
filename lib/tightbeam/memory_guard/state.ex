@@ -196,6 +196,15 @@ defmodule Tightbeam.MemoryGuard.State do
      """}
   ]
 
+  # Re-review att_660ea131 B3: whether a source turn already has a retry, one
+  # probe (the table's own uniqueness is `(rootWakeId, sourceTurnSeq)`). Only
+  # at the end of the schema pass, after the retry table's own migration,
+  # which accepts this exact index and no other foreign object.
+  @retry_source_index "CREATE INDEX memory_guard_retry_source ON wake_retry_attempts (sourceTurnSeq) WHERE retryWakeId IS NOT NULL"
+
+  @doc false
+  def retry_source_index_ddl, do: @retry_source_index
+
   # Rev 2 D4: the queued user carriers present when this is first installed
   # get their fact once (later ones get it at their own enqueue).
   @carrier_backfill """
@@ -224,7 +233,16 @@ defmodule Tightbeam.MemoryGuard.State do
   pass has run (a table rebuild drops its indexes).
   """
   @spec ensure_late_indexes(DB.server()) :: :ok | {:error, term()}
-  def ensure_late_indexes(db), do: late_indexes(db, @late_indexes)
+  def ensure_late_indexes(db) do
+    late_indexes(
+      db,
+      @late_indexes ++
+        [
+          {"wake_retry_attempts",
+           String.replace(@retry_source_index, "CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")}
+        ]
+    )
+  end
 
   defp late_indexes(_db, []), do: :ok
 

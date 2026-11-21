@@ -201,7 +201,9 @@ defmodule Tightbeam.MemoryGuard.Admission do
   end
 
   # B1 (rev 2 D1): the key's marks of lifetimes opened before this release.
-  # A pending item for the key takes the newer generation.
+  # A pending item for the key takes the newer generation and starts its
+  # range again (re-review att_660ea131 B1): a hold below the old cursor,
+  # marked again during this park, is this release's to clear.
   defp unblock_in_txn(txn, key, host) do
     gen = State.next_gen_in_txn(txn)
 
@@ -210,7 +212,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
       """
       INSERT INTO memory_guard_open (kind, ref, subject, host, detail, openedAt, gen)
       VALUES ('unblock', ?1, ?1, ?2, NULL, ?3, ?4)
-      ON CONFLICT(kind, ref) DO UPDATE SET gen=excluded.gen
+      ON CONFLICT(kind, ref) DO UPDATE SET gen=excluded.gen, detail=NULL
       """,
       [key, host, System.system_time(:millisecond), gen]
     )

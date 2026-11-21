@@ -3596,7 +3596,7 @@ defmodule Tightbeam.Wakes do
         AND a.redeliveryTurnSeq IS NULL
         AND a.parentSessionKey IS NULL
         AND NOT EXISTS (
-          SELECT 1 FROM wake_retry_attempts retry
+          SELECT 1 FROM wake_retry_attempts retry INDEXED BY memory_guard_retry_source
           WHERE retry.sourceTurnSeq=observed.seq AND retry.retryWakeId IS NOT NULL
         )
       """,

@@ -1983,9 +1983,6 @@ defmodule Tightbeam.Schema do
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
-    # Memory limits: the guard's access paths on other modules' tables, after
-    # any migration that rebuilds them.
-    :ok = Tightbeam.MemoryGuard.State.ensure_late_indexes(db)
     :ok = ensure_rest_collection_indexes(db)
     :ok = ensure_decision_request_collection_indexes(db)
     :ok = ensure_rest_wake_collection_indexes(db)
@@ -2005,6 +2002,9 @@ defmodule Tightbeam.Schema do
     :ok = ensure_hot_query_indexes(db)
     :ok = migrate_retired_workspace_cleanup(db)
     :ok = Tightbeam.Ephemeral.migrate(db)
+    # Memory limits: the guard's access paths on other modules' tables, after
+    # every migration that rebuilds them (the retry table's included).
+    :ok = Tightbeam.MemoryGuard.State.ensure_late_indexes(db)
 
     case Tightbeam.CronWake.ensure_schema(db) do
       :ok ->
@@ -2844,9 +2844,21 @@ defmodule Tightbeam.Schema do
                ORDER BY type,name
                """)
 
+             # Memory limits (re-review att_660ea131 B3): the guard's own
+             # source probe, created at the end of the schema pass, is the one
+             # other object this table may carry, exactly as written.
+             {guard_index, objects} =
+               Enum.split_with(objects, &match?(["index", "memory_guard_retry_source", _], &1))
+
              unless match?([["index", "wake_retry_root", _]], objects) and
                       normalize_schema_sql(objects |> hd() |> List.last()) ==
-                        normalize_schema_sql(@wake_retry_root_index_ddl) do
+                        normalize_schema_sql(@wake_retry_root_index_ddl) and
+                      Enum.all?(guard_index, fn [_, _, sql] ->
+                        normalize_schema_sql(sql) ==
+                          normalize_schema_sql(
+                            Tightbeam.MemoryGuard.State.retry_source_index_ddl()
+                          )
+                      end) do
                raise ShapeError,
                  message: "incompatible_wake_retry_source_scope: unknown table-bound objects"
              end
