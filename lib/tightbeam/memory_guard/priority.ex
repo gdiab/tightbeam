@@ -15,7 +15,7 @@ defmodule Tightbeam.MemoryGuard.Priority do
     passes to another user (AS6).
   """
 
-  alias Tightbeam.{DB, EventLog, NoticeBatcher, Org}
+  alias Tightbeam.{DB, EventLog, Org}
   alias Tightbeam.DB.Txn
   alias Tightbeam.MemoryGuard.State
 
@@ -56,21 +56,15 @@ defmodule Tightbeam.MemoryGuard.Priority do
     pending?
   end
 
-  # The batch carriers among a session's oldest 16 queued turns (re-review
-  # att_5f6e6736 sweep: at most 16 turn rows read, on `turns_pending`).
+  # R3a (bounded-continuations design rev 2 D4): a queued carrier of the
+  # session carries a user post, one probe of the durable fact written at
+  # the carrier's enqueue and removed when it leaves the queue.
   defp carrier_with_user_post?(txn, session_key) do
-    txn
-    |> Txn.q(
-      """
-      SELECT wakeId FROM (
-        SELECT wakeId, isBatchCarrier FROM turns INDEXED BY turns_pending
-        WHERE status IN ('queued','running') AND status='queued' AND sessionKey=?1
-        ORDER BY seq LIMIT 16)
-      WHERE isBatchCarrier=1 AND wakeId IS NOT NULL
-      """,
+    Txn.q(
+      txn,
+      "SELECT 1 FROM memory_guard_user_carriers WHERE sessionKey=?1 LIMIT 1",
       [session_key]
-    )
-    |> Enum.any?(fn [wake_id] -> NoticeBatcher.carrier_human_posts_in_txn(txn, wake_id) != [] end)
+    ) != []
   end
 
   @doc """

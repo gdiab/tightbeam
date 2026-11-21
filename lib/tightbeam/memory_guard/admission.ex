@@ -23,8 +23,6 @@ defmodule Tightbeam.MemoryGuard.Admission do
   # Current state in `memory_guard_open` (review B7): what is pending or held
   # now, and the done markers looked up by turn, so no sample or admission
   # reads the lifecycle history.
-  @quota_pending "quota_readmission"
-  @unblock "unblock"
   @memory_pending "memory_readmission"
   @step_hold "step_hold"
   @readmitted "readmitted_queued"
@@ -108,14 +106,15 @@ defmodule Tightbeam.MemoryGuard.Admission do
     ) != []
   end
 
-  # The release transaction's own share of a quota hook: as many units (one
-  # observation or one evaluation examined, each a few indexed lookups) as
-  # the guard's whole per-sample budget (re-review att_5f6e6736 B3).
-  @release_budget 64
+  # Bounded-continuations design §3 with rev 2 D2/D3. One step of a quota
+  # episode does at most this many units (an observation, an evaluation or a
+  # cover row examined, each a few primary-key or index lookups), in one
+  # transaction: the release's own inline step and each wake run alike.
+  @step_units 64
+  @wait_ms 5_000
+  @quota_consumer "memory_guard_quota"
 
-  # At most this many of a session's pending redeliveries are checked for an
-  # incident's membership; past it the session counts as covered (held).
-  @covered_rows 8
+  @episode_columns "episodeId, incidentId, harness, host, obsHigh, phase, cursor, passMark, passFound, watermark, deferred, parkingRecorded, fallbackRecorded, superseded"
 
   @doc """
   At a quota-park release (companion B5), clear the blocked marks of the
@@ -123,40 +122,64 @@ defmodule Tightbeam.MemoryGuard.Admission do
   pre-activity quota-failed turns, once, when no other reason holds a
   session it covers (R6a).
 
-  Both are bounded continuations (re-review att_5f6e6736 B1, B3):
-  - the blocked marks are an `unblock` open item the guard clears 32 at a
-    time;
-  - the hook is a `quota_readmission` item. This transaction runs its
-    first 64 units: a small incident is checked, decided and re-admitted
-    here, in one step; a larger one is continued by the guard, a page per
-    sample, its cursor committed with each page.
+  Both are bounded continuations (bounded-continuations design rev 1 §§1,
+  3, rev 2 D1–D3):
+  - the marks are an `unblock` item the guard clears 32 at a time;
+  - the hook is a quota *episode* of this release, its owed observations
+    fixed by the incident's largest observation rowid now. This transaction
+    runs its first step (64 units): a small incident is checked, decided and
+    re-admitted here. A larger one, or one that waits, is continued by its
+    own internal wake (`memory_guard_quota`), run by the wake scheduler
+    whether or not a memory guard is configured. An earlier unfinished
+    episode of the same incident is superseded: it only cleans up.
 
-  While a memory reason stands on the host the hook waits (it is deferred).
-  With no memory guard configured nothing would continue it, so the hook
-  runs to the end in this transaction, as the companion's re-admission
-  always has. Returns `:resumed` (decided) or `:deferred`.
+  Returns `:resumed` (decided) or `:deferred`.
   """
   @spec quota_released_in_txn(Txn.t(), String.t(), String.t(), String.t()) ::
           :deferred | :resumed
   def quota_released_in_txn(%Txn{} = txn, incident_id, harness, host) do
     key = HarnessProcess.adapter_key_name({Harness.parse!(harness).id(), "shared", host})
-    State.open_in_txn(txn, @unblock, key, key, host, nil)
+    unblock_in_txn(txn, key, host)
 
-    item = %{
-      "host" => host,
-      "harness" => harness,
-      "incidentId" => incident_id,
-      "phase" => "check",
-      "cursor" => nil,
-      "mark" => nil,
-      "deferred" => false
-    }
+    Txn.q(
+      txn,
+      "UPDATE memory_guard_quota_episodes SET superseded=1, phase='cleanup', cursor=0 WHERE incidentId=?1 AND superseded=0",
+      [incident_id]
+    )
+
+    [[obs_high]] =
+      Txn.q(
+        txn,
+        "SELECT coalesce(max(rowid), 0) FROM harness_health_observations WHERE incidentId=?1",
+        [incident_id]
+      )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO memory_guard_quota_episodes
+        (incidentId, harness, host, obsHigh, phase, passMark, createdAt)
+      VALUES (?1, ?2, ?3, ?4, 'check', ?5, ?6)
+      """,
+      [
+        incident_id,
+        harness,
+        host,
+        obs_high,
+        newest_evaluation(txn),
+        System.system_time(:millisecond)
+      ]
+    )
+
+    [[id]] = Txn.q(txn, "SELECT last_insert_rowid()", [])
+    ep = episode_in_txn(txn, id)
 
     case Tightbeam.MemoryGuard.host_reasons(host) do
       [] ->
-        budget = if Tightbeam.MemoryGuard.configured?(), do: @release_budget, else: :all
-        {result, _units} = quota_run_in_txn(txn, item, "quota_park", budget)
-        result
+        # The park this transaction releases is its own: not a park again.
+        {status, _units, ep} = step_in_txn(txn, ep, "quota_park", [], @step_units, false)
+        settle_in_txn(txn, ep, status, nil)
+        if ep.phase == "check", do: :deferred, else: :resumed
 
       remaining ->
         EventLog.lifecycle_in_txn(
@@ -171,271 +194,419 @@ defmodule Tightbeam.MemoryGuard.Admission do
           })
         )
 
-        save_quota_in_txn(txn, %{item | "deferred" => true}, true)
+        ep = mark_deferred_in_txn(txn, ep)
+        settle_in_txn(txn, ep, :wait, nil)
         :deferred
     end
   end
 
-  @doc """
-  One bounded step of a deferred or continuing quota hook (a
-  `quota_readmission` open item), in one transaction, with at most `budget`
-  units. `memory_reasons` are the memory reasons standing on its host now: a
-  hook not yet decided waits while any stands. Returns `{:ok, units}` or
-  `{:error, message}`.
-  """
-  @spec run_quota_item(DB.server(), map(), [String.t()], pos_integer()) ::
-          {:ok, pos_integer()} | {:error, String.t()}
-  def run_quota_item(db, %{detail: detail}, memory_reasons, budget) do
-    item = JSON.decode!(detail)
+  # B1 (rev 2 D1): the key's marks of lifetimes opened before this release.
+  # A pending item for the key takes the newer generation.
+  defp unblock_in_txn(txn, key, host) do
+    gen = State.next_gen_in_txn(txn)
 
-    case DB.transaction(db, fn txn ->
-           if item["phase"] == "check" and memory_reasons != [],
-             do: {:deferred, 1},
-             else: quota_run_in_txn(txn, item, "memory", budget)
-         end) do
-      {:ok, {_result, units}} -> {:ok, units}
+    Txn.q(
+      txn,
+      """
+      INSERT INTO memory_guard_open (kind, ref, subject, host, detail, openedAt, gen)
+      VALUES ('unblock', ?1, ?1, ?2, NULL, ?3, ?4)
+      ON CONFLICT(kind, ref) DO UPDATE SET gen=excluded.gen
+      """,
+      [key, host, System.system_time(:millisecond), gen]
+    )
+  end
+
+  @doc """
+  The internal consumer `memory_guard_quota` (rev 2 D3, the deferred current
+  wake): one step of the episode the wake names, in one transaction with
+  the wake's own update. Work left: this wake's `dueAt` moves (now, or 5 s
+  while the episode waits) and `{:ok, :deferred}` keeps it pending. Done:
+  the wake is consumed with the last step. A step that raises rolls back
+  whole, and the scheduler retries it.
+  """
+  @spec quota_wake(DB.server(), map()) :: :ok | {:ok, :deferred} | {:error, String.t()}
+  def quota_wake(db, %{wake_id: wake_id}) do
+    DB.transaction(db, fn txn ->
+      case Txn.q(
+             txn,
+             "SELECT prompt FROM wakes WHERE wakeId=?1 AND consumer=?2 AND state='pending'",
+             [wake_id, @quota_consumer]
+           ) do
+        [[id]] ->
+          case episode_in_txn(txn, String.to_integer(id)) do
+            nil ->
+              Wakes.consume_internal_in_txn(txn, wake_id)
+              :ok
+
+            ep ->
+              reasons =
+                if ep.phase == "check", do: Tightbeam.MemoryGuard.host_reasons(ep.host), else: []
+
+              released = if ep.deferred == 1, do: "memory", else: "quota_park"
+              {status, _units, ep} = step_in_txn(txn, ep, released, reasons, @step_units, true)
+              settle_in_txn(txn, ep, status, wake_id)
+          end
+
+        [] ->
+          :ok
+      end
+    end)
+    |> case do
+      {:ok, :ok} -> :ok
+      {:ok, :deferred} -> {:ok, :deferred}
       {:error, error} -> {:error, Exception.message(error)}
     end
-  catch
-    :exit, reason -> {:error, inspect(reason)}
   end
 
-  # Steps until the hook is done, waits, or the budget is spent; the item's
-  # progress is saved with the step. `:all` (no guard to continue it) runs
-  # the hook to its end.
-  defp quota_run_in_txn(txn, item, released, budget) do
-    {status, units, item} = quota_step_in_txn(txn, item, released, budget)
+  # Saves the episode after a step and arms or moves its wake, in the
+  # step's transaction. Returns `:ok` (done) or `:deferred`.
+  defp settle_in_txn(txn, ep, :done, wake_id) do
+    Txn.q(txn, "DELETE FROM memory_guard_quota_episodes WHERE episodeId=?1", [ep.id])
+    if wake_id, do: Wakes.consume_internal_in_txn(txn, wake_id)
+    :ok
+  end
 
-    case status do
-      :done ->
-        State.close_in_txn(txn, @quota_pending, item["incidentId"])
-        {:resumed, units}
+  defp settle_in_txn(txn, ep, status, wake_id) do
+    save_episode_in_txn(txn, ep)
+    now = System.system_time(:millisecond)
+    due = if status == :wait, do: now + @wait_ms, else: now
 
-      :more when budget == :all ->
-        {result, more} = quota_run_in_txn(txn, item, released, :all)
-        {result, units + more}
+    if wake_id do
+      Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1 AND state='pending'", [wake_id, due])
+    else
+      arm_wake_in_txn(txn, ep, due)
+    end
 
-      :more ->
-        save_quota_in_txn(txn, item, false)
-        {if(item["phase"] == "run", do: :resumed, else: :deferred), units}
+    :deferred
+  end
 
-      :deferred ->
-        save_quota_in_txn(txn, item, false)
-        {:deferred, units}
+  defp arm_wake_in_txn(txn, ep, due) do
+    case anchor_in_txn(txn, ep.incident) do
+      nil ->
+        raise DB.Error, message: "quota episode #{ep.id} has no session to file its wake under"
+
+      anchor ->
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: "memory-guard-quota:#{ep.id}",
+          session_key: anchor,
+          origin: "process:tightbeam",
+          consumer: @quota_consumer,
+          prompt: Integer.to_string(ep.id),
+          due_at: due,
+          # The anchor is only where the row is filed, as park_stranding's.
+          target_gate: 0
+        })
     end
   end
 
-  defp save_quota_in_txn(txn, item, new_deferral?) do
-    id = item["incidentId"]
-    detail = JSON.encode!(item)
-
-    unless State.open_in_txn?(txn, @quota_pending, id) do
-      State.open_in_txn(txn, @quota_pending, id, id, item["host"], detail)
-
-      if new_deferral?,
-        do:
-          EventLog.lifecycle_in_txn(
-            txn,
-            "quota_readmission_deferred",
-            id,
-            JSON.encode!(%{host: item["host"], harness: item["harness"], incidentId: id})
-          )
-    end
-
-    State.update_detail_in_txn(txn, @quota_pending, id, detail)
-  end
-
-  # The hook is one hook covering every session of the incident: it runs
-  # once, only when no session it covers is held by another standing reason
-  # (R6a "no re-admission hook SHALL run … until the last standing reason
-  # clears", T14; matrix G2). Paged:
-  # - "check" pages the incident's observations, checking each covered
-  #   session (harness parking: one probe per step; an open limit-fallback
-  #   evaluation: one probe per session). A held session ends the pass: the
-  #   deferral is recorded once, and the next pass starts again.
-  # - At the end of a pass that took more than one step, the evaluations
-  #   opened since it began (`mark`, id keyset) are checked too, so a session
-  #   checked early and held later is still seen; the decision is then made
-  #   in one transaction with that check: admission resumes, recorded.
-  # - "run" pages the same observations and re-admits each source once.
-  defp quota_step_in_txn(txn, item, released, budget) do
-    key = {Harness.parse!(item["harness"]).id(), "shared", item["host"]}
-
-    cond do
-      # A key parked again is left for that park's own release.
-      HarnessProcess.parked_in_txn?(txn, key) ->
-        {:deferred, 1, item}
-
-      item["phase"] == "check" ->
-        quota_check_in_txn(txn, item, key, released, budget)
-
-      true ->
-        quota_readmit_in_txn(txn, item, budget, 0)
-    end
-  end
-
-  defp quota_check_in_txn(txn, item, key, released, budget) do
-    incident_id = item["incidentId"]
-    first_step? = item["cursor"] == nil and item["mark"] == nil
-    item = if item["mark"], do: item, else: Map.put(item, "mark", newest_evaluation(txn))
-
-    {sources, examined, next} =
-      Wakes.quota_intent_page_in_txn(txn, incident_id, cursor(item), page_size(budget))
-
-    held =
-      if parking_in_txn?(txn, key),
-        do: {"harness_process_parking", sources |> Enum.map(&Enum.at(&1, 1)) |> Enum.uniq()},
-        else: fallback_held(txn, sources)
-
-    cond do
-      held != nil ->
-        {:deferred, max(examined, 1), quota_deferred_in_txn(txn, item, released, held)}
-
-      next != nil ->
-        {:more, max(examined, 1), Map.put(item, "cursor", Tuple.to_list(next))}
-
-      first_step? ->
-        quota_decide_in_txn(txn, item, released, budget, max(examined, 1))
-
-      true ->
-        quota_watermark_in_txn(txn, item, released, budget, examined)
-    end
-  end
-
-  defp fallback_held(txn, sources) do
-    case sources
-         |> Enum.map(&Enum.at(&1, 1))
-         |> Enum.uniq()
-         |> Enum.filter(&fallback_open_in_txn?(txn, &1)) do
+  defp anchor_in_txn(txn, incident_id) do
+    case Txn.q(
+           txn,
+           "SELECT sessionKey FROM harness_health_members WHERE incidentId=?1 ORDER BY sessionKey LIMIT 1",
+           [incident_id]
+         ) do
+      [[session_key]] -> session_key
       [] -> nil
-      sessions -> {"limit_fallback", sessions}
     end
   end
 
-  # The evaluations opened since the pass began, a page at a time: an open
-  # one on a covered session holds the hook; once none is left unchecked the
-  # hook is decided, in this transaction.
-  defp quota_watermark_in_txn(txn, item, released, budget, used) do
-    limit = page_size(remaining(budget, used))
+  defp episode_in_txn(txn, id) do
+    case Txn.q(
+           txn,
+           "SELECT #{@episode_columns} FROM memory_guard_quota_episodes WHERE episodeId=?1",
+           [id]
+         ) do
+      [
+        [
+          id,
+          incident,
+          harness,
+          host,
+          high,
+          phase,
+          cursor,
+          mark,
+          found,
+          watermark,
+          deferred,
+          parking,
+          fallback,
+          superseded
+        ]
+      ] ->
+        %{
+          id: id,
+          incident: incident,
+          harness: harness,
+          host: host,
+          high: high,
+          phase: phase,
+          cursor: cursor,
+          mark: mark,
+          found: found,
+          watermark: watermark,
+          deferred: deferred,
+          parking: parking,
+          fallback: fallback,
+          superseded: superseded
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  defp save_episode_in_txn(txn, ep) do
+    Txn.q(
+      txn,
+      """
+      UPDATE memory_guard_quota_episodes
+      SET phase=?2, cursor=?3, passMark=?4, passFound=?5, watermark=?6, deferred=?7,
+          parkingRecorded=?8, fallbackRecorded=?9
+      WHERE episodeId=?1
+      """,
+      [
+        ep.id,
+        ep.phase,
+        ep.cursor,
+        ep.mark,
+        ep.found,
+        ep.watermark,
+        ep.deferred,
+        ep.parking,
+        ep.fallback
+      ]
+    )
+  end
+
+  # One step: `{:done | :more | :wait, units, episode}`.
+  # - check: a full pass over the owed observations (rowid ≤ obsHigh), each
+  #   covered session recorded once (`memory_guard_quota_cover`) and each
+  #   newly held (session, reason) pair recorded once. A pass that found a
+  #   hold ends; the next starts after 5 s.
+  # - the watermark: at the end of a clean pass, the evaluations opened since
+  #   it began; an open one counts exactly when its session is covered.
+  # - decide (with the last watermark page, in one transaction), then run
+  #   (re-admit each source once), then cleanup (the cover rows, a page per
+  #   step), then done.
+  defp step_in_txn(txn, ep, released, memory_reasons, budget, park_check?) do
+    key = {Harness.parse!(ep.harness).id(), "shared", ep.host}
+
+    cond do
+      ep.phase == "cleanup" ->
+        cleanup_in_txn(txn, ep, budget, 0)
+
+      ep.phase == "run" ->
+        readmit_in_txn(txn, ep, budget, 0)
+
+      # Not yet decided: it waits while a memory reason stands on its host,
+      # and a key parked again is left for that park's own release.
+      memory_reasons != [] or (park_check? and HarnessProcess.parked_in_txn?(txn, key)) ->
+        {:wait, 1, ep}
+
+      ep.watermark != nil ->
+        watermark_in_txn(txn, ep, key, released, budget, 0)
+
+      true ->
+        check_in_txn(txn, ep, key, released, budget)
+    end
+  end
+
+  defp check_in_txn(txn, ep, key, released, budget) do
+    {sources, examined, next} =
+      Wakes.quota_episode_page_in_txn(txn, ep.incident, ep.cursor, ep.high, budget)
+
+    used = max(examined, 1)
+    sessions = sources |> Enum.map(&Enum.at(&1, 1)) |> Enum.uniq()
+    for session_key <- sessions, do: cover_in_txn(txn, ep.id, session_key)
+
+    ep =
+      if parking_in_txn?(txn, key),
+        do: hold_found_in_txn(txn, ep, released, "harness_process_parking", sessions),
+        else: ep
+
+    ep =
+      Enum.reduce(sessions, ep, fn session_key, ep ->
+        if fallback_open_in_txn?(txn, session_key),
+          do: hold_found_in_txn(txn, ep, released, "limit_fallback", [session_key]),
+          else: ep
+      end)
+
+    cond do
+      next != nil ->
+        {:more, used, %{ep | cursor: next}}
+
+      ep.found == 1 ->
+        {:wait, used, new_pass_in_txn(txn, ep)}
+
+      true ->
+        watermark_in_txn(txn, %{ep | watermark: ep.mark}, key, released, budget, used)
+    end
+  end
+
+  defp watermark_in_txn(txn, ep, key, released, budget, used) do
+    limit = max(budget - used, 1)
 
     rows =
       Txn.q(
         txn,
         "SELECT id, sessionKey, outcome FROM limit_fallback_evaluations WHERE id > ?1 ORDER BY id LIMIT ?2",
-        [item["mark"], limit]
+        [ep.watermark, limit]
       )
 
     used = used + max(length(rows), 1)
 
-    held =
-      for [_id, session_key, nil] <- rows,
-          covered_in_txn?(txn, session_key, item["incidentId"]),
-          uniq: true,
-          do: session_key
+    ep =
+      for [_id, session_key, nil] <- rows, covered_in_txn?(txn, ep.id, session_key), reduce: ep do
+        ep -> hold_found_in_txn(txn, ep, released, "limit_fallback", [session_key])
+      end
+
+    ep =
+      if ep.found == 0 and parking_in_txn?(txn, key),
+        do: hold_found_in_txn(txn, ep, released, "harness_process_parking", []),
+        else: ep
 
     cond do
-      held != [] ->
-        {:deferred, used, quota_deferred_in_txn(txn, item, released, {"limit_fallback", held})}
+      ep.found == 1 ->
+        {:wait, used, new_pass_in_txn(txn, ep)}
 
       length(rows) == limit ->
         [[last | _] | _] = Enum.reverse(rows)
-        {:more, used, Map.put(item, "mark", last)}
+        {:more, used, %{ep | watermark: last}}
 
       true ->
-        quota_decide_in_txn(txn, item, released, budget, used)
+        decide_in_txn(txn, ep, released, budget, used)
     end
   end
 
-  # Whether a session has a pending pre-activity redelivery of the incident:
-  # at most 8 of its pending quota redeliveries are looked at (partial index
-  # `memory_guard_redelivery_session`); past them, it counts as covered.
-  defp covered_in_txn?(txn, session_key, incident_id) do
-    rows =
-      Txn.q(
-        txn,
-        """
-        SELECT sourceTurnSeq FROM health_redelivery_attempts
-          INDEXED BY memory_guard_redelivery_session
-        WHERE sessionKey=?1 AND redeliveryTurnSeq IS NULL AND failureClass='rate-limit-dead'
-        LIMIT ?2
-        """,
-        [session_key, @covered_rows + 1]
-      )
-
-    length(rows) > @covered_rows or
-      Enum.any?(rows, fn [seq] ->
-        Txn.q(
-          txn,
-          "SELECT 1 FROM harness_health_observations WHERE correlationId=?1 AND incidentId=?2",
-          ["harness-turn:#{seq}:rate-limit-dead", incident_id]
-        ) != []
-      end)
-  end
-
-  defp quota_decide_in_txn(txn, item, released, budget, used) do
-    incident_id = item["incidentId"]
-
-    if item["deferred"],
+  defp decide_in_txn(txn, ep, released, budget, used) do
+    if ep.deferred == 1,
       do:
         EventLog.lifecycle_in_txn(
           txn,
           "quota_readmission_resumed",
-          incident_id,
-          JSON.encode!(%{host: item["host"], harness: item["harness"]})
+          ep.incident,
+          JSON.encode!(%{host: ep.host, harness: ep.harness})
         )
 
-    resumed_in_txn(txn, incident_id, item["host"], last_released(txn, incident_id, released))
-    item = %{item | "phase" => "run", "cursor" => nil}
+    last = if ep.fallback == 1, do: "limit_fallback", else: released
+    resumed_in_txn(txn, ep.incident, ep.host, last)
+    ep = %{ep | phase: "run", cursor: 0, watermark: nil}
 
-    case remaining(budget, used) do
-      0 -> {:more, used, item}
-      left -> quota_readmit_in_txn(txn, item, left, used)
-    end
+    if used < budget, do: readmit_in_txn(txn, ep, budget, used), else: {:more, used, ep}
   end
 
-  defp quota_readmit_in_txn(txn, item, budget, used) do
+  defp readmit_in_txn(txn, ep, budget, used) do
     {sources, examined, next} =
-      Wakes.quota_intent_page_in_txn(txn, item["incidentId"], cursor(item), page_size(budget))
+      Wakes.quota_episode_page_in_txn(txn, ep.incident, ep.cursor, ep.high, max(budget - used, 1))
 
     for source <- sources, do: Wakes.readmit_quota_source_in_txn(txn, source)
     used = used + max(examined, 1)
 
-    if next == nil,
-      do: {:done, used, item},
-      else: {:more, used, Map.put(item, "cursor", Tuple.to_list(next))}
+    cond do
+      next != nil -> {:more, used, %{ep | cursor: next}}
+      used < budget -> cleanup_in_txn(txn, %{ep | phase: "cleanup", cursor: 0}, budget, used)
+      true -> {:more, used, %{ep | phase: "cleanup", cursor: 0}}
+    end
   end
 
-  # A held session ends the pass. Its deferral is recorded once per reason
-  # (the release and each remaining hold are distinguishable records, R6a),
-  # and the next pass starts from the beginning.
-  defp quota_deferred_in_txn(txn, item, released, {reason, sessions}) do
-    incident_id = item["incidentId"]
+  defp cleanup_in_txn(txn, ep, budget, used) do
+    limit = max(budget - used, 1)
 
-    unless hold_recorded?(txn, incident_id, reason),
-      do:
-        EventLog.lifecycle_in_txn(
-          txn,
-          "admission_hold_remaining",
-          incident_id,
-          JSON.encode!(%{
-            host: item["host"],
-            harness: item["harness"],
-            released: released,
-            remaining: [reason],
-            sessions: sessions
-          })
-        )
+    Txn.q(
+      txn,
+      """
+      DELETE FROM memory_guard_quota_cover WHERE episodeId=?1 AND sessionKey IN (
+        SELECT sessionKey FROM memory_guard_quota_cover WHERE episodeId=?1 LIMIT ?2)
+      """,
+      [ep.id, limit]
+    )
 
-    unless item["deferred"],
-      do:
-        EventLog.lifecycle_in_txn(
-          txn,
-          "quota_readmission_deferred",
-          incident_id,
-          JSON.encode!(%{host: item["host"], harness: item["harness"], incidentId: incident_id})
-        )
+    deleted = Txn.changes(txn)
+    status = if deleted < limit, do: :done, else: :more
+    {status, used + max(deleted, 1), ep}
+  end
 
-    %{item | "deferred" => true, "cursor" => nil, "mark" => nil}
+  # A held (session, reason) pair, recorded once per episode: session-level
+  # pairs in the session's cover row, harness parking (key-level) once.
+  defp hold_found_in_txn(txn, ep, released, "harness_process_parking", sessions) do
+    if ep.parking == 0,
+      do: hold_record_in_txn(txn, ep, released, "harness_process_parking", sessions)
+
+    mark_deferred_in_txn(txn, %{ep | parking: 1, found: 1})
+  end
+
+  defp hold_found_in_txn(txn, ep, released, reason, [session_key]) do
+    [[recorded]] =
+      Txn.q(
+        txn,
+        "SELECT recorded FROM memory_guard_quota_cover WHERE episodeId=?1 AND sessionKey=?2",
+        [ep.id, session_key]
+      )
+
+    recorded = JSON.decode!(recorded)
+
+    unless reason in recorded do
+      hold_record_in_txn(txn, ep, released, reason, [session_key])
+
+      Txn.q(
+        txn,
+        "UPDATE memory_guard_quota_cover SET recorded=?3 WHERE episodeId=?1 AND sessionKey=?2",
+        [ep.id, session_key, JSON.encode!([reason | recorded])]
+      )
+    end
+
+    mark_deferred_in_txn(txn, %{ep | fallback: 1, found: 1})
+  end
+
+  defp hold_record_in_txn(txn, ep, released, reason, sessions) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "admission_hold_remaining",
+      ep.incident,
+      JSON.encode!(%{
+        host: ep.host,
+        harness: ep.harness,
+        released: released,
+        remaining: [reason],
+        sessions: sessions,
+        episode: ep.id
+      })
+    )
+  end
+
+  # The episode's first wait is recorded once.
+  defp mark_deferred_in_txn(_txn, %{deferred: 1} = ep), do: ep
+
+  defp mark_deferred_in_txn(txn, ep) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "quota_readmission_deferred",
+      ep.incident,
+      JSON.encode!(%{host: ep.host, harness: ep.harness, incidentId: ep.incident, episode: ep.id})
+    )
+
+    %{ep | deferred: 1}
+  end
+
+  defp new_pass_in_txn(txn, ep),
+    do: %{ep | cursor: 0, found: 0, watermark: nil, mark: newest_evaluation(txn)}
+
+  defp cover_in_txn(txn, id, session_key) do
+    Txn.q(
+      txn,
+      "INSERT INTO memory_guard_quota_cover (episodeId, sessionKey) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+      [id, session_key]
+    )
+  end
+
+  # Rev 1 §3 (F3): the incident's own membership, one primary-key probe.
+  defp covered_in_txn?(txn, id, session_key) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM memory_guard_quota_cover WHERE episodeId=?1 AND sessionKey=?2",
+      [id, session_key]
+    ) != []
   end
 
   defp newest_evaluation(txn) do
@@ -443,34 +614,6 @@ defmodule Tightbeam.MemoryGuard.Admission do
       [[id]] when is_integer(id) -> id
       _ -> 0
     end
-  end
-
-  defp cursor(%{"cursor" => [at, id]}), do: {at, id}
-  defp cursor(_item), do: nil
-
-  defp page_size(:all), do: @release_budget
-  defp page_size(budget), do: max(budget, 1)
-
-  defp remaining(:all, _used), do: @release_budget
-  defp remaining(budget, used), do: max(budget - used, 0)
-
-  defp hold_recorded?(txn, incident_id, reason) do
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM lifecycle_events
-      WHERE kind='admission_hold_remaining' AND subject=?1
-        AND EXISTS (SELECT 1 FROM json_each(detail,'$.remaining') WHERE value=?2)
-      LIMIT 1
-      """,
-      [incident_id, reason]
-    ) != []
-  end
-
-  # The reason whose release let the hook run: a limit-fallback evaluation
-  # when one held it last, else the release that ran it.
-  defp last_released(txn, incident_id, released) do
-    if hold_recorded?(txn, incident_id, "limit_fallback"), do: "limit_fallback", else: released
   end
 
   @doc "Record that admission resumed on a key once its last standing reason cleared."
@@ -781,7 +924,8 @@ defmodule Tightbeam.MemoryGuard.Admission do
   @spec pending?(DB.server()) :: boolean()
   def pending?(db) do
     case DB.transaction(db, fn txn ->
-           State.any_in_txn?(txn, @quota_pending) or State.any_in_txn?(txn, @memory_pending)
+           Txn.q(txn, "SELECT 1 FROM memory_guard_quota_episodes LIMIT 1", []) != [] or
+             State.any_in_txn?(txn, @memory_pending)
          end) do
       {:ok, pending?} -> pending?
       # Unknown is pending: the next pass looks again.

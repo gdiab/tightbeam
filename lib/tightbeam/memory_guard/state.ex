@@ -64,8 +64,21 @@ defmodule Tightbeam.MemoryGuard.State do
     orderKey   TEXT,
     blocked    TEXT,
     adapterKey TEXT,
+    -- Bounded-continuations design rev 2 D1: the generation of a hold's
+    -- lifetime (kind 'hold', and its tombstone 'hold_owed'), of a release
+    -- note or of an unblock item, from `memory_guard_seq`; and a tombstone's
+    -- drop generation.
+    gen        INTEGER,
+    droppedGen INTEGER,
     PRIMARY KEY (kind, ref)
   );
+  -- One counter, `gen`, allocated in commit order (one writer at a time):
+  -- never reused, never tied.
+  CREATE TABLE IF NOT EXISTS memory_guard_seq (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+  );
+  INSERT OR IGNORE INTO memory_guard_seq (name, value) VALUES ('gen', 0);
   CREATE INDEX IF NOT EXISTS memory_guard_open_subject ON memory_guard_open(subject, kind);
   CREATE INDEX IF NOT EXISTS memory_guard_open_host
     ON memory_guard_open(kind, host, openedAt, ref);
@@ -79,11 +92,63 @@ defmodule Tightbeam.MemoryGuard.State do
   -- att_5f6e6736 B1), and probed for a still-blocked hold ahead in line.
   CREATE INDEX IF NOT EXISTS memory_guard_holds_blocked
     ON memory_guard_open(adapterKey, host, orderKey, ref) WHERE kind = 'hold' AND blocked IS NOT NULL;
-  -- A session's pending quota redeliveries, for a quota hook's membership
-  -- check (B3); the table is the wakes' and exists before this one.
-  CREATE INDEX IF NOT EXISTS memory_guard_redelivery_session
-    ON health_redelivery_attempts(sessionKey)
-    WHERE redeliveryTurnSeq IS NULL AND failureClass = 'rate-limit-dead';
+  -- Rev 2 D1: an unblock pages its key's marks by generation; a release
+  -- note pages its host's holds and tombstones by generation; notes of a
+  -- host are found by generation.
+  CREATE INDEX IF NOT EXISTS memory_guard_holds_blocked_gen
+    ON memory_guard_open(adapterKey, host, gen) WHERE kind = 'hold' AND blocked IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS memory_guard_holds_gen
+    ON memory_guard_open(host, gen) WHERE kind IN ('hold','hold_owed');
+  CREATE INDEX IF NOT EXISTS memory_guard_notes
+    ON memory_guard_open(host, gen) WHERE kind = 'release_note';
+  -- Rev 2 D2: one quota-hook episode per park release, with its fixed
+  -- observation high-water, and the sessions it covers (with the reasons
+  -- already recorded for each).
+  CREATE TABLE IF NOT EXISTS memory_guard_quota_episodes (
+    episodeId  INTEGER PRIMARY KEY AUTOINCREMENT,
+    incidentId TEXT NOT NULL,
+    harness    TEXT NOT NULL,
+    host       TEXT NOT NULL,
+    obsHigh    INTEGER NOT NULL,
+    phase      TEXT NOT NULL CHECK (phase IN ('check','run','cleanup')),
+    cursor     INTEGER NOT NULL DEFAULT 0,
+    passMark   INTEGER NOT NULL DEFAULT 0,
+    passFound  INTEGER NOT NULL DEFAULT 0,
+    watermark  INTEGER,
+    deferred   INTEGER NOT NULL DEFAULT 0,
+    parkingRecorded INTEGER NOT NULL DEFAULT 0,
+    fallbackRecorded INTEGER NOT NULL DEFAULT 0,
+    superseded INTEGER NOT NULL DEFAULT 0,
+    createdAt  INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS memory_guard_quota_episodes_incident
+    ON memory_guard_quota_episodes(incidentId, episodeId);
+  CREATE TABLE IF NOT EXISTS memory_guard_quota_cover (
+    episodeId  INTEGER NOT NULL,
+    sessionKey TEXT NOT NULL,
+    recorded   TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (episodeId, sessionKey)
+  );
+  -- Rev 2 D4: a queued notice-batch carrier turn that carries a user post
+  -- (R3a), written in the carrier's own enqueue and removed by the turn's
+  -- leaving `queued`, on every path.
+  CREATE TABLE IF NOT EXISTS memory_guard_user_carriers (
+    carrierSeq INTEGER PRIMARY KEY,
+    sessionKey TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS memory_guard_user_carriers_session
+    ON memory_guard_user_carriers(sessionKey);
+  CREATE TRIGGER IF NOT EXISTS memory_guard_user_carrier_dequeued
+  AFTER UPDATE OF status ON turns
+  WHEN OLD.status = 'queued' AND NEW.status != 'queued'
+  BEGIN
+    DELETE FROM memory_guard_user_carriers WHERE carrierSeq = OLD.seq;
+  END;
+  CREATE TRIGGER IF NOT EXISTS memory_guard_user_carrier_deleted
+  AFTER DELETE ON turns
+  BEGIN
+    DELETE FROM memory_guard_user_carriers WHERE carrierSeq = OLD.seq;
+  END;
   -- Whether a session has a queued turn or pending prompt wake from a user
   -- (R3a's class), one probe each (the tables exist before this one).
   CREATE INDEX IF NOT EXISTS memory_guard_turns_origin
@@ -110,29 +175,84 @@ defmodule Tightbeam.MemoryGuard.State do
   """
 
   @doc "Create the current-state tables (additive; no stamp change)."
-  # The memory guard reads the live adapter launches and a key's newest
-  # launch without reading the launch history (re-review att_5f6e6736). The
-  # launch table is created later in the schema pass, which runs this module
-  # again after it; these follow once it exists.
-  @launch_indexes """
-  CREATE INDEX IF NOT EXISTS harness_processes_live ON harness_processes (launchSequence)
-    WHERE state IN ('launching','running','park_requested');
-  CREATE INDEX IF NOT EXISTS harness_processes_key_sequence
-    ON harness_processes (adapterKey, launchSequence);
+  # Indexes on tables created later in the schema pass, which runs this
+  # module again after them; each follows once its table exists.
+  # - The memory guard reads the live adapter launches and a key's newest
+  #   launch without reading the launch history (re-review att_5f6e6736).
+  # - A quota episode pages its incident's observations by rowid (rev 2 D2);
+  #   SQLite appends the rowid to this index.
+  @late_indexes [
+    {"harness_processes",
+     """
+     CREATE INDEX IF NOT EXISTS harness_processes_live ON harness_processes (launchSequence)
+       WHERE state IN ('launching','running','park_requested');
+     CREATE INDEX IF NOT EXISTS harness_processes_key_sequence
+       ON harness_processes (adapterKey, launchSequence);
+     """},
+    {"harness_health_observations",
+     """
+     CREATE INDEX IF NOT EXISTS memory_guard_observations_incident
+       ON harness_health_observations (incidentId);
+     """}
+  ]
+
+  # Rev 2 D4: the queued user carriers present when this is first installed
+  # get their fact once (later ones get it at their own enqueue).
+  @carrier_backfill """
+  INSERT OR IGNORE INTO memory_guard_user_carriers (carrierSeq, sessionKey)
+  SELECT t.seq, t.sessionKey FROM turns t INDEXED BY turns_pending
+  WHERE t.status IN ('queued','running') AND t.status = 'queued' AND t.isBatchCarrier = 1
+    AND EXISTS (
+      SELECT 1 FROM notice_batches b
+      JOIN notice_batch_members m ON m.batchId = b.batchId AND m.state = 'included'
+      JOIN wakes w ON w.wakeId = m.sourceWakeId
+      WHERE b.deliveryWakeId = t.wakeId AND w.origin LIKE 'user:%'
+        AND w.sourceClientIdentity IS NOT NULL);
+  INSERT INTO memory_guard_seq (name, value) VALUES ('carrier_backfill', 1);
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
-    with :ok <- DB.execute(db, @ddl) do
-      case DB.query(
-             db,
-             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='harness_processes'"
-           ) do
-        {:ok, [_]} -> DB.execute(db, @launch_indexes)
-        {:ok, []} -> :ok
-        {:error, _} = error -> error
-      end
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- late_indexes(db, @late_indexes) do
+      carrier_backfill(db)
     end
+  end
+
+  defp late_indexes(_db, []), do: :ok
+
+  defp late_indexes(db, [{table, ddl} | rest]) do
+    case DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [table]) do
+      {:ok, [_]} -> with :ok <- DB.execute(db, ddl), do: late_indexes(db, rest)
+      {:ok, []} -> late_indexes(db, rest)
+      {:error, _} = error -> error
+    end
+  end
+
+  defp carrier_backfill(db) do
+    case DB.query(
+           db,
+           """
+           SELECT (SELECT 1 FROM memory_guard_seq WHERE name='carrier_backfill'),
+                  (SELECT 1 FROM sqlite_master WHERE type='table' AND name='notice_batch_members')
+           """
+         ) do
+      {:ok, [[nil, 1]]} -> DB.execute(db, @carrier_backfill)
+      {:ok, _} -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc """
+  Allocate the next generation (rev 2 D1), inside the allocating
+  transaction: generations follow commit order and are never reused.
+  """
+  @spec next_gen_in_txn(Txn.t()) :: pos_integer()
+  def next_gen_in_txn(%Txn{} = txn) do
+    [[gen]] =
+      Txn.q(txn, "UPDATE memory_guard_seq SET value=value+1 WHERE name='gen' RETURNING value", [])
+
+    gen
   end
 
   @doc "Record an open item, once (`ref` identifies it within `kind`)."

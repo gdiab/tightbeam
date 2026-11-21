@@ -164,14 +164,59 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
   """
   @spec nudge_held(DB.server(), String.t(), tuple() | nil) ::
           {:ok, tuple() | nil} | {:error, String.t()}
-  def nudge_held(db, host, cursor) do
-    with {:ok, page} <- State.page(db, @open_kind, host, cursor, nil, @nudge_page) do
+  def nudge_held(db, host, cursor, high \\ nil) do
+    with {:ok, page} <- State.page(db, @open_kind, host, cursor, high, @nudge_page) do
       for %{subject: session_key} <- page, do: nudge(session_key)
 
       {:ok,
        if(length(page) == @nudge_page,
          do: {List.last(page).opened_at, List.last(page).ref}
        )}
+    end
+  end
+
+  @doc """
+  One pass of the Watcher's `off` nudges (bounded-continuations design §4):
+  a page of 64 of the holds open when the cycle began (its high-water), from
+  the durable cursor (`watcher_nudge` item of the host), which is saved
+  after the page so a restart resumes the cycle. A nudge is idempotent, so a
+  crash between the nudges and the save only repeats them.
+  """
+  @spec nudge_pass(DB.server(), String.t()) :: :ok | {:error, String.t()}
+  def nudge_pass(db, host) do
+    with {:ok, {cursor, high}} <- nudge_cycle(db, host),
+         {:ok, high} <- if(high, do: {:ok, high}, else: State.high_water(db, @open_kind, host)),
+         {:ok, next} <- if(high, do: nudge_held(db, host, cursor, high), else: {:ok, nil}) do
+      save_cycle(db, host, next && {next, high})
+    end
+  end
+
+  defp nudge_cycle(db, host) do
+    case DB.transaction(db, &State.get_in_txn(&1, "watcher_nudge", host)) do
+      {:ok, %{detail: detail}} ->
+        %{"cursor" => cursor, "high" => high} = JSON.decode!(detail)
+        {:ok, {List.to_tuple(cursor), List.to_tuple(high)}}
+
+      {:ok, nil} ->
+        {:ok, {nil, nil}}
+
+      {:error, error} ->
+        {:error, Exception.message(error)}
+    end
+  end
+
+  defp save_cycle(db, host, cycle) do
+    DB.transaction(db, fn txn ->
+      State.close_in_txn(txn, "watcher_nudge", host)
+
+      with {cursor, high} <- cycle do
+        detail = JSON.encode!(%{cursor: Tuple.to_list(cursor), high: Tuple.to_list(high)})
+        State.open_in_txn(txn, "watcher_nudge", host, host, host, detail)
+      end
+    end)
+    |> case do
+      {:ok, _} -> :ok
+      {:error, error} -> {:error, Exception.message(error)}
     end
   end
 

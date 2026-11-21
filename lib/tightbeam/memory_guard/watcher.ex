@@ -45,8 +45,6 @@ defmodule Tightbeam.MemoryGuard.Watcher do
       root_uid: Keyword.get(opts, :root_uid, 0),
       finding: Keyword.get(opts, :finding, fn -> Tightbeam.MemoryGuard.RootPath.finding() end),
       root_seen: MapSet.new(),
-      # Where the next pass's page of `off` nudges starts (nil: the start).
-      nudge_cursor: nil,
       # Each episode's alert text, with the root-path finding taken when it
       # was first sent; a retry sends the same text.
       messages: %{}
@@ -152,14 +150,14 @@ defmodule Tightbeam.MemoryGuard.Watcher do
 
   # While `off` is in force with the guard down, the lanes still held from
   # before are admitted when they ask again: a page of 64 is nudged per pass
-  # (re-review att_5f6e6736 B4), cycling through the holds.
+  # (re-review att_5f6e6736 B4), cycling through the holds from a durable
+  # cursor (bounded-continuations design §4).
   defp nudge_off_holds(state) do
     with "off" <- Unguarded.mode_in_force(state.db, state.host),
-         {:ok, next} <- Unguarded.nudge_held(state.db, state.host, state.nudge_cursor) do
-      %{state | nudge_cursor: next}
-    else
-      _ -> state
-    end
+         {:error, error} <- Unguarded.nudge_pass(state.db, state.host),
+         do: Logger.warning("memory guard watcher: held lanes not nudged, retried: #{error}")
+
+    state
   end
 
   # The oldest `guard_unavailable` hold still open on the host (one indexed

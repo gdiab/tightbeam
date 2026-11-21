@@ -219,6 +219,18 @@ defmodule Tightbeam.Ledger do
         Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
       end
 
+      # Memory limits R3a (bounded-continuations design rev 2 D4): a carrier
+      # that carries a user post makes its session user-facing while it is
+      # queued. The delivery counted its posts; a trigger removes the fact
+      # when the turn leaves `queued`.
+      if is_batch_carrier == 1 and Map.get(attrs, :user_posts, 0) > 0 do
+        Txn.q(
+          txn,
+          "INSERT INTO memory_guard_user_carriers (carrierSeq, sessionKey) VALUES (?1, ?2)",
+          [seq, session_key]
+        )
+      end
+
       QueuedMessageSuppression.replace_own_queued_in_txn(txn, seq, attrs)
 
       if transition =

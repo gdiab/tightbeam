@@ -855,27 +855,6 @@ defmodule Tightbeam.MemoryGuard do
     {:noreply, state}
   end
 
-  # Up to `n` sessions with a queued turn after `after_key`, one indexed probe
-  # each on `turns_pending` (a session's many queued turns are skipped, not
-  # read).
-  defp queued_lanes(_db, _after_key, 0, acc), do: {:ok, Enum.reverse(acc)}
-
-  defp queued_lanes(db, after_key, n, acc) do
-    case DB.query(
-           db,
-           """
-           SELECT sessionKey FROM turns INDEXED BY turns_pending
-           WHERE status IN ('queued','running') AND status='queued' AND sessionKey > ?1
-           ORDER BY sessionKey LIMIT 1
-           """,
-           [after_key]
-         ) do
-      {:ok, [[key]]} -> queued_lanes(db, key, n - 1, [key | acc])
-      {:ok, []} -> {:ok, Enum.reverse(acc)}
-      {:error, _} = error -> error
-    end
-  end
-
   def handle_info({:DOWN, monitor, :process, adapter, _reason}, state) do
     case Map.fetch(state.adapters, adapter) do
       {:ok, %{monitor: ^monitor, host: host}} ->
@@ -1842,6 +1821,27 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
+  # Up to `n` sessions with a queued turn after `after_key`, one indexed probe
+  # each on `turns_pending` (a session's many queued turns are skipped, not
+  # read).
+  defp queued_lanes(_db, _after_key, 0, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp queued_lanes(db, after_key, n, acc) do
+    case DB.query(
+           db,
+           """
+           SELECT sessionKey FROM turns INDEXED BY turns_pending
+           WHERE status IN ('queued','running') AND status='queued' AND sessionKey > ?1
+           ORDER BY sessionKey LIMIT 1
+           """,
+           [after_key]
+         ) do
+      {:ok, [[key]]} -> queued_lanes(db, key, n - 1, [key | acc])
+      {:ok, []} -> {:ok, Enum.reverse(acc)}
+      {:error, _} = error -> error
+    end
+  end
+
   defp oldest_queued(db, session_key) do
     case DB.query(
            db,
@@ -1929,27 +1929,45 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
-  # Returns the hold's durable start (`openedAt`), kept across updates.
+  # Returns the hold's durable start (`openedAt`), kept across updates. A
+  # new hold lifetime takes a generation (bounded-continuations rev 2 D1);
+  # an update of the same lifetime keeps it.
   defp put_hold_in_txn(txn, session, details, seq, order_key, blocked, adapter_key, now) do
-    Txn.q(
-      txn,
-      """
-      INSERT INTO memory_guard_open
-        (kind, ref, subject, host, detail, openedAt, orderKey, blocked, adapterKey)
-      VALUES ('hold', ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
-      ON CONFLICT(kind, ref) DO UPDATE SET host=excluded.host, detail=excluded.detail,
-        orderKey=excluded.orderKey, blocked=excluded.blocked, adapterKey=excluded.adapterKey
-      """,
-      [
-        session.session_key,
-        session.host,
-        JSON.encode!(%{details: details, seq: seq}),
-        now,
-        order_key,
-        blocked,
-        adapter_key
-      ]
-    )
+    detail = JSON.encode!(%{details: details, seq: seq})
+
+    case Txn.q(txn, "SELECT 1 FROM memory_guard_open WHERE kind='hold' AND ref=?1", [
+           session.session_key
+         ]) do
+      [] ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO memory_guard_open
+            (kind, ref, subject, host, detail, openedAt, orderKey, blocked, adapterKey, gen)
+          VALUES ('hold', ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+          """,
+          [
+            session.session_key,
+            session.host,
+            detail,
+            now,
+            order_key,
+            blocked,
+            adapter_key,
+            State.next_gen_in_txn(txn)
+          ]
+        )
+
+      [_] ->
+        Txn.q(
+          txn,
+          """
+          UPDATE memory_guard_open SET host=?2, detail=?3, orderKey=?4, blocked=?5, adapterKey=?6
+          WHERE kind='hold' AND ref=?1
+          """,
+          [session.session_key, session.host, detail, order_key, blocked, adapter_key]
+        )
+    end
 
     [[since]] =
       Txn.q(txn, "SELECT openedAt FROM memory_guard_open WHERE kind='hold' AND ref=?1", [
@@ -1959,9 +1977,71 @@ defmodule Tightbeam.MemoryGuard do
     since
   end
 
+  # A hold ends. One that a pending release note still owes a record (rev 2
+  # D1/D2 §2) becomes a tombstone (`hold_owed`, ref `session:gen`) with its
+  # pre-drop details and its drop generation, so the record is never lost.
   defp drop_hold_in_txn(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT host, detail, openedAt, gen FROM memory_guard_open WHERE kind='hold' AND ref=?1",
+           [session_key]
+         ) do
+      [[host, detail, opened_at, gen]] when is_integer(gen) ->
+        if note_owed_in_txn?(txn, host, gen) do
+          Txn.q(
+            txn,
+            """
+            INSERT INTO memory_guard_open
+              (kind, ref, subject, host, detail, openedAt, gen, droppedGen)
+            VALUES ('hold_owed', ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            """,
+            [
+              "#{session_key}:#{gen}",
+              session_key,
+              host,
+              detail
+              |> JSON.decode!()
+              |> Map.put("droppedAt", System.system_time(:millisecond))
+              |> JSON.encode!(),
+              opened_at,
+              gen,
+              State.next_gen_in_txn(txn)
+            ]
+          )
+        end
+
+      _ ->
+        :ok
+    end
+
     Txn.q(txn, "DELETE FROM memory_guard_open WHERE kind='hold' AND ref=?1", [session_key])
     State.close_subject_in_txn(txn, "marker_posted", session_key)
+  end
+
+  # Whether a pending release note on `host` still owes the hold of
+  # generation `gen` its record: the active (oldest) note, released after the
+  # hold opened and not yet past it, or any later note (not started). Two
+  # indexed probes on `memory_guard_notes`.
+  defp note_owed_in_txn?(txn, host, gen) do
+    case Txn.q(
+           txn,
+           """
+           SELECT gen, detail FROM memory_guard_open
+           WHERE kind='release_note' AND host=?1 ORDER BY gen LIMIT 1
+           """,
+           [host]
+         ) do
+      [] ->
+        false
+
+      [[active_gen, detail]] ->
+        (active_gen > gen and (JSON.decode!(detail)["cursor"] || 0) < gen) or
+          Txn.q(
+            txn,
+            "SELECT 1 FROM memory_guard_open WHERE kind='release_note' AND host=?1 AND gen > ?2 LIMIT 1",
+            [host, max(active_gen, gen)]
+          ) != []
+    end
   end
 
   # R3a: class first, then the oldest waiting turn; zero-padded so the text
@@ -2154,7 +2234,6 @@ defmodule Tightbeam.MemoryGuard do
   @open_streams [
     {:open, "hold"},
     {:open, "memory_readmission"},
-    {:open, "quota_readmission"},
     {:open, "step_hold"},
     {:open, "release_note"},
     {:open, "unblock"}
@@ -2163,8 +2242,8 @@ defmodule Tightbeam.MemoryGuard do
   @sample_budget 64
   @page_rows 32
 
-  # One sample's bounded work (rev 3 D5; re-review att_5f6e6736): twelve
-  # streams, six journal kinds and six kinds of open items, take turns (the
+  # One sample's bounded work (rev 3 D5; re-review att_5f6e6736): eleven
+  # streams, six journal kinds and five kinds of open items, take turns (the
   # first rotates each sample). Each gets an equal part of the remaining
   # budget of 64 units, at most 32, at least 1.
   #
@@ -2283,23 +2362,6 @@ defmodule Tightbeam.MemoryGuard do
     {state, 1}
   end
 
-  # A quota hook: one bounded step of its pages (B3). Not yet decided, it
-  # waits while a memory reason stands on its host (R6a).
-  defp stream_act(state, {:open, "quota_readmission"}, %{host: host} = item, budget) do
-    with %{} = host_state <- Map.get(state.hosts, host) do
-      case Admission.run_quota_item(state.db, item, host_level_reasons(host_state), budget) do
-        {:ok, units} ->
-          {state, units}
-
-        {:error, error} ->
-          Logger.warning("memory guard: deferred re-admission retried: #{error}")
-          {state, 1}
-      end
-    else
-      _ -> {state, 1}
-    end
-  end
-
   # FS2: once everything the step needs is in place, a step-refusal hold is
   # released and its lane nudged.
   defp stream_act(state, {:open, "step_hold"}, %{subject: session_key}, _budget) do
@@ -2311,55 +2373,37 @@ defmodule Tightbeam.MemoryGuard do
     {state, 1}
   end
 
-  # R6a (re-review att_5f6e6736 B2): a host-level release's remaining-hold
-  # records, one for every hold the release left in place, a page per step:
-  # each page's records and its cursor commit together, so a restart resumes
-  # after the last page written and never records a hold twice. Holds opened
-  # after the release are not its remaining holds.
-  defp stream_act(state, {:open, "release_note"}, %{ref: ref, detail: detail}, budget) do
-    note = JSON.decode!(detail)
-    {after_key, after_ref} = List.to_tuple(note["cursor"] || ["", ""])
+  # R6a, bounded-continuations design §2 with rev 2 D1: a host-level
+  # release's remaining-hold records. What is owed is fixed by generation:
+  # the host's holds and tombstones of a lifetime opened before the note
+  # (`gen < note.gen`) and, for a tombstone, ended after it. Notes of a host
+  # run oldest first; one step reads at most `budget` rows, and its records
+  # and cursor commit together, so a restart resumes after the last page and
+  # never records a hold twice. A tombstone no later note owes is deleted.
+  defp stream_act(state, {:open, "release_note"}, %{ref: ref, host: host}, budget) do
+    now = state.clock.()
 
     DB.transaction(state.db, fn txn ->
-      rows =
-        Txn.q(
-          txn,
-          """
-          SELECT ref, orderKey, openedAt FROM memory_guard_open
-          WHERE kind='hold' AND host=?1 AND (orderKey, ref) > (?2, ?3)
-          ORDER BY orderKey, ref LIMIT ?4
-          """,
-          [note["host"], after_key, after_ref, budget]
-        )
+      case Txn.q(
+             txn,
+             "SELECT gen, detail FROM memory_guard_open WHERE kind='release_note' AND ref=?1",
+             [ref]
+           ) do
+        [[note_gen, detail]] ->
+          if Txn.q(
+               txn,
+               "SELECT 1 FROM memory_guard_open WHERE kind='release_note' AND host=?1 AND gen < ?2 LIMIT 1",
+               [host, note_gen]
+             ) != [] do
+            # Not this host's oldest note: it waits its turn.
+            1
+          else
+            note_step_in_txn(txn, ref, note_gen, JSON.decode!(detail), budget, now)
+          end
 
-      for [session_key, _order, opened_at] <- rows, opened_at <= note["at"] do
-        remaining = note["remaining"] ++ Admission.other_reasons_in_txn(txn, session_key)
-
-        if remaining != [],
-          do:
-            EventLog.lifecycle_in_txn(
-              txn,
-              "admission_hold_remaining",
-              session_key,
-              JSON.encode!(%{
-                host: note["host"],
-                released: note["released"],
-                remaining: remaining
-              })
-            )
+        [] ->
+          1
       end
-
-      case rows do
-        rows when length(rows) < budget ->
-          State.close_in_txn(txn, "release_note", ref)
-
-        rows ->
-          [last_ref, last_key, _] = List.last(rows)
-          note = Map.put(note, "cursor", [last_key, last_ref])
-          State.update_detail_in_txn(txn, "release_note", ref, JSON.encode!(note))
-      end
-
-      max(length(rows), 1)
     end)
     |> case do
       {:ok, units} ->
@@ -2374,38 +2418,164 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
-  # B1: a quota release's blocked marks, cleared a page per step on
-  # `memory_guard_holds_blocked`. A cleared hold is only a candidate again:
-  # its own reasons are confirmed when it is next walked, so none is admitted
-  # before its standing reason is clear. While marks remain, `waiting_ahead`
-  # holds a later session behind a blocked one ahead of it; the last page
-  # nudges the eligible waiters.
+  # B1, design §1 with rev 2 D1: a quota release's blocked marks. What is
+  # owed is the key's marked holds of a lifetime opened before the release
+  # (`gen < unblock.gen`), paged by generation, so a hold marked again after
+  # it was cleared is behind the cursor and not chased. A cleared hold is
+  # only a candidate again: its own reasons are confirmed when it is next
+  # walked, so none is admitted before its standing reason is clear. While
+  # the item is open, `waiting_ahead` holds a later session behind a marked
+  # hold ahead of it; the last page nudges the eligible waiters.
   defp stream_act(state, {:open, "unblock"}, %{ref: key, host: host}, budget) do
     DB.transaction(state.db, fn txn ->
-      Txn.q(
-        txn,
-        """
-        UPDATE memory_guard_open SET blocked=NULL WHERE kind='hold' AND ref IN (
-          SELECT ref FROM memory_guard_open
-          WHERE kind='hold' AND adapterKey=?1 AND blocked IS NOT NULL LIMIT ?2)
-        """,
-        [key, budget]
-      )
+      case Txn.q(
+             txn,
+             "SELECT gen, detail FROM memory_guard_open WHERE kind='unblock' AND ref=?1",
+             [key]
+           ) do
+        [[item_gen, detail]] ->
+          cursor = (detail && JSON.decode!(detail)["cursor"]) || 0
 
-      cleared = Txn.changes(txn)
-      if cleared < budget, do: State.close_in_txn(txn, "unblock", key)
-      cleared
+          rows =
+            Txn.q(
+              txn,
+              """
+              SELECT ref, gen FROM memory_guard_open
+              WHERE kind='hold' AND adapterKey=?1 AND host=?2 AND blocked IS NOT NULL
+                AND gen > ?3 AND gen < ?4
+              ORDER BY gen LIMIT ?5
+              """,
+              [key, host, cursor, item_gen, budget]
+            )
+
+          for [ref, _gen] <- rows,
+              do:
+                Txn.q(
+                  txn,
+                  "UPDATE memory_guard_open SET blocked=NULL WHERE kind='hold' AND ref=?1",
+                  [
+                    ref
+                  ]
+                )
+
+          if length(rows) < budget do
+            State.close_in_txn(txn, "unblock", key)
+            {:done, max(length(rows), 1)}
+          else
+            [_, last] = List.last(rows)
+            State.update_detail_in_txn(txn, "unblock", key, JSON.encode!(%{cursor: last}))
+            {:more, length(rows)}
+          end
+
+        [] ->
+          {:more, 1}
+      end
     end)
     |> case do
-      {:ok, cleared} when cleared < budget ->
-        {release_check(state, host), max(cleared, 1)}
+      {:ok, {:done, units}} ->
+        {release_check(state, host), units}
 
-      {:ok, cleared} ->
-        {state, cleared}
+      {:ok, {:more, units}} ->
+        {state, units}
 
       {:error, error} ->
         Logger.warning("memory guard: blocked marks not yet cleared: #{Exception.message(error)}")
         {state, 1}
+    end
+  end
+
+  @host_details ["memory_floor", "memory_budget"]
+
+  defp note_step_in_txn(txn, ref, note_gen, note, budget, now) do
+    host = note["host"]
+
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT kind, ref, subject, detail, gen, droppedGen FROM memory_guard_open
+        WHERE kind IN ('hold','hold_owed') AND host=?1 AND gen > ?2 AND gen < ?3
+        ORDER BY gen LIMIT ?4
+        """,
+        [host, note["cursor"] || 0, note_gen, budget]
+      )
+
+    for row <- rows, do: note_row_in_txn(txn, note, note_gen, row, now)
+
+    case rows do
+      rows when length(rows) < budget ->
+        State.close_in_txn(txn, "release_note", ref)
+
+      rows ->
+        [_, _, _, _, last, _] = List.last(rows)
+
+        State.update_detail_in_txn(
+          txn,
+          "release_note",
+          ref,
+          JSON.encode!(Map.put(note, "cursor", last))
+        )
+    end
+
+    max(length(rows), 1)
+  end
+
+  # One owed row. Host reasons are exact at the release (the note); the
+  # session's own reasons are as read now (`readAt`), or, for a hold that
+  # resumed before its page, its last details (`resumedAt`). Agreement (i).
+  defp note_row_in_txn(txn, note, _note_gen, ["hold", _ref, session_key, detail, _gen, _], now) do
+    remaining =
+      Enum.uniq(
+        note["remaining"] ++
+          session_details(detail) ++ Admission.other_reasons_in_txn(txn, session_key)
+      )
+
+    note_record_in_txn(txn, note, session_key, remaining, %{readAt: now})
+  end
+
+  defp note_row_in_txn(
+         txn,
+         note,
+         note_gen,
+         ["hold_owed", ref, session_key, detail, gen, dropped],
+         _now
+       ) do
+    if dropped > note_gen do
+      remaining = Enum.uniq(note["remaining"] ++ session_details(detail))
+      resumed_at = JSON.decode!(detail)["droppedAt"]
+      note_record_in_txn(txn, note, session_key, remaining, %{resumedAt: resumed_at})
+    end
+
+    # Deleted once no later note owes it: none released while it lived.
+    if Txn.q(
+         txn,
+         """
+         SELECT 1 FROM memory_guard_open
+         WHERE kind='release_note' AND host=?1 AND gen > ?2 AND gen < ?3 LIMIT 1
+         """,
+         [note["host"], max(note_gen, gen), dropped]
+       ) == [],
+       do: State.close_in_txn(txn, "hold_owed", ref)
+  end
+
+  defp note_record_in_txn(_txn, _note, _session_key, [], _at), do: :ok
+
+  defp note_record_in_txn(txn, note, session_key, remaining, at) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "admission_hold_remaining",
+      session_key,
+      JSON.encode!(
+        Map.merge(at, %{host: note["host"], released: note["released"], remaining: remaining})
+      )
+    )
+  end
+
+  # The hold's own (not host-level) memory details.
+  defp session_details(detail) do
+    case JSON.decode!(detail) do
+      %{"details" => details} when is_map(details) -> Map.keys(details) -- @host_details
+      _ -> []
     end
   end
 
@@ -4497,7 +4667,17 @@ defmodule Tightbeam.MemoryGuard do
           JSON.encode!(Map.merge(facts, %{host: host, detail: detail, remaining: remaining_host}))
         )
 
-        State.open_in_txn(txn, "release_note", "#{host}:#{detail}:#{now}", host, host, note)
+        # Rev 2 D1: the note's generation fixes what it owes.
+        gen = State.next_gen_in_txn(txn)
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO memory_guard_open (kind, ref, subject, host, detail, openedAt, gen)
+          VALUES ('release_note', ?1, ?2, ?2, ?3, ?4, ?5)
+          """,
+          ["#{host}:#{detail}:#{gen}", host, note, now, gen]
+        )
       end)
 
     case result do

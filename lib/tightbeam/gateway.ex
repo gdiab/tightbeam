@@ -353,6 +353,9 @@ defmodule Tightbeam.Gateway do
           internal_consumers: %{
             "rate_limit_reset" => &Tightbeam.RateLimitReset.release(db, &1),
             "park_stranding" => &Tightbeam.ParkStranding.notify(db, &1),
+            # Memory limits: a quota re-admission hook's episode, a bounded
+            # step per run (bounded-continuations design rev 2 D3).
+            "memory_guard_quota" => &Tightbeam.MemoryGuard.Admission.quota_wake(db, &1),
             # These internal consumers remain only to drain wakes persisted by
             # pre-removal releases. They intentionally neither read generations
             # nor send effort-check-in decisions/notices.
@@ -3074,6 +3077,9 @@ defmodule Tightbeam.Gateway do
             turn_attrs
             |> Map.put(:trigger_source, "batch")
             |> Map.put(:batch_member_count, count)
+            # Memory limits R3a: the user posts this carrier carries, counted
+            # by the delivery's own pass (no rescan at enqueue).
+            |> Map.put(:user_posts, length(human_source_messages))
             |> Map.put(
               :is_batch_carrier,
               chat_message_format == "member-rows-v1" and

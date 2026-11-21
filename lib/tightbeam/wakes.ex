@@ -3540,44 +3540,38 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
-  One page of an open quota incident's re-admission hook (memory limits R6a,
-  re-review att_5f6e6736 B3): at most `limit` of the incident's observations
-  after `cursor` (`{observedAt, id}`, nil for the start), on index
-  `harness_health_observation_incident`, each with an O(1) lookup of its
-  pending pre-activity redelivery source (the rows
-  `readmit_released_quota_intents_in_txn/2` re-admits). Returns
+  One page of a quota episode's owed observations (memory limits R6a;
+  bounded-continuations design rev 2 D2): at most `limit` of the incident's
+  observations with `cursor < rowid ≤ high` (the episode's high-water,
+  fixed at its release), in rowid order on `memory_guard_observations_incident`,
+  each with an O(1) lookup of its pending pre-activity redelivery source
+  (the rows `readmit_released_quota_intents_in_txn/2` re-admits). Returns
   `{sources, examined, next}`: the page's sources in source-seq order, the
   observations examined, and the next page's cursor (nil: this was the last).
   """
-  @spec quota_intent_page_in_txn(Txn.t(), String.t(), tuple() | nil, pos_integer()) ::
-          {[list()], non_neg_integer(), tuple() | nil}
-  def quota_intent_page_in_txn(%Txn{} = txn, incident_id, cursor, limit)
+  @spec quota_episode_page_in_txn(Txn.t(), String.t(), integer(), integer(), pos_integer()) ::
+          {[list()], non_neg_integer(), integer() | nil}
+  def quota_episode_page_in_txn(%Txn{} = txn, incident_id, cursor, high, limit)
       when is_binary(incident_id) and is_integer(limit) and limit > 0 do
-    {after_at, after_id} = cursor || {-1, ""}
-
     observations =
       Txn.q(
         txn,
         """
-        SELECT id, observedAt, correlationId, failureClass, evidenceKind
+        SELECT rowid, correlationId, failureClass, evidenceKind
         FROM harness_health_observations
-        WHERE incidentId=?1 AND (observedAt, id) > (?2, ?3)
-        ORDER BY observedAt, id LIMIT ?4
+        WHERE incidentId=?1 AND rowid > ?2 AND rowid <= ?3
+        ORDER BY rowid LIMIT ?4
         """,
-        [incident_id, after_at, after_id, limit]
+        [incident_id, cursor, high, limit]
       )
 
     sources =
-      for [_id, _at, correlation, "rate-limit-dead", "terminal-failure"] <- observations,
+      for [_rowid, correlation, "rate-limit-dead", "terminal-failure"] <- observations,
           [_, seq] <- [Regex.run(~r/\Aharness-turn:(\d+):rate-limit-dead\z/, correlation)],
           source <- quota_source_in_txn(txn, String.to_integer(seq)),
           do: source
 
-    next =
-      if length(observations) == limit do
-        [id, at | _] = List.last(observations)
-        {at, id}
-      end
+    next = if length(observations) == limit, do: observations |> List.last() |> hd()
 
     {sources |> Enum.uniq_by(&hd/1) |> Enum.sort_by(&Enum.at(&1, 3)), length(observations), next}
   end
@@ -3611,7 +3605,7 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
-  Re-admit one source of `quota_intent_page_in_txn/4` (once: a source already
+  Re-admit one source of `quota_episode_page_in_txn/5` (once: a source already
   re-admitted is no longer pending). Returns the count re-admitted (0 or 1).
   """
   @spec readmit_quota_source_in_txn(Txn.t(), list()) :: non_neg_integer()
