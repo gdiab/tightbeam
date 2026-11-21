@@ -94,10 +94,32 @@ defmodule Tightbeam.QuotaRelease do
           JSON.encode!(%{harness: harness, host: host, cause: cause, reasons: reasons, at: at})
         )
 
+        # The release ended this quota cause (companion B2 marker): the fence
+        # is no longer the incident's quota park, so the standing reason's own
+        # settlement completes it through the guarded path (v1.7 C1).
+        unmark_quota_fence_in_txn(txn, key, incident_id)
+
         released_in_txn(txn, incident_id, harness, host)
         {:held, reasons}
     end
   end
+
+  defp unmark_quota_fence_in_txn(txn, key, incident_id) do
+    if Txn.q(
+         txn,
+         "SELECT COUNT(*) FROM pragma_table_info('harness_park_fences') WHERE name='quotaIncidentId'"
+       ) == [[1]] do
+      Txn.q(
+        txn,
+        "UPDATE harness_park_fences SET quotaIncidentId=NULL WHERE adapterKey=?1 AND quotaIncidentId=?2",
+        [adapter_key(key), incident_id]
+      )
+    end
+
+    :ok
+  end
+
+  defp adapter_key({harness, preset, host}), do: "#{harness}:#{preset}@#{host}"
 
   @readmitting_causes [
     "declared_reset",
