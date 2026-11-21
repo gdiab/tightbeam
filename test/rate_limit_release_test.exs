@@ -745,9 +745,28 @@ defmodule Tightbeam.RateLimitReleaseTest do
          nudge: fn _ -> :ok end}
       )
 
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert Tightbeam.MemoryGuard.host_reasons("testhost") == ["memory_floor"]
       %{root: root}
+    end
+
+    # A guard sample, then one run of each pending quota-episode wake (the
+    # wake scheduler's part: bounded-continuations design rev 2 D3), due or
+    # not.
+    defp tick!(db) do
+      :ok = Tightbeam.MemoryGuard.tick()
+
+      {:ok, wakes} =
+        DB.query(
+          db,
+          "SELECT wakeId FROM wakes WHERE consumer='memory_guard_quota' AND state='pending' ORDER BY wakeId"
+        )
+
+      # An error is the scheduler's retry: the step rolled back whole.
+      for [wake_id] <- wakes,
+          do: Tightbeam.MemoryGuard.Admission.quota_wake(db, %{wake_id: wake_id})
+
+      :ok
     end
 
     defp meminfo!(root, percent) do
@@ -806,13 +825,13 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert lifecycle(db, "admission_resumed") == []
 
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
 
       assert [{_incident, %{"after" => ["memory"]}}] = lifecycle(db, "admission_resumed")
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
 
       # Exactly once: another release finds nothing pending.
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert length(queued_messages(db)) == 2
     end
 
@@ -835,7 +854,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       cond do
         done?.() -> :ok
         ticks == 0 -> flunk("not done within its bound")
-        true -> Tightbeam.MemoryGuard.tick() && tick_until!(db, done?, ticks - 1)
+        true -> tick!(db) && tick_until!(db, done?, ticks - 1)
       end
     end
 
@@ -846,7 +865,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert queued_messages(db) == []
 
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       # One sample's share is at most 32 units: not all 80 at once.
       assert length(queued_messages(db)) < 80
 
@@ -855,7 +874,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert [{_incident, %{"after" => ["memory"]}}] = lifecycle(db, "admission_resumed")
 
       # Exactly once.
-      for _ <- 1..3, do: :ok = Tightbeam.MemoryGuard.tick()
+      for _ <- 1..3, do: :ok = tick!(db)
       assert length(queued_messages(db)) == 80
     end
 
@@ -864,7 +883,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       seqs = parked_with_many_quota_failed_turns!(db)
       release_at_reset!(db)
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert queued_messages(db) == []
 
       # c1's turns come first, so the first sample checked only c1.
@@ -875,7 +894,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
           [hd(seqs)]
         )
 
-      for _ <- 1..15, do: :ok = Tightbeam.MemoryGuard.tick()
+      for _ <- 1..15, do: :ok = tick!(db)
       assert queued_messages(db) == []
 
       assert [_, {_incident, %{"remaining" => ["limit_fallback"], "sessions" => ["c1"]}}] =
@@ -897,7 +916,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       {first, second} = parked_with_two_quota_failed_turns!(db)
 
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert [{"testhost", %{"detail" => "memory_floor"}}] = lifecycle(db, "memory_guard_release")
       assert HarnessProcess.parked?(db, @codex_key)
       assert queued_messages(db) == []
@@ -932,7 +951,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
 
       fallback!(db, first, true)
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
 
       # The memory release leaves the evaluation standing: nothing re-admitted,
       # no resumption, the remaining hold recorded once.
@@ -946,17 +965,17 @@ defmodule Tightbeam.RateLimitReleaseTest do
                 %{"released" => "memory", "remaining" => ["limit_fallback"], "sessions" => ["c1"]}}
              ] = lifecycle(db, "admission_hold_remaining")
 
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert queued_messages(db) == []
       assert length(lifecycle(db, "admission_hold_remaining")) == 2
 
       fallback!(db, first, false)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert [{_incident, %{"after" => ["limit_fallback"]}}] = lifecycle(db, "admission_resumed")
       assert [_] = lifecycle(db, "quota_readmission_resumed")
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
 
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert length(queued_messages(db)) == 2
       assert length(lifecycle(db, "admission_resumed")) == 1
     end
@@ -974,7 +993,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
 
       assert HarnessProcess.parked?(db, @codex_key)
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
 
       # Only c1 is under an open evaluation; c2 is clear. The hook covers both.
       {:ok, _} =
@@ -990,7 +1009,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert [{_, %{"remaining" => ["limit_fallback"], "sessions" => ["c1"]}}] =
                lifecycle(db, "admission_hold_remaining")
 
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert queued_messages(db) == []
 
       {:ok, _} =
@@ -999,13 +1018,13 @@ defmodule Tightbeam.RateLimitReleaseTest do
           "UPDATE limit_fallback_evaluations SET outcome='withheld', reason='test', decidedAt=2"
         )
 
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
 
       assert Enum.sort(queued_messages(db)) ==
                Enum.sort([source_message(db, first), source_message(db, second)])
 
       assert [_] = lifecycle(db, "admission_resumed")
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert length(queued_messages(db)) == 2
     end
 
@@ -1023,15 +1042,15 @@ defmodule Tightbeam.RateLimitReleaseTest do
         """)
 
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       # The hook and its record are one step: nothing was re-admitted.
       assert queued_messages(db) == []
       assert lifecycle(db, "admission_resumed") == []
 
       {:ok, _} = DB.query(db, "DROP TRIGGER g5_fail_resume")
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert length(queued_messages(db)) == 2
       assert [_] = lifecycle(db, "quota_readmission_resumed")
     end
@@ -1046,14 +1065,14 @@ defmodule Tightbeam.RateLimitReleaseTest do
 
       try do
         meminfo!(root, 50)
-        :ok = Tightbeam.MemoryGuard.tick()
+        :ok = tick!(db)
         assert queued_messages(db) == []
         assert lifecycle(db, "quota_readmission_resumed") == []
       after
         {:ok, _} = DB.query(db, "ALTER TABLE lfe_hidden RENAME TO limit_fallback_evaluations")
       end
 
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
     end
 
@@ -1069,11 +1088,11 @@ defmodule Tightbeam.RateLimitReleaseTest do
         )
 
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert queued_messages(db) == []
 
       {:ok, _} = DB.query(db, "DELETE FROM harness_park_fences")
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
     end
 
@@ -1081,7 +1100,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
          %{db: db, root: root} do
       {first, second} = parked_with_two_quota_failed_turns!(db)
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
 
       {:ok, _} =
         DB.query(
@@ -1106,7 +1125,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
       {:ok, _} =
         DB.query(db, "UPDATE harness_processes SET resolvedAt=2 WHERE launchId='g4-parking'")
 
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
     end
 
@@ -1114,7 +1133,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
          %{db: db, root: root} do
       {first, second} = parked_with_two_quota_failed_turns!(db)
       meminfo!(root, 50)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert Tightbeam.MemoryGuard.host_reasons("testhost") == []
 
       fallback!(db, first, true)
@@ -1126,7 +1145,7 @@ defmodule Tightbeam.RateLimitReleaseTest do
                lifecycle(db, "admission_hold_remaining")
 
       fallback!(db, first, false)
-      :ok = Tightbeam.MemoryGuard.tick()
+      :ok = tick!(db)
       assert [{_incident, %{"after" => ["limit_fallback"]}}] = lifecycle(db, "admission_resumed")
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
     end
@@ -1195,6 +1214,213 @@ defmodule Tightbeam.RateLimitReleaseTest do
     end
 
     def handle_cast(_message, parent), do: {:noreply, parent}
+  end
+
+  # Bounded-continuations design §3 with rev 2 D2/D3: the quota hook's
+  # episodes, owned by their internal wake. No memory guard runs here
+  # (`memory_guard: false`, the test configuration): the wake alone drives it.
+  describe "quota episodes (design rev 1/2 §3, D2, D3)" do
+    defp failures!(db, counts) do
+      error = future_codex_error(System.system_time(:millisecond))
+      seqs = for {key, n} <- counts, _ <- 1..n, do: fail_turn(db, key, error)
+
+      assert {:ok, _} =
+               DB.transaction(db, fn txn ->
+                 observe_in_txn(txn, "open", "c1", "testhost", System.system_time(:millisecond))
+               end)
+
+      seqs
+    end
+
+    defp incident(db) do
+      {:ok, [[id]]} =
+        DB.query(
+          db,
+          "SELECT id FROM harness_health_incidents WHERE failureClass='rate-limit-dead'"
+        )
+
+      id
+    end
+
+    defp quota_wakes(db) do
+      {:ok, rows} =
+        DB.query(
+          db,
+          "SELECT wakeId FROM wakes WHERE consumer='memory_guard_quota' AND state='pending' ORDER BY wakeId"
+        )
+
+      Enum.map(rows, &hd/1)
+    end
+
+    # The scheduler's part: one run of each pending wake per round, due or not.
+    defp run_wakes!(db, rounds \\ 1) do
+      for _ <- 1..rounds, wake_id <- quota_wakes(db) do
+        Tightbeam.MemoryGuard.Admission.quota_wake(db, %{wake_id: wake_id})
+      end
+
+      :ok
+    end
+
+    defp eval!(db, key, seq) do
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT INTO limit_fallback_evaluations (sessionKey, turnSeq, heldAt, createdAt) VALUES (?1, ?2, 1, 1)",
+          [key, seq]
+        )
+    end
+
+    defp decide!(db, key) do
+      {:ok, _} =
+        DB.query(
+          db,
+          "UPDATE limit_fallback_evaluations SET outcome='applied', decidedAt=2 WHERE sessionKey=?1",
+          [key]
+        )
+    end
+
+    defp count!(db, sql) do
+      {:ok, [[n]]} = DB.query(db, sql)
+      n
+    end
+
+    test "with no guard, the wake alone continues an 80-turn hook: the release's 64 units, then a page per run; each source once, in order; the wake consumed",
+         %{db: db} do
+      seqs = failures!(db, [{"c1", 80}])
+      release_at_reset!(db)
+      assert length(queued_messages(db)) < 80
+      assert [_] = quota_wakes(db)
+
+      run_wakes!(db, 10)
+      assert queued_messages(db) == Enum.map(seqs, &source_message(db, &1))
+      assert [{_, %{"after" => ["quota_park"]}}] = lifecycle(db, "admission_resumed")
+      assert quota_wakes(db) == []
+      assert count!(db, "SELECT COUNT(*) FROM memory_guard_quota_episodes") == 0
+      assert count!(db, "SELECT COUNT(*) FROM memory_guard_quota_cover") == 0
+
+      # D2: a turn that fails after the release, into the same incident, is
+      # not this episode's (its rowid is above the high-water).
+      late = fail_turn(db, "c2", future_codex_error(System.system_time(:millisecond)))
+      run_wakes!(db, 3)
+      assert length(queued_messages(db)) == 80
+      refute source_message(db, late) in queued_messages(db)
+    end
+
+    test "F4: two sessions held on different pages each get their own record, in one pass; the hook runs once both evaluations decide",
+         %{db: db} do
+      seqs = failures!(db, [{"c1", 70}, {"c2", 10}])
+      eval!(db, "c1", hd(seqs))
+      eval!(db, "c2", Enum.at(seqs, 70))
+      release_at_reset!(db)
+      run_wakes!(db, 4)
+
+      held =
+        for {_, %{"remaining" => ["limit_fallback"], "sessions" => [s]}} <-
+              lifecycle(db, "admission_hold_remaining"),
+            do: s
+
+      assert Enum.sort(held) == ["c1", "c2"]
+      assert queued_messages(db) == []
+
+      decide!(db, "c1")
+      run_wakes!(db, 4)
+      assert queued_messages(db) == []
+
+      decide!(db, "c2")
+      run_wakes!(db, 6)
+      assert Enum.sort(queued_messages(db)) == Enum.sort(Enum.map(seqs, &source_message(db, &1)))
+
+      # Each pair recorded once, however many passes found it.
+      assert length(held) == length(lifecycle(db, "admission_hold_remaining"))
+    end
+
+    test "F3: an evaluation opened mid-pass on a session the incident does not cover (with unrelated pending redeliveries) does not hold the hook",
+         %{db: db} do
+      error = future_codex_error(System.system_time(:millisecond))
+      r1 = for _ <- 1..10, do: fail_turn(db, "r1", error)
+      seqs = failures!(db, [{"c1", 80}])
+      release_at_reset!(db)
+      eval!(db, "r1", hd(r1))
+      run_wakes!(db, 6)
+      assert queued_messages(db) == Enum.map(seqs, &source_message(db, &1))
+
+      refute Enum.any?(lifecycle(db, "admission_hold_remaining"), fn {_, d} ->
+               d["remaining"] == ["limit_fallback"]
+             end)
+    end
+
+    test "D2: a second release of the same incident supersedes the first episode; each episode's cover rows are its own; every source once",
+         %{db: db} do
+      seqs = failures!(db, [{"c1", 80}])
+      release_at_reset!(db)
+      id = incident(db)
+
+      {:ok, _} =
+        DB.transaction(
+          db,
+          &Tightbeam.MemoryGuard.Admission.quota_released_in_txn(&1, id, "codex", "testhost")
+        )
+
+      {:ok, [[first, 1], [second, 0]]} =
+        DB.query(
+          db,
+          "SELECT episodeId, superseded FROM memory_guard_quota_episodes ORDER BY episodeId"
+        )
+
+      cover = fn ep ->
+        count!(db, "SELECT COUNT(*) FROM memory_guard_quota_cover WHERE episodeId=#{ep}")
+      end
+
+      assert cover.(second) > 0
+      run_wakes!(db, 1)
+      assert cover.(first) == 0
+      assert cover.(second) > 0
+
+      run_wakes!(db, 10)
+      assert queued_messages(db) == Enum.map(seqs, &source_message(db, &1))
+      assert quota_wakes(db) == []
+    end
+
+    test "D3: a run that fails mid-check or mid-cleanup rolls back whole; the wake stays pending and the next run continues; nothing twice",
+         %{db: db} do
+      seqs = failures!(db, [{"c1", 80}])
+      release_at_reset!(db)
+
+      {:ok, _} =
+        DB.query(db, """
+        CREATE TRIGGER quota_fail BEFORE INSERT ON lifecycle_events WHEN NEW.kind='admission_resumed'
+        BEGIN SELECT RAISE(ABORT, 'injected'); END
+        """)
+
+      [wake] = quota_wakes(db)
+
+      {:ok, [[cursor]]} = DB.query(db, "SELECT cursor FROM memory_guard_quota_episodes")
+
+      assert {:error, "injected"} =
+               Tightbeam.MemoryGuard.Admission.quota_wake(db, %{wake_id: wake})
+
+      assert {:ok, [[^cursor]]} = DB.query(db, "SELECT cursor FROM memory_guard_quota_episodes")
+      assert [^wake] = quota_wakes(db)
+
+      {:ok, _} = DB.query(db, "DROP TRIGGER quota_fail")
+
+      # Fail at cleanup's first delete, once.
+      {:ok, _} =
+        DB.query(db, """
+        CREATE TRIGGER cleanup_fail BEFORE DELETE ON memory_guard_quota_cover
+        BEGIN SELECT RAISE(ABORT, 'injected cleanup'); END
+        """)
+
+      run_wakes!(db, 4)
+      assert count!(db, "SELECT COUNT(*) FROM memory_guard_quota_cover") > 0
+      assert [^wake] = quota_wakes(db)
+
+      {:ok, _} = DB.query(db, "DROP TRIGGER cleanup_fail")
+      run_wakes!(db, 4)
+      assert queued_messages(db) == Enum.map(seqs, &source_message(db, &1))
+      assert [_] = lifecycle(db, "admission_resumed")
+      assert quota_wakes(db) == []
+    end
   end
 
   describe "host zone" do

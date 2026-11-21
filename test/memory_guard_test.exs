@@ -317,6 +317,54 @@ defmodule Tightbeam.MemoryGuardTest do
     start_supervised!({FakeAdapter, test: self()}, id: {:adapter, System.unique_integer()})
   end
 
+  # A rate-limit incident naming `session_key` (a member), opened as the
+  # provider's evidence opens one.
+  defp quota_incident!(ctx, session_key, host) do
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.HarnessHealth.observe_in_txn(txn, %{
+          correlation_id: "open-#{System.unique_integer([:positive])}",
+          harness: "claude",
+          host: host,
+          failure_class: "rate-limit-dead",
+          evidence_kind: "authoritative-provider",
+          session_key: session_key,
+          assignment_id: nil,
+          observed_at: System.system_time(:millisecond),
+          cause: "usageLimitExceeded",
+          principal: "process:test"
+        })
+      end)
+
+    {:ok, [[id]]} =
+      DB.query(ctx.db, "SELECT incidentId FROM harness_health_members WHERE sessionKey=?1", [
+        session_key
+      ])
+
+    # The park is released, as at the release that runs the hook.
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM harness_park_fences")
+    id
+  end
+
+  # The wake scheduler's part (bounded-continuations design rev 2 D3): one
+  # run of each pending quota-episode wake, due or not.
+  defp run_quota_wakes!(ctx) do
+    for wake_id <- quota_wakes(ctx),
+        do: Admission.quota_wake(ctx.db, %{wake_id: wake_id})
+
+    :ok
+  end
+
+  defp quota_wakes(ctx) do
+    {:ok, rows} =
+      DB.query(
+        ctx.db,
+        "SELECT wakeId FROM wakes WHERE consumer='memory_guard_quota' AND state='pending' ORDER BY wakeId"
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
   defp events(db, kind) do
     {:ok, rows} =
       DB.query(db, "SELECT subject,detail FROM lifecycle_events WHERE kind=?1 ORDER BY id", [kind])
@@ -2236,6 +2284,14 @@ defmodule Tightbeam.MemoryGuardTest do
       on_exit(fn -> MemoryGuard.expect(false) end)
 
       MemoryGuard.expect(false)
+      # A quota incident of a session on this host (its wake is filed there).
+      session!(ctx, "agent:quota")
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET host=?1 WHERE sessionKey='agent:quota'", [local])
+
+      incident = quota_incident!(ctx, "agent:quota", local)
+
       assert MemoryGuard.launch_env(key, "L-down", opts, ctx.db) == []
       assert MemoryGuard.host_reasons(local) == []
 
@@ -2252,10 +2308,10 @@ defmodule Tightbeam.MemoryGuardTest do
       assert {:ok, :deferred} =
                DB.transaction(
                  ctx.db,
-                 &Admission.quota_released_in_txn(&1, "incident-down", "claude", local)
+                 &Admission.quota_released_in_txn(&1, incident, "claude", local)
                )
 
-      assert [{"incident-down", %{"remaining" => ["memory_guard_unavailable"]}}] =
+      assert [{^incident, %{"remaining" => ["memory_guard_unavailable"]}}] =
                events(ctx.db, "admission_hold_remaining")
     end
 
@@ -5496,27 +5552,33 @@ defmodule Tightbeam.MemoryGuardTest do
       guard!(ctx)
       :ok = MemoryGuard.tick()
       assert MemoryGuard.host_reasons(@host) == ["memory_floor"]
+      # A quota incident of a session on this host (its wake is filed there).
+      session!(ctx, "agent:quota")
+      incident = quota_incident!(ctx, "agent:quota", @host)
 
       {:ok, :deferred} =
         DB.transaction(
           ctx.db,
-          &Admission.quota_released_in_txn(&1, "incident-1", "claude", @host)
+          &Admission.quota_released_in_txn(&1, incident, "claude", @host)
         )
 
-      assert [{"incident-1", %{"released" => "quota_park", "remaining" => ["memory_floor"]}}] =
+      assert [{^incident, %{"released" => "quota_park", "remaining" => ["memory_floor"]}}] =
                events(ctx.db, "admission_hold_remaining")
 
-      assert [{"incident-1", _}] = events(ctx.db, "quota_readmission_deferred")
+      assert [{^incident, _}] = events(ctx.db, "quota_readmission_deferred")
       assert events(ctx.db, "admission_resumed") == []
 
       meminfo!(ctx.root, total, div(total * 16, 100))
       :ok = MemoryGuard.tick()
-      assert [{"incident-1", %{"after" => ["memory"]}}] = events(ctx.db, "admission_resumed")
-      assert [{"incident-1", _}] = events(ctx.db, "quota_readmission_resumed")
+      run_quota_wakes!(ctx)
+      assert [{^incident, %{"after" => ["memory"]}}] = events(ctx.db, "admission_resumed")
+      assert [{^incident, _}] = events(ctx.db, "quota_readmission_resumed")
 
-      # Exactly once: a later release finds nothing pending.
+      # Exactly once: the episode is done and its wake consumed.
       :ok = MemoryGuard.tick()
+      run_quota_wakes!(ctx)
       assert length(events(ctx.db, "quota_readmission_resumed")) == 1
+      assert quota_wakes(ctx) == []
     end
 
     test "a floor release while a quota park stands records the remaining hold and admits nothing",
@@ -6756,10 +6818,19 @@ defmodule Tightbeam.MemoryGuardTest do
     end
   end
 
-  describe "bounded continuations (re-review att_5f6e6736 B1, B2, B4)" do
+  describe "bounded continuations (design rev 1/2)" do
+    alias Tightbeam.MemoryGuard.State, as: GuardState
+
     @key "claude:shared@testhost"
 
-    defp holds!(ctx, prefix, count, fields) do
+    # Holds as the guard writes them: each lifetime takes a generation.
+    # `turns: true` gives each session a queued turn (else the eligible walk
+    # finds it gone and ends the hold through the real drop path).
+    defp holds!(ctx, prefix, count, fields \\ []) do
+      if Keyword.get(fields, :turns, false) do
+        for n <- 1..count, do: session!(ctx, "#{prefix}#{n}") && queue!(ctx, "#{prefix}#{n}", "w")
+      end
+
       {:ok, _} =
         DB.transaction(ctx.db, fn txn ->
           for n <- 1..count do
@@ -6767,17 +6838,17 @@ defmodule Tightbeam.MemoryGuardTest do
               txn,
               """
               INSERT INTO memory_guard_open
-                (kind, ref, subject, host, detail, openedAt, orderKey, blocked, adapterKey)
-              VALUES (?1, ?2, ?2, ?3, '{"details":{"resident_cap":1},"seq":0}', ?4, ?5, ?6, ?7)
+                (kind, ref, subject, host, detail, openedAt, orderKey, blocked, adapterKey, gen)
+              VALUES ('hold', ?1, ?1, ?2, '{"details":{"resident_cap":1},"seq":0}', ?3, ?4, ?5, ?6, ?7)
               """,
               [
-                Keyword.get(fields, :kind, "hold"),
                 "#{prefix}#{n}",
                 @host,
                 Keyword.get(fields, :opened_at, n),
                 "00:" <> String.pad_leading("#{n}", 20, "0"),
                 Keyword.get(fields, :blocked),
-                @key
+                @key,
+                GuardState.next_gen_in_txn(txn)
               ]
             )
           end
@@ -6789,11 +6860,29 @@ defmodule Tightbeam.MemoryGuardTest do
       n
     end
 
-    test "B1: a quota release clears its key's blocked marks at most 32 per sample, and holds a later session behind a marked one ahead until they are cleared",
-         ctx do
-      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
-      guard!(ctx)
+    defp rows!(ctx, sql) do
+      {:ok, rows} = DB.query(ctx.db, sql, [])
+      rows
+    end
 
+    defp blocked(ctx),
+      do:
+        count!(
+          ctx,
+          "SELECT COUNT(*) FROM memory_guard_open WHERE kind='hold' AND blocked IS NOT NULL"
+        )
+
+    defp notes(ctx), do: events(ctx.db, "admission_hold_remaining")
+
+    # A real host-level release: the floor breached, then clear.
+    defp floor_release!(ctx) do
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      :ok = MemoryGuard.tick()
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 50, 100))
+      :ok = MemoryGuard.tick()
+    end
+
+    defp cap!(ctx) do
       {:ok, {:ok, _}} =
         DB.transaction(
           ctx.db,
@@ -6804,9 +6893,14 @@ defmodule Tightbeam.MemoryGuardTest do
       adapter = adapter!()
       for n <- 1..2, do: session!(ctx, "agent:r#{n}", "sid-r#{n}")
       resident!(adapter, ["sid-r1", "sid-r2"])
+    end
 
-      holds!(ctx, "agent:p", 100, blocked: "quota_park")
-      for n <- 1..100, do: session!(ctx, "agent:p#{n}") && queue!(ctx, "agent:p#{n}", "w")
+    test "unblock (§1, D1): 32 per sample; order guard; restart resumes; a re-mark behind the cursor and a later hold are not cleared",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      cap!(ctx)
+      holds!(ctx, "agent:p", 100, blocked: "quota_park", turns: true)
 
       {:ok, _} =
         DB.transaction(
@@ -6814,15 +6908,11 @@ defmodule Tightbeam.MemoryGuardTest do
           &Admission.quota_released_in_txn(&1, "incident-b1", "claude", @host)
         )
 
-      blocked = fn ->
-        count!(
-          ctx,
-          "SELECT COUNT(*) FROM memory_guard_open WHERE kind='hold' AND blocked IS NOT NULL"
-        )
-      end
-
-      # The release itself writes one row, not 100.
-      assert blocked.() == 100
+      # The release writes one row, not 100; a hold opened after it in the
+      # same millisecond has a later generation.
+      [[at]] = rows!(ctx, "SELECT openedAt FROM memory_guard_open WHERE kind='unblock'")
+      holds!(ctx, "agent:late-mark", 1, blocked: "quota_park", opened_at: at)
+      assert blocked(ctx) == 101
 
       # One slot is free, but marked holds ahead of it may be eligible now.
       session!(ctx, "agent:late")
@@ -6830,80 +6920,187 @@ defmodule Tightbeam.MemoryGuardTest do
       assert {:held, ["resident_cap"]} = MemoryGuard.admit("agent:late")
 
       :ok = MemoryGuard.tick()
-      assert blocked.() >= 100 - 32
+      assert blocked(ctx) in (101 - 32)..100
 
-      for _ <- 1..40, blocked.() > 0, do: :ok = MemoryGuard.tick()
-      assert blocked.() == 0
-      assert count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='unblock'") == 0
-      assert_received {:nudged, "agent:p1"}
-    end
-
-    test "B2: a host release records the remaining hold of every hold it left, a page per sample, once each across a restart, and none for a hold opened after it",
-         ctx do
-      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
-      guard!(ctx)
-      now = System.system_time(:millisecond)
-      holds!(ctx, "agent:h", 70, opened_at: now - 1_000)
-      holds!(ctx, "agent:after", 1, opened_at: now + 60_000)
-
-      note =
-        JSON.encode!(%{
-          host: @host,
-          released: "memory_floor",
-          remaining: ["memory_budget"],
-          at: now
-        })
-
+      # p1 was cleared; marked again (still blocked by another reason), it is
+      # behind the cursor and not chased.
       {:ok, _} =
-        DB.transaction(
-          ctx.db,
-          &Tightbeam.MemoryGuard.State.open_in_txn(
-            &1,
-            "release_note",
-            "#{@host}:memory_floor:#{now}",
-            @host,
-            @host,
-            note
-          )
-        )
+        DB.query(ctx.db, "UPDATE memory_guard_open SET blocked='quota_park' WHERE ref='agent:p1'")
 
-      notes = fn -> events(ctx.db, "admission_hold_remaining") end
-
-      :ok = MemoryGuard.tick()
-      assert length(notes.()) in 1..32
-
-      # A restart mid-way resumes after the last page written.
+      # A restart mid-pass resumes from the durable cursor.
       stop_supervised!(MemoryGuard)
       guard!(ctx)
-      for _ <- 1..20, do: :ok = MemoryGuard.tick()
 
-      subjects = Enum.map(notes.(), &elem(&1, 0))
-      assert length(subjects) == 70
+      for _ <- 1..40,
+          count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='unblock'") > 0,
+          do: :ok = MemoryGuard.tick()
+
+      assert count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='unblock'") == 0
+
+      assert [["agent:late-mark1"], ["agent:p1"]] =
+               rows!(
+                 ctx,
+                 "SELECT ref FROM memory_guard_open WHERE kind='hold' AND blocked IS NOT NULL ORDER BY ref"
+               )
+    end
+
+    test "release note (§2, D1): one record per hold open at the release, paged, across a restart; none for a hold opened after it in its millisecond",
+         ctx do
+      guard!(ctx)
+      holds!(ctx, "agent:h", 70, turns: true)
+      floor_release!(ctx)
+
+      assert length(notes(ctx)) in 1..32
+      [[at]] = rows!(ctx, "SELECT openedAt FROM memory_guard_open WHERE kind='release_note'")
+      holds!(ctx, "agent:after", 1, turns: true, opened_at: at)
+
+      stop_supervised!(MemoryGuard)
+      guard!(ctx)
+      for _ <- 1..30, do: :ok = MemoryGuard.tick()
+
+      subjects = Enum.map(notes(ctx), &elem(&1, 0))
       assert Enum.sort(subjects) == Enum.sort(for n <- 1..70, do: "agent:h#{n}")
 
-      assert Enum.all?(notes.(), fn {_, detail} ->
-               detail == %{
-                 "host" => @host,
-                 "released" => "memory_floor",
-                 "remaining" => ["memory_budget"]
-               }
+      assert Enum.all?(notes(ctx), fn {_, detail} ->
+               %{"released" => "memory_floor", "remaining" => ["resident_cap"], "readAt" => t} =
+                 detail
+
+               is_integer(t)
              end)
 
       assert count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='release_note'") == 0
     end
 
-    test "B4: the Watcher's clock reads the oldest guard_unavailable hold alone, and the off nudges go 64 at a time",
+    test "release note (§2, D1): a hold ended before its page keeps its record (tombstone); notes FIFO; drop and reopen in one ms are two lifetimes",
          ctx do
-      holds!(ctx, "agent:u", 70, kind: "unguarded_hold", opened_at: 5_000)
+      guard!(ctx)
+      # No queued turns: the release's own eligible walk ends these holds.
+      holds!(ctx, "agent:t", 70)
+      floor_release!(ctx)
+      assert count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='hold'") == 0
+
+      assert count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='hold_owed'") in 38..70
+
+      # agent:t1 opens again in the same millisecond and ends again at the
+      # second release: a second lifetime, a second tombstone identity.
+      holds!(ctx, "agent:t", 1, opened_at: 1)
+      floor_release!(ctx)
+
+      for _ <- 1..40, do: :ok = MemoryGuard.tick()
+
+      records = notes(ctx)
+
+      assert Enum.all?(records, fn {_, detail} ->
+               %{"remaining" => ["resident_cap"], "resumedAt" => t} = detail
+               is_integer(t)
+             end)
+
+      # The first release's 70, then the second's one (FIFO by generation).
+      {first, second} = Enum.split(Enum.map(records, &elem(&1, 0)), 70)
+      assert Enum.sort(first) == Enum.sort(for n <- 1..70, do: "agent:t#{n}")
+      assert second == ["agent:t1"]
+
+      assert count!(
+               ctx,
+               "SELECT COUNT(*) FROM memory_guard_open WHERE kind IN ('hold_owed','release_note')"
+             ) == 0
+    end
+
+    test "Watcher nudges (§4): 64 per pass from a durable cursor; a restart resumes; later holds wait for the next cycle",
+         ctx do
+      {:ok, _} =
+        DB.transaction(ctx.db, fn txn ->
+          for n <- 1..150,
+              do:
+                GuardState.open_in_txn(
+                  txn,
+                  "unguarded_hold",
+                  "agent:u#{n}",
+                  "agent:u#{n}",
+                  @host,
+                  nil
+                )
+        end)
+
+      cursor = fn ->
+        case rows!(ctx, "SELECT detail FROM memory_guard_open WHERE kind='watcher_nudge'") do
+          [[detail]] -> JSON.decode!(detail)["cursor"]
+          [] -> nil
+        end
+      end
+
+      assert :ok = Unguarded.nudge_pass(ctx.db, @host)
+      assert [_, "agent:u" <> _] = first = cursor.()
+
+      # A "restart": nothing in memory; the next pass reads the cursor.
+      assert :ok = Unguarded.nudge_pass(ctx.db, @host)
+      assert cursor.() > first
 
       {:ok, _} =
-        DB.query(ctx.db, "UPDATE memory_guard_open SET openedAt=1234 WHERE ref='agent:u37'")
+        DB.transaction(
+          ctx.db,
+          &GuardState.open_in_txn(&1, "unguarded_hold", "agent:z", "agent:z", @host, nil)
+        )
 
-      assert {:ok, 1234} = Unguarded.held_since(ctx.db, @host)
+      assert :ok = Unguarded.nudge_pass(ctx.db, @host)
+      assert cursor.() == nil
       assert {:ok, nil} = Unguarded.held_since(ctx.db, "elsewhere")
+    end
 
-      assert {:ok, {_, _} = next} = Unguarded.nudge_held(ctx.db, @host, nil)
-      assert {:ok, nil} = Unguarded.nudge_held(ctx.db, @host, next)
+    test "user-facing class (§5, D4): a queued user carrier at any position, until claim or cancellation",
+         ctx do
+      carrier = fn key, posts ->
+        {:ok, {:ok, seq}} =
+          DB.transaction(ctx.db, fn txn ->
+            Ledger.enqueue_in_txn(txn, %{
+              session_key: key,
+              message_id: "m-carrier-#{System.unique_integer([:positive])}",
+              origin: "process:tightbeam",
+              prompt: "[batched notices: 1]",
+              is_batch_carrier: true,
+              user_posts: posts
+            })
+          end)
+
+        seq
+      end
+
+      worker = fn key ->
+        {:ok, _} =
+          Ledger.enqueue(ctx.db, %{
+            session_key: key,
+            message_id: "m-w-#{System.unique_integer([:positive])}",
+            origin: "agent:other",
+            prompt: "work"
+          })
+      end
+
+      class = fn key -> Tightbeam.MemoryGuard.Priority.class(ctx.db, Org.get(ctx.db, key)) end
+
+      session!(ctx, "agent:w")
+      for _ <- 1..20, do: worker.("agent:w")
+      _ = carrier.("agent:w", 0)
+      assert class.("agent:w") == "worker"
+      _ = carrier.("agent:w", 1)
+      assert class.("agent:w") == "user-facing"
+
+      # Claim: the carrier leaves the queue.
+      session!(ctx, "agent:c1")
+      _ = carrier.("agent:c1", 2)
+      assert class.("agent:c1") == "user-facing"
+      assert {:ok, _} = Ledger.claim_next(ctx.db, "agent:c1", "owner-1")
+      assert class.("agent:c1") == "worker"
+
+      # Cancellation.
+      session!(ctx, "agent:c2")
+      seq = carrier.("agent:c2", 1)
+      {:ok, _} = DB.transaction(ctx.db, &Ledger.cancel_queued_in_txn(&1, seq, "test"))
+      assert class.("agent:c2") == "worker"
+
+      assert count!(
+               ctx,
+               "SELECT COUNT(*) FROM memory_guard_user_carriers WHERE sessionKey IN ('agent:c1','agent:c2')"
+             ) == 0
     end
   end
 end
