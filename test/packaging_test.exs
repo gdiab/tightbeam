@@ -13,6 +13,21 @@ defmodule Tightbeam.PackagingTest do
     Path.join(@repo_root, "docs/ONBOARDING.md")
   ]
 
+  test "option 2: the release step makes the build's own Erlang cookie owner-only" do
+    release = Path.join(System.tmp_dir!(), "tb-cookie-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(release) end)
+    cookie = Path.join(release, "releases/COOKIE")
+    File.mkdir_p!(Path.dirname(cookie))
+    File.write!(cookie, "fixture-not-a-real-cookie")
+    File.chmod!(cookie, 0o644)
+
+    assert %{path: ^release} = Tightbeam.MixProject.restrict_release_cookie(%{path: release})
+    assert Bitwise.band(File.stat!(cookie).mode, 0o777) == 0o600
+
+    # Mix configures no cookie, so every clean build writes its own random one.
+    refute File.read!(Path.join(@repo_root, "mix.exs")) =~ ~r/\bcookie:/
+  end
+
   test "the systemd daemon-credential docs stay bound to both halves of the importer seam" do
     # systemd LoadCredential delivers the seeded key as $CREDENTIALS_DIRECTORY/<id>.
     # BOTH halves of that path are code the docs must not drift from, or a
