@@ -22,7 +22,6 @@ defmodule Tightbeam.Application do
 
   @impl true
   def start(_type, _args) do
-    restore_service_path()
     :persistent_term.erase({__MODULE__, :shutdown_deadline})
     Tightbeam.SchedulerMisses.init()
 
@@ -407,20 +406,4 @@ defmodule Tightbeam.Application do
   # so this is only the fallback — but it shares the one definition of the default
   # so a change cannot land in three places and miss one.
   defp default_base_dir, do: Tightbeam.BaseDir.default()
-
-  # Core fix (A), C21.1: the packaged launcher runs the release's launch scripts with
-  # a system-only PATH, so a tool planted in a user-writable PATH directory cannot
-  # steer the VM's flags, and hands the service's own PATH over in
-  # TIGHTBEAM_GATEWAY_PATH. Restore it before anything looks up a harness CLI.
-  @doc false
-  def restore_service_path do
-    case System.get_env("TIGHTBEAM_GATEWAY_PATH") do
-      nil ->
-        :ok
-
-      path ->
-        System.put_env("PATH", path)
-        System.delete_env("TIGHTBEAM_GATEWAY_PATH")
-    end
-  end
 end

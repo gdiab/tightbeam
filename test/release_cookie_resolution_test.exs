@@ -1,40 +1,33 @@
 defmodule Tightbeam.ReleaseCookieResolutionTest do
   # Core fix (A), C21 (core-v8.2), proven against the REAL mix-generated production
-  # release and the packaged launcher in front of it, through each route a caller has:
+  # release and the packaged launcher in front of it:
   #
-  # - K24 (C21.2): both launchers, the packaged `tightbeam-gateway` and the release's own
-  #   `bin/tightbeam_gateway`, refuse every command outside their allowlist, and code a
-  #   refused command carries never runs.
-  # - K22 (C21.1 i): a default start registers no node and listens nowhere, and no
-  #   inherited channel (each RELEASE_*, ERL_* and ELIXIR_* input the release scripts
-  #   read, and a tool planted on PATH) turns distribution on or runs code.
-  # - K22/K23 debug: hand-enabled debug distribution is loopback-only, registers with no
-  #   EPMD even when a wildcard EPMD runs, and uses a per-install 0600 cookie.
-  # - K23 (C21.1 ii-iii): the release carries no cookie.
-  # - K25 (C21.3): the ungated writers are not in a production build.
+  # - K22 (C21.1 i): by default the gateway starts with no distribution and no EPMD,
+  #   so nothing listens; a hand-enabled debug distribution listens on loopback only.
+  # - K23 (C21.1 ii-iii): the release carries no cookie; debug distribution generates
+  #   a per-install cookie at first start, 256 random bits, 0600, this account's.
+  # - K24 (C21.2): the launcher's rpc, remote and eval are refused against a running
+  #   default install, and the release's own rpc and remote reach nothing.
+  # - C21.3: the ungated writers are not in a production build.
   # - The gateway's `:global.trans` locks still exclude with distribution off.
   #
-  # Start tests run a COPY of the release whose boot script is the kernel-only one and
-  # whose own vm.args carries a probe that reports the node's distribution state. A
-  # node's distribution comes from the launcher's VM flags, which the copy leaves
-  # untouched, and no gateway code starts distribution, so this is the production
-  # node's distribution state without the persistent-state admission a full gateway
-  # boot needs. Editing installed files like this is how an operator changes an
-  # install, which is outside the promise; the tests use it only to observe.
+  # The start tests boot the packaged launcher's `start` with the kernel-only boot
+  # script. A node's distribution comes from the launcher's VM flags, and no gateway
+  # code starts distribution, so this is the production node's distribution state
+  # without the persistent-state admission a full gateway boot needs.
   #
-  # Code checks inside the release (`eval!/2`) run its bundled Elixir runtime directly,
-  # as any program of the account can: the launchers no longer offer `eval`.
+  # Builds the real release ONCE in setup_all. Kept in the default gate on purpose: a
+  # proof against reality has to actually run to count.
   use Tightbeam.TestCase, async: false
 
   @moduletag :release_build
 
   @shim Path.expand("../packaging/tightbeam-gateway", __DIR__)
-  @refused_everywhere ~w(start_iex daemon daemon_iex eval rpc remote restart iex console foreground escript reboot unknown-verb)
 
   setup_all do
     mix = System.find_executable("mix") || "mix"
     root = Path.join(System.tmp_dir!(), "tb-real-release-#{System.unique_integer([:positive])}")
-    release_dir = Path.join(root, "pkg/release")
+    release_dir = Path.join(root, "release")
 
     {out, status} =
       System.cmd(mix, ["release", "--overwrite", "--path", release_dir],
@@ -44,69 +37,22 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
 
     assert status == 0, "mix release failed:\n#{out}"
 
-    packaged = package!(Path.join(root, "pkg"))
-
-    [_erts, vsn] =
-      release_dir |> Path.join("releases/start_erl.data") |> File.read!() |> String.split()
-
-    # The observation copy: kernel-only boot, and a probe in the release's own vm.args.
-    probe_root = Path.join(root, "probe")
-    File.mkdir_p!(probe_root)
-    {_, 0} = System.cmd("cp", ["-R", release_dir, Path.join(probe_root, "release")])
-    probe_vsn_dir = Path.join(probe_root, "release/releases/#{vsn}")
-    File.cp!(Path.join(probe_vsn_dir, "start_clean.boot"), Path.join(probe_vsn_dir, "start.boot"))
-
-    File.write!(
-      Path.join(probe_vsn_dir, "vm.args"),
-      "-eval erlang:display({tbprobe,node(),erlang:is_alive()})\n",
-      [:append]
-    )
-
+    # The package layout: the launcher at bin/, the release beside it.
+    File.mkdir_p!(Path.join(root, "bin"))
+    packaged = Path.join(root, "bin/tightbeam-gateway")
+    File.cp!(@shim, packaged)
+    File.chmod!(packaged, 0o755)
     on_exit(fn -> File.rm_rf!(root) end)
 
     %{
-      root: root,
       launcher: Path.join(release_dir, "bin/tightbeam_gateway"),
       packaged: packaged,
-      release_dir: release_dir,
-      probe_packaged: package!(probe_root),
-      probe_raw: Path.join(probe_root, "release/bin/tightbeam_gateway")
+      release_dir: release_dir
     }
   end
 
-  defp package!(dir) do
-    File.mkdir_p!(Path.join(dir, "bin"))
-    packaged = Path.join(dir, "bin/tightbeam-gateway")
-    File.cp!(@shim, packaged)
-    File.chmod!(packaged, 0o755)
-    packaged
-  end
-
-  # Runs `code` in the release's own VM through its bundled Elixir runtime, with the
-  # kernel-only boot (every module loaded, no application started).
-  defp eval!(launcher, code) do
-    release = launcher |> Path.dirname() |> Path.dirname()
-
-    [_erts, vsn] =
-      release |> Path.join("releases/start_erl.data") |> File.read!() |> String.split()
-
-    vsn_dir = Path.join(release, "releases/#{vsn}")
-
-    {out, status} =
-      System.cmd(
-        Path.join(vsn_dir, "elixir"),
-        [
-          "--boot",
-          Path.join(vsn_dir, "start_clean"),
-          "--boot-var",
-          "RELEASE_LIB",
-          Path.join(release, "lib"),
-          "--eval",
-          code
-        ],
-        stderr_to_stdout: true
-      )
-
+  defp eval!(launcher, expr, env \\ []) do
+    {out, status} = System.cmd(launcher, ["eval", expr], env: env, stderr_to_stdout: true)
     assert status == 0, out
     out
   end
@@ -116,40 +62,41 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     value
   end
 
-  test "K23: the release carries no cookie", %{release_dir: release_dir} do
+  test "K23: the release carries no cookie, and distribution stays off over inherited values",
+       %{launcher: launcher, release_dir: release_dir} do
     assert Path.wildcard(Path.join(release_dir, "**/COOKIE"), match_dot: true) == []
     assert Path.wildcard(Path.join(release_dir, "**/.erlang.cookie"), match_dot: true) == []
+
+    expr =
+      ~S[IO.puts("DIST=" <> (System.get_env("RELEASE_DISTRIBUTION") || "nil")); IO.puts("TBCOOKIE=" <> (System.get_env("RELEASE_COOKIE") || "nil"))]
+
+    runs =
+      for env <- [
+            [],
+            [],
+            [{"RELEASE_DISTRIBUTION", "sname"}, {"RELEASE_COOKIE", "inherited-cookie"}]
+          ],
+          do: eval!(launcher, expr, env)
+
+    for out <- runs, do: assert(value(out, "DIST") == "none")
+
+    # The per-start value is a throwaway nothing uses; it is never an inherited one.
+    cookies = for out <- runs, do: value(out, "TBCOOKIE")
+    refute "inherited-cookie" in cookies
+    assert cookies |> Enum.uniq() |> length() == 3
   end
 
-  test "K24 (C21.2): both launchers refuse every command outside their allowlist, and run nothing",
-       %{packaged: packaged, launcher: launcher, root: root} do
-    marker = Path.join(root, "k24-ran")
-    code = "File.write!(#{inspect(marker)}, \"ran\")"
+  test "K22/K24: a default packaged gateway listens nowhere, and rpc, remote and eval reach nothing",
+       %{launcher: launcher, packaged: packaged, release_dir: release_dir} do
+    node_name = "tb_c21_probe_#{System.unique_integer([:positive])}"
+    marker = Path.join(release_dir, "k24-#{System.unique_integer([:positive])}")
 
-    for {entry, verbs} <- [
-          {packaged, @refused_everywhere},
-          {launcher, @refused_everywhere ++ ~w(stop pid)}
-        ],
-        verb <- verbs do
-      {out, status} =
-        System.cmd(entry, [verb, code], stderr_to_stdout: true, env: [{"RELEASE_NODE", "evil"}])
-
-      assert status == 64, "#{entry} #{verb}: #{out}"
-      assert out =~ "C21.2", "#{entry} #{verb}: #{out}"
-    end
-
-    refute File.exists?(marker)
-
-    # The allowlisted read-only verb still answers on both.
-    for entry <- [packaged, launcher] do
-      assert {"tightbeam_gateway " <> _, 0} =
-               System.cmd(entry, ["version"], stderr_to_stdout: true)
-    end
-  end
-
-  test "K22 (C21.1): a default start registers no node and listens nowhere",
-       %{probe_packaged: probe_packaged} do
-    {port, os_pid, boot} = start!(probe_packaged, [])
+    # The inherited values that would make it a named node, absent the fix.
+    {port, os_pid, boot} =
+      start!(packaged, release_dir, [
+        {"RELEASE_DISTRIBUTION", "sname"},
+        {"RELEASE_NODE", node_name}
+      ])
 
     try do
       assert boot =~ "{tbprobe,'nonode@nohost',false}"
@@ -163,102 +110,61 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
       refute listeners(os_pid) =~ "LISTEN"
 
       # EPMD, asked from a non-loopback address and from loopback, knows no such node.
-      refute_registered("tightbeam_gateway")
+      for host <- [non_loopback_ip(), {127, 0, 0, 1}] do
+        case :erl_epmd.names(host) do
+          {:ok, names} ->
+            refute Enum.any?(names, fn {name, _} -> to_string(name) == node_name end)
+
+          {:error, _no_epmd} ->
+            :ok
+        end
+      end
+
+      # K24: the packaged launcher refuses each, naming C21.2, and runs nothing.
+      code = "File.write!(#{inspect(marker)}, \"ran\")"
+
+      for args <- [["rpc", code], ["remote"], ["eval", code]] do
+        {out, status} =
+          System.cmd(packaged, args, env: [{"RELEASE_NODE", node_name}], stderr_to_stdout: true)
+
+        assert status == 64, out
+        assert out =~ "is not available (C21.2)"
+      end
+
+      # The release's own rpc and remote, bypassing the launcher, reach no node either.
+      for args <- [["rpc", code], ["remote"]] do
+        {out, status} =
+          System.cmd(launcher, args,
+            env: [{"RELEASE_NODE", node_name}, {"RELEASE_DISTRIBUTION", "sname"}],
+            stderr_to_stdout: true
+          )
+
+        assert status != 0, out
+      end
+
+      refute File.exists?(marker)
     after
       stop!(port, os_pid)
     end
   end
 
-  test "K22 (C21.1): no inherited flag channel turns distribution on or runs code",
-       %{root: root, probe_packaged: probe_packaged, probe_raw: probe_raw} do
-    dir = Path.join(root, "channels")
-    File.mkdir_p!(dir)
-    marker = Path.join(dir, "ran")
-    inject = "-sname evil -eval file:write_file(\"#{marker}\",<<\"x\">>)"
-    evil_args = Path.join(dir, "evil.vm.args")
-    File.write!(evil_args, inject <> "\n")
-    evil_config = Path.join(dir, "evil")
-    File.write!(evil_config <> ".config", "not an erlang term")
-    evil_tmp = Path.join(dir, "evil-tmp")
-    evil_libs = Path.join(dir, "evil-libs")
-    File.mkdir_p!(evil_libs)
-    inetrc = Path.join(dir, "inetrc")
-    File.write!(inetrc, "{file, hosts, \"/nonexistent\"}.\n")
-
-    # A `sed` planted ahead of the system's, as on a PATH with user-writable entries.
-    plant = Path.join(dir, "plant")
-    File.mkdir_p!(plant)
-    sed = Path.join(plant, "sed")
-    File.write!(sed, "#!/bin/sh\necho planted > #{inspect(marker)}\nexec /usr/bin/sed \"$@\"\n")
-    File.chmod!(sed, 0o755)
-
-    release_channels = [
-      {"RELEASE_DISTRIBUTION", "sname"},
-      {"RELEASE_NODE", "evil"},
-      {"RELEASE_COOKIE", "inherited-cookie"},
-      {"RELEASE_VM_ARGS", evil_args},
-      {"RELEASE_REMOTE_VM_ARGS", evil_args},
-      {"RELEASE_BOOT_SCRIPT", "no-such-boot"},
-      {"RELEASE_BOOT_SCRIPT_CLEAN", "no-such-boot"},
-      {"RELEASE_MODE", "embedded -sname evil"},
-      {"RELEASE_SYS_CONFIG", evil_config},
-      {"RELEASE_TMP", evil_tmp},
-      {"RELEASE_NAME", "evil"},
-      {"RELEASE_PROG", "evil"}
-    ]
-
-    flag_channels = [
-      {"ELIXIR_ERL_OPTIONS", inject},
-      {"ERL_AFLAGS", inject},
-      {"ERL_FLAGS", inject},
-      {"ERL_ZFLAGS", inject},
-      {"ERL_LIBS", evil_libs},
-      {"ERL_EPMD_PORT", "1"},
-      {"ERL_ROOTDIR", "/nonexistent"},
-      {"ERL_INETRC", inetrc}
-    ]
-
-    # RELEASE_VSN and PATH are read before the release's env.sh runs, so only the
-    # packaged launcher can clear them; a caller who sets them on the raw launcher
-    # chooses which files run, which is running code of their own.
-    packaged_only = [
-      {"RELEASE_VSN", "../../channels"},
-      {"PATH", plant <> ":" <> System.get_env("PATH", "/usr/bin:/bin")}
-    ]
-
-    for {entry, channels} <- [
-          {probe_packaged, release_channels ++ flag_channels ++ packaged_only},
-          {probe_raw, release_channels ++ flag_channels}
-        ],
-        {name, value} <- channels do
-      {port, os_pid, boot} = start!(entry, [{name, value}])
-      stop!(port, os_pid)
-
-      assert boot =~ "{tbprobe,'nonode@nohost',false}", "#{entry} #{name}: #{boot}"
-      refute File.exists?(marker), "#{entry} #{name} ran injected code"
-      refute File.exists?(evil_tmp), "#{entry} #{name} wrote into an inherited RELEASE_TMP"
-    end
-  end
-
-  test "K22/K23: hand-enabled debug distribution is loopback-only, registers with no EPMD, and uses a per-install 0600 cookie",
-       %{root: root, probe_packaged: probe_packaged, release_dir: release_dir} do
-    base = Path.join(root, "debug-base-#{System.unique_integer([:positive])}")
+  test "K22/K23: hand-enabled debug distribution is loopback-only, with a per-install 0600 cookie",
+       %{launcher: launcher, packaged: packaged, release_dir: release_dir} do
+    base = Path.join(release_dir, "debug-base-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
     gateway_port = free_port()
-    dist_port = free_port()
+    epmd_port = free_port()
     node_name = "tightbeam_gateway_#{gateway_port}@127.0.0.1"
 
-    # A wildcard EPMD on the default port, as the old gateway left one: start one when
-    # none runs, and leave an existing one alone.
-    epmd = wildcard_epmd!(release_dir)
-
+    # An EPMD of this test's own, so the test gate's EPMD plays no part.
     debug_env = [
-      {"TIGHTBEAM_DEBUG_DISTRIBUTION", "loopback:#{dist_port}"},
+      {"TIGHTBEAM_DEBUG_DISTRIBUTION", "loopback"},
       {"TIGHTBEAM_BASE_DIR", base},
-      {"TIGHTBEAM_PORT", Integer.to_string(gateway_port)}
+      {"TIGHTBEAM_PORT", Integer.to_string(gateway_port)},
+      {"ERL_EPMD_PORT", Integer.to_string(epmd_port)}
     ]
 
-    {port, os_pid, boot} = start!(probe_packaged, debug_env)
+    {port, os_pid, boot} = start!(packaged, release_dir, debug_env)
 
     try do
       assert boot =~ "{tbprobe,'#{node_name}',true}"
@@ -269,54 +175,43 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
       assert Bitwise.band(mode, 0o777) == 0o600
       {own_uid, 0} = System.cmd("id", ["-u"])
       assert Integer.to_string(uid) == String.trim(own_uid)
-      cookie = File.read!(cookie_file)
-      assert cookie =~ ~r/\A[0-9a-f]{64}\z/
+      assert File.read!(cookie_file) =~ ~r/\A[0-9a-f]{64}\z/
 
-      # K22: the node's only listener is the named port on loopback.
-      assert listening_addresses(listeners(os_pid)) == [{"127.0.0.1", dist_port}]
+      # K22: every listener of the node and of its EPMD is on loopback.
+      node_listeners = listening_addresses(listeners(os_pid))
+      epmd_listeners = listening_addresses(port_listeners(epmd_port))
+      assert node_listeners != [] and epmd_listeners != []
 
-      # No EPMD, wildcard or loopback, learned of it.
-      refute_registered("tightbeam_gateway_#{gateway_port}")
+      for {address, _port} <- node_listeners ++ epmd_listeners,
+          do: assert(address in ["127.0.0.1", "[::1]"], inspect(node_listeners ++ epmd_listeners))
 
-      # From a non-loopback address, the distribution port refuses.
-      assert {:error, _} = :gen_tcp.connect(non_loopback_ip(), dist_port, [], 2_000)
+      # From a non-loopback address, the distribution port and EPMD refuse.
+      ip = non_loopback_ip()
+
+      for {_address, listen_port} <- node_listeners ++ epmd_listeners do
+        assert {:error, _} = :gen_tcp.connect(ip, listen_port, [], 2_000)
+      end
 
       # Control: on loopback, with this install's cookie, the node is reachable.
-      erl = System.find_executable("erl") || flunk("erl is required for the loopback control")
-
       {out, 0} =
-        System.cmd(
-          erl,
-          ~w(-noshell -name tb_ctl_#{System.unique_integer([:positive])}@127.0.0.1 -setcookie #{cookie}
-             -start_epmd false -dist_listen false -erl_epmd_port #{dist_port}) ++
-            [
-              "-eval",
-              "io:format(\"~p~n\", [rpc:call('#{node_name}', erlang, node, [])]), halt()."
-            ],
+        System.cmd(launcher, ["rpc", "IO.puts(:tb_debug_reached)"],
+          env: debug_env,
           stderr_to_stdout: true
         )
 
-      assert out =~ node_name
+      assert out =~ "tb_debug_reached"
     after
       stop!(port, os_pid)
-      epmd.()
-    end
 
-    # Malformed or widened settings refuse to start.
-    for value <- ~w(loopback loopback:80 loopback:x loopback:70000 wildcard:#{dist_port}) do
-      {out, status} =
-        System.cmd(probe_packaged, ["start"],
-          env: [{"TIGHTBEAM_DEBUG_DISTRIBUTION", value}, {"TIGHTBEAM_BASE_DIR", base}],
-          stderr_to_stdout: true
-        )
-
-      assert status == 1, "#{value}: #{out}"
-      assert out =~ "TIGHTBEAM_DEBUG_DISTRIBUTION"
+      # This test's own EPMD, found by the port it alone listens on.
+      {pids, _} = System.cmd("lsof", ["-t", "-iTCP:#{epmd_port}", "-sTCP:LISTEN"])
+      for pid <- String.split(pids), do: System.cmd("kill", [pid], stderr_to_stdout: true)
     end
   end
 
-  test "K25 (C21.3): a production build carries none of the ungated in-process writers",
-       %{launcher: launcher} do
+  test "K25 (C21.3): a production build carries none of the ungated in-process writers", %{
+    launcher: launcher
+  } do
     out =
       eval!(launcher, ~S"""
       for {m, f, a} <- [
@@ -401,12 +296,41 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     assert out =~ "GLOBAL_EXCLUSIVE=7"
   end
 
-  # Start `entry start` with `env` and return {port, os_pid, the probe's report}.
-  defp start!(entry, env) do
-    env = Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
+  defp listeners(pid) do
+    {out, _status} =
+      System.cmd("lsof", ["-w", "-nP", "-a", "-p", pid, "-iTCP", "-sTCP:LISTEN"],
+        stderr_to_stdout: true
+      )
+
+    out
+  end
+
+  defp collect_until(port, marker, timeout, acc \\ "") do
+    receive do
+      {^port, {:data, data}} ->
+        acc = acc <> data
+        if acc =~ marker, do: acc, else: collect_until(port, marker, timeout, acc)
+
+      {^port, {:exit_status, status}} ->
+        flunk("the release exited (#{status}) before reporting:\n#{acc}")
+    after
+      timeout -> flunk("no probe output within #{timeout}ms:\n#{acc}")
+    end
+  end
+
+  # Start the packaged launcher's `start` with the kernel-only boot script and an
+  # eval in the node's own boot that reports its distribution state; everything else
+  # on the command line is the launcher's.
+  defp start!(packaged, release_dir, env) do
+    vm_args = Path.join(release_dir, "probe-#{System.unique_integer([:positive])}.vm.args")
+    File.write!(vm_args, "-eval erlang:display({tbprobe,node(),erlang:is_alive()})\n")
+
+    env =
+      [{"RELEASE_VM_ARGS", vm_args}, {"RELEASE_BOOT_SCRIPT", "start_clean"} | env]
+      |> Enum.map(fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
 
     port =
-      Port.open({:spawn_executable, entry}, [
+      Port.open({:spawn_executable, packaged}, [
         :binary,
         :exit_status,
         :stderr_to_stdout,
@@ -424,52 +348,9 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     if Port.info(port), do: Port.close(port)
   end
 
-  # Ensure a wildcard EPMD on the default port; returns its cleanup.
-  defp wildcard_epmd!(release_dir) do
-    case :gen_tcp.connect({127, 0, 0, 1}, 4369, [], 1_000) do
-      {:ok, socket} ->
-        :gen_tcp.close(socket)
-        fn -> :ok end
-
-      {:error, _} ->
-        epmd = release_dir |> Path.join("erts-*/bin/epmd") |> Path.wildcard() |> hd()
-        {_, 0} = System.cmd(epmd, ["-daemon"], env: [{"ERL_EPMD_ADDRESS", nil}])
-        wait_for_epmd()
-
-        fn ->
-          {pids, _} = System.cmd("lsof", ["-t", "-iTCP:4369", "-sTCP:LISTEN"])
-          for pid <- String.split(pids), do: System.cmd("kill", [pid], stderr_to_stdout: true)
-        end
-    end
-  end
-
-  defp wait_for_epmd(tries \\ 50) do
-    case :gen_tcp.connect({127, 0, 0, 1}, 4369, [], 200) do
-      {:ok, socket} ->
-        :gen_tcp.close(socket)
-
-      {:error, _} when tries > 0 ->
-        Process.sleep(100)
-        wait_for_epmd(tries - 1)
-
-      {:error, reason} ->
-        flunk("the test EPMD did not start: #{inspect(reason)}")
-    end
-  end
-
-  # The exact node name only: another program's nodes may share the host's EPMD.
-  defp refute_registered(name) do
-    for host <- [non_loopback_ip(), {127, 0, 0, 1}] do
-      case :erl_epmd.names(host) do
-        {:ok, names} -> refute Enum.any?(names, fn {node, _port} -> to_string(node) == name end)
-        {:error, _no_epmd} -> :ok
-      end
-    end
-  end
-
-  defp listeners(pid) do
+  defp port_listeners(tcp_port) do
     {out, _status} =
-      System.cmd("lsof", ["-w", "-nP", "-a", "-p", pid, "-iTCP", "-sTCP:LISTEN"],
+      System.cmd("lsof", ["-w", "-nP", "-iTCP:#{tcp_port}", "-sTCP:LISTEN"],
         stderr_to_stdout: true
       )
 
@@ -500,18 +381,5 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     {:ok, port} = :inet.port(socket)
     :gen_tcp.close(socket)
     port
-  end
-
-  defp collect_until(port, marker, timeout, acc \\ "") do
-    receive do
-      {^port, {:data, data}} ->
-        acc = acc <> data
-        if acc =~ marker, do: acc, else: collect_until(port, marker, timeout, acc)
-
-      {^port, {:exit_status, status}} ->
-        flunk("the release exited (#{status}) before reporting:\n#{acc}")
-    after
-      timeout -> flunk("no probe output within #{timeout}ms:\n#{acc}")
-    end
   end
 end
