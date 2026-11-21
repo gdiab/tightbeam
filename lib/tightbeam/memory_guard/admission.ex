@@ -150,7 +150,7 @@ defmodule Tightbeam.MemoryGuard.Admission do
     [[obs_high]] =
       Txn.q(
         txn,
-        "SELECT coalesce(max(rowid), 0) FROM harness_health_observations WHERE incidentId=?1",
+        "SELECT coalesce(max(rowid), 0) FROM harness_health_observations INDEXED BY memory_guard_observations_incident WHERE incidentId=?1",
         [incident_id]
       )
 
@@ -281,9 +281,11 @@ defmodule Tightbeam.MemoryGuard.Admission do
   end
 
   defp arm_wake_in_txn(txn, ep, due) do
-    case anchor_in_txn(txn, ep.incident) do
+    case anchor_in_txn(txn, ep) do
+      # As park_stranding: the incident names no session, so none is held
+      # and no owner is affected: nothing is owed.
       nil ->
-        raise DB.Error, message: "quota episode #{ep.id} has no session to file its wake under"
+        Txn.q(txn, "DELETE FROM memory_guard_quota_episodes WHERE episodeId=?1", [ep.id])
 
       anchor ->
         Wakes.schedule_in_txn(txn, %{
@@ -299,11 +301,19 @@ defmodule Tightbeam.MemoryGuard.Admission do
     end
   end
 
-  defp anchor_in_txn(txn, incident_id) do
+  # Where the wake is filed, as park_stranding's: a session of the incident
+  # (or one the episode covers). Each arm is an indexed probe; one row.
+  defp anchor_in_txn(txn, ep) do
     case Txn.q(
            txn,
-           "SELECT sessionKey FROM harness_health_members WHERE incidentId=?1 ORDER BY sessionKey LIMIT 1",
-           [incident_id]
+           """
+           SELECT sessionKey FROM (
+             SELECT sessionKey FROM harness_health_members WHERE incidentId=?1
+             UNION ALL
+             SELECT sessionKey FROM memory_guard_quota_cover WHERE episodeId=?2)
+           LIMIT 1
+           """,
+           [ep.incident, ep.id]
          ) do
       [[session_key]] -> session_key
       [] -> nil

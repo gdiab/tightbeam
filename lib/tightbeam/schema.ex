@@ -1983,6 +1983,9 @@ defmodule Tightbeam.Schema do
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
+    # Memory limits: the guard's access paths on other modules' tables, after
+    # any migration that rebuilds them.
+    :ok = Tightbeam.MemoryGuard.State.ensure_late_indexes(db)
     :ok = ensure_rest_collection_indexes(db)
     :ok = ensure_decision_request_collection_indexes(db)
     :ok = ensure_rest_wake_collection_indexes(db)

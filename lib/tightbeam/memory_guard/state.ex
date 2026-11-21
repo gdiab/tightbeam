@@ -219,6 +219,13 @@ defmodule Tightbeam.MemoryGuard.State do
     end
   end
 
+  @doc """
+  The indexes on other modules' tables, once every migration of the schema
+  pass has run (a table rebuild drops its indexes).
+  """
+  @spec ensure_late_indexes(DB.server()) :: :ok | {:error, term()}
+  def ensure_late_indexes(db), do: late_indexes(db, @late_indexes)
+
   defp late_indexes(_db, []), do: :ok
 
   defp late_indexes(db, [{table, ddl} | rest]) do
@@ -234,10 +241,15 @@ defmodule Tightbeam.MemoryGuard.State do
            db,
            """
            SELECT (SELECT 1 FROM memory_guard_seq WHERE name='carrier_backfill'),
-                  (SELECT 1 FROM sqlite_master WHERE type='table' AND name='notice_batch_members')
+                  (SELECT 1 FROM sqlite_master WHERE type='table' AND name='notice_batch_members'),
+                  (SELECT 1 FROM sqlite_master WHERE type='index' AND name='turns_pending'),
+                  (SELECT 1 FROM pragma_table_info('turns') WHERE name='isBatchCarrier'),
+                  (SELECT 1 FROM pragma_table_info('wakes') WHERE name='sourceClientIdentity')
            """
          ) do
-      {:ok, [[nil, 1]]} -> DB.execute(db, @carrier_backfill)
+      # Only on the current shape (a historical pass of the schema runs this
+      # module too): a later pass, or the next start, backfills.
+      {:ok, [[nil, 1, 1, 1, 1]]} -> DB.execute(db, @carrier_backfill)
       {:ok, _} -> :ok
       {:error, _} = error -> error
     end

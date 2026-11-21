@@ -3558,7 +3558,7 @@ defmodule Tightbeam.Wakes do
         txn,
         """
         SELECT rowid, correlationId, failureClass, evidenceKind
-        FROM harness_health_observations
+        FROM harness_health_observations INDEXED BY memory_guard_observations_incident
         WHERE incidentId=?1 AND rowid > ?2 AND rowid <= ?3
         ORDER BY rowid LIMIT ?4
         """,
