@@ -31,3 +31,8 @@ config :tightbeam, :port, 0
 config :tightbeam,
   pairing_unfreeze_path_override: true,
   pairing_unfreeze_path: "/nonexistent/tightbeam-test/pairing-unfreeze"
+
+# Core fix (A), review B1: compile the ungated in-process writer fixtures
+# (Devices.approve/3, deny/2, revoke/2, add_user/3, set_user_admin/3 and
+# Placement.register_host/3) into test builds only.
+config :tightbeam, test_fixtures: true

@@ -435,9 +435,9 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
     assert Devices.user(ctx.db, "ghost") == nil
   end
 
-  ## Review B1: an in-process caller cannot synthesize user authentication
+  ## K25 (C21.3, C21.4): an in-process caller cannot synthesize user authentication
 
-  test "B1: an internal call naming George's device without its credential proof is refused",
+  test "K25 (C21.4): an internal call naming George's device without its credential proof is refused",
        ctx do
     forged_proofs = [
       {:absent, nil},
@@ -521,7 +521,8 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
              )
   end
 
-  test "B1: an internal call naming Main without Main's credential proof cannot rule", ctx do
+  test "K25 (C21.4): an internal call naming Main without Main's credential proof cannot rule",
+       ctx do
     id = ask(ctx, ctx.worker, ["accept"])
 
     forged = %{
