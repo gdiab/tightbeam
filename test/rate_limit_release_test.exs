@@ -812,8 +812,84 @@ defmodule Tightbeam.RateLimitReleaseTest do
       assert queued_messages(db) == [source_message(db, first), source_message(db, second)]
 
       # Exactly once: another release finds nothing pending.
-      :ok = Tightbeam.MemoryGuard.Admission.run_deferred(db, "testhost")
+      :ok = Tightbeam.MemoryGuard.tick()
       assert length(queued_messages(db)) == 2
+    end
+
+    # Re-review att_5f6e6736 B3: an incident of 80 quota-failed turns, 40 of
+    # c1 and then 40 of c2, more than one sample's budget.
+    defp parked_with_many_quota_failed_turns!(db) do
+      error = future_codex_error(System.system_time(:millisecond))
+      first = for _ <- 1..40, do: fail_turn(db, "c1", error)
+      second = for _ <- 1..40, do: fail_turn(db, "c2", error)
+
+      assert {:ok, _} =
+               DB.transaction(db, fn txn ->
+                 observe_in_txn(txn, "open", "c1", "testhost", System.system_time(:millisecond))
+               end)
+
+      first ++ second
+    end
+
+    defp tick_until!(db, done?, ticks \\ 30) do
+      cond do
+        done?.() -> :ok
+        ticks == 0 -> flunk("not done within its bound")
+        true -> Tightbeam.MemoryGuard.tick() && tick_until!(db, done?, ticks - 1)
+      end
+    end
+
+    test "B3: a quota hook larger than a sample's budget is decided and re-admitted a page per sample: every source once, in order",
+         %{db: db, root: root} do
+      seqs = parked_with_many_quota_failed_turns!(db)
+      release_at_reset!(db)
+      assert queued_messages(db) == []
+
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+      # One sample's share is at most 32 units: not all 80 at once.
+      assert length(queued_messages(db)) < 80
+
+      tick_until!(db, fn -> length(queued_messages(db)) == 80 end)
+      assert queued_messages(db) == Enum.map(seqs, &source_message(db, &1))
+      assert [{_incident, %{"after" => ["memory"]}}] = lifecycle(db, "admission_resumed")
+
+      # Exactly once.
+      for _ <- 1..3, do: :ok = Tightbeam.MemoryGuard.tick()
+      assert length(queued_messages(db)) == 80
+    end
+
+    test "B3: a limit-fallback evaluation opened mid-check on a session already checked holds the hook; it runs once that evaluation decides",
+         %{db: db, root: root} do
+      seqs = parked_with_many_quota_failed_turns!(db)
+      release_at_reset!(db)
+      meminfo!(root, 50)
+      :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == []
+
+      # c1's turns come first, so the first sample checked only c1.
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT INTO limit_fallback_evaluations (sessionKey, turnSeq, heldAt, createdAt) VALUES ('c1', ?1, 1, 1)",
+          [hd(seqs)]
+        )
+
+      for _ <- 1..15, do: :ok = Tightbeam.MemoryGuard.tick()
+      assert queued_messages(db) == []
+
+      assert [_, {_incident, %{"remaining" => ["limit_fallback"], "sessions" => ["c1"]}}] =
+               lifecycle(db, "admission_hold_remaining")
+
+      {:ok, _} =
+        DB.query(
+          db,
+          "UPDATE limit_fallback_evaluations SET outcome='applied', decidedAt=2 WHERE sessionKey='c1'"
+        )
+
+      tick_until!(db, fn -> length(queued_messages(db)) == 80 end)
+      assert queued_messages(db) == Enum.map(seqs, &source_message(db, &1))
+      assert [{_incident, %{"after" => ["limit_fallback"]}}] = lifecycle(db, "admission_resumed")
     end
 
     test "(a) the floor releases first: the park still holds and nothing is re-admitted; at the park's release, once, in order",

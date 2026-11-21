@@ -1602,6 +1602,11 @@ defmodule Tightbeam.LimitFallbackSwitchTest do
         assert count(ctx.db, "SELECT COUNT(*) FROM harness_park_fences") == 0
         assert unknown_effect_notices(ctx.db) == []
 
+        # Each recorded refusal's file is removed once its record commits, so
+        # the next lookup never reads the history (re-review att_5f6e6736).
+        :sys.get_state(Tightbeam.MemoryGuard)
+        assert File.ls!(refusals) == []
+
         # The fake host's own oom_score_adj is missing: not healthy, still held.
         :ok = Tightbeam.MemoryGuard.tick()
         assert turn_status(ctx.db, held) == "queued"

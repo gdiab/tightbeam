@@ -238,6 +238,7 @@ defmodule Tightbeam.MemoryGuardTest do
         end),
       idle_check: Keyword.get(opts, :idle_check, &Tightbeam.Acp.Adapter.idle_session?/2),
       before_close_commit: Keyword.get(opts, :before_close_commit, fn _ -> :ok end),
+      close_hook: Keyword.get(opts, :close_hook, fn _point, _sid -> :ok end),
       before_kill_send: Keyword.get(opts, :before_kill_send, fn _ -> :ok end),
       root_uid: Keyword.get(opts, :root_uid, 0),
       finding: Keyword.get(opts, :finding, fn -> strict_finding() end),
@@ -3415,7 +3416,7 @@ defmodule Tightbeam.MemoryGuardTest do
 
       pending_readmission!(ctx, "agent:a", 999_999)
       assert Admission.pending?(ctx.db)
-      _ = Admission.run_deferred(ctx.db, @host)
+      :ok = MemoryGuard.tick()
 
       assert [{_, %{"sourceSeq" => 999_999, "readmittedSeq" => nil, "sourceGone" => true}}] =
                events(ctx.db, "memory_readmission_done")
@@ -3432,7 +3433,7 @@ defmodule Tightbeam.MemoryGuardTest do
       # The same source again (a replayed settlement): no second turn.
       pending_readmission!(ctx, "agent:a", seq)
       assert Admission.pending?(ctx.db)
-      _ = Admission.run_deferred(ctx.db, @host)
+      :ok = MemoryGuard.tick()
       assert length(events(ctx.db, "memory_readmission_done")) == 1
       refute Admission.pending?(ctx.db)
     end
@@ -5514,7 +5515,7 @@ defmodule Tightbeam.MemoryGuardTest do
       assert [{"incident-1", _}] = events(ctx.db, "quota_readmission_resumed")
 
       # Exactly once: a later release finds nothing pending.
-      :ok = Admission.run_deferred(ctx.db, @host)
+      :ok = MemoryGuard.tick()
       assert length(events(ctx.db, "quota_readmission_resumed")) == 1
     end
 
@@ -6118,25 +6119,43 @@ defmodule Tightbeam.MemoryGuardTest do
 
     @conditional "Tightbeam had decided to close it to free memory and cannot confirm whether it did"
 
-    # A close the guard decided before a restart, left at `phase`.
-    defp close_left!(ctx, phase, sent_at \\ nil) do
-      now = System.system_time(:millisecond)
+    # Drives the production close of sid-c (the floor is breached, so the
+    # guard closes its idle process) to a crash point and stops the guard
+    # there; the close task stays blocked, as a crashed gateway's would.
+    # Points (rev 4 D1): `:before_call`, inside the close call before it acts;
+    # `:called`, after the call returned `:ok` and before `dispatched` is
+    # written; `:dispatched`, right after it. `ends_process: false`: the call
+    # returns `:ok` but the process stays. Returns the close's journal id.
+    defp crash_close!(ctx, point, opts \\ []) do
+      test = self()
 
-      intent = %{
-        sid: "sid-c",
-        sessionKey: "agent:c",
-        reason: "resident_cap",
-        markerKey: "closed:agent:c:sid-c:x1",
-        target: %{pid: 961, start: 961, unit: nil}
-      }
+      block = fn ->
+        send(test, {:crash_point, point})
+        Process.sleep(:infinity)
+      end
 
-      {:ok, id} =
-        DB.transaction(
-          ctx.db,
-          &Journal.intend_in_txn(&1, "idle_close", "sid-c:x1", @host, "agent:c", intent, now)
-        )
+      closer = fn _adapter, sid, _reason ->
+        if point == :before_call, do: block.()
+        if Keyword.get(opts, :ends_process, true), do: closed_process!(ctx, sid)
+        :ok
+      end
 
-      if phase == "dispatched", do: :ok = Journal.dispatch(ctx.db, id, %{sentAt: sent_at || now})
+      proc!(ctx.root, 961, 1, 961, 10 * @mib)
+      launch!(ctx.base, "sl-c", "sid-c", 961, 961, 512 * @mib)
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      adapter = adapter!()
+
+      guard!(ctx,
+        closer: closer,
+        close_hook: fn at, _sid -> if at == point, do: block.(), else: :ok end
+      )
+
+      resident!(adapter, ["sid-c"])
+      :ok = MemoryGuard.tick()
+      assert_receive {:crash_point, ^point}, 2_000
+      stop_supervised!(MemoryGuard)
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      {:ok, [%{id: id}]} = Journal.page(ctx.db, @host, "idle_close", nil, nil, 8)
       id
     end
 
@@ -6165,11 +6184,13 @@ defmodule Tightbeam.MemoryGuardTest do
       assert {:ok, []} = Journal.page(ctx.db, @host, "idle_close", nil, nil, 8)
     end
 
-    test "O2 (rev 5, 2): intended, process alive after a restart: abandoned, nothing recorded as attempted",
+    test "O2 (rev 5, 2): crash in the close call, before it acts, process alive: abandoned, nothing recorded as attempted",
          ctx do
-      proc!(ctx.root, 961, 1, 961, 10 * @mib)
-      launch!(ctx.base, "sl-c", "sid-c", 961, 961, 512 * @mib)
-      id = close_left!(ctx, "intended")
+      id = crash_close!(ctx, :before_call)
+
+      assert %{phase: "intended", intent: %{"markerKey" => "closed:agent:c:sid-c:" <> _}} =
+               Journal.get(ctx.db, id)
+
       guard!(ctx)
       :ok = MemoryGuard.tick()
       assert %{phase: "done", outcome: %{"outcome" => "abandoned"}} = Journal.get(ctx.db, id)
@@ -6178,11 +6199,10 @@ defmodule Tightbeam.MemoryGuardTest do
       assert markers_of(ctx, "agent:c") == []
     end
 
-    test "O2 (rev 5, 3 and 4; the spec author's test): intended, process gone after a restart: one close_unconfirmed, exactly one conditional marker, no idle_closed, a fresh next turn",
+    test "O2 (rev 5, 3; the spec author's test): crash in the close call, the process then ending on its own: one close_unconfirmed, exactly one conditional marker, no idle_closed, a fresh next turn",
          ctx do
-      # Covers both a crash before the close call and one after it returned
-      # but before `dispatched`: nothing that survives a restart separates them.
-      id = close_left!(ctx, "intended")
+      id = crash_close!(ctx, :before_call)
+      gone!(ctx.root, 961)
       guard!(ctx)
       :ok = MemoryGuard.tick()
       :ok = MemoryGuard.tick()
@@ -6202,9 +6222,25 @@ defmodule Tightbeam.MemoryGuardTest do
       assert :ok = MemoryGuard.admit("agent:c")
     end
 
-    test "O2 (rev 5, 5): dispatched, process gone after a restart: idle_closed and one plain marker",
+    test "O2 (rev 5, 4; the spec author's test): crash after the close call returned, before dispatched: the same neutral outcome and one conditional marker",
          ctx do
-      id = close_left!(ctx, "dispatched")
+      id = crash_close!(ctx, :called)
+      assert %{phase: "intended"} = Journal.get(ctx.db, id)
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+      :ok = MemoryGuard.tick()
+
+      assert %{phase: "done", outcome: %{"outcome" => "unconfirmed"}} = Journal.get(ctx.db, id)
+      assert [{"agent:c", _}] = events(ctx.db, "memory_guard_close_unconfirmed")
+      assert events(ctx.db, "memory_guard_idle_closed") == []
+      assert [marker] = markers_of(ctx, "agent:c")
+      assert marker =~ @conditional
+    end
+
+    test "O2 (rev 5, 5): crash after dispatched, process gone: idle_closed and one plain marker",
+         ctx do
+      id = crash_close!(ctx, :dispatched)
+      assert %{phase: "dispatched", dispatch: %{"sentAt" => _}} = Journal.get(ctx.db, id)
       guard!(ctx)
       :ok = MemoryGuard.tick()
       assert %{phase: "done", outcome: %{"outcome" => "confirmed"}} = Journal.get(ctx.db, id)
@@ -6216,11 +6252,10 @@ defmodule Tightbeam.MemoryGuardTest do
       assert marker =~ "Tightbeam closed this session's process while it was idle"
     end
 
-    test "O2 (rev 5, 6): dispatched, process alive past the confirm window after a restart: close_failed",
+    test "O2 (rev 5, 6): crash after dispatched, process alive past the confirm window: close_failed",
          ctx do
-      proc!(ctx.root, 961, 1, 961, 10 * @mib)
-      launch!(ctx.base, "sl-c", "sid-c", 961, 961, 512 * @mib)
-      id = close_left!(ctx, "dispatched", System.system_time(:millisecond) - 60_000)
+      id = crash_close!(ctx, :dispatched, ends_process: false)
+      Process.sleep(400)
       guard!(ctx)
       :ok = MemoryGuard.tick()
       assert %{phase: "done", outcome: %{"outcome" => "failed"}} = Journal.get(ctx.db, id)
@@ -6228,24 +6263,35 @@ defmodule Tightbeam.MemoryGuardTest do
       assert markers_of(ctx, "agent:c") == []
     end
 
-    test "O2 (rev 5, 7): the outcome write fails: retried; the marker is never sent twice",
+    test "O2 (rev 5, 7): the real close's outcome write fails: retried; the marker is never sent twice",
          ctx do
       {:ok, _} =
         DB.query(ctx.db, """
-        CREATE TRIGGER o2_out BEFORE INSERT ON lifecycle_events WHEN NEW.kind='memory_guard_close_unconfirmed'
+        CREATE TRIGGER o2_out BEFORE INSERT ON lifecycle_events WHEN NEW.kind='memory_guard_idle_closed'
         BEGIN SELECT RAISE(ABORT, 'injected'); END
         """)
 
-      id = close_left!(ctx, "intended")
+      proc!(ctx.root, 961, 1, 961, 10 * @mib)
+      launch!(ctx.base, "sl-c", "sid-c", 961, 961, 512 * @mib)
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      adapter = adapter!()
       guard!(ctx)
+      resident!(adapter, ["sid-c"])
       :ok = MemoryGuard.tick()
-      assert %{phase: "intended"} = Journal.get(ctx.db, id)
+      settle_closes!()
+      assert_received {:closed, "sid-c", _}
+
+      {:ok, [%{id: id, phase: "dispatched"}]} =
+        Journal.page(ctx.db, @host, "idle_close", nil, nil, 8)
+
       assert markers_of(ctx, "agent:c") == []
 
       {:ok, _} = DB.query(ctx.db, "DROP TRIGGER o2_out")
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
 
       for _ <- 1..3, do: :ok = MemoryGuard.tick()
-      assert [_] = events(ctx.db, "memory_guard_close_unconfirmed")
+      assert %{phase: "done", outcome: %{"outcome" => "confirmed"}} = Journal.get(ctx.db, id)
+      assert [_] = events(ctx.db, "memory_guard_idle_closed")
       assert [_] = markers_of(ctx, "agent:c")
     end
   end
@@ -6707,6 +6753,157 @@ defmodule Tightbeam.MemoryGuardTest do
         )
 
       assert blocked == 300
+    end
+  end
+
+  describe "bounded continuations (re-review att_5f6e6736 B1, B2, B4)" do
+    @key "claude:shared@testhost"
+
+    defp holds!(ctx, prefix, count, fields) do
+      {:ok, _} =
+        DB.transaction(ctx.db, fn txn ->
+          for n <- 1..count do
+            Tightbeam.DB.Txn.q(
+              txn,
+              """
+              INSERT INTO memory_guard_open
+                (kind, ref, subject, host, detail, openedAt, orderKey, blocked, adapterKey)
+              VALUES (?1, ?2, ?2, ?3, '{"details":{"resident_cap":1},"seq":0}', ?4, ?5, ?6, ?7)
+              """,
+              [
+                Keyword.get(fields, :kind, "hold"),
+                "#{prefix}#{n}",
+                @host,
+                Keyword.get(fields, :opened_at, n),
+                "00:" <> String.pad_leading("#{n}", 20, "0"),
+                Keyword.get(fields, :blocked),
+                @key
+              ]
+            )
+          end
+        end)
+    end
+
+    defp count!(ctx, sql, params \\ []) do
+      {:ok, [[n]]} = DB.query(ctx.db, sql, params)
+      n
+    end
+
+    test "B1: a quota release clears its key's blocked marks at most 32 per sample, and holds a later session behind a marked one ahead until they are cleared",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+
+      {:ok, {:ok, _}} =
+        DB.transaction(
+          ctx.db,
+          &Settings.set_in_txn(&1, @host, "residentCap", "3", "user:owner", 16 * @gib)
+        )
+
+      :ok = MemoryGuard.settings_changed(@host)
+      adapter = adapter!()
+      for n <- 1..2, do: session!(ctx, "agent:r#{n}", "sid-r#{n}")
+      resident!(adapter, ["sid-r1", "sid-r2"])
+
+      holds!(ctx, "agent:p", 100, blocked: "quota_park")
+      for n <- 1..100, do: session!(ctx, "agent:p#{n}") && queue!(ctx, "agent:p#{n}", "w")
+
+      {:ok, _} =
+        DB.transaction(
+          ctx.db,
+          &Admission.quota_released_in_txn(&1, "incident-b1", "claude", @host)
+        )
+
+      blocked = fn ->
+        count!(
+          ctx,
+          "SELECT COUNT(*) FROM memory_guard_open WHERE kind='hold' AND blocked IS NOT NULL"
+        )
+      end
+
+      # The release itself writes one row, not 100.
+      assert blocked.() == 100
+
+      # One slot is free, but marked holds ahead of it may be eligible now.
+      session!(ctx, "agent:late")
+      queue!(ctx, "agent:late", "late")
+      assert {:held, ["resident_cap"]} = MemoryGuard.admit("agent:late")
+
+      :ok = MemoryGuard.tick()
+      assert blocked.() >= 100 - 32
+
+      for _ <- 1..40, blocked.() > 0, do: :ok = MemoryGuard.tick()
+      assert blocked.() == 0
+      assert count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='unblock'") == 0
+      assert_received {:nudged, "agent:p1"}
+    end
+
+    test "B2: a host release records the remaining hold of every hold it left, a page per sample, once each across a restart, and none for a hold opened after it",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      now = System.system_time(:millisecond)
+      holds!(ctx, "agent:h", 70, opened_at: now - 1_000)
+      holds!(ctx, "agent:after", 1, opened_at: now + 60_000)
+
+      note =
+        JSON.encode!(%{
+          host: @host,
+          released: "memory_floor",
+          remaining: ["memory_budget"],
+          at: now
+        })
+
+      {:ok, _} =
+        DB.transaction(
+          ctx.db,
+          &Tightbeam.MemoryGuard.State.open_in_txn(
+            &1,
+            "release_note",
+            "#{@host}:memory_floor:#{now}",
+            @host,
+            @host,
+            note
+          )
+        )
+
+      notes = fn -> events(ctx.db, "admission_hold_remaining") end
+
+      :ok = MemoryGuard.tick()
+      assert length(notes.()) in 1..32
+
+      # A restart mid-way resumes after the last page written.
+      stop_supervised!(MemoryGuard)
+      guard!(ctx)
+      for _ <- 1..20, do: :ok = MemoryGuard.tick()
+
+      subjects = Enum.map(notes.(), &elem(&1, 0))
+      assert length(subjects) == 70
+      assert Enum.sort(subjects) == Enum.sort(for n <- 1..70, do: "agent:h#{n}")
+
+      assert Enum.all?(notes.(), fn {_, detail} ->
+               detail == %{
+                 "host" => @host,
+                 "released" => "memory_floor",
+                 "remaining" => ["memory_budget"]
+               }
+             end)
+
+      assert count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='release_note'") == 0
+    end
+
+    test "B4: the Watcher's clock reads the oldest guard_unavailable hold alone, and the off nudges go 64 at a time",
+         ctx do
+      holds!(ctx, "agent:u", 70, kind: "unguarded_hold", opened_at: 5_000)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE memory_guard_open SET openedAt=1234 WHERE ref='agent:u37'")
+
+      assert {:ok, 1234} = Unguarded.held_since(ctx.db, @host)
+      assert {:ok, nil} = Unguarded.held_since(ctx.db, "elsewhere")
+
+      assert {:ok, {_, _} = next} = Unguarded.nudge_held(ctx.db, @host, nil)
+      assert {:ok, nil} = Unguarded.nudge_held(ctx.db, @host, next)
     end
   end
 end
