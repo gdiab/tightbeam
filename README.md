@@ -319,19 +319,9 @@ identity, or an incompatible schema is refused.
 Supported. Give each instance its own `TIGHTBEAM_BASE_DIR` and its own
 `TIGHTBEAM_PORT` and you are done.
 
-A release build runs without Erlang distribution: it starts no EPMD, registers no
-node name and listens on no distribution port, so no other process can attach to
-it and run code inside it. The package carries no Erlang cookie.
-`tightbeam-gateway rpc`, `remote` and `eval` are refused.
-
-For debugging only, an operator can enable distribution by hand in the service's
-environment: `TIGHTBEAM_DEBUG_DISTRIBUTION=loopback`. The node is then
-`tightbeam_gateway_<port>@127.0.0.1`, listening on loopback only, and any EPMD it
-starts listens on loopback only. Its cookie is generated at first start in
-`<base_dir>/debug-distribution.cookie` (mode 0600). Any process of the gateway's
-account can read that cookie and run code in the gateway, so remove the setting and
-restart when you are done. An EPMD that another program already started keeps its
-own addresses.
+A release build runs without Erlang distribution: it registers no node name and
+listens on no distribution port, so no other process can attach to it and run
+code inside it. `tightbeam-gateway rpc` and `remote` are refused.
 
 The lifecycle verbs `tightbeam-gateway stop` and `pid` FIND a running
 gateway through its descriptor at `<base_dir>/gateway.json` — resolved from

@@ -24,8 +24,8 @@ REL="$DIR/release/bin/tightbeam_gateway"
 # it. The mix release resolves `stop`/`rpc` by NODE NAME, an inherited
 # RELEASE_NODE wins, and the shared Erlang cookie let the test's `stop` reach and
 # halt PRODUCTION. So the incident verb no longer resolves a node at all: `stop`
-# SIGTERMs the OS pid the descriptor records, identity-gated. `rpc`, `remote` and
-# `eval` are refused: the release runs without Erlang distribution (core C21).
+# SIGTERMs the OS pid the descriptor records, identity-gated. `rpc`/`remote` are
+# refused: the release runs without Erlang distribution (core fix (A), B1).
 #
 # There is NO TIGHTBEAM_HOME fallback, NO ~/.tightbeam default, NO port-derived
 # guess: an absent TIGHTBEAM_BASE_DIR or descriptor is a REFUSAL, so reaching an
@@ -185,16 +185,16 @@ case "$verb" in
     printf '  Production restart: `systemctl restart tightbeam`.\n' >&2
     exit 64
     ;;
-  rpc | remote | eval)
-    # Core fix (A), C21.2: the production launcher offers no release debug entry. The
-    # gateway runs without Erlang distribution (rel/env.sh.eex), and no command here
-    # runs code in it or beside it.
-    printf 'tightbeam-gateway: `%s` is not available (C21.2): the gateway offers no route\n' "$verb" >&2
-    printf '  into the running node. Use the routed interfaces: the tightbeam CLI and Chat.\n' >&2
+  rpc | remote)
+    # Core fix (A), review B1: live-node code execution is not offered. The release
+    # runs without Erlang distribution (rel/env.sh.eex), so there is no node to reach;
+    # this refusal makes that explicit rather than an Erlang connection error.
+    printf 'tightbeam-gateway: `%s` is not available: the gateway runs without Erlang\n' "$verb" >&2
+    printf '  distribution, so no process can run code inside the live node.\n' >&2
     exit 64
     ;;
   *)
-    # start and every other release verb (version, daemon, ...). The release
+    # start and every other release verb (version, eval, daemon, ...). The release
     # runs without Erlang distribution, so it registers no node name and two
     # instances on one machine cannot collide on one.
     case "${1:-}" in

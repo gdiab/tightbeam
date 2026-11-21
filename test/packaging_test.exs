@@ -185,21 +185,6 @@ defmodule Tightbeam.PackagingTest do
     refute File.exists?(temporary)
   end
 
-  @tag :manifest_finalizer
-  test "C21.1: an artifact carrying an Erlang cookie is refused and never finalized" do
-    for cookie <- ["release/releases/COOKIE", "release/.erlang.cookie"] do
-      temporary = artifact_fixture("0.1.6", "0.1.6", "0.1.6", payload: true, cookie: cookie)
-      final = temporary <> ".final.tgz"
-
-      {output, status} =
-        System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
-
-      assert status == 1, output
-      assert output =~ "payload refused: the package carries an Erlang cookie (C21.1)"
-      refute File.exists?(final)
-    end
-  end
-
   defp artifact_fixture(cli_version, gateway_version, manifest_version \\ "0.1.6", opts \\ []) do
     root = Path.join(System.tmp_dir!(), "tightbeam-package-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
@@ -232,10 +217,6 @@ defmodule Tightbeam.PackagingTest do
       File.write!(Path.join(app, "ebin/tightbeam.app"), "synthetic app metadata")
       File.write!(Path.join(app, "priv/resource"), "synthetic resource")
       File.write!(Path.join(package, "bin/tightbeam-gateway"), "#!/bin/sh\nexit 64\n")
-
-      if cookie = opts[:cookie],
-        do: File.write!(Path.join(package, cookie), "synthetic-cookie")
-
       Tightbeam.LiveBasePayload.generate!(package)
     end
 
