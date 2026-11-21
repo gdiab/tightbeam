@@ -3448,7 +3448,17 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag cold_gateway: true, tmp_dir: true
-  test "children writes the owned pid identity into the descriptor, fresh every boot",
+  test "children writes the instance's ACTUAL RELEASE_NODE and owned pid into the descriptor, fresh every boot",
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_descriptor.exs",
+      "guarded-gateway-descriptor: ok"
+    )
+  end
+
+  @tag cold_gateway: true, tmp_dir: true
+  test "the node the REAL writer persists is what rpc resolves; ambient node+cookie cannot override (writer→consumer seam)",
        %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,

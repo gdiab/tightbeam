@@ -27,12 +27,6 @@ defmodule Tightbeam.Devices do
 
   @type db :: GenServer.server()
 
-  # Core fix (A), review B1: the ungated in-process writers below (`approve/3`,
-  # `deny/2`, `revoke/2`, `add_user/3`, `set_user_admin/3`) exist only in test builds,
-  # as fixtures. Production code reaches devices and users only through the gated
-  # `*_with_firehose` writers and pairing.
-  @test_fixtures Application.compile_env(:tightbeam, :test_fixtures, false)
-
   @typedoc """
   A device row; `is_admin` is derived from the owning user via JOIN, and a
   removed user confers none. `user_removed` says the owning user is removed.
@@ -249,38 +243,36 @@ defmodule Tightbeam.Devices do
     one_device_or_nil(rows)
   end
 
-  if @test_fixtures do
-    @doc """
-    Approve a pending device: status → allowlisted, mint a fresh token, and
-    attach to the claimed user (or the explicit override `user_id`, creating it
-    non-admin if new). Raises on unknown device, and on a removed user.
-    """
-    @spec approve(db(), String.t(), String.t() | nil) :: device()
-    def approve(db \\ Tightbeam.DB, device_id, user_id \\ nil) do
-      transaction!(db, fn txn ->
-        device = must_get(txn, device_id)
-        target = user_id || device.user_id
+  @doc """
+  Approve a pending device: status → allowlisted, mint a fresh token, and
+  attach to the claimed user (or the explicit override `user_id`, creating it
+  non-admin if new). Raises on unknown device, and on a removed user.
+  """
+  @spec approve(db(), String.t(), String.t() | nil) :: device()
+  def approve(db \\ Tightbeam.DB, device_id, user_id \\ nil) do
+    transaction!(db, fn txn ->
+      device = must_get(txn, device_id)
+      target = user_id || device.user_id
 
-        if UserAdmin.removed_in_txn?(txn, target),
-          do: raise(ArgumentError, "user_removed: #{target}")
+      if UserAdmin.removed_in_txn?(txn, target),
+        do: raise(ArgumentError, "user_removed: #{target}")
 
-        if user_id, do: ensure_user(txn, user_id)
+      if user_id, do: ensure_user(txn, user_id)
 
-        Txn.q(
-          txn,
-          """
-            UPDATE devices
-            SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3
-            WHERE deviceId = ?1
-          """,
-          [device_id, user_id, mint_token()]
-        )
+      Txn.q(
+        txn,
+        """
+          UPDATE devices
+          SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3
+          WHERE deviceId = ?1
+        """,
+        [device_id, user_id, mint_token()]
+      )
 
-        stamp_device_in_txn(txn, device_id, now())
+      stamp_device_in_txn(txn, device_id, now())
 
-        must_get(txn, device_id)
-      end)
-    end
+      must_get(txn, device_id)
+    end)
   end
 
   @doc false
@@ -333,22 +325,20 @@ defmodule Tightbeam.Devices do
     end)
   end
 
-  if @test_fixtures do
-    @doc "Deny a device: status → denied, token cleared. Raises on unknown device."
-    @spec deny(db(), String.t()) :: :ok
-    def deny(db \\ Tightbeam.DB, device_id) do
-      transaction!(db, fn txn ->
-        must_get(txn, device_id)
+  @doc "Deny a device: status → denied, token cleared. Raises on unknown device."
+  @spec deny(db(), String.t()) :: :ok
+  def deny(db \\ Tightbeam.DB, device_id) do
+    transaction!(db, fn txn ->
+      must_get(txn, device_id)
 
-        Txn.q(txn, "UPDATE devices SET status = 'denied', token = NULL WHERE deviceId = ?1", [
-          device_id
-        ])
+      Txn.q(txn, "UPDATE devices SET status = 'denied', token = NULL WHERE deviceId = ?1", [
+        device_id
+      ])
 
-        stamp_device_in_txn(txn, device_id, now())
+      stamp_device_in_txn(txn, device_id, now())
 
-        :ok
-      end)
-    end
+      :ok
+    end)
   end
 
   @doc false
@@ -374,17 +364,15 @@ defmodule Tightbeam.Devices do
     :ok
   end
 
-  if @test_fixtures do
-    @doc "Revoke a device's token (status unchanged — it re-pairs). Raises on unknown device."
-    @spec revoke(db(), String.t()) :: :ok
-    def revoke(db \\ Tightbeam.DB, device_id) do
-      transaction!(db, fn txn ->
-        must_get(txn, device_id)
-        Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
-        stamp_device_in_txn(txn, device_id, now())
-        :ok
-      end)
-    end
+  @doc "Revoke a device's token (status unchanged — it re-pairs). Raises on unknown device."
+  @spec revoke(db(), String.t()) :: :ok
+  def revoke(db \\ Tightbeam.DB, device_id) do
+    transaction!(db, fn txn ->
+      must_get(txn, device_id)
+      Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
+      stamp_device_in_txn(txn, device_id, now())
+      :ok
+    end)
   end
 
   @doc false
@@ -424,18 +412,16 @@ defmodule Tightbeam.Devices do
     end
   end
 
-  if @test_fixtures do
-    @doc "Add a user. The shared cold-start insertion rule makes the first user admin."
-    @spec add_user(db(), String.t(), boolean()) :: user()
-    def add_user(db \\ Tightbeam.DB, user_id, is_admin) do
-      transaction!(db, fn txn ->
-        insert_user(txn, user_id, is_admin)
+  @doc "Add a user. The shared cold-start insertion rule makes the first user admin."
+  @spec add_user(db(), String.t(), boolean()) :: user()
+  def add_user(db \\ Tightbeam.DB, user_id, is_admin) do
+    transaction!(db, fn txn ->
+      insert_user(txn, user_id, is_admin)
 
-        user = must_get_user(txn, user_id)
-        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-        user
-      end)
-    end
+      user = must_get_user(txn, user_id)
+      :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+      user
+    end)
   end
 
   @doc false
@@ -507,23 +493,21 @@ defmodule Tightbeam.Devices do
     end
   end
 
-  if @test_fixtures do
-    @doc "Set a user's admin bit (the promote-user verb's write). Raises on unknown user."
-    @spec set_user_admin(db(), String.t(), boolean()) :: user()
-    def set_user_admin(db \\ Tightbeam.DB, user_id, is_admin) do
-      transaction!(db, fn txn ->
-        must_get_user(txn, user_id)
+  @doc "Set a user's admin bit (the promote-user verb's write). Raises on unknown user."
+  @spec set_user_admin(db(), String.t(), boolean()) :: user()
+  def set_user_admin(db \\ Tightbeam.DB, user_id, is_admin) do
+    transaction!(db, fn txn ->
+      must_get_user(txn, user_id)
 
-        Txn.q(txn, "UPDATE users SET isAdmin = ?2 WHERE userId = ?1", [
-          user_id,
-          if(is_admin, do: 1, else: 0)
-        ])
+      Txn.q(txn, "UPDATE users SET isAdmin = ?2 WHERE userId = ?1", [
+        user_id,
+        if(is_admin, do: 1, else: 0)
+      ])
 
-        user = must_get_user(txn, user_id)
-        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
-        user
-      end)
-    end
+      user = must_get_user(txn, user_id)
+      :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+      user
+    end)
   end
 
   @doc "Pending devices, oldest first (the approval queue)."
