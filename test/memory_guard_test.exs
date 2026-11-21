@@ -7006,6 +7006,121 @@ defmodule Tightbeam.MemoryGuardTest do
              ) == 0
     end
 
+    test "unblock (att_660ea131 B1): a second release while the item is open starts its range again, so a hold marked again during that park is cleared",
+         ctx do
+      meminfo!(ctx.root, 16 * @gib, 12 * @gib)
+      guard!(ctx)
+      holds!(ctx, "agent:p", 100, blocked: "quota_park", turns: true)
+
+      release = fn ->
+        {:ok, _} =
+          DB.transaction(
+            ctx.db,
+            &Admission.quota_released_in_txn(&1, "incident-b1", "claude", @host)
+          )
+      end
+
+      release.()
+      :ok = MemoryGuard.tick()
+      assert blocked(ctx) < 100
+
+      assert [["agent:p1", nil]] =
+               rows!(ctx, "SELECT ref, blocked FROM memory_guard_open WHERE ref='agent:p1'")
+
+      # The key parks again and p1 is marked; then that park releases.
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE memory_guard_open SET blocked='quota_park' WHERE ref='agent:p1'")
+
+      release.()
+
+      for _ <- 1..40,
+          count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='unblock'") > 0,
+          do: :ok = MemoryGuard.tick()
+
+      assert blocked(ctx) == 0
+    end
+
+    test "release note (att_660ea131 B2): a hold that resumes after a quota release, before the floor note reaches it, keeps its quota_park record",
+         ctx do
+      key = "claude:shared@testhost"
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO harness_park_fences (adapterKey, requestedAt, generation) VALUES (?1, 1, 9)",
+          [key]
+        )
+
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 10, 100))
+      guard!(ctx)
+      :ok = MemoryGuard.tick()
+
+      # 200 holds ahead of H, so the floor note pages for several samples.
+      holds!(ctx, "agent:a", 200, turns: true)
+      session!(ctx, "agent:h")
+      queue!(ctx, "agent:h", "w")
+      assert {:held, ["memory_floor"]} = MemoryGuard.admit("agent:h")
+
+      [[detail]] =
+        rows!(ctx, "SELECT detail FROM memory_guard_open WHERE kind='hold' AND ref='agent:h'")
+
+      assert %{"other" => ["quota_park"]} = JSON.decode!(detail)
+
+      # The floor releases (its note owes H a record: H stays parked).
+      meminfo!(ctx.root, 16 * @gib, div(16 * @gib * 50, 100))
+      :ok = MemoryGuard.tick()
+      assert count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='release_note'") == 1
+
+      # The park releases and H resumes before the note reaches it.
+      {:ok, _} = DB.query(ctx.db, "DELETE FROM harness_park_fences")
+
+      {:ok, _} =
+        DB.transaction(
+          ctx.db,
+          &Admission.quota_released_in_txn(&1, "incident-q", "claude", @host)
+        )
+
+      assert :ok = MemoryGuard.admit("agent:h")
+
+      assert [_] =
+               rows!(
+                 ctx,
+                 "SELECT ref FROM memory_guard_open WHERE kind='hold_owed' AND subject='agent:h'"
+               )
+
+      for _ <- 1..60,
+          count!(ctx, "SELECT COUNT(*) FROM memory_guard_open WHERE kind='release_note'") > 0,
+          do: :ok = MemoryGuard.tick()
+
+      assert [
+               {"agent:h",
+                %{"released" => "memory_floor", "remaining" => ["quota_park"], "resumedAt" => _}}
+             ] =
+               Enum.filter(notes(ctx), &(elem(&1, 0) == "agent:h"))
+    end
+
+    test "quota source probe (att_660ea131 B3): a source's retry is found on memory_guard_retry_source, never by scanning the retry history",
+         ctx do
+      {:ok, plan} =
+        DB.query(
+          ctx.db,
+          """
+          EXPLAIN QUERY PLAN
+          SELECT 1 FROM wake_retry_attempts retry INDEXED BY memory_guard_retry_source
+          WHERE retry.sourceTurnSeq=?1 AND retry.retryWakeId IS NOT NULL
+          """,
+          [1]
+        )
+
+      details = Enum.map_join(plan, " ", &List.last/1)
+
+      assert details =~
+               "SEARCH retry USING COVERING INDEX memory_guard_retry_source (sourceTurnSeq=?)" or
+               details =~ "SEARCH retry USING INDEX memory_guard_retry_source (sourceTurnSeq=?)"
+
+      refute details =~ "SCAN"
+    end
+
     test "Watcher nudges (§4): 64 per pass from a durable cursor; a restart resumes; later holds wait for the next cycle",
          ctx do
       {:ok, _} =
