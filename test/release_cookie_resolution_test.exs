@@ -339,8 +339,7 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
       ])
 
     {:os_pid, os_pid} = Port.info(port, :os_pid)
-    # The whole probe term: output can arrive split across reads.
-    {port, Integer.to_string(os_pid), collect_until(port, ~r/\{tbprobe,[^}]*\}/, 30_000)}
+    {port, Integer.to_string(os_pid), collect_until(port, "{tbprobe,", 30_000)}
   end
 
   defp stop!(port, os_pid) do
