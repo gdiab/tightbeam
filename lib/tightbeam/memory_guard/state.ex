@@ -75,8 +75,21 @@ defmodule Tightbeam.MemoryGuard.State do
     ON memory_guard_open(host, orderKey, ref) WHERE kind = 'hold';
   CREATE INDEX IF NOT EXISTS memory_guard_holds_eligible
     ON memory_guard_open(host, orderKey, ref) WHERE kind = 'hold' AND blocked IS NULL;
-  CREATE INDEX IF NOT EXISTS memory_guard_holds_key
-    ON memory_guard_open(kind, adapterKey) WHERE kind = 'hold';
+  -- A quota release's blocked marks, cleared a page at a time (re-review
+  -- att_5f6e6736 B1), and probed for a still-blocked hold ahead in line.
+  CREATE INDEX IF NOT EXISTS memory_guard_holds_blocked
+    ON memory_guard_open(adapterKey, host, orderKey, ref) WHERE kind = 'hold' AND blocked IS NOT NULL;
+  -- A session's pending quota redeliveries, for a quota hook's membership
+  -- check (B3); the table is the wakes' and exists before this one.
+  CREATE INDEX IF NOT EXISTS memory_guard_redelivery_session
+    ON health_redelivery_attempts(sessionKey)
+    WHERE redeliveryTurnSeq IS NULL AND failureClass = 'rate-limit-dead';
+  -- Whether a session has a queued turn or pending prompt wake from a user
+  -- (R3a's class), one probe each (the tables exist before this one).
+  CREATE INDEX IF NOT EXISTS memory_guard_turns_origin
+    ON turns(sessionKey, origin) WHERE status IN ('queued','running');
+  CREATE INDEX IF NOT EXISTS memory_guard_wakes_origin
+    ON wakes(sessionKey, origin) WHERE state = 'pending' AND consumer = 'prompt';
   CREATE TABLE IF NOT EXISTS memory_guard_effects (
     effectId   TEXT PRIMARY KEY,
     kind       TEXT NOT NULL CHECK (kind IN ('override_admission','idle_close','tree_kill',
@@ -97,8 +110,30 @@ defmodule Tightbeam.MemoryGuard.State do
   """
 
   @doc "Create the current-state tables (additive; no stamp change)."
+  # The memory guard reads the live adapter launches and a key's newest
+  # launch without reading the launch history (re-review att_5f6e6736). The
+  # launch table is created later in the schema pass, which runs this module
+  # again after it; these follow once it exists.
+  @launch_indexes """
+  CREATE INDEX IF NOT EXISTS harness_processes_live ON harness_processes (launchSequence)
+    WHERE state IN ('launching','running','park_requested');
+  CREATE INDEX IF NOT EXISTS harness_processes_key_sequence
+    ON harness_processes (adapterKey, launchSequence);
+  """
+
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl) do
+      case DB.query(
+             db,
+             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='harness_processes'"
+           ) do
+        {:ok, [_]} -> DB.execute(db, @launch_indexes)
+        {:ok, []} -> :ok
+        {:error, _} = error -> error
+      end
+    end
+  end
 
   @doc "Record an open item, once (`ref` identifies it within `kind`)."
   @spec open_in_txn(Txn.t(), String.t(), String.t(), String.t(), String.t() | nil, String.t()) ::
@@ -146,40 +181,48 @@ defmodule Tightbeam.MemoryGuard.State do
     Txn.q(txn, "SELECT 1 FROM memory_guard_open WHERE kind=?1 AND ref=?2", [kind, ref]) != []
   end
 
-  @doc """
-  The open items of `kind` on one host, oldest first:
-  `[%{ref, subject, host, detail, opened_at}]`. An index search on
-  `(kind, host, openedAt)`: it costs that host's open items of that kind.
-  """
-  @spec list_in_txn(Txn.t(), String.t(), String.t()) :: [map()]
-  def list_in_txn(%Txn{} = txn, kind, host) when is_binary(host) do
+  @doc "The item `ref` of `kind`, or nil."
+  @spec get_in_txn(Txn.t(), String.t(), String.t()) :: map() | nil
+  def get_in_txn(%Txn{} = txn, kind, ref) do
     txn
     |> Txn.q(
-      """
-      SELECT ref, subject, host, detail, openedAt FROM memory_guard_open
-      WHERE kind=?1 AND host=?2 ORDER BY openedAt, ref
-      """,
-      [kind, host]
+      "SELECT ref, subject, host, detail, openedAt FROM memory_guard_open WHERE kind=?1 AND ref=?2",
+      [kind, ref]
     )
     |> rows()
+    |> List.first()
+  end
+
+  @doc "Replace the detail of the open item `ref` of `kind` (a continuation's cursor)."
+  @spec update_detail_in_txn(Txn.t(), String.t(), String.t(), String.t()) :: :ok
+  def update_detail_in_txn(%Txn{} = txn, kind, ref, detail) do
+    Txn.q(txn, "UPDATE memory_guard_open SET detail=?3 WHERE kind=?1 AND ref=?2", [
+      kind,
+      ref,
+      detail
+    ])
+
+    :ok
   end
 
   @doc """
-  The open items of `kind` on every host, for the few callers that act on all
-  of them (the guard's start, re-admission nudges): costs every open item of
-  that kind.
+  The oldest open item of `kind` on `host` (index `(kind, host, openedAt,
+  ref)`, one row), or nil.
   """
-  @spec list_all_in_txn(Txn.t(), String.t()) :: [map()]
-  def list_all_in_txn(%Txn{} = txn, kind) do
-    txn
-    |> Txn.q(
-      """
-      SELECT ref, subject, host, detail, openedAt FROM memory_guard_open
-      WHERE kind=?1 ORDER BY host, openedAt, ref
-      """,
-      [kind]
-    )
-    |> rows()
+  @spec oldest(DB.server(), String.t(), String.t()) :: {:ok, map() | nil} | {:error, String.t()}
+  def oldest(db, kind, host) do
+    read(db, fn txn ->
+      txn
+      |> Txn.q(
+        """
+        SELECT ref, subject, host, detail, openedAt FROM memory_guard_open
+        WHERE kind=?1 AND host=?2 ORDER BY openedAt, ref LIMIT 1
+        """,
+        [kind, host]
+      )
+      |> rows()
+      |> List.first()
+    end)
   end
 
   @doc """
@@ -283,18 +326,5 @@ defmodule Tightbeam.MemoryGuard.State do
     Enum.map(rows, fn [ref, subject, host, detail, opened_at] ->
       %{ref: ref, subject: subject, host: host, detail: detail, opened_at: opened_at}
     end)
-  end
-
-  @doc "`list_in_txn/3` (host given) or `list_all_in_txn/2` (`:all`) outside a transaction."
-  @spec list(DB.server(), String.t(), String.t() | :all) :: {:ok, [map()]} | {:error, String.t()}
-  def list(db, kind, host) do
-    read = if host == :all, do: &list_all_in_txn(&1, kind), else: &list_in_txn(&1, kind, host)
-
-    case DB.transaction(db, read) do
-      {:ok, items} -> {:ok, items}
-      {:error, error} -> {:error, Exception.message(error)}
-    end
-  catch
-    :exit, reason -> {:error, inspect(reason)}
   end
 end

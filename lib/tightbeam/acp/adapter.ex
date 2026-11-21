@@ -559,7 +559,7 @@ defmodule Tightbeam.Acp.Adapter do
             :ok
 
           {:error, reason} ->
-            row = Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.launch_id == launch_id))
+            row = Tightbeam.HarnessProcess.get(db, launch_id)
             receipt = Conn.launch_exit(conn, 100)
 
             _ =

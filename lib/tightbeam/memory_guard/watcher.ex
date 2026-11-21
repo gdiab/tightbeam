@@ -45,6 +45,8 @@ defmodule Tightbeam.MemoryGuard.Watcher do
       root_uid: Keyword.get(opts, :root_uid, 0),
       finding: Keyword.get(opts, :finding, fn -> Tightbeam.MemoryGuard.RootPath.finding() end),
       root_seen: MapSet.new(),
+      # Where the next pass's page of `off` nudges starts (nil: the start).
+      nudge_cursor: nil,
       # Each episode's alert text, with the root-path finding taken when it
       # was first sent; a retry sends the same text.
       messages: %{}
@@ -77,7 +79,7 @@ defmodule Tightbeam.MemoryGuard.Watcher do
     else
       now = state.clock.()
       publish_pending(state, now)
-      state = open_guard_episode(state, now)
+      state = state |> open_guard_episode(now) |> nudge_off_holds()
 
       %{seen: seen, error: error} =
         RootActions.intake(state.db, state.base_dir, state.host,
@@ -148,20 +150,29 @@ defmodule Tightbeam.MemoryGuard.Watcher do
     end
   end
 
-  # The oldest `guard_unavailable` hold still open on the host: launches have
-  # been held, without a break, since then. Holds that cannot be read open
-  # nothing now and are read again on the next pass.
+  # While `off` is in force with the guard down, the lanes still held from
+  # before are admitted when they ask again: a page of 64 is nudged per pass
+  # (re-review att_5f6e6736 B4), cycling through the holds.
+  defp nudge_off_holds(state) do
+    with "off" <- Unguarded.mode_in_force(state.db, state.host),
+         {:ok, next} <- Unguarded.nudge_held(state.db, state.host, state.nudge_cursor) do
+      %{state | nudge_cursor: next}
+    else
+      _ -> state
+    end
+  end
+
+  # The oldest `guard_unavailable` hold still open on the host (one indexed
+  # row): launches have been held, without a break, since then. Holds that
+  # cannot be read open nothing now and are read again on the next pass.
   defp open_guard_episode(state, now) do
-    case Unguarded.held_sessions(state.db, state.host) do
+    case Unguarded.held_since(state.db, state.host) do
       {:error, reason} ->
         Logger.warning("memory guard watcher: holds cannot be read: #{reason}")
         state
 
-      {:ok, held} ->
-        since = for {_session_key, _host, since} <- held, do: since
-
-        with [_ | _] <- since,
-             oldest = Enum.min(since),
+      {:ok, oldest} ->
+        with true <- is_integer(oldest),
              true <- now - oldest >= Episodes.stuck_ms(),
              {:opened, episode} <-
                Episodes.open(state.db, %{

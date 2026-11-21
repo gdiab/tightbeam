@@ -79,6 +79,13 @@ defmodule Tightbeam.MemoryGuard do
 
   defp expected?, do: :persistent_term.get({__MODULE__, :expected}, false)
 
+  @doc """
+  Whether this runtime runs a guard (running, or restarting): one exists to
+  continue the bounded work left in its open items.
+  """
+  @spec configured?() :: boolean()
+  def configured?, do: expected?()
+
   # The fence's guard: running, back within the wait, or not configured.
   defp fence_guard do
     cond do
@@ -525,6 +532,9 @@ defmodule Tightbeam.MemoryGuard do
       reservations: %{},
       last_used: %{},
       held: %{},
+      # Per {host, detail}, how many sessions are held: kept as holds change
+      # (`put_held/3`, `drop_held/2`), never counted over every hold.
+      held_counts: %{},
       closing: %{},
       # Sessions found busy at close time; skipped until their state changes.
       unclosable: MapSet.new(),
@@ -549,6 +559,9 @@ defmodule Tightbeam.MemoryGuard do
       # that already happened but could not be written yet, and unit removals
       # that failed; all retried each sample.
       pending_markers: %{},
+      # The pending markers' keys in retry order, so each sample retries the
+      # next 32 and none is starved.
+      marker_queue: :queue.new(),
       pending_alerts: %{},
       # M3: when re-admitted turns still queued were last nudged.
       readmitted_nudged_at: 0,
@@ -588,6 +601,10 @@ defmodule Tightbeam.MemoryGuard do
       # Test seam (matrix K7): runs between choosing a close candidate and the
       # conditional `closing` transaction.
       before_close_commit: Keyword.get(opts, :before_close_commit, fn _session_key -> :ok end),
+      # Tests: called at the close's two crash points (rev 4 D1), `:called`
+      # after the close call returned `:ok` and before `dispatched` is
+      # written, `:dispatched` right after it.
+      close_hook: Keyword.get(opts, :close_hook, fn _point, _sid -> :ok end),
       # Test seam (matrix D4, A5): runs in the kill task before the send.
       before_kill_send: Keyword.get(opts, :before_kill_send, fn _target -> :ok end),
       close_confirm_ms: Keyword.get(opts, :close_confirm_ms, 5_000)
@@ -599,6 +616,7 @@ defmodule Tightbeam.MemoryGuard do
       |> publish_all()
       |> rebuild_kills()
       |> load_clocks()
+      |> tap(&Records.prune_refusals(&1.base_dir, &1.clock.()))
       |> sweep_units()
 
     # O17: the durable holds come back, a page per message.
@@ -715,6 +733,16 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   @impl true
+  def handle_cast({:refusal_recorded, launch_id}, state) do
+    with {:error, reason} <- Records.consume_refusal(state.base_dir, launch_id),
+         do:
+           Logger.warning(
+             "memory guard: refusal record #{launch_id} not removed: #{inspect(reason)}"
+           )
+
+    {:noreply, state}
+  end
+
   def handle_cast({:turn_finished, session_key}, state) do
     state = %{state | unclosable: MapSet.new()}
     host = Map.get(state.busy, session_key) || get_in(state.reservations, [session_key, :host])
@@ -814,17 +842,10 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   def handle_info({:nudge_queued, after_key}, state) do
-    case DB.query(
-           state.db,
-           """
-           SELECT DISTINCT sessionKey FROM turns
-           WHERE status='queued' AND sessionKey > ?1 ORDER BY sessionKey LIMIT 64
-           """,
-           [after_key || ""]
-         ) do
-      {:ok, rows} ->
-        for [key] <- rows, do: nudge(state, key)
-        if length(rows) == 64, do: send(self(), {:nudge_queued, rows |> List.last() |> hd()})
+    case queued_lanes(state.db, after_key || "", 64, []) do
+      {:ok, keys} ->
+        for key <- keys, do: nudge(state, key)
+        if length(keys) == 64, do: send(self(), {:nudge_queued, List.last(keys)})
 
       {:error, error} ->
         Logger.warning("memory guard: queued lanes cannot be read, retried: #{inspect(error)}")
@@ -832,6 +853,27 @@ defmodule Tightbeam.MemoryGuard do
     end
 
     {:noreply, state}
+  end
+
+  # Up to `n` sessions with a queued turn after `after_key`, one indexed probe
+  # each on `turns_pending` (a session's many queued turns are skipped, not
+  # read).
+  defp queued_lanes(_db, _after_key, 0, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp queued_lanes(db, after_key, n, acc) do
+    case DB.query(
+           db,
+           """
+           SELECT sessionKey FROM turns INDEXED BY turns_pending
+           WHERE status IN ('queued','running') AND status='queued' AND sessionKey > ?1
+           ORDER BY sessionKey LIMIT 1
+           """,
+           [after_key]
+         ) do
+      {:ok, [[key]]} -> queued_lanes(db, key, n - 1, [key | acc])
+      {:ok, []} -> {:ok, Enum.reverse(acc)}
+      {:error, _} = error -> error
+    end
   end
 
   def handle_info({:DOWN, monitor, :process, adapter, _reason}, state) do
@@ -916,7 +958,7 @@ defmodule Tightbeam.MemoryGuard do
                                       acc ->
             %{"details" => details, "seq" => seq} = JSON.decode!(detail)
             held = %{host: host, seq: seq, details: details, since: since}
-            acc = %{acc | held: Map.put(acc.held, key, held)}
+            acc = put_held(acc, key, held)
 
             with %{} = session <- Org.get(acc.db, key),
                  true <- Priority.user_originated_pending?(acc.db, key),
@@ -1569,15 +1611,38 @@ defmodule Tightbeam.MemoryGuard do
   # `session` (class first, then the oldest waiting turn): 1 if one does, 0 if
   # none (agreed design rev 3 D5: an indexed, bounded selection).
   defp waiting_ahead(state, session, seq) do
-    case eligible_waiters(
-           state,
-           session.host,
-           session.session_key,
-           order_key(state, session, seq),
-           1
+    before = order_key(state, session, seq)
+
+    if unblocking_ahead?(state, session.host, session.session_key, before) do
+      1
+    else
+      case eligible_waiters(state, session.host, session.session_key, before, 1) do
+        {[], :complete} -> 0
+        _ -> 1
+      end
+    end
+  end
+
+  # While a quota release's blocked marks are still being cleared (B1), a
+  # hold of that key still marked ahead of `before` may be eligible: it
+  # counts as someone ahead. One probe per key being cleared on the host (at
+  # most one per adapter key), on `memory_guard_holds_blocked`; unreadable
+  # counts as ahead.
+  defp unblocking_ahead?(state, host, session_key, before) do
+    case DB.query(
+           state.db,
+           """
+           SELECT 1 FROM memory_guard_open u
+           WHERE u.kind='unblock' AND u.host=?1 AND EXISTS (
+             SELECT 1 FROM memory_guard_open h
+             WHERE h.kind='hold' AND h.adapterKey=u.ref AND h.host=?1
+               AND h.blocked IS NOT NULL AND h.orderKey < ?2 AND h.ref != ?3)
+           LIMIT 1
+           """,
+           [host, before, session_key]
          ) do
-      {[], :complete} -> 0
-      _ -> 1
+      {:ok, rows} -> rows != []
+      {:error, _} -> true
     end
   end
 
@@ -1780,7 +1845,12 @@ defmodule Tightbeam.MemoryGuard do
   defp oldest_queued(db, session_key) do
     case DB.query(
            db,
-           "SELECT seq FROM turns WHERE sessionKey=?1 AND status='queued' ORDER BY seq LIMIT 1",
+           # `status IN (…)` is `turns_pending`'s own term: its index, one row.
+           """
+           SELECT seq FROM turns INDEXED BY turns_pending
+           WHERE status IN ('queued','running') AND status='queued' AND sessionKey=?1
+           ORDER BY seq LIMIT 1
+           """,
            [session_key]
          ) do
       {:ok, [[seq]]} -> seq
@@ -1840,11 +1910,11 @@ defmodule Tightbeam.MemoryGuard do
 
     case result do
       {:ok, nil} ->
-        %{state | held: Map.delete(state.held, session.session_key)}
+        drop_held(state, session.session_key)
 
       {:ok, since} ->
         held = %{host: session.host, seq: seq, details: held_details, since: since}
-        state = %{state | held: Map.put(state.held, session.session_key, held)}
+        state = put_held(state, session.session_key, held)
 
         # R7: a user-originated turn that becomes held gets one plain-words
         # marker in its own conversation, once per hold: its key is the hold's
@@ -1891,6 +1961,7 @@ defmodule Tightbeam.MemoryGuard do
 
   defp drop_hold_in_txn(txn, session_key) do
     Txn.q(txn, "DELETE FROM memory_guard_open WHERE kind='hold' AND ref=?1", [session_key])
+    State.close_subject_in_txn(txn, "marker_posted", session_key)
   end
 
   # R3a: class first, then the oldest waiting turn; zero-padded so the text
@@ -1971,17 +2042,26 @@ defmodule Tightbeam.MemoryGuard do
 
       false ->
         try do
-          EventLog.notice(
-            state.db,
-            marker.kind,
-            marker.session_key,
-            JSON.encode!(Map.put(marker.detail, :markerKey, marker.key)),
-            audience: {:session, marker.session_key},
-            message: marker.message,
-            attention: :normal,
-            conn_registry: state.conn_registry
-          )
+          # The marker and the row that says it was posted are one step
+          # (one indexed probe answers "posted?"); the row goes with the hold.
+          {:ok, plan} =
+            DB.transaction(state.db, fn txn ->
+              plan =
+                EventLog.notice_in_txn(
+                  txn,
+                  marker.kind,
+                  marker.session_key,
+                  JSON.encode!(Map.put(marker.detail, :markerKey, marker.key)),
+                  audience: {:session, marker.session_key},
+                  message: marker.message,
+                  attention: :normal
+                )
 
+              State.open_in_txn(txn, "marker_posted", marker.key, marker.session_key, nil, nil)
+              plan
+            end)
+
+          EventLog.publish(plan, conn_registry: state.conn_registry)
           %{state | pending_markers: Map.delete(state.pending_markers, marker.key)}
         rescue
           error -> marker_pending(state, marker, Exception.message(error))
@@ -1992,16 +2072,8 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   defp marker_posted?(db, marker) do
-    case DB.query(
-           db,
-           """
-           SELECT 1 FROM lifecycle_events
-           WHERE kind=?1 AND subject=?2 AND json_extract(detail,'$.markerKey')=?3 LIMIT 1
-           """,
-           [marker.kind, marker.session_key, marker.key]
-         ) do
-      {:ok, [[1]]} -> true
-      {:ok, []} -> false
+    case DB.transaction(db, &State.open_in_txn?(&1, "marker_posted", marker.key)) do
+      {:ok, posted?} -> posted?
       {:error, error} -> {:error, "whether it was posted cannot be read: #{inspect(error)}"}
     end
   catch
@@ -2014,22 +2086,66 @@ defmodule Tightbeam.MemoryGuard do
         do: state,
         else: tap(state, &marker_failed(&1, marker.session_key, marker.kind, error))
 
-    %{state | pending_markers: Map.put(state.pending_markers, marker.key, marker)}
+    queue =
+      if Map.has_key?(state.pending_markers, marker.key),
+        do: state.marker_queue,
+        else: :queue.in(marker.key, state.marker_queue)
+
+    %{
+      state
+      | pending_markers: Map.put(state.pending_markers, marker.key, marker),
+        marker_queue: queue
+    }
   end
 
-  # FS7: retried each sample.
+  # FS7: retried each sample, a fixed number at a time (re-review
+  # att_5f6e6736 sweep): 32 waiting markers and 64 re-nudges, the rest at the
+  # next sample. Stuck alerts are one per episode (per host, at most one per
+  # adapter key and the guard's own), so they are all retried.
+  @retry_markers 32
+  @retry_nudges 64
+
   defp retry_bookkeeping(state) do
-    state =
-      Enum.reduce(Map.values(state.pending_markers), state, &post_marker(&2, &1))
+    state = retry_markers(state, @retry_markers)
 
     state =
       Enum.reduce(Map.values(state.pending_alerts), state, fn pending, acc ->
         notify_stuck(acc, pending.episode, pending.message)
       end)
 
-    for session_key <- state.renudge, do: nudge(state, session_key)
-    state = %{state | renudge: MapSet.new()}
+    now = Enum.take(state.renudge, @retry_nudges)
+    for session_key <- now, do: nudge(state, session_key)
+    state = %{state | renudge: Enum.reduce(now, state.renudge, &MapSet.delete(&2, &1))}
     state |> renudge_ready() |> drain_streams()
+  end
+
+  # The next `n` pending markers in queue order; one still pending goes to
+  # the back of the queue.
+  defp retry_markers(state, 0), do: state
+
+  defp retry_markers(state, n) do
+    case :queue.out(state.marker_queue) do
+      {:empty, _} ->
+        state
+
+      {{:value, key}, queue} ->
+        state = %{state | marker_queue: queue}
+
+        state =
+          case Map.fetch(state.pending_markers, key) do
+            {:ok, marker} ->
+              state = post_marker(state, marker)
+
+              if Map.has_key?(state.pending_markers, key),
+                do: %{state | marker_queue: :queue.in(key, state.marker_queue)},
+                else: state
+
+            :error ->
+              state
+          end
+
+        retry_markers(state, n - 1)
+    end
   end
 
   ## The journal's resolvers and the bounded streams (agreed design: rev 2 (b)–(d),
@@ -2039,18 +2155,27 @@ defmodule Tightbeam.MemoryGuard do
     {:open, "hold"},
     {:open, "memory_readmission"},
     {:open, "quota_readmission"},
-    {:open, "step_hold"}
+    {:open, "step_hold"},
+    {:open, "release_note"},
+    {:open, "unblock"}
   ]
 
   @sample_budget 64
   @page_rows 32
 
-  # One sample's bounded work (rev 3 D5): ten streams, six journal kinds and
-  # four kinds of open items, take turns (the first rotates each sample).
-  # Each gets an equal part of the remaining budget of 64 actions, at most a
-  # page of 32, at least 1. An action costs at most one transaction. A
-  # stream's cycle runs from its cursor up to the high-water key read when the
-  # cycle began, so rows added meanwhile wait for the next cycle.
+  # One sample's bounded work (rev 3 D5; re-review att_5f6e6736): twelve
+  # streams, six journal kinds and six kinds of open items, take turns (the
+  # first rotates each sample). Each gets an equal part of the remaining
+  # budget of 64 units, at most 32, at least 1.
+  #
+  # A unit is one row acted on: a journal effect resolved, an open item
+  # acted on, or one row of a continuation's page (a hold noted, a blocked
+  # mark cleared, a quota observation or evaluation examined). Each unit is a
+  # fixed number of indexed lookups, and each action is one transaction. A
+  # continuation is charged the rows its step took, so no action does more
+  # than its share. A stream's cycle runs from its cursor up to the
+  # high-water key read when the cycle began, so rows added meanwhile wait
+  # for the next cycle.
   defp drain_streams(state) do
     streams = Enum.map(Journal.kinds(), &{:journal, &1}) ++ @open_streams
     n = length(streams)
@@ -2090,14 +2215,20 @@ defmodule Tightbeam.MemoryGuard do
 
     with true <- high != nil,
          {:ok, rows} <- stream_page(state, stream, cursor, high, limit) do
-      state = Enum.reduce(rows, state, &stream_act(&2, stream, &1))
+      {state, used, last} =
+        Enum.reduce_while(rows, {state, 0, nil}, fn row, {acc, used, _last} ->
+          {acc, units} = stream_act(acc, stream, row, limit - used)
+          used = used + max(units, 1)
+          step = if used >= limit, do: :halt, else: :cont
+          {step, {acc, used, row}}
+        end)
 
       next =
-        if length(rows) < limit,
+        if last == nil or (last == List.last(rows) and length(rows) < limit),
           do: {nil, nil},
-          else: {stream_key(stream, List.last(rows)), high}
+          else: {stream_key(stream, last), high}
 
-      {%{state | cursors: Map.put(state.cursors, stream, next)}, length(rows)}
+      {%{state | cursors: Map.put(state.cursors, stream, next)}, used}
     else
       _ -> {%{state | cursors: Map.put(state.cursors, stream, {nil, nil})}, 0}
     end
@@ -2126,46 +2257,156 @@ defmodule Tightbeam.MemoryGuard do
   defp stream_key({:journal, _}, row), do: {row.created_at, row.id}
   defp stream_key({:open, _}, row), do: {row.opened_at, row.ref}
 
-  defp stream_act(state, {:journal, _}, effect), do: resolve_effect(state, effect)
+  # Each action returns the state and the units it took.
+  defp stream_act(state, {:journal, _}, effect, _budget), do: {resolve_effect(state, effect), 1}
 
   # R6 / [SPIRIT] (matrix M1): a held lane is never stranded by a lost nudge:
   # a held session no reason holds now is nudged again.
-  defp stream_act(state, {:open, "hold"}, %{subject: session_key}) do
+  defp stream_act(state, {:open, "hold"}, %{subject: session_key}, _budget) do
     if evaluate_reasons(state, session_key) == [] and
          Admission.other_reasons(state.db, session_key) == [],
        do: nudge(state, session_key)
 
-    state
+    {state, 1}
   rescue
-    _ -> state
+    _ -> {state, 1}
   end
 
-  # Deferred hooks run once no memory reason stands on their host (R6a).
-  defp stream_act(state, {:open, kind}, %{host: host} = item)
-       when kind in ["memory_readmission", "quota_readmission"] do
+  # A deferred not-started re-admission runs once no memory reason stands on
+  # its host (R6a).
+  defp stream_act(state, {:open, "memory_readmission"}, %{host: host} = item, _budget) do
     with %{} = host_state <- Map.get(state.hosts, host),
-         [] <- host_level_reasons(host_state) do
-      result =
-        if kind == "memory_readmission",
-          do: Admission.run_memory_item(state.db, item),
-          else: Admission.run_quota_item(state.db, item)
+         [] <- host_level_reasons(host_state),
+         {:error, error} <- Admission.run_memory_item(state.db, item),
+         do: Logger.warning("memory guard: deferred re-admission retried: #{error}")
 
-      with {:error, error} <- result,
-           do: Logger.warning("memory guard: deferred re-admission retried: #{error}")
+    {state, 1}
+  end
+
+  # A quota hook: one bounded step of its pages (B3). Not yet decided, it
+  # waits while a memory reason stands on its host (R6a).
+  defp stream_act(state, {:open, "quota_readmission"}, %{host: host} = item, budget) do
+    with %{} = host_state <- Map.get(state.hosts, host) do
+      case Admission.run_quota_item(state.db, item, host_level_reasons(host_state), budget) do
+        {:ok, units} ->
+          {state, units}
+
+        {:error, error} ->
+          Logger.warning("memory guard: deferred re-admission retried: #{error}")
+          {state, 1}
+      end
+    else
+      _ -> {state, 1}
     end
-
-    state
   end
 
   # FS2: once everything the step needs is in place, a step-refusal hold is
   # released and its lane nudged.
-  defp stream_act(state, {:open, "step_hold"}, %{subject: session_key}) do
+  defp stream_act(state, {:open, "step_hold"}, %{subject: session_key}, _budget) do
     with %{step_ready: true} <- Map.get(state.hosts, state.local_host),
          :ok <- Records.step_prerequisites(state.base_dir, state.root),
          :ok <- Admission.step_ready(state.db, session_key, state.local_host),
          do: nudge(state, session_key)
 
-    state
+    {state, 1}
+  end
+
+  # R6a (re-review att_5f6e6736 B2): a host-level release's remaining-hold
+  # records, one for every hold the release left in place, a page per step:
+  # each page's records and its cursor commit together, so a restart resumes
+  # after the last page written and never records a hold twice. Holds opened
+  # after the release are not its remaining holds.
+  defp stream_act(state, {:open, "release_note"}, %{ref: ref, detail: detail}, budget) do
+    note = JSON.decode!(detail)
+    {after_key, after_ref} = List.to_tuple(note["cursor"] || ["", ""])
+
+    DB.transaction(state.db, fn txn ->
+      rows =
+        Txn.q(
+          txn,
+          """
+          SELECT ref, orderKey, openedAt FROM memory_guard_open
+          WHERE kind='hold' AND host=?1 AND (orderKey, ref) > (?2, ?3)
+          ORDER BY orderKey, ref LIMIT ?4
+          """,
+          [note["host"], after_key, after_ref, budget]
+        )
+
+      for [session_key, _order, opened_at] <- rows, opened_at <= note["at"] do
+        remaining = note["remaining"] ++ Admission.other_reasons_in_txn(txn, session_key)
+
+        if remaining != [],
+          do:
+            EventLog.lifecycle_in_txn(
+              txn,
+              "admission_hold_remaining",
+              session_key,
+              JSON.encode!(%{
+                host: note["host"],
+                released: note["released"],
+                remaining: remaining
+              })
+            )
+      end
+
+      case rows do
+        rows when length(rows) < budget ->
+          State.close_in_txn(txn, "release_note", ref)
+
+        rows ->
+          [last_ref, last_key, _] = List.last(rows)
+          note = Map.put(note, "cursor", [last_key, last_ref])
+          State.update_detail_in_txn(txn, "release_note", ref, JSON.encode!(note))
+      end
+
+      max(length(rows), 1)
+    end)
+    |> case do
+      {:ok, units} ->
+        {state, units}
+
+      {:error, error} ->
+        Logger.warning(
+          "memory guard: remaining holds not yet recorded: #{Exception.message(error)}"
+        )
+
+        {state, 1}
+    end
+  end
+
+  # B1: a quota release's blocked marks, cleared a page per step on
+  # `memory_guard_holds_blocked`. A cleared hold is only a candidate again:
+  # its own reasons are confirmed when it is next walked, so none is admitted
+  # before its standing reason is clear. While marks remain, `waiting_ahead`
+  # holds a later session behind a blocked one ahead of it; the last page
+  # nudges the eligible waiters.
+  defp stream_act(state, {:open, "unblock"}, %{ref: key, host: host}, budget) do
+    DB.transaction(state.db, fn txn ->
+      Txn.q(
+        txn,
+        """
+        UPDATE memory_guard_open SET blocked=NULL WHERE kind='hold' AND ref IN (
+          SELECT ref FROM memory_guard_open
+          WHERE kind='hold' AND adapterKey=?1 AND blocked IS NOT NULL LIMIT ?2)
+        """,
+        [key, budget]
+      )
+
+      cleared = Txn.changes(txn)
+      if cleared < budget, do: State.close_in_txn(txn, "unblock", key)
+      cleared
+    end)
+    |> case do
+      {:ok, cleared} when cleared < budget ->
+        {release_check(state, host), max(cleared, 1)}
+
+      {:ok, cleared} ->
+        {state, cleared}
+
+      {:error, error} ->
+        Logger.warning("memory guard: blocked marks not yet cleared: #{Exception.message(error)}")
+        {state, 1}
+    end
   end
 
   defp resolve_effect(state, %{kind: "tree_kill"} = e) do
@@ -2398,8 +2639,7 @@ defmodule Tightbeam.MemoryGuard do
 
       live =
         try do
-          for row <- HarnessProcess.list(state.db),
-              row.state in ["launching", "running", "park_requested"],
+          for row <- HarnessProcess.live(state.db),
               do: Cgroup.adapter_unit(layout, row.launch_id)
         rescue
           _ -> :unknown
@@ -2596,11 +2836,11 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   defp resume_if_held(state, session_key) do
-    case Map.pop(state.held, session_key) do
-      {nil, _} ->
+    case Map.get(state.held, session_key) do
+      nil ->
         state
 
-      {held, rest} ->
+      held ->
         # The hold's row and the resumption record are one step; if it cannot
         # be written the admission does not happen (safe_admission holds).
         {:ok, _} =
@@ -2615,9 +2855,37 @@ defmodule Tightbeam.MemoryGuard do
             )
           end)
 
-        %{state | held: rest}
+        drop_held(state, session_key)
     end
   end
+
+  defp put_held(state, session_key, held) do
+    state = drop_held(state, session_key)
+
+    counts =
+      Enum.reduce(Map.keys(held.details), state.held_counts, fn detail, acc ->
+        Map.update(acc, {held.host, detail}, 1, &(&1 + 1))
+      end)
+
+    %{state | held: Map.put(state.held, session_key, held), held_counts: counts}
+  end
+
+  defp drop_held(state, session_key) do
+    case Map.pop(state.held, session_key) do
+      {nil, _} ->
+        state
+
+      {old, rest} ->
+        counts =
+          Enum.reduce(Map.keys(old.details), state.held_counts, fn detail, acc ->
+            Map.update(acc, {old.host, detail}, 0, &max(&1 - 1, 0))
+          end)
+
+        %{state | held: rest, held_counts: counts}
+    end
+  end
+
+  defp held_count(state, host, detail), do: Map.get(state.held_counts, {host, detail}, 0)
 
   # After anything that can free capacity: nudge held sessions oldest first.
   # Each lane re-asks `admit/1`, which keeps the oldest-first order (a younger
@@ -2778,8 +3046,9 @@ defmodule Tightbeam.MemoryGuard do
     if state.inventory_error do
       {:error, "Tightbeam's own records cannot be read: #{state.inventory_error}"}
     else
+      # The launches the live records name, by id (never the launch history).
       ended =
-        for row <- HarnessProcess.list(state.db),
+        for row <- HarnessProcess.rows(state.db, record_launch_ids(state.launches)),
             row.adapter_key == name,
             row.state not in ["launching", "running", "park_requested"],
             do: row.launch_id
@@ -3013,7 +3282,7 @@ defmodule Tightbeam.MemoryGuard do
       HarnessProcess.adapter_key_name(entry.key) == name
     end) or
       Enum.any?(
-        HarnessProcess.list(state.db),
+        HarnessProcess.live(state.db),
         &(&1.adapter_key == name and &1.state == "running")
       )
   end
@@ -3066,16 +3335,16 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   defp custody_unresolved?(state, key) do
-    case launches_of_key(state, key, :any_previous) do
-      {:ok, ended} ->
-        case Records.read_all(state.base_dir) do
-          {:ok, records} -> Enum.any?(records, fn {_id, r} -> r["adapterLaunchId"] in ended end)
-          {:error, _} -> true
-        end
-
-      {:error, _} ->
-        true
+    with {:ok, records} <- Records.read_all(state.base_dir),
+         {:ok, ended} <- launches_of_key(state, key, :any_previous, records) do
+      Enum.any?(records, fn {_id, r} -> r["adapterLaunchId"] in ended end)
+    else
+      {:error, _} -> true
     end
+  end
+
+  defp record_launch_ids(records) do
+    for {_id, r} <- records, is_binary(r["adapterLaunchId"]), uniq: true, do: r["adapterLaunchId"]
   end
 
   defp custody_refused(state, key) do
@@ -3133,9 +3402,10 @@ defmodule Tightbeam.MemoryGuard do
 
   defp guard_clock(host), do: "#{host}:guard"
 
-  # At start: the stuck clocks of this host, as they were.
+  # At start: the stuck clocks of this host, as they were. There is one per
+  # adapter key plus the guard's own, so one page of 64 holds them all.
   defp load_clocks(state) do
-    case State.list(state.db, "stuck_clock", state.local_host) do
+    case State.page(state.db, "stuck_clock", state.local_host, nil, nil, 64) do
       {:ok, clocks} ->
         Enum.reduce(clocks, state, fn %{ref: ref, opened_at: since}, acc ->
           case String.split(ref, ":custody:", parts: 2) do
@@ -3348,6 +3618,7 @@ defmodule Tightbeam.MemoryGuard do
         guard = self()
         ref = make_ref()
         closer = state.closer
+        close_hook = state.close_hook
         idle_check = state.idle_check
         confirm = fn -> close_shown_complete(state, sid) end
         db = state.db
@@ -3359,6 +3630,8 @@ defmodule Tightbeam.MemoryGuard do
               :idle ->
                 case closer.(adapter, sid, reason) do
                   :ok ->
+                    close_hook.(:called, sid)
+
                     # Rev 4 D1: only this record proves the close was issued.
                     with {:error, error} <- Journal.dispatch(db, effect, %{sentAt: clock.()}),
                          do:
@@ -3366,6 +3639,7 @@ defmodule Tightbeam.MemoryGuard do
                              "memory guard: close of #{sid} issued, not recorded: #{error}"
                            )
 
+                    close_hook.(:dispatched, sid)
                     confirm.()
 
                   other ->
@@ -3658,8 +3932,8 @@ defmodule Tightbeam.MemoryGuard do
         with {kind, detail} <- record,
              do: EventLog.lifecycle_in_txn(txn, kind, subject, JSON.encode!(detail))
 
-        if is_binary(marker) and is_binary(session_key) and
-             not marker_posted_in_txn?(txn, session_key, key) do
+        # Completion happens once per close, so its marker is posted once.
+        if is_binary(marker) and is_binary(session_key) do
           EventLog.notice_in_txn(
             txn,
             "memory_guard_idle_closed_marker",
@@ -3688,18 +3962,6 @@ defmodule Tightbeam.MemoryGuard do
 
         state
     end
-  end
-
-  defp marker_posted_in_txn?(txn, session_key, key) do
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM lifecycle_events
-      WHERE kind='memory_guard_idle_closed_marker' AND subject=?1
-        AND json_extract(detail,'$.markerKey')=?2 LIMIT 1
-      """,
-      [session_key, key]
-    ) != []
   end
 
   defp default_idle_check(adapter, sid), do: Tightbeam.Acp.Adapter.idle_session?(adapter, sid)
@@ -3931,7 +4193,7 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   defp local_adapters(state, host) do
-    rows = HarnessProcess.list(state.db)
+    rows = HarnessProcess.live(state.db)
 
     adapters =
       for row <- rows,
@@ -4218,20 +4480,34 @@ defmodule Tightbeam.MemoryGuard do
   # stood once nothing stands, and nudge the held lanes.
   defp host_released(state, host, detail, facts) do
     remaining_host = host_level_reasons(state.hosts[host])
+    now = state.clock.()
 
-    case record(
-           state,
-           "memory_guard_release",
-           host,
-           JSON.encode!(
-             Map.merge(facts, %{host: host, detail: detail, remaining: remaining_host})
-           )
-         ) do
-      :ok -> released(state, host, detail, remaining_host)
+    # R6a (re-review att_5f6e6736 B2): the release record and the
+    # obligation to record what remains for each held session commit
+    # together; those records are written a page per step (`release_note`).
+    note =
+      JSON.encode!(%{host: host, released: detail, remaining: remaining_host, at: now})
+
+    result =
+      DB.transaction(state.db, fn txn ->
+        EventLog.lifecycle_in_txn(
+          txn,
+          "memory_guard_release",
+          host,
+          JSON.encode!(Map.merge(facts, %{host: host, detail: detail, remaining: remaining_host}))
+        )
+
+        State.open_in_txn(txn, "release_note", "#{host}:#{detail}:#{now}", host, host, note)
+      end)
+
+    case result do
+      {:ok, _} -> release_check(state, host)
       # FS7: a release and its record are one step; unrecorded, the hold still
       # stands and the next sample tries again.
       {:error, _} -> restore_hold(state, host, detail)
     end
+  catch
+    :exit, _ -> restore_hold(state, host, detail)
   end
 
   defp restore_hold(state, host, "memory_floor"),
@@ -4241,29 +4517,6 @@ defmodule Tightbeam.MemoryGuard do
     do: put_in(state.hosts[host].budget_held, true)
 
   defp restore_hold(state, _host, _detail), do: state
-
-  defp released(state, host, detail, remaining_host) do
-    # A page of the host's held sessions per event (rev 3 D5); the rest learn
-    # what remains when they are evaluated again.
-    held_keys =
-      for({key, held} <- state.held, held.host == host, do: key) |> Enum.take(@hold_page)
-
-    for session_key <- held_keys do
-      other = Admission.other_reasons(state.db, session_key)
-      remaining = remaining_host ++ other
-
-      if remaining != [] do
-        EventLog.lifecycle(
-          state.db,
-          "admission_hold_remaining",
-          session_key,
-          JSON.encode!(%{host: host, released: detail, remaining: remaining})
-        )
-      end
-    end
-
-    release_check(state, host)
-  end
 
   # R12a / C8: on an enforced host, a session tree the step could not place in
   # its unit runs watched, and that is recorded once per launch.
@@ -4683,7 +4936,7 @@ defmodule Tightbeam.MemoryGuard do
       if layout && record["unit"], do: remove_unit(state, layout.fs, record["unit"]), else: state
 
     Records.remove(state.base_dir, record["launchId"])
-    %{state | launches: Map.delete(state.launches, record["launchId"])}
+    forget_launch(state, record)
   end
 
   @doc false
@@ -4721,6 +4974,18 @@ defmodule Tightbeam.MemoryGuard do
   end
 
   defp nudge_all({:error, _} = error, _state), do: error
+
+  # An ended tree's launch, with what the guard kept in memory for it (its
+  # "announced unplaced" mark and its session process's last use), so these
+  # never grow with every launch the gateway has seen.
+  defp forget_launch(state, record) do
+    %{
+      state
+      | launches: Map.delete(state.launches, record["launchId"]),
+        announced: MapSet.delete(state.announced, {:unplaced_session, record["launchId"]}),
+        last_used: Map.delete(state.last_used, {state.local_host, record["sessionId"]})
+    }
+  end
 
   defp forget_residency(state, host, sid) do
     for {adapter, entry} <- state.adapters, entry.host == host, MapSet.member?(entry.sids, sid) do
@@ -4869,8 +5134,8 @@ defmodule Tightbeam.MemoryGuard do
     # Not knowing which launches ended, or which session processes they left,
     # is not "nothing to end".
     with {:ok, state} <- refresh_launches(state) |> custody(),
-         {:ok, key_launches} <- launches_of_key(state, key, launch_id) do
-      end_launches(state, host, host_state, key_launches, launch_id)
+         {:ok, key_launches} <- launches_of_key(state, key, launch_id, state.launches) do
+      end_launches(state, host, host_state, key, key_launches, launch_id)
     else
       {:error, _} = error -> {error, state}
     end
@@ -4879,11 +5144,10 @@ defmodule Tightbeam.MemoryGuard do
   defp custody({:ok, _} = ok), do: ok
   defp custody({:error, error}), do: {:error, {:custody_unreadable, error}}
 
-  defp end_launches(state, host, host_state, key_launches, launch_id) do
-    key = key_of_launches(state, key_launches)
+  defp end_launches(state, host, host_state, key, key_launches, launch_id) do
     # FS9: the named trees of an accepted custody override no longer fence the
     # key; they stay recorded, shown as orphans with the risk.
-    overridden = if key, do: overridden_trees(state, key), else: %{}
+    overridden = overridden_trees(state, key)
 
     # The override's effect is the replacement adapter's launch; it is
     # recorded once that adapter runs (`custody_overrides_done/2`), never here.
@@ -4922,7 +5186,7 @@ defmodule Tightbeam.MemoryGuard do
               else: acc
 
           Records.remove(acc.base_dir, record["launchId"])
-          %{acc | launches: Map.delete(acc.launches, record["launchId"])}
+          forget_launch(acc, record)
 
         {_record, {:error, _}}, acc ->
           acc
@@ -5179,21 +5443,15 @@ defmodule Tightbeam.MemoryGuard do
     end
   end
 
-  # The ended launch, or (`:any_previous`, before a new launch) every launch of
-  # the key that has already ended; a running adapter's sessions are its own.
-  defp key_of_launches(state, launch_ids) do
-    Enum.find_value(HarnessProcess.list(state.db), fn row ->
-      if row.launch_id in launch_ids, do: parse_key(row.adapter_key)
-    end)
-  rescue
-    _ -> nil
-  end
-
-  defp launches_of_key(state, key, which) do
+  # Of the adapter launches `records` (launch records) name, those of `key`:
+  # the ended launch, or (`:any_previous`, before a new launch) every one that
+  # has already ended; a running adapter's sessions are its own. Read by id,
+  # one row per record at most, never the launch history.
+  defp launches_of_key(state, key, which, records) do
     name = HarnessProcess.adapter_key_name(key)
 
     state.db
-    |> HarnessProcess.list()
+    |> HarnessProcess.rows(record_launch_ids(records))
     |> Enum.filter(&(&1.adapter_key == name))
     |> Enum.filter(fn row ->
       if which == :any_previous,
@@ -5251,7 +5509,7 @@ defmodule Tightbeam.MemoryGuard do
   defp remove_adapter_unit(state, _host_state, _launch_id), do: state
 
   defp adapter_row(state, launch_id) do
-    Enum.find(HarnessProcess.list(state.db), &(&1.launch_id == launch_id))
+    HarnessProcess.get(state.db, launch_id)
   rescue
     _ -> nil
   end
@@ -5293,15 +5551,7 @@ defmodule Tightbeam.MemoryGuard do
         nil
 
       host_state ->
-        held =
-          Enum.reduce(@details, %{}, fn detail, acc ->
-            count =
-              Enum.count(state.held, fn {_key, held} ->
-                held.host == host and Map.has_key?(held.details, detail)
-              end)
-
-            Map.put(acc, detail, count)
-          end)
+        held = Map.new(@details, &{&1, held_count(state, host, &1)})
 
         %{
           host: host,
@@ -5426,10 +5676,7 @@ defmodule Tightbeam.MemoryGuard do
            available: host_state.available,
            total: host_state.total,
            holds: host_level_reasons(host_state),
-           cap_holds:
-             Enum.count(state.held, fn {_k, h} ->
-               h.host == host and Map.has_key?(h.details, "resident_cap")
-             end)
+           cap_holds: held_count(state, host, "resident_cap")
          }}
       )
     end

@@ -3533,45 +3533,90 @@ defmodule Tightbeam.Wakes do
   def readmit_released_quota_intents_in_txn(%Txn{} = txn, incident_id)
       when is_binary(incident_id) do
     txn
-    |> readmit_released_quota_intents_in_txn(incident_id, fn _session_key -> true end)
-    |> elem(0)
-  end
-
-  @doc """
-  The sessions an open quota incident's pending pre-activity redeliveries
-  belong to: the sessions its re-admission hook covers (memory limits R6a).
-  """
-  @spec released_quota_intent_sessions_in_txn(Txn.t(), String.t()) :: [String.t()]
-  def released_quota_intent_sessions_in_txn(%Txn{} = txn, incident_id)
-      when is_binary(incident_id) do
-    txn
     |> health_redelivery_sources_in_txn(incident_id, "rate-limit-dead")
-    |> Enum.map(&Enum.at(&1, 1))
-    |> Enum.uniq()
+    |> Enum.reduce(0, fn source, count ->
+      count + redeliver_health_source_in_txn(txn, source, :release)
+    end)
   end
 
   @doc """
-  As `readmit_released_quota_intents_in_txn/2`, for the sessions `admit?`
-  accepts only. Every other row stays pending, for a later call (memory limits
-  v1.6 R6a: no re-admission while another reason holds its session). Returns
-  the re-admitted count and the sessions left pending.
+  One page of an open quota incident's re-admission hook (memory limits R6a,
+  re-review att_5f6e6736 B3): at most `limit` of the incident's observations
+  after `cursor` (`{observedAt, id}`, nil for the start), on index
+  `harness_health_observation_incident`, each with an O(1) lookup of its
+  pending pre-activity redelivery source (the rows
+  `readmit_released_quota_intents_in_txn/2` re-admits). Returns
+  `{sources, examined, next}`: the page's sources in source-seq order, the
+  observations examined, and the next page's cursor (nil: this was the last).
   """
-  @spec readmit_released_quota_intents_in_txn(Txn.t(), String.t(), (String.t() -> boolean())) ::
-          {non_neg_integer(), [String.t()]}
-  def readmit_released_quota_intents_in_txn(%Txn{} = txn, incident_id, admit?)
-      when is_binary(incident_id) do
-    {ready, held} =
-      txn
-      |> health_redelivery_sources_in_txn(incident_id, "rate-limit-dead")
-      |> Enum.split_with(fn [_key, session_key | _] -> admit?.(session_key) end)
+  @spec quota_intent_page_in_txn(Txn.t(), String.t(), tuple() | nil, pos_integer()) ::
+          {[list()], non_neg_integer(), tuple() | nil}
+  def quota_intent_page_in_txn(%Txn{} = txn, incident_id, cursor, limit)
+      when is_binary(incident_id) and is_integer(limit) and limit > 0 do
+    {after_at, after_id} = cursor || {-1, ""}
 
-    count =
-      Enum.reduce(ready, 0, fn source, count ->
-        count + redeliver_health_source_in_txn(txn, source, :release)
-      end)
+    observations =
+      Txn.q(
+        txn,
+        """
+        SELECT id, observedAt, correlationId, failureClass, evidenceKind
+        FROM harness_health_observations
+        WHERE incidentId=?1 AND (observedAt, id) > (?2, ?3)
+        ORDER BY observedAt, id LIMIT ?4
+        """,
+        [incident_id, after_at, after_id, limit]
+      )
 
-    {count, held |> Enum.map(&Enum.at(&1, 1)) |> Enum.uniq()}
+    sources =
+      for [_id, _at, correlation, "rate-limit-dead", "terminal-failure"] <- observations,
+          [_, seq] <- [Regex.run(~r/\Aharness-turn:(\d+):rate-limit-dead\z/, correlation)],
+          source <- quota_source_in_txn(txn, String.to_integer(seq)),
+          do: source
+
+    next =
+      if length(observations) == limit do
+        [id, at | _] = List.last(observations)
+        {at, id}
+      end
+
+    {sources |> Enum.uniq_by(&hd/1) |> Enum.sort_by(&Enum.at(&1, 3)), length(observations), next}
   end
+
+  # The pending pre-activity redelivery of the failed turn `seq`, as
+  # `health_redelivery_sources_in_txn/3` selects it, by primary and unique
+  # keys only.
+  defp quota_source_in_txn(txn, seq) do
+    Txn.q(
+      txn,
+      """
+      SELECT a.idempotencyKey,a.sessionKey,a.sourceMessageId,a.sourceTurnSeq,
+             a.sourceWakeId,a.origin,a.prompt,a.roleRef,a.roleFallback,a.assignmentId,
+             a.jobRef,a.requestRef
+      FROM turns observed
+      JOIN health_redelivery_attempts a
+        ON a.sessionKey=observed.sessionKey AND a.sourceMessageId=observed.messageId
+      WHERE observed.seq=?1
+        AND observed.status='failed'
+        AND observed.messageId IS NOT NULL
+        AND a.failureClass='rate-limit-dead'
+        AND a.redeliveryTurnSeq IS NULL
+        AND a.parentSessionKey IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM wake_retry_attempts retry
+          WHERE retry.sourceTurnSeq=observed.seq AND retry.retryWakeId IS NOT NULL
+        )
+      """,
+      [seq]
+    )
+  end
+
+  @doc """
+  Re-admit one source of `quota_intent_page_in_txn/4` (once: a source already
+  re-admitted is no longer pending). Returns the count re-admitted (0 or 1).
+  """
+  @spec readmit_quota_source_in_txn(Txn.t(), list()) :: non_neg_integer()
+  def readmit_quota_source_in_txn(%Txn{} = txn, source),
+    do: redeliver_health_source_in_txn(txn, source, :release)
 
   defp health_redelivery_sources_in_txn(txn, incident_id, failure_class) do
     Txn.q(

@@ -2506,8 +2506,7 @@ defmodule Tightbeam.Gateway do
     name = HarnessProcess.adapter_key_name(key)
 
     db
-    |> HarnessProcess.list()
-    |> Enum.find(&(&1.adapter_key == name and (is_nil(started) or &1.created_at <= started)))
+    |> HarnessProcess.latest_of_key(name, started)
     |> case do
       %{launch_id: launch_id} -> launch_id
       nil -> nil

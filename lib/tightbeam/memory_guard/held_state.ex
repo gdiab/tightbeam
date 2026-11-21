@@ -65,9 +65,13 @@ defmodule Tightbeam.MemoryGuard.HeldState do
   def sender_result(_held), do: nil
 
   defp queued?(db, session_key) do
-    case DB.query(db, "SELECT 1 FROM turns WHERE sessionKey=?1 AND status='queued' LIMIT 1", [
-           session_key
-         ]) do
+    case DB.query(
+           db,
+           "SELECT 1 FROM turns INDEXED BY turns_pending WHERE status IN ('queued','running') AND status='queued' AND sessionKey=?1 LIMIT 1",
+           [
+             session_key
+           ]
+         ) do
       {:ok, [[1]]} -> true
       {:ok, []} -> false
       {:error, error} -> raise "the queued turns cannot be read: #{inspect(error)}"

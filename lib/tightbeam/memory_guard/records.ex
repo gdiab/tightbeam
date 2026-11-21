@@ -188,6 +188,50 @@ defmodule Tightbeam.MemoryGuard.Records do
     end
   end
 
+  @doc """
+  Remove the refusal record of `launch_id` once its turn's settlement has
+  recorded it (`memory_guard_step_refused`): the directory then holds only
+  refusals not yet recorded, so `refusal_for/3` never reads the history
+  (re-review att_5f6e6736 sweep). A record already gone is fine.
+  """
+  @spec consume_refusal(String.t(), String.t()) :: :ok | {:error, term()}
+  def consume_refusal(base_dir, launch_id) when is_binary(launch_id) do
+    if Path.basename(launch_id) == launch_id do
+      case File.rm(Path.join([dir(base_dir), "refusals", launch_id <> ".json"])) do
+        {:error, :enoent} -> :ok
+        result -> result
+      end
+    else
+      {:error, :invalid_launch_id}
+    end
+  end
+
+  @doc """
+  At the guard's start: remove refusal records written more than an hour ago,
+  left by a settlement that recorded its refusal but stopped before removing
+  it, or by a launch whose turn never settled (its turn is long past, so
+  `refusal_for/3` would not match it). Returns the number removed.
+  """
+  @spec prune_refusals(String.t(), integer()) :: non_neg_integer()
+  def prune_refusals(base_dir, now) do
+    refusals = Path.join(dir(base_dir), "refusals")
+    cutoff = div(now, 1000) - 3600
+
+    case File.ls(refusals) do
+      {:ok, entries} ->
+        Enum.count(entries, fn entry ->
+          path = Path.join(refusals, entry)
+
+          String.ends_with?(entry, ".json") and
+            match?({:ok, %{mtime: mtime}} when mtime < cutoff, File.stat(path, time: :posix)) and
+            File.rm(path) == :ok
+        end)
+
+      {:error, _} ->
+        0
+    end
+  end
+
   defp read_refusal(path) do
     with {:ok, text} <- File.read(path),
          {:ok, %{} = record} <- JSON.decode(text) do

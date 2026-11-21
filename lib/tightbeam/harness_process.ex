@@ -728,6 +728,87 @@ defmodule Tightbeam.HarnessProcess do
     Enum.map(rows, &decode_row/1)
   end
 
+  @row_columns """
+  launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+  launchSequence, osPid, processGroupId, bootIdentity, identityToken,
+  state, createdAt, parkRequestedAt,
+  killAttemptedAt, killSentAt, resolvedAt,
+  lastError, preparationBootIdentity
+  """
+
+  @doc """
+  The launches with these ids, by primary key: at most one row per id given,
+  never the launch history (memory limits, re-review att_5f6e6736).
+  """
+  @spec rows(DB.server(), [String.t()]) :: [row()]
+  # Queried even with no ids: a table that cannot be read raises, never
+  # reads as no launches (R2a).
+  def rows(db, ids) when is_list(ids) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT #{@row_columns} FROM harness_processes WHERE launchId IN (SELECT value FROM json_each(?1))",
+        [JSON.encode!(Enum.uniq(ids))]
+      )
+
+    Enum.map(rows, &decode_row/1)
+  end
+
+  @doc "One launch by id, or nil."
+  @spec get(DB.server(), String.t()) :: row() | nil
+  def get(db, launch_id) do
+    case rows(db, [launch_id]) do
+      [row] -> row
+      [] -> nil
+    end
+  end
+
+  @doc """
+  The live launches (`launching`, `running`, `park_requested`), newest first,
+  on the partial index `harness_processes_live` (`MemoryGuard.State`): at
+  most two per adapter key
+  (the running adapter and its replacement), never the history.
+  """
+  @spec live(DB.server()) :: [row()]
+  def live(db \\ DB) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT #{@row_columns} FROM harness_processes
+        WHERE state IN ('launching','running','park_requested')
+        ORDER BY launchSequence DESC
+        """
+      )
+
+    Enum.map(rows, &decode_row/1)
+  end
+
+  @doc """
+  The newest launch of the adapter key `name` created at or before `before`
+  (nil: any), newest first on `harness_processes_key_sequence`
+  (`MemoryGuard.State`); it reads only
+  the key's launches newer than `before`.
+  """
+  @spec latest_of_key(DB.server(), String.t(), integer() | nil) :: row() | nil
+  def latest_of_key(db, name, before \\ nil) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT #{@row_columns} FROM harness_processes
+        WHERE adapterKey=?1 AND (?2 IS NULL OR createdAt <= ?2)
+        ORDER BY launchSequence DESC LIMIT 1
+        """,
+        [name, before]
+      )
+
+    case rows do
+      [row] -> decode_row(row)
+      [] -> nil
+    end
+  end
+
   @doc "Read one bounded REST page using only the public HarnessProcess columns."
   def rest_collection_page(db, filters, boundary, limit)
       when is_map(filters) and is_integer(limit) and limit > 0 do

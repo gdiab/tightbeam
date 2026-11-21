@@ -1470,7 +1470,7 @@ defmodule Tightbeam.AdapterCoordinator do
   defp current_launch_id(db, key) do
     name = Tightbeam.HarnessProcess.adapter_key_name(key)
 
-    case Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.adapter_key == name)) do
+    case Tightbeam.HarnessProcess.latest_of_key(db, name) do
       %{launch_id: launch_id} -> launch_id
       nil -> nil
     end

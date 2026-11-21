@@ -143,18 +143,36 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
     end
   end
 
+  @nudge_page 64
+
   @doc """
-  The sessions with an open `guard_unavailable` hold on `host` (or on every
-  host, `:all`, for the guard's start): `{:ok, [{session_key, host, since}]}`,
-  or `{:error, message}` when they cannot be read. The open holds are current
-  state (`Tightbeam.MemoryGuard.State`) searched by host, so this costs that
-  host's holds open now, never the history or other hosts (review B7).
+  When launches on `host` have been held `guard_unavailable` since: the
+  oldest open hold's start (one indexed row, re-review att_5f6e6736 B4), or
+  nil when none is open. `{:error, message}` when it cannot be read.
   """
-  @spec held_sessions(DB.server(), String.t() | :all) ::
-          {:ok, [{String.t(), String.t(), integer()}]} | {:error, String.t()}
-  def held_sessions(db, host) do
-    with {:ok, holds} <- State.list(db, @open_kind, host),
-         do: {:ok, Enum.map(holds, &{&1.subject, &1.host, &1.opened_at})}
+  @spec held_since(DB.server(), String.t()) :: {:ok, integer() | nil} | {:error, String.t()}
+  def held_since(db, host) do
+    with {:ok, oldest} <- State.oldest(db, @open_kind, host),
+         do: {:ok, oldest && oldest.opened_at}
+  end
+
+  @doc """
+  Nudge one page (64) of the sessions held `guard_unavailable` on `host`,
+  oldest first after `cursor` (nil: from the start). Returns the cursor of
+  the next page, or nil when this was the last. A nudge is idempotent: a
+  lane nudged needlessly asks again and is held again.
+  """
+  @spec nudge_held(DB.server(), String.t(), tuple() | nil) ::
+          {:ok, tuple() | nil} | {:error, String.t()}
+  def nudge_held(db, host, cursor) do
+    with {:ok, page} <- State.page(db, @open_kind, host, cursor, nil, @nudge_page) do
+      for %{subject: session_key} <- page, do: nudge(session_key)
+
+      {:ok,
+       if(length(page) == @nudge_page,
+         do: {List.last(page).opened_at, List.last(page).ref}
+       )}
+    end
   end
 
   @doc """
@@ -327,10 +345,10 @@ defmodule Tightbeam.MemoryGuard.Unguarded do
              end)
            ),
          :ok <- published(db, base_dir, publish, bytes, now) do
-      # The change is in force; a nudge that cannot be planned now is made by
-      # the guard's next pass over the holds.
-      with {:ok, held} <- held_sessions(db, host),
-           do: for({session_key, _host, _since} <- held, do: nudge(session_key))
+      # The change is in force: the first page of held lanes is nudged now;
+      # the Watcher nudges the rest, a page per pass, while the guard is down
+      # (and the guard's own pass over the holds once it is back).
+      _ = nudge_held(db, host, nil)
 
       :in_force
     end

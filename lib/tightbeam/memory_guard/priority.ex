@@ -40,10 +40,13 @@ defmodule Tightbeam.MemoryGuard.Priority do
         Txn.q(
           txn,
           """
-          SELECT 1 FROM turns WHERE sessionKey=?1 AND status='queued' AND origin LIKE 'user:%'
+          SELECT 1 FROM turns INDEXED BY memory_guard_turns_origin
+          WHERE status IN ('queued','running') AND status='queued' AND sessionKey=?1
+            AND origin >= 'user:' AND origin < 'user;'
           UNION ALL
-          SELECT 1 FROM wakes WHERE sessionKey=?1 AND state='pending' AND consumer='prompt'
-            AND origin LIKE 'user:%'
+          SELECT 1 FROM wakes INDEXED BY memory_guard_wakes_origin
+          WHERE state='pending' AND consumer='prompt' AND sessionKey=?1
+            AND origin >= 'user:' AND origin < 'user;'
           LIMIT 1
           """,
           [session_key]
@@ -53,10 +56,18 @@ defmodule Tightbeam.MemoryGuard.Priority do
     pending?
   end
 
+  # The batch carriers among a session's oldest 16 queued turns (re-review
+  # att_5f6e6736 sweep: at most 16 turn rows read, on `turns_pending`).
   defp carrier_with_user_post?(txn, session_key) do
     txn
     |> Txn.q(
-      "SELECT wakeId FROM turns WHERE sessionKey=?1 AND status='queued' AND isBatchCarrier=1 AND wakeId IS NOT NULL",
+      """
+      SELECT wakeId FROM (
+        SELECT wakeId, isBatchCarrier FROM turns INDEXED BY turns_pending
+        WHERE status IN ('queued','running') AND status='queued' AND sessionKey=?1
+        ORDER BY seq LIMIT 16)
+      WHERE isBatchCarrier=1 AND wakeId IS NOT NULL
+      """,
       [session_key]
     )
     |> Enum.any?(fn [wake_id] -> NoticeBatcher.carrier_human_posts_in_txn(txn, wake_id) != [] end)
