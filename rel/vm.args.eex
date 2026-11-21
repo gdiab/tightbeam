@@ -1,0 +1,4 @@
+## Option 2 (PO att_7b3c25f9; light route, b0 w_3724f435): Erlang distribution stays on
+## for George's agents but listens on loopback only. 127.0.1.1 is where this
+## host's short name resolves, so sname@<host> rpc/remote keep working.
+-kernel inet_dist_use_interface {127,0,1,1}
