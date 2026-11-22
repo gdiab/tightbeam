@@ -150,6 +150,79 @@ defmodule Tightbeam.SupervisionTest do
              Wakes.get(ctx.db, condition_wait.wake_id)
   end
 
+  # u41's 5d6af764 carry on 0.1.16, met by #683 (ruling att_c5cf3744): on the
+  # integrated target nothing creates an idle wake for a session or a standing
+  # card. Option 2's ladder armed a deadline when an assignment opened, re-armed
+  # it on holder activity and dated continuations, climbed holder -> parent ->
+  # Main (George), and re-armed every open card at boot. Each of those paths
+  # runs here, and neither the holder's lineage nor George's Main gets a wake.
+  test "no idle wake for a session or a standing card on any path the ladder used", ctx do
+    idler = session(ctx.db, "idler", ctx.main.session_key)
+    card = assign(ctx, "standing card")
+    aged = System.system_time(:millisecond) - 24 * 60 * 60 * 1_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [card.id, aged])
+
+    assert %{attest: %{kind: "progress"}} =
+             Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "agent:holder",
+               principal: {:session, ctx.holder.session_key},
+               session_key: nil,
+               params: %{assignment_id: card.id, kind: "progress", note: "still working"}
+             })
+
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
+
+    continuation =
+      handlers["wake"].(%{
+        verb: "wake",
+        origin: "agent:holder",
+        principal: {:session, ctx.holder.session_key},
+        session_key: ctx.holder.session_key,
+        params: %{prompt: "pick the card back up", after_ms: 60_000, assignment_id: card.id}
+      })
+
+    assert is_binary(continuation.wake_id)
+
+    assert %{} =
+             handlers["wake"].(%{
+               verb: "wake",
+               origin: "agent:holder",
+               principal: {:session, ctx.holder.session_key},
+               session_key: ctx.holder.session_key,
+               params: %{cancel_wake_id: continuation.wake_id}
+             })
+
+    # The boot steps that touch open cards (option 2 re-armed each one here).
+    assert :ok = Supervision.close_retired_holder_assignments(ctx.db)
+    assert :ok = Supervision.drain_legacy_inactivity_wakes(ctx.db)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*) FROM wakes
+               WHERE consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')
+                  OR obligationRef LIKE 'assignment-inactivity-%'
+               """
+             )
+
+    for target <- [ctx.parent, ctx.main, idler] do
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE sessionKey=?1", [
+                 target.session_key
+               ]),
+             target.session_key
+    end
+
+    assert %{state: "canceled"} = Wakes.get(ctx.db, continuation.wake_id)
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [card.id])
+  end
+
   defp assign(ctx, subject, session_key \\ nil) do
     session_key = session_key || ctx.holder.session_key
 
