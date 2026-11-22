@@ -39,7 +39,9 @@ defmodule Tightbeam.PackagingTest do
     end
 
     test "per-build generates a fresh owner-only cookie on every assembly", ctx do
-      assert %{path: _} = Tightbeam.MixProject.bake_release_cookie(%{path: ctx.release}, "per-build")
+      assert %{path: _} =
+               Tightbeam.MixProject.bake_release_cookie(%{path: ctx.release}, "per-build")
+
       first = File.read!(ctx.cookie)
       assert Bitwise.band(File.stat!(ctx.cookie).mode, 0o777) == 0o600
       assert byte_size(first) >= 32

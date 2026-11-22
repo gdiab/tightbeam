@@ -8,7 +8,19 @@ defmodule Tightbeam.HarklightWakes do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, ErrorDiagnostic, HarklightLifecycle, Org, Placement, Supervision, Wakes}
+
+  alias Tightbeam.{
+    DB,
+    ErrorDiagnostic,
+    EventLog,
+    HarklightAgent,
+    HarklightLifecycle,
+    Org,
+    Placement,
+    Supervision,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   @attach_retry_delays [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
@@ -160,7 +172,7 @@ defmodule Tightbeam.HarklightWakes do
         :ok
 
       {:ok, entries} ->
-        case ack2_runner(opts) do
+        case ack2_runner(db, turn_seq, entries, opts) do
           {:ok, runner} ->
             Enum.each(entries, fn [handle, event_id, owner_session_key] ->
               args =
@@ -184,6 +196,9 @@ defmodule Tightbeam.HarklightWakes do
 
             :ok
 
+          :unsupported ->
+            :ok
+
           {:error, reason} ->
             Logger.error(
               "Harklight ACK2 could not run for dispatched turn #{turn_seq}: #{reason}"
@@ -201,7 +216,7 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp ack2_runner(opts) do
+  defp ack2_runner(db, turn_seq, entries, opts) do
     case Keyword.get(opts, :runner) do
       runner when is_function(runner, 1) ->
         {:ok, runner}
@@ -212,9 +227,50 @@ defmodule Tightbeam.HarklightWakes do
             {:error, "harklight_cli_missing"}
 
           executable ->
-            {:ok, fn args -> System.cmd(executable, args, stderr_to_stdout: true) end}
+            capabilities = HarklightAgent.capabilities(executable)
+
+            if capabilities.ack2_command do
+              {:ok, fn args -> System.cmd(executable, args, stderr_to_stdout: true) end}
+            else
+              entries
+              |> Enum.map(&hd/1)
+              |> Enum.uniq()
+              |> Enum.each(
+                &record_ack2_omitted(db, &1, capabilities, [:ack2_command], %{turnSeq: turn_seq})
+              )
+
+              :unsupported
+            end
         end
     end
+  end
+
+  defp ack2_flag(true), do: ["--ack2"]
+  defp ack2_flag(false), do: []
+
+  # The receipt is left out only where the agent cannot take it, and that is
+  # recorded per handle: delivery continues, the missing receipt stays visible.
+  defp record_ack2_omitted(db, handle, capabilities, names, detail) do
+    case HarklightAgent.omitted(capabilities, names) do
+      [] ->
+        :ok
+
+      omitted ->
+        Logger.warning(
+          "Harklight ACK2 left out for #{handle}: the installed harklight-agent lacks #{Enum.join(omitted, ", ")}"
+        )
+
+        EventLog.lifecycle(
+          db,
+          "harklight_ack2_unsupported",
+          handle,
+          JSON.encode!(Map.put(detail, :omitted, omitted))
+        )
+    end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   defp safe_ack2_call(runner, args) do
@@ -941,7 +997,6 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-
   def retry_command(db, call) do
     params = Map.get(call, :params, %{})
 
@@ -1344,12 +1399,14 @@ defmodule Tightbeam.HarklightWakes do
     delays = Keyword.get(opts, :attach_retry_delays, @attach_retry_delays)
     window = Keyword.get(opts, :attach_retry_window_ms, @attach_retry_window_ms)
 
+    db = Keyword.get(opts, :db, DB)
+
     {:ok,
      %{
-       db: Keyword.get(opts, :db, DB),
+       db: db,
        listener:
          Keyword.get(opts, :listener, fn manager, handle, vendor_id ->
-           run_listener(manager, handle, vendor_id, delays, window)
+           run_listener(db, manager, handle, vendor_id, delays, window)
          end),
        send_runner: Keyword.get(opts, :send_runner),
        workers: %{},
@@ -2013,7 +2070,6 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-
   def handle_call({:retry_handle, handle}, from, state) do
     cond do
       listener_start_in_flight?(state, handle) ->
@@ -2509,7 +2565,7 @@ defmodule Tightbeam.HarklightWakes do
     end
   end
 
-  defp run_listener(manager, handle, vendor_id, delays, window) do
+  defp run_listener(db, manager, handle, vendor_id, delays, window) do
     Process.flag(:trap_exit, true)
 
     case System.find_executable("harklight-agent") do
@@ -2529,17 +2585,22 @@ defmodule Tightbeam.HarklightWakes do
         )
 
       executable ->
-        args = [
-          "attach",
-          "--session",
-          handle,
-          "--vendor-session-id",
-          vendor_id || "none",
-          "--route",
-          "other",
-          "--controller",
-          "--ack2"
-        ]
+        # ACK2 only where the installed agent accepts it; an agent that does
+        # not would refuse the launch, and with it every reply's delivery.
+        capabilities = HarklightAgent.capabilities(executable)
+        record_ack2_omitted(db, handle, capabilities, [:attach_ack2, :listen_ack2], %{})
+
+        args =
+          [
+            "attach",
+            "--session",
+            handle,
+            "--vendor-session-id",
+            vendor_id || "none",
+            "--route",
+            "other",
+            "--controller"
+          ] ++ ack2_flag(capabilities.attach_ack2)
 
         deadline = System.monotonic_time(:millisecond) + window
 
@@ -2554,7 +2615,7 @@ defmodule Tightbeam.HarklightWakes do
              ) do
           :ok ->
             case GenServer.call(manager, {:attached, handle}, :infinity) do
-              :ok -> follow(manager, executable, handle)
+              :ok -> follow(manager, executable, handle, capabilities)
               {:error, reason} -> finish(manager, handle, reason)
             end
 
@@ -2782,13 +2843,15 @@ defmodule Tightbeam.HarklightWakes do
   defp exit_status_detail(status) when is_integer(status), do: "exit status: #{status}"
   defp exit_status_detail(_), do: "exit status: unknown (not observed)"
 
-  defp follow(manager, executable, handle) do
+  defp follow(manager, executable, handle, capabilities) do
     port =
       Port.open({:spawn_executable, executable}, [
         :binary,
         :exit_status,
         :stderr_to_stdout,
-        args: ["listen", "--follow", "--controller", "--session", handle, "--ack2"]
+        args:
+          ["listen", "--follow", "--controller", "--session", handle] ++
+            ack2_flag(capabilities.listen_ack2)
       ])
 
     try do

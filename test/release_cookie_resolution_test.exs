@@ -20,7 +20,10 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
 
   setup_all do
     mix = System.find_executable("mix") || "mix"
-    build_root = Path.join(System.tmp_dir!(), "tb-real-build-#{System.unique_integer([:positive])}")
+
+    build_root =
+      Path.join(System.tmp_dir!(), "tb-real-build-#{System.unique_integer([:positive])}")
+
     release_dir = Path.join(build_root, "tightbeam/release")
 
     {out, status} =

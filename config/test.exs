@@ -36,3 +36,9 @@ config :tightbeam,
 # (Devices.approve/3, deny/2, revoke/2, add_user/3, set_user_admin/3 and
 # Placement.register_host/3) into test builds only.
 config :tightbeam, test_fixtures: true
+
+# Test builds pin the installed harklight-agent's ACK2 capabilities to the
+# supporting set; the detection itself is tested against agent-shaped fakes
+# (harklight_agent_capabilities_test.exs), which switch it back to :detect.
+config :tightbeam,
+  harklight_agent_capabilities: %{listen_ack2: true, attach_ack2: true, ack2_command: true}

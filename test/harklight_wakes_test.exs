@@ -8040,4 +8040,194 @@ defmodule Tightbeam.HarklightWakesTest do
       eventually(fun, attempts - 1)
     end
   end
+
+  describe "ACK2 fallback B: ACK2 only where the installed agent accepts it" do
+    setup %{db: db} do
+      previous = Application.get_env(:tightbeam, :harklight_agent_capabilities)
+      Application.put_env(:tightbeam, :harklight_agent_capabilities, :detect)
+      root = Path.join(System.tmp_dir!(), "harklight-ack2-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(root)
+      old_path = System.fetch_env!("PATH")
+      System.put_env("PATH", root <> ":" <> old_path)
+
+      on_exit(fn ->
+        Application.put_env(:tightbeam, :harklight_agent_capabilities, previous)
+        System.put_env("PATH", old_path)
+        File.rm_rf!(root)
+      end)
+
+      # The listener prints one person-authored reply, then keeps listening.
+      File.write!(
+        Path.join(root, "reply.jsonl"),
+        event(1, "discussion", "reply from George") <> "\n"
+      )
+
+      %{db: db, root: root, script: Path.join(root, "harklight-agent")}
+    end
+
+    test "detection reads each capability from the agent's own help", ctx do
+      agent_without_ack2!(ctx.script)
+
+      assert Tightbeam.HarklightAgent.detect(ctx.script) ==
+               %{listen_ack2: false, attach_ack2: false, ack2_command: false}
+
+      agent_with_ack2!(ctx.script)
+
+      assert Tightbeam.HarklightAgent.detect(ctx.script) ==
+               %{listen_ack2: true, attach_ack2: true, ack2_command: true}
+    end
+
+    test "an agent without ACK2 still attaches, listens and delivers; the omission is recorded",
+         ctx do
+      agent_without_ack2!(ctx.script)
+      start_supervised!({HarklightWakes, db: ctx.db})
+      _port = await_listener_port()
+
+      assert eventually(fn ->
+               Enum.any?(calls(ctx.script), &String.starts_with?(&1, "listen"))
+             end)
+
+      [attach, listen] = calls(ctx.script)
+
+      assert attach ==
+               "attach --session #{@handle} --vendor-session-id none --route other --controller"
+
+      assert listen == "listen --follow --controller --session #{@handle}"
+
+      # George's reply, read by this listener, reached the session as a wake.
+      assert eventually(fn ->
+               DB.query(
+                 ctx.db,
+                 "SELECT sessionKey FROM harklight_wake_deliveries WHERE eventId='1'"
+               ) == {:ok, [[ctx.session.session_key]]}
+             end)
+
+      assert {:ok, [["active"]]} = DB.query(ctx.db, "SELECT state FROM harklight_wake_handles")
+
+      assert [{@handle, %{"omitted" => ["attach_ack2", "listen_ack2"]}}] = ack2_omissions(ctx.db)
+    end
+
+    test "an agent with ACK2 gets it on attach and listen, and nothing is recorded", ctx do
+      agent_with_ack2!(ctx.script)
+      start_supervised!({HarklightWakes, db: ctx.db})
+      _port = await_listener_port()
+
+      assert eventually(fn ->
+               Enum.any?(calls(ctx.script), &String.starts_with?(&1, "listen"))
+             end)
+
+      [attach, listen] = calls(ctx.script)
+      assert attach =~ ~r/ --controller --ack2$/
+      assert listen == "listen --follow --controller --session #{@handle} --ack2"
+      assert ack2_omissions(ctx.db) == []
+    end
+
+    test "the ack2 receipt runs only on an agent that has the command", ctx do
+      assert :ok = HarklightWakes.capture_line(ctx.db, @handle, event(1, "discussion", "receipt"))
+
+      assert {:ok, [[root]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId FROM harklight_wake_deliveries WHERE sessionKey=?1",
+                 [
+                   ctx.session.session_key
+                 ]
+               )
+
+      turn = deliver_discussion_turn!(ctx.db, root, ctx.session.session_key)
+      Ledger.stamp_adapter(ctx.db, turn.seq, 1)
+      record_prompt_dispatched!(ctx.db, turn)
+
+      agent_without_ack2!(ctx.script)
+
+      assert :ok =
+               HarklightWakes.ack2_for_dispatched_turn(
+                 ctx.db,
+                 turn.seq,
+                 ctx.session.session_key,
+                 "Origin"
+               )
+
+      refute File.exists?(ctx.script <> ".calls")
+
+      assert [{@handle, %{"omitted" => ["ack2_command"], "turnSeq" => seq}}] =
+               ack2_omissions(ctx.db)
+
+      assert seq == turn.seq
+
+      agent_with_ack2!(ctx.script)
+
+      assert :ok =
+               HarklightWakes.ack2_for_dispatched_turn(
+                 ctx.db,
+                 turn.seq,
+                 ctx.session.session_key,
+                 "Origin"
+               )
+
+      assert calls(ctx.script) == ["ack2 --session #{@handle} --event 1 --agent Origin"]
+      assert length(ack2_omissions(ctx.db)) == 1
+    end
+  end
+
+  # Shaped like agent 0.1.3 (measured): --ack2 is a parse error, `ack2` is
+  # an unknown subcommand, and listen/attach help list no --ack2.
+  defp agent_without_ack2!(script) do
+    write_agent!(script, """
+    case " $* " in
+      *" --ack2 "*) echo "error: unexpected argument '--ack2' found" >&2; exit 2 ;;
+    esac
+    if [ "${2:-}" = --help ]; then
+      case "$1" in
+        listen|attach) printf '%s\\n' "Usage: harklight-agent $1 [OPTIONS] --session <SESSION>" '      --controller'; exit 0 ;;
+        *) echo "error: unrecognized subcommand '$1'" >&2; exit 2 ;;
+      esac
+    fi
+    """)
+  end
+
+  defp agent_with_ack2!(script) do
+    write_agent!(script, """
+    if [ "${2:-}" = --help ]; then
+      case "$1" in
+        listen|attach) printf '%s\\n' "Usage: harklight-agent $1 [OPTIONS]" '      --ack2  Report delivery receipts'; exit 0 ;;
+        ack2) printf '%s\\n' 'Usage: harklight-agent ack2 --session <SESSION> --event <EVENT> --agent <NAME>'; exit 0 ;;
+      esac
+    fi
+    """)
+  end
+
+  defp write_agent!(script, help) do
+    File.write!(script, """
+    #!/bin/sh
+    if [ "$1" = status ]; then exit 1; fi
+    #{help}
+    printf '%s\\n' "$*" >> "$0.calls"
+    case "$1" in
+      attach) printf '%s\\n' '{"kind":"attached","ready_for_listen":true}' ;;
+      listen) cat "$(dirname "$0")/reply.jsonl"; exec sleep 300 ;;
+    esac
+    exit 0
+    """)
+
+    File.chmod!(script, 0o700)
+  end
+
+  defp calls(script) do
+    script
+    |> Kernel.<>(".calls")
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.filter(&String.starts_with?(&1, ["attach", "listen", "ack2"]))
+  end
+
+  defp ack2_omissions(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT subject,detail FROM lifecycle_events WHERE kind='harklight_ack2_unsupported' ORDER BY id"
+      )
+
+    Enum.map(rows, fn [subject, detail] -> {subject, JSON.decode!(detail)} end)
+  end
 end
