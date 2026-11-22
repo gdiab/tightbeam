@@ -5260,8 +5260,17 @@ defmodule Tightbeam.Assignments do
            """,
            [assignment_id]
          ) do
-      [[kind, holder, encoded_refs, reviews_assignment_id, review_assignment_id, review_state,
-        attest_id]] ->
+      [
+        [
+          kind,
+          holder,
+          encoded_refs,
+          reviews_assignment_id,
+          review_assignment_id,
+          review_state,
+          attest_id
+        ]
+      ] ->
         %{
           kind: kind,
           holder: holder,
