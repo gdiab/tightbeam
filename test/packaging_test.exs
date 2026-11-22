@@ -26,19 +26,63 @@ defmodule Tightbeam.PackagingTest do
     end
   end
 
-  test "option 2: the release step makes the build's own Erlang cookie owner-only" do
-    release = Path.join(System.tmp_dir!(), "tb-cookie-#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf!(release) end)
-    cookie = Path.join(release, "releases/COOKIE")
-    File.mkdir_p!(Path.dirname(cookie))
-    File.write!(cookie, "fixture-not-a-real-cookie")
-    File.chmod!(cookie, 0o644)
+  describe "option 2: the release step fixes the cookie mode at assembly" do
+    setup do
+      release = Path.join(System.tmp_dir!(), "tb-cookie-#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf!(release) end)
+      cookie = Path.join(release, "releases/COOKIE")
+      File.mkdir_p!(Path.dirname(cookie))
+      # What Mix leaves: a cookie, possibly from an earlier assembly in a reused _build.
+      File.write!(cookie, "fixture-not-a-real-cookie-from-an-old-build")
+      File.chmod!(cookie, 0o644)
+      %{release: release, cookie: cookie, mode: Path.join(release, "releases/COOKIE_MODE")}
+    end
 
-    assert %{path: ^release} = Tightbeam.MixProject.restrict_release_cookie(%{path: release})
-    assert Bitwise.band(File.stat!(cookie).mode, 0o777) == 0o600
+    test "per-build generates a fresh owner-only cookie on every assembly", ctx do
+      assert %{path: _} = Tightbeam.MixProject.bake_release_cookie(%{path: ctx.release}, "per-build")
+      first = File.read!(ctx.cookie)
+      assert Bitwise.band(File.stat!(ctx.cookie).mode, 0o777) == 0o600
+      assert byte_size(first) >= 32
+      refute first =~ "fixture"
+      assert File.read!(ctx.mode) == "per-build\n"
 
-    # Mix configures no cookie, so every clean build writes its own random one.
-    refute File.read!(Path.join(@repo_root, "mix.exs")) =~ ~r/\bcookie:/
+      Tightbeam.MixProject.bake_release_cookie(%{path: ctx.release}, "per-build")
+      refute File.read!(ctx.cookie) == first
+    end
+
+    test "per-install ships no cookie at all", ctx do
+      Tightbeam.MixProject.bake_release_cookie(%{path: ctx.release}, "per-install")
+      refute File.exists?(ctx.cookie)
+      assert File.read!(ctx.mode) == "per-install\n"
+    end
+
+    test "an unknown mode refuses the assembly", ctx do
+      assert_raise Mix.Error, ~r/per-install or per-build/, fn ->
+        Tightbeam.MixProject.bake_release_cookie(%{path: ctx.release}, "baked")
+      end
+
+      refute File.exists?(ctx.mode)
+    end
+
+    test "Mix configures no cookie of its own" do
+      refute File.read!(Path.join(@repo_root, "mix.exs")) =~ ~r/\bcookie:/
+    end
+  end
+
+  test "the launcher refuses `remote` without a terminal before reading any instance" do
+    launcher = Path.join(@repo_root, "packaging/tightbeam-gateway")
+
+    {out, status} =
+      System.cmd("sh", ["-c", ~s(exec "$0" remote < /dev/null), launcher],
+        env: [{"TIGHTBEAM_BASE_DIR", nil}, {"RELEASE_COOKIE", nil}],
+        stderr_to_stdout: true
+      )
+
+    assert status == 64
+    assert out =~ "refusing `remote` without a terminal"
+    assert out =~ "rpc <expr>"
+    # The refusal comes first: the descriptor check (TIGHTBEAM_BASE_DIR) never ran.
+    refute out =~ "TIGHTBEAM_BASE_DIR"
   end
 
   test "the systemd daemon-credential docs stay bound to both halves of the importer seam" do

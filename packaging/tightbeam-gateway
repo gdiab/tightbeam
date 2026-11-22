@@ -210,7 +210,19 @@ case "$verb" in
     printf '  Production restart: `systemctl restart tightbeam`.\n' >&2
     exit 64
     ;;
-  rpc | remote)
+  rpc)
+    do_debug "$@"
+    ;;
+  remote)
+    # `remote` is an interactive shell (iex --remsh) on the running node, and
+    # running it without a terminal is unsafe for that node (evidence
+    # art_3df7f085). Refuse it before anything else; a script or agent
+    # evaluates one expression with `rpc` instead.
+    if [ ! -t 0 ]; then
+      printf 'tightbeam-gateway: refusing `remote` without a terminal on stdin.\n' >&2
+      printf '  Use `tightbeam-gateway rpc <expr>` to evaluate an expression.\n' >&2
+      exit 64
+    fi
     do_debug "$@"
     ;;
   *)

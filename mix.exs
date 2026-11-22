@@ -34,18 +34,40 @@ defmodule Tightbeam.MixProject do
         include_erts: true,
         include_executables_for: [:unix],
         strip_beams: true,
-        steps: [:assemble, &restrict_release_cookie/1]
+        steps: [:assemble, &bake_release_cookie/1]
       ]
     ]
   end
 
-  # Option 2 (PO att_7b3c25f9): the release keeps Erlang distribution, and Mix
-  # writes a fresh random releases/COOKIE into every clean build (no cookie is
-  # configured here). Make that file owner-only, so the installer can hand it to
-  # the gateway's account and no other account on the host can read it.
+  # Option 2 (PO att_7b3c25f9, att_98019d3a): the release keeps Erlang
+  # distribution, and its cookie mode is fixed when the package is assembled.
+  # TIGHTBEAM_COOKIE_MODE selects it; unset means per-build:
+  #   - per-install: the package carries no cookie at all; the installer writes
+  #     the build root's COOKIE (gd-only, 0600) outside the hashed package.
+  #   - per-build: this step generates a fresh cookie for this assembly, owner
+  #     only, replacing whatever Mix left (a reused _build keeps an old one).
+  # The mode is baked into releases/COOKIE_MODE, and rel/env.sh.eex reads the
+  # one file it names on every command, refusing a missing or loose one.
+  @cookie_modes ~w(per-install per-build)
+
   @doc false
-  def restrict_release_cookie(release) do
-    File.chmod!(Path.join(release.path, "releases/COOKIE"), 0o600)
+  def bake_release_cookie(release, mode \\ System.get_env("TIGHTBEAM_COOKIE_MODE", "per-build")) do
+    unless mode in @cookie_modes do
+      Mix.raise("TIGHTBEAM_COOKIE_MODE must be per-install or per-build, not #{inspect(mode)}")
+    end
+
+    releases = Path.join(release.path, "releases")
+    cookie = Path.join(releases, "COOKIE")
+    File.rm_rf!(cookie)
+
+    if mode == "per-build" do
+      # Created empty and restricted before the secret is written into it.
+      File.touch!(cookie)
+      File.chmod!(cookie, 0o600)
+      File.write!(cookie, Base.encode32(:crypto.strong_rand_bytes(32), padding: false))
+    end
+
+    File.write!(Path.join(releases, "COOKIE_MODE"), mode <> "\n")
     release
   end
 
