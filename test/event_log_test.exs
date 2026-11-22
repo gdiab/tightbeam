@@ -152,6 +152,21 @@ defmodule Tightbeam.EventLogTest do
     assert subject == "epoch:#{e3 - 1}"
   end
 
+  test "boot epochs: an older unstamped epoch is not reported again after a clean one", %{
+    db: db
+  } do
+    e1 = EventLog.boot(db)
+    e2 = EventLog.boot(db)
+    assert [%{kind: "dirty_exit", subject: first}] = EventLog.lifecycle_events(db)
+    assert first == "epoch:#{e1}"
+
+    :ok = EventLog.clean_shutdown(db, e2)
+    _e3 = EventLog.boot(db)
+
+    # e1 is still unstamped, but the epoch before this boot shut down cleanly.
+    assert [%{subject: ^first}] = EventLog.lifecycle_events(db)
+  end
+
   test "lifecycle records are free-form kinds on their own table", %{db: db} do
     :ok = EventLog.lifecycle(db, "adapter_restart", "claude:default", "backoff=2s gen=3")
     assert [%{kind: "adapter_restart", subject: "claude:default"}] = EventLog.lifecycle_events(db)

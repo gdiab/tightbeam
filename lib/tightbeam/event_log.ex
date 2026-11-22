@@ -804,10 +804,14 @@ defmodule Tightbeam.EventLog do
   def boot(db \\ Tightbeam.DB) do
     {:ok, {epoch, _prior_epoch}} =
       DB.transaction(db, fn txn ->
+        # Only the immediately prior epoch: an older one left unstamped was
+        # already reported at the boot that followed it, so it is not this
+        # boot's dirty exit.
         prior =
           Tightbeam.DB.Txn.q(txn, """
             SELECT epoch FROM boot_epochs
-            WHERE cleanShutdownAt IS NULL ORDER BY epoch DESC LIMIT 1
+            WHERE cleanShutdownAt IS NULL
+              AND epoch = (SELECT MAX(epoch) FROM boot_epochs)
           """)
 
         prior_epoch =
