@@ -186,7 +186,8 @@ defmodule Tightbeam.SupervisionTest do
 
     assert is_binary(continuation.wake_id)
 
-    assert %{} =
+    # The cancel commits in its own transaction and reports the accepted event.
+    assert {:accepted_in_txn, _event_id, %{canceled: true}} =
              handlers["wake"].(%{
                verb: "wake",
                origin: "agent:holder",
