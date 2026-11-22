@@ -45,7 +45,12 @@ defmodule Tightbeam.RestReadConnectionsTest do
     :ok = ensure_all_schemas(db)
 
     {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Reader", platform: nil, model: nil})
+      Tightbeam.TestDevices.pair(db, %{
+        device_id: "d1",
+        claimed_name: "Reader",
+        platform: nil,
+        model: nil
+      })
 
     session =
       Org.create(db, %{

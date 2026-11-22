@@ -585,23 +585,28 @@ defmodule Tightbeam.ParkStrandingTest do
     })
   end
 
-  # Two sessions' typed Codex quota failures open the shared incident and park
-  # the key, as the terminal-turn path does in production.
+  # Typed Codex quota failures open the shared incident and park the key, as
+  # the terminal-turn path does in production. On 0.1.16 a typed Codex limit
+  # is authoritative and parks at the first failure (#668); the second
+  # session's failure joins the same incident.
   defp open_codex_park!(db) do
     fail_turn(db, "c1", @codex_limit, "asg_held")
-    refute HarnessProcess.parked?(db, @codex_key)
+    assert HarnessProcess.parked?(db, @codex_key)
     fail_turn(db, "c2", @codex_limit)
     assert HarnessProcess.parked?(db, @codex_key)
     open_incident!(db, "codex")
   end
 
   defp resume!(db, incident) do
-    assert {:ok, :released} =
+    assert {:ok, :admission_resumed} =
              DB.transaction(db, fn txn ->
-               QuotaRelease.release_named_in_txn(txn, incident.id, "codex", "testhost", %{
+               # 0.1.16's named release (v1.7): an explicit resume with nothing
+               # else standing resumes admission and re-admits held turns.
+               QuotaRelease.release_in_txn(txn, incident.id, "codex", "testhost",
                  cause: "explicit_resume",
-                 actor: "user:#{@owner}"
-               })
+                 actor: "user:#{@owner}",
+                 readmit: true
+               )
              end)
   end
 

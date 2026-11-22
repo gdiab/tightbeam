@@ -4787,7 +4787,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     :ok = ensure_all_schemas(db)
 
     {:paired, _device} =
-      Devices.pair(db, %{
+      Tightbeam.TestDevices.pair(db, %{
         device_id: "turn-events-device",
         claimed_name: "Test Device",
         platform: nil,

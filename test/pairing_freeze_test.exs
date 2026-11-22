@@ -16,7 +16,6 @@ defmodule Tightbeam.PairingFreezeTest do
     DB,
     Devices,
     EventLog,
-    Model,
     Org,
     OwnerAlerts,
     PairingFreeze,
@@ -37,21 +36,8 @@ defmodule Tightbeam.PairingFreezeTest do
     _ada = TestDevices.paired!(db, "ada", admin: true, device_id: "ada-phone")
     _guest = TestDevices.paired!(db, "guest", device_id: "guest-phone")
 
-    for user <- ["george", "ada", "guest"] do
-      Org.create(db, %{
-        session_key: Org.personal_session_key(user),
-        display_name: "Main",
-        kind: "main",
-        is_built_in: true,
-        owner_user_id: user,
-        origin: "user:#{user}",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
-    end
+    # 0.1.16 gives each Main a free global display label.
+    for user <- ["george", "ada", "guest"], do: ensure_main_session(db, user)
 
     :ok = Org.put_setting(db, "owner-alerts-user", "george")
     %{db: db, george: george}

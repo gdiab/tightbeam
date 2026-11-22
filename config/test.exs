@@ -39,6 +39,6 @@ config :tightbeam, test_fixtures: true
 
 # Test builds pin the installed harklight-agent's ACK2 capabilities to the
 # supporting set; the detection itself is tested against agent-shaped fakes
-# (harklight_agent_capabilities_test.exs), which switch it back to :detect.
+# (harklight_wakes_test.exs, "ACK2 fallback B"), which switch it back to :detect.
 config :tightbeam,
   harklight_agent_capabilities: %{listen_ack2: true, attach_ack2: true, ack2_command: true}

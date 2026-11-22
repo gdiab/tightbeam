@@ -949,8 +949,9 @@ defmodule Tightbeam.OwnerAlertsTest do
                "SELECT sql FROM sqlite_master WHERE type='table' AND name='owner_alerts'"
              )
 
+    # Contract v3.14 R12: the one DDL carries all eleven kinds (G1's included).
     assert sql =~
-             "kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback','memory-pressure')),"
+             "kind              TEXT NOT NULL CHECK (kind IN ('usage-limit','stall','model-fallback','memory-pressure','pairing-freeze-lifted','pairing-unfreeze-ignored','recovery-enrolled','admin-recovered','root-recovery-enroll','root-pairing-code','memory-guard-stuck')),"
 
     assert :ok = OwnerAlerts.ensure_schema(db)
 

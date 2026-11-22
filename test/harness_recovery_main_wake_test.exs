@@ -330,10 +330,12 @@ defmodule Tightbeam.HarnessRecoveryMainWakeTest do
                [hold.id]
              )
 
+    # R11's park-stranding check is an internal process wake on the parking
+    # session's row; it prompts no one. Nothing else may reach a held member.
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM wakes WHERE sessionKey IN (?1,?2,?3)",
+               "SELECT count(*) FROM wakes WHERE sessionKey IN (?1,?2,?3) AND consumer <> 'park_stranding'",
                [member_a1, member_a2, member_b1]
              )
 
@@ -1145,10 +1147,12 @@ defmodule Tightbeam.HarnessRecoveryMainWakeTest do
                [hold.id]
              )
 
+    # R11's park-stranding check is an internal process wake on the parking
+    # session's row; it prompts no one. Nothing else may reach a held member.
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM wakes WHERE sessionKey IN (?1,?2,?3)",
+               "SELECT count(*) FROM wakes WHERE sessionKey IN (?1,?2,?3) AND consumer <> 'park_stranding'",
                [member_a1, member_a2, member_b1]
              )
   end

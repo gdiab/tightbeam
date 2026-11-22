@@ -61,11 +61,14 @@ defmodule GatewayHarnessRefusal do
 
       {:ok, {_address, port}} = ThousandIsland.listener_info(server)
 
-      {:ok, device} =
-        SimClient.pair("127.0.0.1", port,
+      # Core fix (A) freezes pairing; the device comes from the paired-device fixture.
+      {:paired, device} =
+        Tightbeam.TestDevices.pair(db, %{
           device_id: "context-refusal-device",
-          claimed_name: "Fixture"
-        )
+          claimed_name: "Fixture",
+          platform: nil,
+          model: nil
+        })
 
       {:ok, client} =
         SimClient.connect("127.0.0.1", port, device.token, device_id: "context-refusal-device")

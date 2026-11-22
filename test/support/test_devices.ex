@@ -17,6 +17,22 @@ defmodule Tightbeam.TestDevices do
 
   alias Tightbeam.{DB, Devices}
 
+  # A database from before core fix (A) has no tokenCollected column; the fix's
+  # own migration later marks every token it finds collected.
+  defp collected?(db) do
+    {:ok, [[n]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name='tokenCollected'"
+      )
+
+    n == 1
+  end
+
+  defp collected_set(db), do: if(collected?(db), do: ", tokenCollected = 1", else: "")
+  defp collected_column(db), do: if(collected?(db), do: ", tokenCollected", else: "")
+  defp collected_value(db), do: if(collected?(db), do: ", 1", else: "")
+
   @doc "Emulate pre-fix pairing for a fixture: see the moduledoc."
   @spec pair(GenServer.server(), map()) :: {:paired, map()} | {:pending, map()} | :denied
   def pair(db, input) do
@@ -31,7 +47,7 @@ defmodule Tightbeam.TestDevices do
 
       %{status: "allowlisted"} ->
         :ok =
-          exec(db, "UPDATE devices SET token = ?2, tokenCollected = 1 WHERE deviceId = ?1", [
+          exec(db, "UPDATE devices SET token = ?2#{collected_set(db)} WHERE deviceId = ?1", [
             device_id,
             mint_token()
           ])
@@ -53,9 +69,9 @@ defmodule Tightbeam.TestDevices do
             db,
             """
             INSERT INTO devices
-              (deviceId, userId, claimedName, status, token, platform, model, createdAt,
-               tokenCollected)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
+              (deviceId, userId, claimedName, status, token, platform, model, createdAt
+               #{collected_column(db)})
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 #{collected_value(db)})
             """,
             [
               device_id,

@@ -114,6 +114,11 @@ defmodule GuardAck2Turn do
         executable,
         """
         #!/bin/sh
+        # An agent with the ack2 command: its help lists --event (ACK2 fallback B).
+        if [ "${2:-}" = --help ]; then
+          printf '%s\\n' 'Usage: harklight-agent ack2 --session <SESSION> --event <EVENT> --agent <NAME>'
+          exit 0
+        fi
         printf '%s\\n' "$*" >> "$0.calls"
         : > "$0.started"
         while [ ! -f "$0.release" ]; do sleep 0.01; done

@@ -371,9 +371,9 @@ defmodule Tightbeam.UserRemovalCrossLineTest do
 
       assert_refused_unchanged!(
         ctx,
-        # c1's validate_in_txn! (R8, unchanged) fails on the absent objects;
-        # the adoption rolls back and refuses.
-        ~r/user removal adoption rolled back/,
+        # c1's validate_in_txn! (R8) refuses the first absent object by name
+        # (contract v3.11 N8); the adoption rolls back, changing nothing.
+        ~r/incompatible_limit_fallback_schema: sessions\.limitFallbackOff is missing/,
         "limit-fallback-v1-0114"
       )
     end

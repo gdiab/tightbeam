@@ -912,7 +912,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "personal Main chooses a free global label without changing stable keys", ctx do
     {:paired, first} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "main-first",
         claimed_name: "First",
         platform: nil,
@@ -943,7 +943,7 @@ defmodule Tightbeam.Wire.SocketTest do
     })
 
     {:pending, pending} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "main-second",
         claimed_name: "Second",
         platform: nil,
@@ -976,7 +976,7 @@ defmodule Tightbeam.Wire.SocketTest do
   test "personal Main allocation failure ends auth without creating or registering a session",
        ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{
+      Tightbeam.TestDevices.pair(ctx.db, %{
         device_id: "main-failure",
         claimed_name: "Failure",
         platform: nil,

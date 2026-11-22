@@ -605,12 +605,15 @@ defmodule Tightbeam.RateLimitReleaseTest do
     incident = park_codex(db, "held", "c1")
     assert HarnessProcess.parked?(db, @codex_key)
 
-    assert {:ok, :released} =
+    assert {:ok, :admission_resumed} =
              DB.transaction(db, fn txn ->
-               QuotaRelease.release_named_in_txn(txn, incident.id, "codex", "testhost", %{
+               # 0.1.16's named release (v1.7): an explicit resume with nothing
+               # else standing resumes admission and re-admits held turns.
+               QuotaRelease.release_in_txn(txn, incident.id, "codex", "testhost",
                  cause: "explicit_resume",
-                 actor: "user:tester"
-               })
+                 actor: "user:tester",
+                 readmit: true
+               )
              end)
 
     refute HarnessProcess.parked?(db, @codex_key)

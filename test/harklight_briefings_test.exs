@@ -248,12 +248,14 @@ defmodule Tightbeam.HarklightBriefingsTest do
     open_id = open.id
     resolved_id = resolved.id
 
-    rule_call = %{
-      verb: "operator-rule",
-      origin: "user:#{@owner}",
-      principal: {:user, @owner},
-      params: %{request_id: resolved_id, decision: "accept", rationale: "Prior decision"}
-    }
+    # Core fix (A): the owner rules from their own paired device.
+    device = Tightbeam.TestDevices.paired!(ctx.db, @owner, admin: true)
+
+    rule_call =
+      Tightbeam.TestDevices.device_call(device, %{
+        verb: "operator-rule",
+        params: %{request_id: resolved_id, decision: "accept", rationale: "Prior decision"}
+      })
 
     assert %{status: "ruled", decision: "accept"} =
              Escalation.operator_rule(ctx.db, rule_call, authorized: true)
