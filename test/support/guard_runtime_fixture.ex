@@ -58,13 +58,24 @@ defmodule Tightbeam.GuardRuntimeFixture do
           base
         ]
 
+    preserved_test_env = ["TIGHTBEAM_TEST_TRIPWIRE_LOG"]
+
     env =
       System.get_env()
       |> Map.keys()
       |> Enum.filter(
-        &(String.starts_with?(&1, "TIGHTBEAM_") or String.starts_with?(&1, "RELEASE_"))
+        &((String.starts_with?(&1, "TIGHTBEAM_") or String.starts_with?(&1, "RELEASE_")) and
+            &1 not in preserved_test_env)
       )
       |> Enum.map(&{&1, nil})
+
+    inherited_test_env =
+      Enum.flat_map(preserved_test_env, fn name ->
+        case System.get_env(name) do
+          nil -> []
+          value -> [{name, value}]
+        end
+      end)
 
     env =
       env ++
@@ -74,7 +85,7 @@ defmodule Tightbeam.GuardRuntimeFixture do
           {"TIGHTBEAM_BASE_DIR", base},
           {"TIGHTBEAM_HOME", base},
           {"TIGHTBEAM_TEST_ROOT", tmp}
-        ]
+        ] ++ inherited_test_env
 
     %{
       executable: System.find_executable("elixir"),

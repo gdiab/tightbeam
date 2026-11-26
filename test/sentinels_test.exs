@@ -637,6 +637,11 @@ defmodule Tightbeam.SentinelsTest do
 
       assert env["TIGHTBEAM_AS_PROCESS"] == "sentinel:alpha-bundle/watch"
       assert env["TIGHTBEAM_BASE_DIR"] == ctx.base
+      assert env["TIGHTBEAM_TEST_ROOT"] == System.fetch_env!("TIGHTBEAM_TEST_ROOT")
+
+      assert env["TIGHTBEAM_TEST_TRIPWIRE_LOG"] ==
+               System.fetch_env!("TIGHTBEAM_TEST_TRIPWIRE_LOG")
+
       assert env["WATCH_TARGET"] == "alpha-value"
       assert env["CODEX_HOME"] == "/synthetic/codex-home"
       assert String.starts_with?(env["PATH"], "/synthetic/cli/bin:")

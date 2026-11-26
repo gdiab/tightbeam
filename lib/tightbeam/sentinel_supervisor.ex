@@ -200,8 +200,19 @@ defmodule Tightbeam.SentinelSupervisor do
 
   # The child's environment is the gateway's minus everything Tightbeam or the
   # release owns and minus the names it declares, plus the CLI on PATH, its own
-  # attribution and exactly its own settings.
+  # attribution and exactly its own settings. A test parent also carries its two
+  # isolation bounds through the child; neither name is added in production.
   defp child_env(state, sentinel) do
+    test_isolation =
+      ["TIGHTBEAM_TEST_ROOT", "TIGHTBEAM_TEST_TRIPWIRE_LOG"]
+      |> Enum.flat_map(fn name ->
+        case System.get_env(name) do
+          nil -> []
+          value -> [{name, value}]
+        end
+      end)
+      |> Map.new()
+
     scrubbed =
       for {name, _value} <- System.get_env(),
           String.starts_with?(name, "TIGHTBEAM_") or
@@ -219,6 +230,7 @@ defmodule Tightbeam.SentinelSupervisor do
       "TIGHTBEAM_AS_PROCESS" => "sentinel:" <> sentinel.qualified
     })
     |> Map.merge(Map.new(Sentinels.settings(state.db, state.host, sentinel.qualified)))
+    |> Map.merge(test_isolation)
     |> Enum.map(fn
       {name, false} -> {String.to_charlist(name), false}
       {name, value} -> {String.to_charlist(name), String.to_charlist(value)}

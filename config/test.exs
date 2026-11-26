@@ -38,6 +38,7 @@ home = Path.join(suite_tmp, "home")
 base = Path.join(suite_tmp, "app")
 bin = Path.join(suite_tmp, "tripwire-bin")
 tripwire_log = Path.join(suite_tmp, "forbidden-execution")
+quoted_tripwire_log = "'" <> String.replace(tripwire_log, "'", "'\"'\"'") <> "'"
 File.mkdir_p!(home)
 File.mkdir_p!(bin)
 
@@ -46,7 +47,7 @@ for name <- ["tightbeam", "codex", "claude", "cursor-agent", "opencode", "pi", "
 
   File.write!(
     path,
-    "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf 'synthetic 1.0\\n'; exit 0; fi\nprintf '%s\\n' '#{name}' >> \"$TIGHTBEAM_TEST_TRIPWIRE_LOG\"\nexit 97\n"
+    "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf 'synthetic 1.0\\n'; exit 0; fi\nprintf '%s\\n' '#{name}' >> #{quoted_tripwire_log}\nexit 97\n"
   )
 
   File.chmod!(path, 0o755)

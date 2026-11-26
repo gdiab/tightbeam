@@ -24,6 +24,7 @@ static INSTALL_TEST_ISOLATION: extern "C" fn() = {
         fs::create_dir_all(&bin).expect("create Rust test tripwire directory");
 
         let log = root.join("forbidden-execution");
+        let quoted_log = format!("'{}'", log.to_string_lossy().replace('\'', "'\"'\"'"));
         for name in [
             "tightbeam",
             "codex",
@@ -38,7 +39,7 @@ static INSTALL_TEST_ISOLATION: extern "C" fn() = {
             fs::write(
                 &path,
                 format!(
-                    "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf 'synthetic 1.0\\n'; exit 0; fi\nprintf '%s\\n' '{name}' >> \"$TIGHTBEAM_TEST_TRIPWIRE_LOG\"\nexit 97\n"
+                    "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf 'synthetic 1.0\\n'; exit 0; fi\nprintf '%s\\n' '{name}' >> {quoted_log}\nexit 97\n"
                 ),
             )
             .expect("write Rust test tripwire");

@@ -10,6 +10,9 @@ defmodule Tightbeam.IdentityRestartTest do
     binary = Path.expand("cli/target/release/tightbeam")
 
     fixture = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "identity_restart.exs")
+    tripwire_log = Application.fetch_env!(:tightbeam, :test_tripwire_log)
+    assert {"TIGHTBEAM_TEST_ROOT", tmp} in fixture.env
+    assert {"TIGHTBEAM_TEST_TRIPWIRE_LOG", tripwire_log} in fixture.env
 
     for phase <- ["conflict", "abort", "resolve", "normal"] do
       {output, status} =
