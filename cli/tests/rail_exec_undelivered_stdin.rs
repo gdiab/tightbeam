@@ -7,6 +7,9 @@
 //! that failed. This asserts the real binary's real bytes: the parsed line appears only
 //! when a child exit was actually observed (task #43).
 
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
+
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};

@@ -1,5 +1,7 @@
 //! Complete artifacts output through the compiled CLI and real HTTP framing.
 //! All records, identities and tokens here are synthetic; no gateway is booted.
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::{Read, Write};

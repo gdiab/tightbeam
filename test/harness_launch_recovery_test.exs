@@ -250,6 +250,27 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
   end
 
   test "a remote launch is never reboot proof", ctx do
+    previous_runner =
+      Application.get_env(:tightbeam, :harness_process_command_runner_for_test)
+
+    Application.put_env(
+      :tightbeam,
+      :harness_process_command_runner_for_test,
+      fn "ssh", _args, _timeout_ms -> {"synthetic remote unavailable", 255} end
+    )
+
+    on_exit(fn ->
+      if previous_runner do
+        Application.put_env(
+          :tightbeam,
+          :harness_process_command_runner_for_test,
+          previous_runner
+        )
+      else
+        Application.delete_env(:tightbeam, :harness_process_command_runner_for_test)
+      end
+    end)
+
     {row, _} =
       prepare(ctx,
         cmd: ["ssh", "remote.invalid", "claude", "acp"],

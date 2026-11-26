@@ -1,3 +1,6 @@
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
+
 use std::process::Command;
 
 #[test]

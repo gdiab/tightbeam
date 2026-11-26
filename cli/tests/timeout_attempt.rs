@@ -3,6 +3,9 @@
 //! test resolver until the client's own deadline has expired. These cases do
 //! not replace real gateway listener lifecycle/restart R9 evidence.
 
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
+
 use std::error::Error as _;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

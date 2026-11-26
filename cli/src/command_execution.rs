@@ -1,11 +1,14 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static RECEIPT_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 struct Manifest {
     execution_id: String,
@@ -374,9 +377,89 @@ fn create_once(path: &Path, bytes: &[u8], already_exists: &str) -> Result<(), St
 }
 
 fn write_json_once(path: &Path, value: &Value) -> Result<(), String> {
+    write_json_once_with_hook(path, value, |_| Ok(()))
+}
+
+fn write_json_once_with_hook<F>(path: &Path, value: &Value, before_publish: F) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
     let mut bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
-    create_once(path, &bytes, "execution receipt already exists")
+    ensure_parent(path)?;
+    let (temp_path, mut file) = open_receipt_temp(path)?;
+    let write_result = file
+        .write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "receipt temp file could not be written at {}: {error}",
+                temp_path.display()
+            )
+        });
+    drop(file);
+
+    let result = write_result.and_then(|()| {
+        before_publish(&temp_path)?;
+        fs::hard_link(&temp_path, path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "execution receipt already exists".to_string()
+            } else {
+                format!(
+                    "receipt could not be published at {}: {error}",
+                    path.display()
+                )
+            }
+        })?;
+        sync_parent(path)?;
+        fs::remove_file(&temp_path).map_err(|error| {
+            format!(
+                "receipt temp file could not be removed at {}: {error}",
+                temp_path.display()
+            )
+        })?;
+        sync_parent(path)
+    });
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn open_receipt_temp(path: &Path) -> Result<(PathBuf, File), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "receipt path has no parent".to_string())?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "receipt path has no file name".to_string())?;
+
+    loop {
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            RECEIPT_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temp_path = parent.join(temp_name);
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "receipt temp file could not be opened in {}: {error}",
+                    parent.display()
+                ));
+            }
+        }
+    }
 }
 
 fn write_not_started(manifest: &Manifest, error: &str) -> Result<(), String> {
@@ -503,12 +586,26 @@ fn now_ms() -> u128 {
 mod tests {
     use super::{
         Manifest, current_host, decode_status, hex_sha256, pipe, run, supervise, wait_child,
+        write_json_once_with_hook,
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    fn publication_test_root(name: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-command-exec-publication-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
 
     #[test]
     fn hashes_exact_bytes() {
@@ -522,6 +619,77 @@ mod tests {
     fn decodes_exit_and_signal_statuses() {
         assert_eq!(decode_status(7 << 8), (Some(7), None));
         assert_eq!(decode_status(libc::SIGTERM), (None, Some(libc::SIGTERM)));
+    }
+
+    #[test]
+    fn json_receipt_is_not_visible_until_complete_and_flushed() {
+        let root = publication_test_root("held-writer");
+        let path = root.join("terminal.json");
+        let value = json!({"executionId": "held-writer", "exitCode": 0});
+        let expected = value.clone();
+        let writer_path = path.clone();
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let writer = thread::spawn(move || {
+            write_json_once_with_hook(&writer_path, &value, |held_path| {
+                held_tx.send(held_path.to_path_buf()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+
+        let held_path = held_rx.recv().unwrap();
+        let final_while_held = fs::read(&path);
+        let staged_while_held = fs::read(&held_path);
+        release_tx.send(()).unwrap();
+        assert_eq!(writer.join().unwrap(), Ok(()));
+
+        assert_ne!(held_path, path);
+        assert_eq!(
+            final_while_held.unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let staged: Value = serde_json::from_slice(&staged_while_held.unwrap()).unwrap();
+        assert_eq!(staged, expected);
+        let published: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(published, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn json_receipt_publication_refuses_to_clobber() {
+        let root = publication_test_root("no-clobber");
+        let path = root.join("terminal.json");
+        let original = b"{\"executionId\":\"first\"}\n";
+        fs::write(&path, original).unwrap();
+
+        let error = write_json_once_with_hook(&path, &json!({"executionId": "second"}), |_| Ok(()))
+            .unwrap_err();
+
+        assert_eq!(error, "execution receipt already exists");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_leftover_temp_file_is_not_receipt_evidence() {
+        let root = publication_test_root("crash-leftover");
+        let path = root.join("terminal.json");
+        let leftover = root.join(".terminal.json.tmp-crash");
+        fs::write(&leftover, b"{\"executionId\":").unwrap();
+
+        assert_eq!(
+            fs::read(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        write_json_once_with_hook(&path, &json!({"executionId": "published"}), |_| Ok(())).unwrap();
+
+        let published: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(published["executionId"], "published");
+        assert_eq!(fs::read(&leftover).unwrap(), b"{\"executionId\":");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

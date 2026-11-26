@@ -38,7 +38,7 @@ defmodule Tightbeam.CredentialHealthCliTest do
   setup do
     root =
       Path.join(
-        System.tmp_dir!(),
+        System.fetch_env!("TIGHTBEAM_TEST_ROOT"),
         "tightbeam-credential-health-cli-#{System.unique_integer([:positive])}"
       )
 

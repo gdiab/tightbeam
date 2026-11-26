@@ -7,8 +7,8 @@ Application.put_env(:tightbeam, :workspace_cleanup_runner, fn _invocation, _scri
   {"synthetic SSH runner not configured for this test", 255}
 end)
 
-if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
-  expected_node = System.get_env("TIGHTBEAM_GATE_NODE")
+if authoritative_gate_claim = Application.get_env(:tightbeam, :authoritative_gate_claim) do
+  expected_node = authoritative_gate_claim.expected_node
   actual_node = node() |> Atom.to_string() |> String.split("@", parts: 2) |> hd()
   port = Application.get_env(:tightbeam, :port)
 
@@ -85,12 +85,10 @@ if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
     end
   end
 
-  # The claim is consumed by this top-level VM. Some conformance tests launch
-  # nested focused Mix tests, and an argv-level node name deliberately does not
-  # propagate to them. Leaving the claim in the environment would make those
-  # ordinary child runs impersonate an authoritative gate and refuse correctly.
-  System.delete_env("TIGHTBEAM_AUTHORITATIVE_GATE")
-  System.delete_env("TIGHTBEAM_GATE_NODE")
+  # The claim is consumed by this top-level VM. Delete its internal copy after
+  # validation so test code cannot reuse it; nested focused Mix runs start with
+  # neither the scrubbed shell variables nor this VM's application environment.
+  Application.delete_env(:tightbeam, :authoritative_gate_claim)
 end
 
 # The suite is not hermetic, and every dependency it has on the machine around it
@@ -307,6 +305,13 @@ ExUnit.after_suite(fn _result ->
     harness process fixtures leaked from this suite run:
     #{Tightbeam.HarnessProcessCensus.format(leaked)}
     """
+  end
+
+  tripwire_log = Application.fetch_env!(:tightbeam, :test_tripwire_log)
+
+  if File.exists?(tripwire_log) do
+    attempted = tripwire_log |> File.read!() |> String.split("\n", trim: true) |> Enum.uniq()
+    raise "test isolation refused forbidden executable(s): #{Enum.join(attempted, ", ")}"
   end
 end)
 

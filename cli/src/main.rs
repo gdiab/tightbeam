@@ -23,6 +23,8 @@ mod process_tree;
 mod rail_action;
 mod session_connect;
 mod skills;
+#[cfg(test)]
+mod test_isolation;
 mod transport_receipt;
 mod users;
 

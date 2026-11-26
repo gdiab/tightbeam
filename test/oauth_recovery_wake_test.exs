@@ -393,6 +393,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
            name: Credentials.server(@host),
            base_dir: ctx.base,
            machine: @host,
+           sh: fn _command -> {"synthetic provider fixture", 0} end,
            start: fn _provider, _kind -> :ok end,
            on_credential_present: fn _provider -> :ok end,
            resume: fn _provider -> :ok end

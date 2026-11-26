@@ -1457,7 +1457,9 @@ fn emit_delivery(ceremony: &Ceremony<'_>, deliverable: &Deliverable, ttl: Option
         wake_id,
         file_path.as_deref(),
     );
-    println!("{line}");
+    if !test_isolation_active() {
+        println!("{line}");
+    }
 }
 
 /// Wake the owner user with the sign-in prompt -- the durable substrate row AND the
@@ -1502,14 +1504,13 @@ fn notify_operator(ceremony: &Ceremony<'_>, deliverable: &Deliverable, machine: 
 
 /// Write the 0600 delivery file into the CURRENT DIRECTORY -- the session workdir for an
 /// agent-run ceremony (durable artifact space), the invoker's directory for a user run.
-/// Never /tmp, never home by construction: it lands where the operator invoked onboard.
+/// Tests route the same write into their isolated root. Never /tmp, never home in production:
+/// it lands where the operator invoked onboard.
 /// Best-effort: a write failure is loud but does not fail the ceremony, since the wake and
 /// stdout still carry the deliverable. Returns the path written, for the structured line.
 fn write_delivery_file(provider: &str, minted_ms: i64, contents: &str) -> Option<String> {
     let name = format!("onboard-delivery-{provider}-{minted_ms}.json");
-    let path = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(&name);
+    let path = delivery_dir().join(&name);
     // create_new (O_CREAT|O_EXCL): on Unix the mode argument is honored ONLY when the file is
     // created, so a create+truncate of an existing name would keep that file's old, possibly
     // world-readable mode. Refusing to reuse a name makes a non-0600 delivery file
@@ -1530,6 +1531,16 @@ fn write_delivery_file(provider: &str, minted_ms: i64, contents: &str) -> Option
             None
         }
     }
+}
+
+fn test_isolation_active() -> bool {
+    std::env::var_os("TIGHTBEAM_TEST_ROOT").is_some()
+}
+
+fn delivery_dir() -> PathBuf {
+    std::env::var_os("TIGHTBEAM_TEST_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// codex's device code appears on stdout the instant it is minted, then codex POLLS for up to
@@ -1590,7 +1601,7 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
 /// Extracted from `run_openai_onboarding` for one reason: so the teed drive -- the piped
 /// stdout flowing through `attend_teed`/`tee_pump` into `emit_delivery` mid-run -- is
 /// exercisable against a stub child. Production points it at codex; the tests point it at a
-/// `/bin/sh` stub that replays a real device-auth capture.
+/// `/bin/sh` stub that replays a synthetic device-auth-shaped capture.
 fn supervise_teed(
     mut command: ProcessCommand,
     ceremony: &Ceremony<'_>,
@@ -1689,8 +1700,10 @@ fn tee_pump(
         match out.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
-                let _ = stdout.write_all(&chunk[..n]);
-                let _ = stdout.flush();
+                if !test_isolation_active() {
+                    let _ = stdout.write_all(&chunk[..n]);
+                    let _ = stdout.flush();
+                }
                 buffer.extend_from_slice(&chunk[..n]);
                 // The code sits in the first few hundred bytes; a generous cap bounds memory
                 // without ever dropping it.
@@ -3688,10 +3701,10 @@ mod tests {
         assert_eq!(error, "dedicated Cursor identity is absent");
     }
 
-    /// Serializes the tests that drive `emit_delivery`, because `write_delivery_file` writes into
-    /// the process-wide current directory (the shared crate root under `cargo test`) and each such
-    /// test globs + deletes `onboard-delivery-openai-*.json` to clean up. Without this lock two of
-    /// them running in parallel delete each other's file mid-run. Poison is ignored: a panicking
+    /// Serializes the tests that drive `emit_delivery`, because each one shares the process-wide
+    /// isolated delivery directory and globs + deletes `onboard-delivery-openai-*.json` to clean
+    /// up. Without this lock two of them running in parallel delete each other's file mid-run.
+    /// Poison is ignored: a panicking
     /// assertion in one test must surface as that test's failure, not as a poison error masking it
     /// in the next.
     static DELIVERY_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -4327,7 +4340,14 @@ mod tests {
             .env(STAGING, &staging)
             .env(CANCEL, &cancel)
             .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -4579,7 +4599,7 @@ mod tests {
 
     /// The teed OpenAI drive delivers MID-RUN, end to end through the real loop.
     ///
-    /// This is the seam an independent review flagged as unproven: real device-auth bytes had
+    /// This is the seam an independent review flagged as unproven: synthetic device-auth-shaped bytes had
     /// never been driven through the LIVE tee -- `supervise_teed` -> `attend_teed` ->
     /// `tee_pump` -> `extract_codex_device` -> `emit_delivery` -> operator wake. The pure
     /// extraction is unit-tested against this same fixture in `onboard_emit`; this proves the
@@ -4595,7 +4615,7 @@ mod tests {
         );
 
         let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = delivery_dir();
         let before = openai_delivery_files(&cwd);
 
         let mut command = ProcessCommand::new("/bin/sh");
@@ -4641,18 +4661,18 @@ mod tests {
         assert!(emitted, "the teed drive never emitted the delivery mid-run");
 
         let sent = sent.into_inner();
-        assert_eq!(sent.len(), 1, "expected exactly one wake, got {sent:?}");
+        assert_eq!(sent.len(), 1, "expected exactly one captured wake");
         let body = &sent[0];
-        assert!(body.contains(r#""verb":"wake""#), "{body}");
-        assert!(body.contains(r#""userId":"mike""#), "{body}");
-        // The real capture's code and URL, carried on the durable wake row.
+        assert!(body.contains(r#""verb":"wake""#), "wake verb missing");
+        assert!(body.contains(r#""userId":"mike""#), "wake user missing");
+        // The synthetic fixture's code and URL, carried on the durable wake row.
         assert!(
-            body.contains("VG6S-L35ON"),
-            "code missing from wake: {body}"
+            body.contains("TEST-CODE"),
+            "synthetic code missing from captured wake"
         );
         assert!(
-            body.contains("auth.openai.com/codex/device"),
-            "url missing from wake: {body}"
+            body.contains("example.invalid/device"),
+            "synthetic URL missing from captured wake"
         );
     }
 
@@ -4663,7 +4683,7 @@ mod tests {
     /// (resolving the stub through the ceremony's harness catalog) -> `supervise_teed` ->
     /// `attend_teed` -> `tee_pump` -> `extract_codex_device` -> `emit_delivery` -> operator wake
     /// + `write_delivery_file` (0600) -> the structured line -> `codex_staged_a_credential`. The
-    /// stub replays the real codex 0.146.0 device-auth capture to its teed stdout, then banks a
+    /// stub replays the synthetic codex-shaped device-auth capture to its teed stdout, then banks a
     /// non-empty `auth.json` into `$CODEX_HOME` and exits 0, so the delivery must fire mid-run AND
     /// the leg must return Ok. Asserting the delivery FILE's mode and contents -- not just the
     /// wake -- is what makes `write_delivery_file` a proven step of this path, not an inferred one.
@@ -4690,7 +4710,7 @@ mod tests {
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
 
-        // The codex stub: replay the real capture to (teed) stdout, then bank a credential into
+        // The codex stub: replay the synthetic fixture to (teed) stdout, then bank a credential into
         // $CODEX_HOME and exit 0 -- exactly the success shape codex_staged_a_credential accepts.
         let stub = root.join("codex-stub.sh");
         fs::write(
@@ -4736,7 +4756,7 @@ mod tests {
         };
 
         let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = delivery_dir();
         let before = openai_delivery_files(&cwd);
 
         let result = run_openai_onboarding(staging.to_str().unwrap(), &ceremony);
@@ -4761,16 +4781,16 @@ mod tests {
 
         // The operator wake carried the real code and URL.
         let sent = sent.into_inner();
-        assert_eq!(sent.len(), 1, "expected exactly one wake, got {sent:?}");
+        assert_eq!(sent.len(), 1, "expected exactly one captured wake");
         let body = &sent[0];
-        assert!(body.contains(r#""verb":"wake""#), "{body}");
+        assert!(body.contains(r#""verb":"wake""#), "wake verb missing");
         assert!(
-            body.contains("VG6S-L35ON"),
-            "code missing from wake: {body}"
+            body.contains("TEST-CODE"),
+            "synthetic code missing from captured wake"
         );
         assert!(
-            body.contains("auth.openai.com/codex/device"),
-            "url missing from wake: {body}"
+            body.contains("example.invalid/device"),
+            "synthetic URL missing from captured wake"
         );
 
         // write_delivery_file wrote exactly one 0600 file carrying the same code and URL.
@@ -4782,12 +4802,12 @@ mod tests {
         let (mode, contents) = file_evidence.expect("the delivery file should exist");
         assert_eq!(mode, 0o600, "the delivery file must be private (0600)");
         assert!(
-            contents.contains("VG6S-L35ON"),
-            "code missing from delivery file: {contents}"
+            contents.contains("TEST-CODE"),
+            "synthetic code missing from captured delivery file"
         );
         assert!(
-            contents.contains("auth.openai.com/codex/device"),
-            "url missing from delivery file: {contents}"
+            contents.contains("example.invalid/device"),
+            "synthetic URL missing from captured delivery file"
         );
     }
 
@@ -4807,7 +4827,7 @@ mod tests {
         );
 
         let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = delivery_dir();
         let before = openai_delivery_files(&cwd);
 
         let mut command = ProcessCommand::new("/bin/sh");
@@ -4889,7 +4909,7 @@ mod tests {
     fn a_fresh_delivery_file_is_created_private_0600() {
         use std::os::unix::fs::PermissionsExt;
         let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = delivery_dir();
         // A distinctive minted timestamp so the name cannot clash with a real delivery file.
         let minted = 1_700_000_000_000 + std::process::id() as i64;
         let path = cwd.join(format!("onboard-delivery-openai-{minted}.json"));
@@ -4920,7 +4940,7 @@ mod tests {
     fn an_existing_delivery_name_is_refused_not_silently_reused() {
         use std::os::unix::fs::PermissionsExt;
         let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = delivery_dir();
         let minted = 1_700_000_000_001 + std::process::id() as i64;
         let path = cwd.join(format!("onboard-delivery-openai-{minted}.json"));
 
@@ -4928,7 +4948,7 @@ mod tests {
         fs::write(&path, "PRIOR").unwrap();
         fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let written = write_delivery_file("openai", minted, "{\"secret\":\"VG6S-L35ON\"}");
+        let written = write_delivery_file("openai", minted, "{\"secret\":\"TEST-CODE\"}");
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         let contents = fs::read_to_string(&path).unwrap();
@@ -4959,7 +4979,7 @@ mod tests {
         // A plausible future codex format our extractor cannot parse (no "one-time code" marker)
         // and which contains neither phrase the old gate keyed on. Synthetic by necessity: it is
         // a format that does not exist yet -- the drift the fallback is built to survive.
-        let drift = "To finish signing in, open https://auth.openai.com/activate and type the pairing key: WXYZ-1234";
+        let drift = "To finish signing in, open https://example.invalid/activate and type the pairing key: WXYZ-1234";
         assert!(
             onboard_emit::extract_codex_device(drift).is_none(),
             "the drifted block must be a genuine parse miss"
@@ -5021,7 +5041,7 @@ mod tests {
         };
 
         let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = delivery_dir();
         let before = openai_delivery_files(&cwd);
 
         let result = run_openai_onboarding(staging.to_str().unwrap(), &ceremony);
@@ -5043,11 +5063,7 @@ mod tests {
         );
         // ...but the deliverable was NOT lost: exactly one raw-tail wake carried the drifted block.
         let sent = sent.into_inner();
-        assert_eq!(
-            sent.len(),
-            1,
-            "expected exactly one raw-tail wake, got {sent:?}"
-        );
+        assert_eq!(sent.len(), 1, "expected exactly one captured raw-tail wake");
         assert!(
             sent[0].contains("WXYZ-1234"),
             "raw tail missing the drifted code: {}",
@@ -5067,7 +5083,7 @@ mod tests {
         let file_body = file_body.expect("a delivery file must be written for the raw tail");
         assert!(
             file_body.contains("WXYZ-1234"),
-            "raw tail missing from delivery file: {file_body}"
+            "raw tail missing from captured delivery file"
         );
     }
 
@@ -5253,8 +5269,8 @@ mod tests {
             owner_user_id: Some("mike".to_owned()),
         };
         let deliverable = Deliverable::DeviceCode {
-            url: "https://auth.openai.com/codex/device".to_owned(),
-            code: "VG6S-L35ON".to_owned(),
+            url: "https://example.invalid/device".to_owned(),
+            code: "TEST-CODE".to_owned(),
         };
 
         let notified = notify_operator(&ceremony, &deliverable, "node-c");
@@ -5267,10 +5283,13 @@ mod tests {
             }
         );
         let body = &sent.borrow()[0];
-        assert!(body.contains(r#""verb":"wake""#), "{body}");
-        assert!(body.contains(r#""userId":"mike""#), "{body}");
+        assert!(body.contains(r#""verb":"wake""#), "wake verb missing");
+        assert!(body.contains(r#""userId":"mike""#), "wake user missing");
         // The wake row carries the code text itself -- it IS the durable delivery record.
-        assert!(body.contains("VG6S-L35ON"), "{body}");
+        assert!(
+            body.contains("TEST-CODE"),
+            "synthetic code missing from captured wake"
+        );
     }
 
     #[test]

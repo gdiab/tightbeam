@@ -1,3 +1,6 @@
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 

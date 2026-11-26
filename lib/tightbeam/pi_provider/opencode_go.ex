@@ -30,7 +30,20 @@ defmodule Tightbeam.PiProvider.OpenCodeGo do
 
   @impl true
   def fetch_catalog(state) do
-    sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
+    case Map.fetch(state.options, :sh) do
+      :error ->
+        if System.get_env("TIGHTBEAM_TEST_ROOT") do
+          {:error, :test_catalog_transport_not_configured}
+        else
+          fetch_catalog_with(state, &Support.system_cmd_out/1)
+        end
+
+      {:ok, explicit} ->
+        fetch_catalog_with(state, explicit)
+    end
+  end
+
+  defp fetch_catalog_with(state, sh) do
     destination = Map.get(state, :host_config, %{ssh: nil}).ssh
 
     with {:ok, paths} <- catalog_executables(state, destination) do

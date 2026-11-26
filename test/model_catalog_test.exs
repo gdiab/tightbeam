@@ -2230,12 +2230,16 @@ defmodule Tightbeam.ModelCatalogTest do
       sh = fn [command | args] = argv ->
         send(parent, {:probe, argv})
 
-        System.cmd(command, args,
-          env: [
-            {"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")},
-            {"CATALOG_BODY", body_path}
-          ]
-        )
+        if command == "sh" do
+          System.cmd(command, args,
+            env: [
+              {"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")},
+              {"CATALOG_BODY", body_path}
+            ]
+          )
+        else
+          {"synthetic remote unavailable", 255}
+        end
       end
 
       catalog = start_catalog(ctx, sh: sh)
@@ -2276,9 +2280,13 @@ defmodule Tightbeam.ModelCatalogTest do
       File.chmod!(non_executable, 0o644)
 
       sh = fn [command | args] ->
-        System.cmd(command, args,
-          env: [{"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")}]
-        )
+        if command == "sh" do
+          System.cmd(command, args,
+            env: [{"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")}]
+          )
+        else
+          {"synthetic remote unavailable", 255}
+        end
       end
 
       for binding <- ["codex", non_executable] do

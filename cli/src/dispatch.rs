@@ -2203,7 +2203,7 @@ fn discover_with<F>(get_env: F, cwd: &Path, home_dir: &Path) -> Result<Endpoint,
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(endpoint) = discover_session_from(cwd)? {
+    if let Some(endpoint) = discover_session_from_bounded(cwd, get_env("TIGHTBEAM_TEST_ROOT"))? {
         return Ok(endpoint);
     }
 
@@ -2222,7 +2222,27 @@ where
 }
 
 fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
-    for directory in cwd.ancestors() {
+    discover_session_from_bounded(cwd, None)
+}
+
+fn discover_session_from_bounded(
+    cwd: &Path,
+    test_root: Option<String>,
+) -> Result<Option<Endpoint>, String> {
+    let test_root = test_root.map(PathBuf::from);
+
+    if test_root
+        .as_ref()
+        .is_some_and(|root| !cwd.starts_with(root))
+    {
+        return Ok(None);
+    }
+
+    for directory in cwd.ancestors().take_while(|directory| {
+        test_root
+            .as_ref()
+            .is_none_or(|root| directory.starts_with(root))
+    }) {
         let path = directory.join(".tightbeam-session");
         if !path.exists() {
             continue;
@@ -3826,7 +3846,8 @@ pub fn run(command: Command) -> Result<(), String> {
         move || {
             if session_identity {
                 let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-                discover_session_from(&cwd)?.ok_or_else(|| identity_required(&cwd))
+                discover_session_from_bounded(&cwd, std::env::var("TIGHTBEAM_TEST_ROOT").ok())?
+                    .ok_or_else(|| identity_required(&cwd))
             } else {
                 discover()
             }
@@ -4280,7 +4301,8 @@ fn tune_model_params(
 
 fn print_current_session_identity() -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let session_key = current_session_key_from(&cwd)?;
+    let session_key =
+        current_session_key_from_bounded(&cwd, std::env::var("TIGHTBEAM_TEST_ROOT").ok())?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({"sessionKey": session_key}))
@@ -4290,7 +4312,27 @@ fn print_current_session_identity() -> Result<(), String> {
 }
 
 fn current_session_key_from(cwd: &Path) -> Result<String, String> {
-    for directory in cwd.ancestors() {
+    current_session_key_from_bounded(cwd, None)
+}
+
+fn current_session_key_from_bounded(
+    cwd: &Path,
+    test_root: Option<String>,
+) -> Result<String, String> {
+    let test_root = test_root.map(PathBuf::from);
+
+    if test_root
+        .as_ref()
+        .is_some_and(|root| !cwd.starts_with(root))
+    {
+        return Err("session identity unavailable outside the test root".to_owned());
+    }
+
+    for directory in cwd.ancestors().take_while(|directory| {
+        test_root
+            .as_ref()
+            .is_none_or(|root| directory.starts_with(root))
+    }) {
         let path = directory.join(".tightbeam-session");
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -7028,6 +7070,34 @@ mod tests {
                     .display()
                     .to_string()
             )
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_root_blocks_a_session_marker_above_the_isolated_workdir() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_test_root_{unique}"));
+        let isolated = root.join("isolated");
+        let cwd = isolated.join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"url":"https://real.invalid","token":"must-not-be-read"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_session_from_bounded(&cwd, Some(isolated.display().to_string())),
+            Ok(None)
+        );
+        assert_eq!(
+            current_session_key_from_bounded(&cwd, Some(isolated.display().to_string())),
+            Err("session identity unavailable: no .tightbeam-session marker".to_owned())
         );
 
         fs::remove_dir_all(root).unwrap();

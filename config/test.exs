@@ -1,5 +1,14 @@
 import Config
 
+source_tool_home = System.fetch_env!("HOME")
+source_path = System.fetch_env!("PATH")
+source_cargo_home = System.get_env("CARGO_HOME", Path.join(source_tool_home, ".cargo"))
+
+authoritative_gate_claim =
+  if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
+    %{expected_node: System.get_env("TIGHTBEAM_GATE_NODE")}
+  end
+
 suite_nonce =
   12
   |> :crypto.strong_rand_bytes()
@@ -14,16 +23,170 @@ suite_tmp =
 File.mkdir_p!(suite_tmp)
 System.put_env("TMPDIR", suite_tmp)
 
+# A test process must not inherit a live Tightbeam or provider identity from the
+# shell that launched it. Keep every implicit home/base lookup inside the suite
+# root, and put fail-closed tripwires ahead of installed CLIs on PATH. Tripwires
+# record only the executable name: arguments may contain credentials.
+for name <- System.get_env() |> Map.keys(),
+    String.starts_with?(name, "TIGHTBEAM_") or
+      String.starts_with?(name, "RELEASE_") or
+      String.ends_with?(name, "_API_KEY") or
+      String.ends_with?(name, "_OAUTH_TOKEN") or
+      String.ends_with?(name, "_CREDENTIALS") or
+      String.ends_with?(name, "_TOKEN") or
+      name in [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "SSH_AUTH_SOCK"
+      ],
+    do: System.delete_env(name)
+
+home = Path.join(suite_tmp, "home")
+base = Path.join(suite_tmp, "app")
+bin = Path.join(suite_tmp, "tripwire-bin")
+tool_bin = Path.join(suite_tmp, "tool-bin")
+tripwire_log = Path.join(suite_tmp, "forbidden-execution")
+quoted_tripwire_log = "'" <> String.replace(tripwire_log, "'", "'\"'\"'") <> "'"
+File.mkdir_p!(home)
+File.mkdir_p!(bin)
+File.mkdir_p!(tool_bin)
+
+# Established tests start nested Mix builds. Seed their synthetic HOME with
+# only executable build tooling and immutable package artefacts; never copy
+# Hex state, Mix configuration, provider homes, or credentials from the runner.
+copy_tool_dir! = fn source, target ->
+  case File.cp_r(source, target) do
+    {:ok, _copied} -> :ok
+    {:error, _reason, _path} -> raise "test isolation could not copy build tooling"
+  end
+
+  paths = [target | Path.wildcard(Path.join(target, "**/*"), match_dot: true)]
+
+  if Enum.any?(paths, &(File.lstat!(&1).type == :symlink)) do
+    raise "test isolation refuses symlinked build tooling"
+  end
+end
+
+source_hex_archives = Path.join([source_tool_home, ".mix", "archives", "hex-*"])
+hex_archives = Path.wildcard(source_hex_archives)
+
+if hex_archives == [] do
+  raise "test isolation requires an installed Hex archive"
+end
+
+isolated_archives = Path.join([home, ".mix", "archives"])
+File.mkdir_p!(isolated_archives)
+
+for archive <- hex_archives do
+  copy_tool_dir!.(archive, Path.join(isolated_archives, Path.basename(archive)))
+end
+
+for source <- Path.wildcard(Path.join([source_tool_home, ".mix", "elixir", "*", "rebar3"])) do
+  if File.lstat!(source).type != :regular do
+    raise "test isolation refuses non-regular Rebar tooling"
+  end
+
+  target = Path.join(home, Path.relative_to(source, source_tool_home))
+  File.mkdir_p!(Path.dirname(target))
+  File.cp!(source, target)
+end
+
+source_elixir_make_cache = Path.join([source_tool_home, ".cache", "elixir_make"])
+
+if File.dir?(source_elixir_make_cache) do
+  target = Path.join([home, ".cache", "elixir_make"])
+  File.mkdir_p!(Path.dirname(target))
+  copy_tool_dir!.(source_elixir_make_cache, target)
+end
+
+source_cargo_registry = Path.join(source_cargo_home, "registry")
+
+unless File.dir?(source_cargo_registry) do
+  raise "test isolation requires an installed Cargo registry cache"
+end
+
+isolated_cargo_home = Path.join(home, ".cargo")
+File.mkdir_p!(isolated_cargo_home)
+copy_tool_dir!.(source_cargo_registry, Path.join(isolated_cargo_home, "registry"))
+
+# Nested test builds use the already-installed Rust toolchain directly. The
+# wrappers keep rustup and Cargo homes synthetic, and offline mode makes a
+# missing local dependency an immediate refusal instead of a download.
+source_rustc =
+  System.find_executable("rustc") || raise "test isolation requires an installed Rust toolchain"
+
+{rust_sysroot, 0} = System.cmd(source_rustc, ["--print", "sysroot"])
+rust_sysroot = String.trim(rust_sysroot)
+
+for name <- ~w(cargo rustc rustdoc) do
+  source = Path.join([rust_sysroot, "bin", name])
+
+  if File.lstat!(source).type != :regular do
+    raise "test isolation refuses missing or non-regular Rust tooling"
+  end
+
+  quoted_source = "'" <> String.replace(source, "'", "'\"'\"'") <> "'"
+  path = Path.join(tool_bin, name)
+  File.write!(path, "#!/bin/sh\nexec #{quoted_source} \"$@\"\n")
+  File.chmod!(path, 0o755)
+end
+
+registry = File.read!(Path.expand("../priv/harness_registry.json", __DIR__))
+
+provider_cli_names =
+  Regex.scan(~r/"cli_binary"\s*:\s*"([^"]+)"/, registry, capture: :all_but_first)
+  |> List.flatten()
+
+for name <- Enum.uniq(["tightbeam", "opencode", "npm", "ssh" | provider_cli_names]) do
+  path = Path.join(bin, name)
+
+  File.write!(
+    path,
+    "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf 'synthetic 1.0\\n'; exit 0; fi\nprintf '%s\\n' '#{name}' >> #{quoted_tripwire_log}\nexit 97\n"
+  )
+
+  File.chmod!(path, 0o755)
+end
+
+git_config = Path.join(home, ".gitconfig")
+File.write!(git_config, "[user]\n\tname = Tightbeam Test\n\temail = test@example.invalid\n")
+
+System.put_env("HOME", home)
+System.put_env("TMP", suite_tmp)
+System.put_env("TEMP", suite_tmp)
+System.put_env("XDG_CONFIG_HOME", Path.join(home, ".config"))
+System.put_env("CODEX_HOME", Path.join(home, ".codex"))
+System.put_env("GIT_CONFIG_GLOBAL", git_config)
+System.put_env("TIGHTBEAM_TEST_ROOT", suite_tmp)
+System.put_env("TIGHTBEAM_BASE_DIR", base)
+System.put_env("TIGHTBEAM_HOME", base)
+System.put_env("TIGHTBEAM_TEST_TRIPWIRE_LOG", tripwire_log)
+System.put_env("CARGO_NET_OFFLINE", "true")
+System.put_env("CARGO_HOME", isolated_cargo_home)
+System.put_env("RUSTUP_HOME", Path.join(home, ".rustup"))
+System.put_env("RUSTC", Path.join(tool_bin, "rustc"))
+System.put_env("RUSTDOC", Path.join(tool_bin, "rustdoc"))
+
+fixture_bin = Path.expand("../priv/harness_cli", __DIR__)
+System.put_env("PATH", Enum.join([fixture_bin, tool_bin, bin, source_path], ":"))
+
 # Keep the auto-started app off the real ~/.tightbeam during tests.
 config :tightbeam,
        :base_dir,
-       Path.join(suite_tmp, "app")
+       base
 
 config :tightbeam, :autostart, false
 config :tightbeam, :local_host_name, "testhost"
 config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp
+config :tightbeam, :test_tripwire_log, tripwire_log
 config :tightbeam, :port, 0
+
+if authoritative_gate_claim do
+  config :tightbeam, :authoritative_gate_claim, authoritative_gate_claim
+end
 
 # Core fix (A) C6a: tests point the unfreeze-file reader at fixtures. Only this
 # environment compiles the override; by default the hatch reads a path that does
