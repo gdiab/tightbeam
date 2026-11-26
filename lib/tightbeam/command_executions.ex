@@ -561,18 +561,68 @@ defmodule Tightbeam.CommandExecutions do
     end
   end
 
-  defp write_json_once(path, value) do
+  @doc false
+  def write_json_once_for_test(path, value, before_publish)
+      when is_function(before_publish, 1) do
+    write_json_once(path, value, before_publish)
+  end
+
+  defp write_json_once(path, value), do: write_json_once(path, value, fn _path -> :ok end)
+
+  defp write_json_once(path, value, before_publish) do
     File.mkdir_p!(Path.dirname(path))
     bytes = JSON.encode!(value) <> "\n"
 
-    case :file.open(String.to_charlist(path), [:write, :binary, :exclusive]) do
-      {:ok, file} ->
-        result =
-          with :ok <- :file.write(file, bytes),
-               do: :file.sync(file)
+    case open_receipt_temp(path) do
+      {:ok, temp_path, file} ->
+        write_result =
+          try do
+            with :ok <- :file.write(file, bytes),
+                 do: :file.sync(file)
+          after
+            :ok = :file.close(file)
+          end
 
-        :ok = :file.close(file)
-        result
+        try do
+          with :ok <- write_result,
+               :ok <- before_publish.(temp_path),
+               :ok <- File.ln(temp_path, path),
+               :ok <- sync_parent(path),
+               :ok <- File.rm(temp_path),
+               do: sync_parent(path)
+        after
+          _ = File.rm(temp_path)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp open_receipt_temp(path) do
+    temp_path =
+      Path.join(
+        Path.dirname(path),
+        ".#{Path.basename(path)}.tmp-#{System.pid()}-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    case :file.open(String.to_charlist(temp_path), [:write, :binary, :exclusive]) do
+      {:ok, file} -> {:ok, temp_path, file}
+      {:error, :eexist} -> open_receipt_temp(path)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp sync_parent(path) do
+    parent = path |> Path.dirname() |> String.to_charlist()
+
+    case :file.open(parent, [:read, :raw, :directory]) do
+      {:ok, directory} ->
+        try do
+          :file.sync(directory)
+        after
+          :ok = :file.close(directory)
+        end
 
       {:error, reason} ->
         {:error, reason}
