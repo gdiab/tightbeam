@@ -3,11 +3,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const TEST_PARENT_PID: &str = "TIGHTBEAM_RUST_TEST_PARENT_PID";
+
 #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
 #[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
 #[used]
 static INSTALL_TEST_ISOLATION: extern "C" fn() = {
     extern "C" fn install() {
+        if established_self_reexec_child() {
+            return;
+        }
+
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -95,6 +101,7 @@ static INSTALL_TEST_ISOLATION: extern "C" fn() = {
             std::env::set_var("TIGHTBEAM_BASE_DIR", &base);
             std::env::set_var("TIGHTBEAM_HOME", &base);
             std::env::set_var("TIGHTBEAM_TEST_TRIPWIRE_LOG", &log);
+            std::env::set_var(TEST_PARENT_PID, std::process::id().to_string());
             std::env::set_var("PATH", path);
             libc::atexit(assert_tripwire_clean);
         }
@@ -102,6 +109,61 @@ static INSTALL_TEST_ISOLATION: extern "C" fn() = {
 
     install
 };
+
+fn established_self_reexec_child() -> bool {
+    // A direct child running one of the test binary's exact, established re-exec
+    // protocols keeps its parent's already-scrubbed environment and test root.
+    // Every other invocation must install fresh isolation, including ordinary
+    // descendants that happen to execute the same test binary.
+    let parent_matches = std::env::var(TEST_PARENT_PID)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        == Some(unsafe { libc::getppid() } as u32);
+    if !parent_matches {
+        return false;
+    }
+
+    let args: Vec<_> = std::env::args_os().collect();
+    let Some(exact) = args
+        .windows(2)
+        .find(|pair| pair[0] == "--exact")
+        .and_then(|pair| pair[1].to_str())
+    else {
+        return false;
+    };
+
+    if let Some(test) = exact.strip_prefix("child_process::tests::") {
+        let control = format!("TIGHTBEAM_ISOLATED_{}", test.to_ascii_uppercase());
+        return std::env::var_os(control).as_deref() == Some(std::ffi::OsStr::new("1"));
+    }
+
+    match exact {
+        "transport_receipt::tests::independent_processes_share_nonwaiting_lock_and_rotation" => {
+            std::env::var_os("TIGHTBEAM_RECEIPT_TEST_BASE").is_some()
+                && std::env::var_os("TIGHTBEAM_RECEIPT_TEST_MODE").is_some()
+        }
+        "ceremonies::tests::term_during_codex_onboarding_cancels_its_exact_lease_and_keeps_the_interrupt" => {
+            [
+                "TIGHTBEAM_CODEX_SIGNAL_INNER",
+                "TIGHTBEAM_CODEX_SIGNAL_MARKER",
+                "TIGHTBEAM_CODEX_SIGNAL_STAGING",
+                "TIGHTBEAM_CODEX_SIGNAL_CANCEL",
+            ]
+            .iter()
+            .all(|name| std::env::var_os(name).is_some())
+                && std::env::var_os("TIGHTBEAM_CODEX_SIGNAL_INNER").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+                && std::env::var_os("TIGHTBEAM_MACHINE").as_deref()
+                    == Some(std::ffi::OsStr::new("signal-fixture-host"))
+        }
+        "ceremonies::tests::an_inherited_sigchld_ignore_keeps_timeout_group_identity_reserved" => {
+            std::env::var_os("TIGHTBEAM_SIGCHLD_CEREMONY_INNER").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+                && std::env::var_os("TIGHTBEAM_SIGCHLD_CEREMONY_DIR").is_some()
+        }
+        _ => false,
+    }
+}
 
 extern "C" fn assert_tripwire_clean() {
     let Some(log) = std::env::var_os("TIGHTBEAM_TEST_TRIPWIRE_LOG").map(PathBuf::from) else {

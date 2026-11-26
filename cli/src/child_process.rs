@@ -826,10 +826,16 @@ mod tests {
     /// running in parallel. Isolation is what keeps a signal regression from terminating
     /// its neighbours.
     fn alone(test: &str) -> bool {
+        const EXPECTED_ROOT: &str = "TB_TEST_EXPECTED_ISOLATION_ROOT";
         let variable = format!("TIGHTBEAM_ISOLATED_{}", test.to_ascii_uppercase());
         if std::env::var_os(&variable).is_some() {
+            assert!(
+                std::env::var_os("TIGHTBEAM_TEST_ROOT") == std::env::var_os(EXPECTED_ROOT),
+                "isolated child lost its parent's test root"
+            );
             return true;
         }
+        let root = std::env::var_os("TIGHTBEAM_TEST_ROOT").expect("test isolation root");
         let status = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -837,6 +843,7 @@ mod tests {
                 "--nocapture",
             ])
             .env(&variable, "1")
+            .env(EXPECTED_ROOT, root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -844,6 +851,33 @@ mod tests {
             .unwrap();
         assert!(status.success(), "isolated regression {test} failed");
         false
+    }
+
+    #[test]
+    fn ordinary_self_reexec_reapplies_the_production_environment_scrub() {
+        const MODE: &str = "TB_TEST_ORDINARY_REEXEC_MODE";
+        const TEST: &str =
+            "child_process::tests::ordinary_self_reexec_reapplies_the_production_environment_scrub";
+
+        if std::env::var_os(MODE).is_some() {
+            assert!(
+                std::env::var_os("TIGHTBEAM_URL").is_none(),
+                "ordinary child retained a production endpoint"
+            );
+            assert!(std::env::var_os("TIGHTBEAM_TEST_ROOT").is_some());
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(MODE, "child")
+            .env("TIGHTBEAM_URL", "http://must-be-scrubbed.invalid")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "ordinary scrub-check child failed");
     }
 
     #[test]

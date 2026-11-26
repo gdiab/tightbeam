@@ -4340,7 +4340,14 @@ mod tests {
             .env(STAGING, &staging)
             .env(CANCEL, &cancel)
             .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
