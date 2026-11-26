@@ -128,7 +128,11 @@ pub fn recover_admin(user: &str) -> Result<(), String> {
 
 /// `tightbeam root-admin <recovery-enroll|pairing-code> --user <userId>` (S1.5).
 pub fn root_admin(action: RootAction, user: &str) -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
+    root_admin_as(&host(), action, user)
+}
+
+fn root_admin_as(host: &impl Host, action: RootAction, user: &str) -> Result<(), String> {
+    if !host.is_root() {
         return Err(format!(
             "root-admin {} needs root: run it as `sudo tightbeam root-admin {} --user {user}`, \
              with your own password. Nothing changed.",
@@ -138,13 +142,13 @@ pub fn root_admin(action: RootAction, user: &str) -> Result<(), String> {
     }
     refuse_session_context()?;
     let mut tty = Terminal::open()?;
-    let account = invoking_account();
+    let account = host.invoking_account();
     let tty_name = tty.name();
     let base = crate::base_dir::resolve();
 
     // Act as the database's owner from here on, so the gateway's account can still
     // open state.db, its journal files and the lock file afterwards (S1.5 (5)).
-    drop_to_owner(&base.join("state.db"))?;
+    drop_to_owner(host, &base.join("state.db"))?;
     let _lock = BaseLock::acquire(&base)?;
 
     let mut connection = open_database(&base)?;
@@ -512,39 +516,118 @@ impl SignalRestore {
     }
 }
 
-fn invoking_account() -> String {
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        if !user.is_empty() {
-            return user;
+// --- host identity (S1.5 items 1, 5 and 6) -----------------------------------
+
+/// What `root-admin` asks of the host: whether this process is root, who invoked it
+/// (S1.5 (6)), and becoming the database's owner (S1.5 (5)). The release CLI makes the
+/// system calls (`RealHost`). Only a CLI built with the `root-admin-seam` cargo
+/// feature, which the release and package builds never enable, answers from values
+/// compiled into it (`SeamHost`); no argument, environment variable or file selects
+/// it (F1 erratum 1 rev 4 §1c.1, stage1-v12 §6.3). Everything after these answers is
+/// the same product code in both.
+trait Host {
+    fn is_root(&self) -> bool;
+    fn invoking_account(&self) -> String;
+    fn become_owner(&self, uid: u32, gid: u32) -> Result<(), String>;
+}
+
+#[cfg(not(feature = "root-admin-seam"))]
+fn host() -> RealHost {
+    RealHost
+}
+
+#[cfg(feature = "root-admin-seam")]
+fn host() -> SeamHost {
+    SeamHost
+}
+
+struct RealHost;
+
+impl Host for RealHost {
+    fn is_root(&self) -> bool {
+        let euid = unsafe { libc::geteuid() };
+        euid == 0
+    }
+
+    fn invoking_account(&self) -> String {
+        if let Ok(user) = std::env::var("SUDO_USER") {
+            if !user.is_empty() {
+                return user;
+            }
+        }
+        let pw = unsafe { libc::getpwuid(libc::getuid()) };
+        if pw.is_null() {
+            format!("uid {}", unsafe { libc::getuid() })
+        } else {
+            unsafe { CStr::from_ptr((*pw).pw_name) }
+                .to_string_lossy()
+                .into_owned()
         }
     }
-    let pw = unsafe { libc::getpwuid(libc::getuid()) };
-    if pw.is_null() {
-        format!("uid {}", unsafe { libc::getuid() })
-    } else {
-        unsafe { CStr::from_ptr((*pw).pw_name) }
-            .to_string_lossy()
-            .into_owned()
+
+    fn become_owner(&self, uid: u32, gid: u32) -> Result<(), String> {
+        unsafe {
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setgid(gid) != 0
+                || libc::setuid(uid) != 0
+            {
+                return Err("cannot act as the database's owner; nothing changed".to_owned());
+            }
+        }
+        Ok(())
     }
 }
 
-fn drop_to_owner(database: &Path) -> Result<(), String> {
+/// The marker a seam-built CLI carries, so the package check can refuse one
+/// (`packaging/verify-payload.sh`). The release build does not contain it.
+#[cfg(feature = "root-admin-seam")]
+pub const SEAM_MARKER: &str = "tightbeam-root-admin-test-seam";
+
+/// The account a seam-built CLI records, compiled in: never read from the
+/// environment.
+#[cfg(feature = "root-admin-seam")]
+pub const SEAM_ACCOUNT: &str = "seam-operator";
+
+/// Test builds only: reports root, records a fixed invoking account, and in place of
+/// the owner switch writes the requested uid and gid to standard error, so a test can
+/// check the switch targets exactly `state.db`'s owner before any write.
+#[cfg(feature = "root-admin-seam")]
+struct SeamHost;
+
+#[cfg(feature = "root-admin-seam")]
+impl Host for SeamHost {
+    fn is_root(&self) -> bool {
+        true
+    }
+
+    fn invoking_account(&self) -> String {
+        SEAM_ACCOUNT.to_owned()
+    }
+
+    fn become_owner(&self, uid: u32, gid: u32) -> Result<(), String> {
+        eprintln!("{SEAM_MARKER}: become_owner uid={uid} gid={gid}");
+        Ok(())
+    }
+}
+
+/// The database's owner, from `state.db` itself.
+fn database_owner(database: &Path) -> Result<(u32, u32), String> {
     let meta = std::fs::metadata(database).map_err(|error| {
         format!(
             "cannot read {}: {error}; nothing changed",
             database.display()
         )
     })?;
-    let (uid, gid) = (meta.uid(), meta.gid());
-    unsafe {
-        if libc::setgroups(0, std::ptr::null()) != 0
-            || libc::setgid(gid) != 0
-            || libc::setuid(uid) != 0
-        {
-            return Err("cannot act as the database's owner; nothing changed".to_owned());
-        }
-    }
-    Ok(())
+    Ok((meta.uid(), meta.gid()))
+}
+
+fn drop_to_owner(host: &impl Host, database: &Path) -> Result<(), String> {
+    let (uid, gid) = database_owner(database)?;
+    host.become_owner(uid, gid)
+}
+
+fn invoking_account() -> String {
+    RealHost.invoking_account()
 }
 
 // --- database ---------------------------------------------------------------
@@ -1060,5 +1143,74 @@ mod tests {
         let refusal = read_hidden(&term).unwrap_err();
         assert!(refusal.contains("could not be restored"), "{refusal}");
         assert!(!refusal.contains("TBR-SECRET-INPUT"));
+    }
+
+    /// An in-process host for the identity decision and the owner switch (stage1-v12
+    /// §6.3: in-process injection by Rust tests). It records each switch it is asked for.
+    struct RecordingHost {
+        root: bool,
+        switched: std::cell::RefCell<Vec<(u32, u32)>>,
+    }
+
+    impl Host for RecordingHost {
+        fn is_root(&self) -> bool {
+            self.root
+        }
+
+        fn invoking_account(&self) -> String {
+            "recording-operator".to_owned()
+        }
+
+        fn become_owner(&self, uid: u32, gid: u32) -> Result<(), String> {
+            self.switched.borrow_mut().push((uid, gid));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn root_admin_refuses_a_non_root_host_before_anything_else() {
+        let host = RecordingHost {
+            root: false,
+            switched: Default::default(),
+        };
+        let refusal = root_admin_as(&host, RootAction::PairingCode, "george").unwrap_err();
+        assert!(refusal.contains("needs root"), "{refusal}");
+        assert!(refusal.contains("Nothing changed"), "{refusal}");
+        assert!(host.switched.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_owner_switch_targets_exactly_the_databases_uid_and_gid() {
+        let dir = std::env::temp_dir().join(format!("tb-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("state.db");
+        std::fs::write(&database, b"").unwrap();
+        let meta = std::fs::metadata(&database).unwrap();
+
+        let host = RecordingHost {
+            root: true,
+            switched: Default::default(),
+        };
+        drop_to_owner(&host, &database).unwrap();
+        assert_eq!(*host.switched.borrow(), vec![(meta.uid(), meta.gid())]);
+
+        // A missing state.db refuses rather than switching anywhere.
+        let missing = dir.join("absent/state.db");
+        assert!(
+            drop_to_owner(&host, &missing)
+                .unwrap_err()
+                .contains("nothing changed")
+        );
+        assert_eq!(host.switched.borrow().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The release build answers from the system: an ordinary test process is not root
+    /// whatever its environment says.
+    #[cfg(not(feature = "root-admin-seam"))]
+    #[test]
+    fn the_release_host_answers_root_from_the_effective_uid_only() {
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(host().is_root(), euid == 0);
     }
 }

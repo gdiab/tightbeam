@@ -230,6 +230,22 @@ defmodule Tightbeam.PackagingTest do
   end
 
   @tag :manifest_finalizer
+  test "stage1-v12 §6.3: an artifact carrying a root-admin test-seam CLI is refused and never finalized" do
+    temporary = artifact_fixture("0.1.6", "0.1.6", "0.1.6", payload: true, seam: true)
+    final = temporary <> ".final.tgz"
+
+    {output, status} =
+      System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+
+    assert status == 1, output
+
+    assert output =~
+             "payload refused: the package carries a root-admin test-seam build of the CLI"
+
+    refute File.exists?(final)
+  end
+
+  @tag :manifest_finalizer
   test "a metadata-poisoned temporary artifact never receives the final installable name" do
     temporary = artifact_fixture("0.1.6", "0.1.6", "0.1.6", payload: true)
     poison_pax_header!(temporary, "SCHILY.fflags")
@@ -268,7 +284,9 @@ defmodule Tightbeam.PackagingTest do
     File.mkdir_p!(Path.join(package, "release/releases"))
 
     cli = Path.join(package, "bin/tightbeam")
-    File.write!(cli, "#!/bin/sh\necho #{cli_version}\n")
+    # A seam-built CLI carries its compiled-in marker (cli/src/device_recovery.rs).
+    seam = if opts[:seam], do: "# tightbeam-root-admin-test-seam\n", else: ""
+    File.write!(cli, "#!/bin/sh\n#{seam}echo #{cli_version}\n")
     File.chmod!(cli, 0o755)
 
     File.write!(

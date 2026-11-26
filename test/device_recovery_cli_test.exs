@@ -94,15 +94,15 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
   # Run `args` on a pseudo-terminal, typing `input` after `delay` seconds.
   defp on_tty(ctx, args, input, opts \\ []) do
     delay = Keyword.get(opts, :delay, "0.6")
-    prefix = Keyword.get(opts, :prefix, [])
+    cli = Keyword.get(opts, :cli, @cli)
     cwd = Keyword.get(opts, :cwd, ctx.base)
-    command = Enum.map_join(prefix ++ [@cli | args], " ", &shell_quote/1)
+    command = Enum.map_join([cli | args], " ", &shell_quote/1)
 
     linger = Keyword.get(opts, :linger, 2)
 
     System.cmd("sh", ["-c", tty_pipeline(command, input, delay, linger)],
       cd: cwd,
-      env: env(ctx),
+      env: env(ctx) ++ Keyword.get(opts, :env, []),
       stderr_to_stdout: true
     )
   end
@@ -574,32 +574,95 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     assert echo_after_signal(ctx, "KILL") == :off
   end
 
-  ## P5c: the root-shell path (CI runners only, where passwordless sudo exists)
+  ## P5c: the root-shell path, in the suite and with no privilege (stage1-v12 P5c, §6.3)
 
-  @root_capable System.get_env("CI") == "true" and
-                  match?({_, 0}, System.cmd("sudo", ["-n", "true"], stderr_to_stdout: true))
-  @tag if(@root_capable, do: [], else: [skip: "needs passwordless sudo on a CI runner"])
-  test "P5c: root-admin needs root, a terminal, no session context and the lock; it records, alerts and writes as the owner",
+  # The CLI built with the root-admin test seam (cargo feature `root-admin-seam`), at its
+  # own target directory. It answers root, the account below and a recorded owner switch
+  # from values compiled into it; nothing at run time selects them. Everything after
+  # those answers is the release CLI's code. The package check refuses such a build
+  # (packaging/verify-payload.sh). The real-root half is the hosted step P5c-H
+  # (.github/workflows/root-admin-evidence.yml), outside every suite.
+  @seam_account "seam-operator"
+  @seam_marker "tightbeam-root-admin-test-seam"
+
+  defp seam_cli! do
+    cargo = System.find_executable("cargo") || flunk("cargo is required to build the seam CLI")
+    target = Path.expand("../cli/target/root-admin-seam", __DIR__)
+
+    {out, status} =
+      System.cmd(
+        cargo,
+        [
+          "build",
+          "--release",
+          "--locked",
+          "--features",
+          "root-admin-seam",
+          "--target-dir",
+          target,
+          "--manifest-path",
+          Path.expand("../cli/Cargo.toml", __DIR__)
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, out
+    Path.join(target, "release/tightbeam")
+  end
+
+  # Everything a root-admin refusal must leave untouched.
+  defp state(db) do
+    for table <- ~w(lifecycle_events gateway_host_actions pairing_codes recovery_secrets devices) do
+      {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY 1")
+      {table, rows}
+    end
+  end
+
+  defp root_admin(ctx, seam, action, opts \\ []) do
+    on_tty(ctx, ["root-admin", action, "--user", "george"], "", [cli: seam] ++ opts)
+  end
+
+  test "P5c: root-admin refuses without root, the lock, a terminal or outside a session directory; it records, alerts and switches to the owner",
        ctx do
     db = ctx.db
-    sudo = ["sudo", "-n", "env", "TIGHTBEAM_BASE_DIR=#{ctx.base}"]
+    seam = seam_cli!()
 
-    # Not root: refused.
-    {output, status} = on_tty(ctx, ["root-admin", "pairing-code", "--user", "george"], "")
-    assert status != 0
-    assert output =~ "needs root"
+    # An environment that would name another account, or claim CI or root, if anything
+    # read it: none of it decides the root answer or the recorded account.
+    hostile = [
+      {"SUDO_USER", "env-sudo-user"},
+      {"USER", "root"},
+      {"LOGNAME", "root"},
+      {"CI", "true"},
+      {"GITHUB_ACTIONS", "true"}
+    ]
 
-    # Root with the gateway running (the lock held): refused.
-    holder = hold_lock(Path.join(ctx.base, "gateway.lock"))
+    owner = File.stat!(Path.join(ctx.base, "state.db"))
+    switch = "#{@seam_marker}: become_owner uid=#{owner.uid} gid=#{owner.gid}"
+
+    # (A1) The release-built CLI, no seam, as this suite's own non-root account.
+    before = state(db)
 
     {output, status} =
-      on_tty(ctx, ["root-admin", "pairing-code", "--user", "george"], "", prefix: sudo)
+      on_tty(ctx, ["root-admin", "pairing-code", "--user", "george"], "", env: hostile)
 
     assert status != 0, output
-    assert output =~ "lock is held"
-    release_lock(holder)
+    assert output =~ "needs root"
+    refute output =~ @seam_marker
+    assert state(db) == before
 
-    # Root from a directory holding a session credential: refused.
+    # (A3) Root with the gateway running (the lock held): refused. The owner switch
+    # targets state.db's owner and comes before the lock and every write.
+    holder = hold_lock(Path.join(ctx.base, "gateway.lock"))
+    {output, status} = root_admin(ctx, seam, "pairing-code", env: hostile)
+    assert status != 0, output
+    assert output =~ "lock is held"
+    assert output =~ switch
+    release_lock(holder)
+    assert state(db) == before
+
+    # (A4) Root from a directory holding a session credential: refused, before any
+    # owner switch.
     session_dir = Path.join(ctx.base, "session")
     File.mkdir_p!(session_dir)
 
@@ -608,49 +671,50 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
       ~s({"url":"http://127.0.0.1:1","token":"x"})
     )
 
-    {output, status} =
-      on_tty(ctx, ["root-admin", "pairing-code", "--user", "george"], "",
-        prefix: sudo,
-        cwd: session_dir
-      )
-
-    assert status != 0
+    {output, status} = root_admin(ctx, seam, "pairing-code", cwd: session_dir, env: hostile)
+    assert status != 0, output
     assert output =~ "session credential"
+    refute output =~ "become_owner"
+    assert state(db) == before
 
-    # Root with no controlling terminal: refused.
+    # (A5) Root with no controlling terminal: refused, and no gateway_host_actions row.
     {output, status} =
-      System.cmd(
-        "sudo",
-        [
-          "-n",
-          "env",
-          "TIGHTBEAM_BASE_DIR=#{ctx.base}",
-          @cli,
-          "root-admin",
-          "pairing-code",
-          "--user",
-          "george"
-        ],
+      System.cmd(seam, ["root-admin", "pairing-code", "--user", "george"],
         cd: ctx.base,
+        env: env(ctx) ++ hostile,
         stderr_to_stdout: true
       )
 
-    assert status != 0
+    assert status != 0, output
     assert output =~ "terminal"
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM gateway_host_actions")
+    assert state(db) == before
 
-    # Properly: a code and a secret, shown once on the terminal.
-    {code_out, 0} =
-      on_tty(ctx, ["root-admin", "pairing-code", "--user", "george"], "", prefix: sudo)
-
+    # (A6) Properly, on a real pseudo-terminal: a code, then a secret, each shown once.
+    {code_out, 0} = root_admin(ctx, seam, "pairing-code", env: hostile)
     code = code_in(code_out)
     assert code, code_out
+    assert length(String.split(code_out, code)) == 2
 
-    {secret_out, 0} =
-      on_tty(ctx, ["root-admin", "recovery-enroll", "--user", "george"], "", prefix: sudo)
+    {secret_out, 0} = root_admin(ctx, seam, "recovery-enroll", env: hostile)
 
-    [new_secret] = Regex.run(~r/TBR-[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}/, secret_out)
+    [new_secret] =
+      Regex.run(~r/TBR-[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}/, secret_out)
 
+    assert length(String.split(secret_out, new_secret)) == 2
+
+    # (A8) Each run switched to exactly state.db's owner uid and gid.
+    assert code_out =~ switch
+    assert secret_out =~ switch
+
+    # Only verifiers are stored: a 32-byte Argon2id output, never the plaintext.
+    {:ok, [[verifier, salt]]} =
+      DB.query(db, "SELECT verifier, salt FROM recovery_secrets WHERE userId = 'george'")
+
+    assert byte_size(verifier) == 32 and byte_size(salt) == 16
+    assert verifier == Tightbeam.Native.argon2id(new_secret, salt)
+
+    # (A7) Two root_admin_action records, in order, with the seam's account.
     actions = lifecycle(db, "root_admin_action")
 
     assert Enum.map(actions, &JSON.decode!(&1.detail)["action"]) == [
@@ -661,45 +725,71 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     for action <- actions do
       detail = JSON.decode!(action.detail)
       assert detail["userId"] == "george"
-      assert detail["account"] == System.get_env("USER")
+      assert detail["account"] == @seam_account
       assert detail["tty"] =~ "/dev/"
+      assert is_integer(detail["at"])
     end
 
     assert JSON.decode!(hd(actions).detail)["codeId"] =~ ~r/\Apc_/
 
-    # state.db and its journal files still belong to the database's owner.
-    owner = File.stat!(Path.join(ctx.base, "state.db")).uid
+    # (A11) No secret or code appears in any table.
+    {:ok, tables} = DB.query(db, "SELECT name FROM sqlite_master WHERE type = 'table'")
 
-    for file <-
-          Path.wildcard(Path.join(ctx.base, "state.db*")) ++ [Path.join(ctx.base, "gateway.lock")] do
-      assert File.stat!(file).uid == owner, file
-    end
-
-    # No secret or code appears in any record.
-    for table <- ~w(lifecycle_events gateway_host_actions events messages) do
-      {:ok, rows} = DB.query(db, "SELECT * FROM #{table}")
+    for [table] <- tables do
+      {:ok, rows} = DB.query(db, ~s(SELECT * FROM "#{table}"))
       text = inspect(rows, limit: :infinity, printable_limit: :infinity)
-      refute text =~ code
-      refute text =~ new_secret
+      refute text =~ code, table
+      refute text =~ new_secret, table
     end
 
-    # On start: one alert and one Main wake per action.
+    # (A9) On start: one alert and one Main blocker wake per action, for every admin.
+    ada = TestDevices.paired!(db, "ada", admin: true, device_id: "ada-phone")
+
+    Org.create(db, %{
+      session_key: Org.personal_session_key(ada.user_id),
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: ada.user_id,
+      origin: "user:#{ada.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
     :ok = DeviceLifecycle.observe_at_boot(db, "/nonexistent/tightbeam-test/pairing-unfreeze")
 
-    {:ok, [[2]]} =
+    {:ok, alerts} =
       DB.query(
         db,
-        "SELECT COUNT(*) FROM owner_alerts WHERE kind IN ('root-pairing-code', 'root-recovery-enroll')"
+        "SELECT kind, body FROM owner_alerts WHERE kind IN ('root-pairing-code', 'root-recovery-enroll') ORDER BY kind"
       )
 
-    {:ok, wakes} = DB.query(db, "SELECT prompt FROM wakes WHERE class = 'blocker'")
-    assert length(wakes) == 2
+    assert Enum.map(alerts, &hd/1) == ["root-pairing-code", "root-recovery-enroll"]
 
-    assert Enum.any?(wakes, fn [prompt] ->
-             prompt =~ "A root shell on the gateway host issued a pairing code for george"
-           end)
+    for [_kind, body] <- alerts do
+      assert body =~ "A root shell on the gateway host"
+      assert body =~ "for george"
+      assert body =~ "by #{@seam_account} on /dev/"
+    end
 
-    # The code pairs a device; the new secret enables recover-admin.
+    {:ok, wakes} =
+      DB.query(db, "SELECT sessionKey, prompt FROM wakes WHERE class = 'blocker' ORDER BY 1, 2")
+
+    mains = Enum.map(wakes, &hd/1)
+
+    assert Enum.frequencies(mains) == %{
+             Org.personal_session_key("ada") => 2,
+             Org.personal_session_key("george") => 2
+           }
+
+    prompts = Enum.map(wakes, fn [_session, prompt] -> prompt end)
+    assert Enum.count(prompts, &(&1 =~ "issued a pairing code for george")) == 2
+    assert Enum.count(prompts, &(&1 =~ "enrolled a recovery secret for george")) == 2
+
+    # (A10) The code pairs a device; the new secret enables recover-admin.
     assert {:paired, _} = TestDevices.coded_pair(db, "root-paired", "Duo", code, ctx.admission)
     {out, 0} = on_tty(ctx, ["recover-admin", "--user", "george"], new_secret)
     assert code_in(out)

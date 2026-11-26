@@ -9,6 +9,12 @@ edition = "2024"
 # ships 1.75, so this is the first wall a customer hits.
 rust-version = "1.85"
 
+[features]
+# Test builds only (stage1-v12 §6.3, F1 erratum 1 rev 4 §1c.1): `root-admin` answers
+# root, a fixed invoking account and a recorded owner switch from values compiled in.
+# The release and package builds never enable it.
+root-admin-seam = []
+
 [dependencies]
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"] }
 base64 = "0.22"
