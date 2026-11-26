@@ -219,12 +219,24 @@ defmodule Tightbeam.Harness.CursorRailsTest do
 
   describe "real observation entry — observes, never blocks" do
     test "an artifact-record command is allowed, not denied" do
+      fixture_dir =
+        Path.join(
+          System.fetch_env!("TIGHTBEAM_TEST_ROOT"),
+          "cursor-observation-fixture-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(fixture_dir)
+      fixture = Path.join(fixture_dir, "tightbeam")
+      File.write!(fixture, "#!/bin/sh\nexit 0\n")
+      File.chmod!(fixture, 0o755)
+      on_exit(fn -> File.rm_rf!(fixture_dir) end)
+
       # observation_entry rides in hook_settings; isolate it by matcher/shape.
       %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
       # Every reserved entry is matcher "Bash"; compile the whole set and run each
       # against an artifact-record command — none may DENY it (observation is exit 0).
       %{"hooks" => %{"beforeShellExecution" => hooks}} =
-        CursorRails.compile(%{"hooks" => %{"PreToolUse" => entries}})
+        CursorRails.compile(%{"hooks" => %{"PreToolUse" => entries}}, path: fixture_dir)
 
       for hook <- hooks do
         verdict = run_hook(hook, shell_stdin("tightbeam artifact-record --kind report"))

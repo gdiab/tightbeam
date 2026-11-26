@@ -132,12 +132,16 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
     refute Path.type(relative_home) == :absolute
     refute relative_home == ".." or String.starts_with?(relative_home, "../")
     assert [_ | _] = Path.wildcard(Path.join([home, ".mix", "archives", "hex-*"]))
+    assert File.dir?(Path.join([home, ".cargo", "registry"]))
+
+    tool_bin = Path.join(root, "tool-bin")
+    assert Enum.all?(~w(cargo rustc rustdoc), &File.regular?(Path.join(tool_bin, &1)))
 
     for path <-
           Path.wildcard(Path.join([home, ".mix", "**", "*"]), match_dot: true) ++
             Path.wildcard(Path.join([home, ".cache", "elixir_make", "**", "*"]),
               match_dot: true
-            ) do
+            ) ++ Path.wildcard(Path.join([home, ".cargo", "**", "*"]), match_dot: true) do
       refute File.lstat!(path).type == :symlink
     end
 
@@ -145,6 +149,10 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
           Path.join([".hex", "hex.config"]),
           Path.join([".codex", "auth.json"]),
           Path.join([".claude", ".credentials.json"]),
+          Path.join([".cargo", "credentials"]),
+          Path.join([".cargo", "credentials.toml"]),
+          Path.join([".cargo", "config"]),
+          Path.join([".cargo", "config.toml"]),
           ".tightbeam-session"
         ] do
       refute File.exists?(Path.join(home, relative))

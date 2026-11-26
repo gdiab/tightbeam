@@ -1,6 +1,8 @@
 import Config
 
 source_tool_home = System.fetch_env!("HOME")
+source_path = System.fetch_env!("PATH")
+source_cargo_home = System.get_env("CARGO_HOME", Path.join(source_tool_home, ".cargo"))
 
 authoritative_gate_claim =
   if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
@@ -44,10 +46,12 @@ for name <- System.get_env() |> Map.keys(),
 home = Path.join(suite_tmp, "home")
 base = Path.join(suite_tmp, "app")
 bin = Path.join(suite_tmp, "tripwire-bin")
+tool_bin = Path.join(suite_tmp, "tool-bin")
 tripwire_log = Path.join(suite_tmp, "forbidden-execution")
 quoted_tripwire_log = "'" <> String.replace(tripwire_log, "'", "'\"'\"'") <> "'"
 File.mkdir_p!(home)
 File.mkdir_p!(bin)
+File.mkdir_p!(tool_bin)
 
 # Established tests start nested Mix builds. Seed their synthetic HOME with
 # only executable build tooling and immutable package artefacts; never copy
@@ -97,7 +101,45 @@ if File.dir?(source_elixir_make_cache) do
   copy_tool_dir!.(source_elixir_make_cache, target)
 end
 
-for name <- ["tightbeam", "codex", "claude", "cursor-agent", "opencode", "pi", "npm", "ssh"] do
+source_cargo_registry = Path.join(source_cargo_home, "registry")
+
+unless File.dir?(source_cargo_registry) do
+  raise "test isolation requires an installed Cargo registry cache"
+end
+
+isolated_cargo_home = Path.join(home, ".cargo")
+File.mkdir_p!(isolated_cargo_home)
+copy_tool_dir!.(source_cargo_registry, Path.join(isolated_cargo_home, "registry"))
+
+# Nested test builds use the already-installed Rust toolchain directly. The
+# wrappers keep rustup and Cargo homes synthetic, and offline mode makes a
+# missing local dependency an immediate refusal instead of a download.
+source_rustc =
+  System.find_executable("rustc") || raise "test isolation requires an installed Rust toolchain"
+
+{rust_sysroot, 0} = System.cmd(source_rustc, ["--print", "sysroot"])
+rust_sysroot = String.trim(rust_sysroot)
+
+for name <- ~w(cargo rustc rustdoc) do
+  source = Path.join([rust_sysroot, "bin", name])
+
+  if File.lstat!(source).type != :regular do
+    raise "test isolation refuses missing or non-regular Rust tooling"
+  end
+
+  quoted_source = "'" <> String.replace(source, "'", "'\"'\"'") <> "'"
+  path = Path.join(tool_bin, name)
+  File.write!(path, "#!/bin/sh\nexec #{quoted_source} \"$@\"\n")
+  File.chmod!(path, 0o755)
+end
+
+registry = File.read!(Path.expand("../priv/harness_registry.json", __DIR__))
+
+provider_cli_names =
+  Regex.scan(~r/"cli_binary"\s*:\s*"([^"]+)"/, registry, capture: :all_but_first)
+  |> List.flatten()
+
+for name <- Enum.uniq(["tightbeam", "opencode", "npm", "ssh" | provider_cli_names]) do
   path = Path.join(bin, name)
 
   File.write!(
@@ -121,9 +163,14 @@ System.put_env("TIGHTBEAM_TEST_ROOT", suite_tmp)
 System.put_env("TIGHTBEAM_BASE_DIR", base)
 System.put_env("TIGHTBEAM_HOME", base)
 System.put_env("TIGHTBEAM_TEST_TRIPWIRE_LOG", tripwire_log)
+System.put_env("CARGO_NET_OFFLINE", "true")
+System.put_env("CARGO_HOME", isolated_cargo_home)
+System.put_env("RUSTUP_HOME", Path.join(home, ".rustup"))
+System.put_env("RUSTC", Path.join(tool_bin, "rustc"))
+System.put_env("RUSTDOC", Path.join(tool_bin, "rustdoc"))
 
 fixture_bin = Path.expand("../priv/harness_cli", __DIR__)
-System.put_env("PATH", Enum.join([fixture_bin, bin, System.fetch_env!("PATH")], ":"))
+System.put_env("PATH", Enum.join([fixture_bin, tool_bin, bin, source_path], ":"))
 
 # Keep the auto-started app off the real ~/.tightbeam during tests.
 config :tightbeam,

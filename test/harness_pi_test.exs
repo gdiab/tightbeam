@@ -488,6 +488,17 @@ defmodule Tightbeam.HarnessPiTest do
              Pi.fetch_catalog(state)
   end
 
+  test "catalog refuses an ambient test transport before constructing a provider request" do
+    state = %{
+      base_dir: tmp_dir!("pi-catalog-no-ambient-transport"),
+      options: %{},
+      host_config: %{ssh: nil}
+    }
+
+    assert {:error, :test_catalog_transport_not_configured} =
+             Tightbeam.PiProvider.OpenCodeGo.fetch_catalog(state)
+  end
+
   test "a malformed OpenCode Go model does not discard healthy catalog entries" do
     state = %{
       base_dir: "/vector/base",

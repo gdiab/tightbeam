@@ -161,7 +161,7 @@ where
     let base_dir = crate::base_dir::resolve_with(
         &|name: &str| {
             let value = get_env(name);
-            if value.is_some() {
+            if value.is_some() && matches!(name, "TIGHTBEAM_BASE_DIR" | "TIGHTBEAM_HOME") {
                 selected_from_env.set(true);
             }
             value
@@ -669,6 +669,20 @@ mod tests {
             instance_id(&fs::canonicalize(&default_dir).unwrap())
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_root_bounds_the_default_without_changing_its_source_class() {
+        let root = PathBuf::from("/tmp/isolated");
+        let home = root.join("home");
+        let env = |name: &str| match name {
+            "TIGHTBEAM_TEST_ROOT" => Some(root.display().to_string()),
+            _ => None,
+        };
+
+        let (base_dir, source) = resolve_gateway_base(&env, &home);
+        assert_eq!(base_dir, home.join(".tightbeam"));
+        assert_eq!(source, EndpointSource::Default);
     }
 
     #[test]
