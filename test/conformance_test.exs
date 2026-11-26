@@ -2744,7 +2744,7 @@ defmodule Tightbeam.ConformanceTest do
     assert File.regular?(dependency)
 
     {output, status} =
-      System.cmd("mix", ["test", "--no-deps-check", "--no-compile", dependency, "--trace"],
+      System.cmd("mix", ["test", dependency, "--trace"],
         cd: Path.expand("."),
         stderr_to_stdout: true,
         env: [{"MIX_ENV", "test"}]

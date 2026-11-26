@@ -1,5 +1,7 @@
 import Config
 
+source_tool_home = System.fetch_env!("HOME")
+
 authoritative_gate_claim =
   if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
     %{expected_node: System.get_env("TIGHTBEAM_GATE_NODE")}
@@ -46,6 +48,54 @@ tripwire_log = Path.join(suite_tmp, "forbidden-execution")
 quoted_tripwire_log = "'" <> String.replace(tripwire_log, "'", "'\"'\"'") <> "'"
 File.mkdir_p!(home)
 File.mkdir_p!(bin)
+
+# Established tests start nested Mix builds. Seed their synthetic HOME with
+# only executable build tooling and immutable package artefacts; never copy
+# Hex state, Mix configuration, provider homes, or credentials from the runner.
+copy_tool_dir! = fn source, target ->
+  case File.cp_r(source, target) do
+    {:ok, _copied} -> :ok
+    {:error, _reason, _path} -> raise "test isolation could not copy build tooling"
+  end
+
+  paths = [target | Path.wildcard(Path.join(target, "**/*"), match_dot: true)]
+
+  if Enum.any?(paths, &(File.lstat!(&1).type == :symlink)) do
+    raise "test isolation refuses symlinked build tooling"
+  end
+end
+
+source_hex_archives = Path.join([source_tool_home, ".mix", "archives", "hex-*"])
+hex_archives = Path.wildcard(source_hex_archives)
+
+if hex_archives == [] do
+  raise "test isolation requires an installed Hex archive"
+end
+
+isolated_archives = Path.join([home, ".mix", "archives"])
+File.mkdir_p!(isolated_archives)
+
+for archive <- hex_archives do
+  copy_tool_dir!.(archive, Path.join(isolated_archives, Path.basename(archive)))
+end
+
+for source <- Path.wildcard(Path.join([source_tool_home, ".mix", "elixir", "*", "rebar3"])) do
+  if File.lstat!(source).type != :regular do
+    raise "test isolation refuses non-regular Rebar tooling"
+  end
+
+  target = Path.join(home, Path.relative_to(source, source_tool_home))
+  File.mkdir_p!(Path.dirname(target))
+  File.cp!(source, target)
+end
+
+source_elixir_make_cache = Path.join([source_tool_home, ".cache", "elixir_make"])
+
+if File.dir?(source_elixir_make_cache) do
+  target = Path.join([home, ".cache", "elixir_make"])
+  File.mkdir_p!(Path.dirname(target))
+  copy_tool_dir!.(source_elixir_make_cache, target)
+end
 
 for name <- ["tightbeam", "codex", "claude", "cursor-agent", "opencode", "pi", "npm", "ssh"] do
   path = Path.join(bin, name)

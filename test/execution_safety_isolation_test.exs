@@ -124,6 +124,33 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
     assert capture =~ "suite node is"
   end
 
+  test "isolated HOME contains build tooling without credential state" do
+    root = System.fetch_env!("TIGHTBEAM_TEST_ROOT")
+    home = System.fetch_env!("HOME")
+    relative_home = Path.relative_to(home, root)
+
+    refute Path.type(relative_home) == :absolute
+    refute relative_home == ".." or String.starts_with?(relative_home, "../")
+    assert [_ | _] = Path.wildcard(Path.join([home, ".mix", "archives", "hex-*"]))
+
+    for path <-
+          Path.wildcard(Path.join([home, ".mix", "**", "*"]), match_dot: true) ++
+            Path.wildcard(Path.join([home, ".cache", "elixir_make", "**", "*"]),
+              match_dot: true
+            ) do
+      refute File.lstat!(path).type == :symlink
+    end
+
+    for relative <- [
+          Path.join([".hex", "hex.config"]),
+          Path.join([".codex", "auth.json"]),
+          Path.join([".claude", ".credentials.json"]),
+          ".tightbeam-session"
+        ] do
+      refute File.exists?(Path.join(home, relative))
+    end
+  end
+
   defp occupy_or_observe_production_port! do
     case :gen_tcp.listen(@production_port, [
            :binary,
