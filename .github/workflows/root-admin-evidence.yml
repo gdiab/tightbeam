@@ -61,6 +61,16 @@ jobs:
           mkdir -p "$ROOT/bin"
           install -m 0755 cli/target/release/tightbeam "$ROOT/bin/tightbeam"
 
+      # The test environment's isolation (config/test.exs) builds offline against a
+      # copy of this runner's Cargo registry, so the native extensions' locked
+      # dependencies must be present before that compile, as ci.yml's earlier
+      # non-test `mix compile` leaves them. Fetch exactly the locked crates here, in
+      # preparation; the test-environment compile itself stays offline.
+      - name: Fetch the native extensions' locked crates (preparation, before offline compile)
+        run: |
+          cargo fetch --locked --manifest-path native/topline_unicode/Cargo.toml
+          cargo fetch --locked --manifest-path native/tightbeam_native/Cargo.toml
+
       - name: Compile the base-preparation script's environment
         env:
           MIX_ENV: test
