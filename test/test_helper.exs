@@ -308,6 +308,13 @@ ExUnit.after_suite(fn _result ->
     #{Tightbeam.HarnessProcessCensus.format(leaked)}
     """
   end
+
+  tripwire_log = Application.fetch_env!(:tightbeam, :test_tripwire_log)
+
+  if File.exists?(tripwire_log) do
+    attempted = tripwire_log |> File.read!() |> String.split("\n", trim: true) |> Enum.uniq()
+    raise "test isolation refused forbidden executable(s): #{Enum.join(attempted, ", ")}"
+  end
 end)
 
 defmodule Tightbeam.CredentialParkTestReceiver do

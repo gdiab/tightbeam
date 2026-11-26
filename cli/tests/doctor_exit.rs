@@ -1,3 +1,6 @@
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
+
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::{fs, time::SystemTime};

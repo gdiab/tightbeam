@@ -3,6 +3,9 @@
 //! Named process-group scenarios: same-group pre-stop, signal-time revalidation failure,
 //! and (in unit tests) PID/PGID reuse plus macOS individual-PID EPERM handling.
 
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;

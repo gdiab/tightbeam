@@ -26,6 +26,9 @@
 //! behaviour neither platform documents as stable, the assertion is a plain band check,
 //! and the day darwin adopts the other reading this is already in place.
 
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
+
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};

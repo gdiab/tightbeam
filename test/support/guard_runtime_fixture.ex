@@ -66,7 +66,15 @@ defmodule Tightbeam.GuardRuntimeFixture do
       )
       |> Enum.map(&{&1, nil})
 
-    env = env ++ [{"TMPDIR", tmp}, {"TIGHTBEAM_BASE_DIR", base}]
+    env =
+      env ++
+        [
+          {"HOME", Path.join(tmp, "home")},
+          {"TMPDIR", tmp},
+          {"TIGHTBEAM_BASE_DIR", base},
+          {"TIGHTBEAM_HOME", base},
+          {"TIGHTBEAM_TEST_ROOT", tmp}
+        ]
 
     %{
       executable: System.find_executable("elixir"),

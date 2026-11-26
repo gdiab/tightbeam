@@ -1,14 +1,10 @@
+[1mSynthetic device authorization[0m
 
-Welcome to Codex [v[90m0.146.0[0m]
-[90mOpenAI's command-line coding agent[0m
+Open this link in a browser:
+  [94mhttps://example.invalid/device[0m
 
-Follow these steps to sign in with ChatGPT using device code authorization:
+Enter this one-time code:
+  [93mTEST-CODE[0m
 
-1. Open this link in your browser and sign in to your account
-   [94mhttps://auth.openai.com/codex/device[0m
-
-2. Enter this one-time code [90m(expires in 15 minutes)[0m
-   [94mVG6S-L35ON[0m
-
-[90mContinue only if you started this login in Codex. If a website or another person gave you this code, cancel.[0m
-
+This synthetic fixture preserves the captured stream shape for parser tests.
+No provider request is made. Press Ctrl-C to cancel.

@@ -16,6 +16,9 @@
 //! the single `killpg` it used to be leaves the escapee alive and turns this test red. That
 //! was confirmed against this test before it landed.
 
+#[path = "support/test_isolation.rs"]
+mod test_isolation;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;

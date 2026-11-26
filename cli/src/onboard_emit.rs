@@ -9,8 +9,8 @@
 //! operator wake (both driven by `ceremonies`, which holds the wire).
 //!
 //! The functions here are PURE -- extraction, ansi stripping, and json/prose shaping -- so
-//! they are unit-tested against a REAL captured `codex login --device-auth` response
-//! (`tests/fixtures/codex-device-auth-0.146.0.txt`), never a hand-idealized one. The I/O
+//! they are unit-tested against a synthetic, same-shape `codex login --device-auth` response
+//! (`tests/fixtures/codex-device-auth-0.146.0.txt`). The I/O
 //! (teeing the child, sending the wire requests) lives in `ceremonies`.
 
 use serde_json::json;
@@ -227,7 +227,7 @@ fn first_https(text: &str) -> Option<String> {
 }
 
 /// The first dash-joined group of upper-case-alnum runs appearing AFTER `marker`.
-/// e.g. `VG6S-L35ON`. Each run must be >= 3 chars so ordinary hyphenation is not matched.
+/// e.g. `TEST-CODE`. Each run must be >= 3 chars so ordinary hyphenation is not matched.
 fn first_code_after(text: &str, marker: &str) -> Option<String> {
     let from = text.find(marker)? + marker.len();
     let tail = &text[from..];
@@ -287,19 +287,19 @@ pub(crate) fn raw_tail(raw: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    /// Real capture: `codex login --device-auth` (codex-cli 0.146.0), stdout piped to a
-    /// file, base64-round-tripped. NOT hand-authored -- the fixture is the wire truth.
-    const CODEX_REAL: &str = include_str!("../tests/fixtures/codex-device-auth-0.146.0.txt");
+    /// Synthetic, same-shape `codex login --device-auth` stream.
+    const CODEX_SYNTHETIC: &str = include_str!("../tests/fixtures/codex-device-auth-0.146.0.txt");
 
     #[test]
-    fn extracts_url_and_code_from_the_real_codex_stream() {
-        let deliverable = extract_codex_device(CODEX_REAL).expect("extracts from real output");
-        assert_eq!(
-            deliverable,
-            Deliverable::DeviceCode {
-                url: "https://auth.openai.com/codex/device".to_owned(),
-                code: "VG6S-L35ON".to_owned(),
-            }
+    fn extracts_url_and_code_from_the_synthetic_codex_stream() {
+        let deliverable = extract_codex_device(CODEX_SYNTHETIC).expect("extracts synthetic output");
+        assert!(
+            deliverable
+                == (Deliverable::DeviceCode {
+                    url: "https://example.invalid/device".to_owned(),
+                    code: "TEST-CODE".to_owned(),
+                }),
+            "synthetic device deliverable mismatch"
         );
     }
 
@@ -313,30 +313,32 @@ mod tests {
     fn version_string_and_warning_are_not_read_as_the_code() {
         // The code must come from AFTER the "one-time code" marker: the version `0.146.0`
         // and the word `Codex.` in the trailing warning must not win.
-        let deliverable = extract_codex_device(CODEX_REAL).expect("extracts");
+        let deliverable = extract_codex_device(CODEX_SYNTHETIC).expect("extracts");
         match deliverable {
-            Deliverable::DeviceCode { code, .. } => assert_eq!(code, "VG6S-L35ON"),
-            other => panic!("expected device code, got {other:?}"),
+            Deliverable::DeviceCode { code, .. } => {
+                assert!(code == "TEST-CODE", "synthetic code mismatch")
+            }
+            _ => panic!("expected synthetic device code"),
         }
     }
 
     #[test]
     fn missing_code_yields_none_so_the_caller_records_the_tail() {
-        let only_url = "Open this link\n   https://auth.openai.com/codex/device\n";
+        let only_url = "Open this link\n   https://example.invalid/device\n";
         assert!(extract_codex_device(only_url).is_none());
     }
 
     #[test]
     fn missing_url_yields_none() {
-        let only_code = "Enter this one-time code\n   VG6S-L35ON\n";
+        let only_code = "Enter this one-time code\n   TEST-CODE\n";
         assert!(extract_codex_device(only_code).is_none());
     }
 
     #[test]
     fn structured_line_is_one_json_object_under_a_stable_key() {
         let deliverable = Deliverable::DeviceCode {
-            url: "https://auth.openai.com/codex/device".to_owned(),
-            code: "VG6S-L35ON".to_owned(),
+            url: "https://example.invalid/device".to_owned(),
+            code: "TEST-CODE".to_owned(),
         };
         let line = structured_line(
             "openai",
@@ -351,8 +353,11 @@ mod tests {
         assert_eq!(d["provider"], "openai");
         assert_eq!(d["machine"], "node-c");
         assert_eq!(d["kind"], "device_code");
-        assert_eq!(d["url"], "https://auth.openai.com/codex/device");
-        assert_eq!(d["code"], "VG6S-L35ON");
+        assert!(
+            d["url"] == "https://example.invalid/device",
+            "synthetic URL mismatch"
+        );
+        assert!(d["code"] == "TEST-CODE", "synthetic code mismatch");
         assert_eq!(d["operatorWake"], "w_1");
         assert_eq!(d["deliveryFile"], "/w/onboard-delivery-openai-1.json");
     }
@@ -373,8 +378,8 @@ mod tests {
     #[test]
     fn delivery_file_carries_deliverable_minting_and_notification() {
         let deliverable = Deliverable::DeviceCode {
-            url: "https://auth.openai.com/codex/device".to_owned(),
-            code: "VG6S-L35ON".to_owned(),
+            url: "https://example.invalid/device".to_owned(),
+            code: "TEST-CODE".to_owned(),
         };
         let notified = Notified::Waked {
             user_id: "mike".to_owned(),
@@ -390,7 +395,7 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&file).expect("valid json");
         let d = &parsed["onboardingDelivery"];
-        assert_eq!(d["code"], "VG6S-L35ON");
+        assert!(d["code"] == "TEST-CODE", "synthetic code mismatch");
         assert_eq!(d["mintedAtMs"], 1000);
         assert_eq!(d["expiresAtMs"], 901_000);
         assert_eq!(d["notification"]["notified"], true);
@@ -416,7 +421,7 @@ mod tests {
 
     #[test]
     fn raw_tail_keeps_the_end_and_strips_ansi() {
-        let tail = raw_tail(CODEX_REAL, 80);
+        let tail = raw_tail(CODEX_SYNTHETIC, 80);
         assert!(tail.len() <= 80);
         assert!(!tail.contains('\x1b'));
         // The end of the block is the warning line; the tail must include its close.

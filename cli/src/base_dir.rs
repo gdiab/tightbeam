@@ -49,10 +49,15 @@ pub fn resolve_with<F>(get_env: &F, home_dir: &Path) -> PathBuf
 where
     F: Fn(&str) -> Option<String>,
 {
-    get_env("TIGHTBEAM_BASE_DIR")
+    let selected = get_env("TIGHTBEAM_BASE_DIR")
         .or_else(|| get_env("TIGHTBEAM_HOME"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_in(home_dir))
+        .unwrap_or_else(|| default_in(home_dir));
+
+    match get_env("TIGHTBEAM_TEST_ROOT").map(PathBuf::from) {
+        Some(root) if !selected.starts_with(&root) => root.join("refused-outside-test-root"),
+        _ => selected,
+    }
 }
 
 /// The default when neither variable is set.
@@ -129,6 +134,20 @@ mod tests {
         assert_eq!(
             resolve_with(&env(&[("TIGHTBEAM_HOME", "")]), Path::new("/home/someone")),
             PathBuf::new()
+        );
+    }
+
+    #[test]
+    fn test_root_refuses_a_base_dir_outside_the_isolated_tree() {
+        assert_eq!(
+            resolve_with(
+                &env(&[
+                    ("TIGHTBEAM_BASE_DIR", "/live/org"),
+                    ("TIGHTBEAM_TEST_ROOT", "/tmp/isolated"),
+                ]),
+                Path::new("/home/someone"),
+            ),
+            PathBuf::from("/tmp/isolated/refused-outside-test-root")
         );
     }
 

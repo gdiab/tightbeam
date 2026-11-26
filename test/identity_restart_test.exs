@@ -18,8 +18,7 @@ defmodule Tightbeam.IdentityRestartTest do
           stderr_to_stdout: true
         )
 
-      File.write!(Path.join(tmp, "#{phase}.log"), output)
-      assert status == 0, output
+      assert status == 0, "identity restart phase failed with status #{inspect(status)}"
       assert output =~ "identity-restart: #{phase} passed"
     end
   end
