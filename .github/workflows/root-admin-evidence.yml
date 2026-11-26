@@ -132,11 +132,15 @@ jobs:
             "$ROOT/pairing-code.capture" "$ROOT/recovery-enroll.capture" | tee "$ROOT/real-root.txt"
 
       - name: (A9) Boot observation as tbowner, then the alert and wake check
-        env:
-          MIX_ENV: test
         run: |
-          sudo -u tbowner -H env PATH="$PATH" MIX_ENV=test \
-            mix run --no-compile --no-deps-check scripts/root_admin_evidence.exs observe "$ROOT"
+          # Plain elixir on the build compiled above, as tbowner with an emptied
+          # environment: no Mix, no Hex, no dependency resolution, nothing of the
+          # runner account's but PATH to the pinned toolchain.
+          pa=()
+          for ebin in "$GITHUB_WORKSPACE"/_build/test/lib/*/ebin; do pa+=(-pa "$ebin"); done
+          test -d "$GITHUB_WORKSPACE/_build/test/lib/tightbeam/ebin"
+          sudo -u tbowner -H env -i PATH="$PATH" HOME=/home/tbowner LANG=C.UTF-8 \
+            elixir "${pa[@]}" scripts/root_admin_evidence.exs observe "$ROOT"
           sudo -u tbowner -H python3 scripts/root_admin_evidence_check.py alerts \
             "$ROOT/base" "$(id -un)" | tee "$ROOT/alerts.txt"
 
