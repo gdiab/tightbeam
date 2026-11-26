@@ -2,11 +2,16 @@
 # its own OS process by `device_lifecycle_user_creation_test.exs`. It starts the real
 # database owner (admission and the base lock), then:
 #
-#   migrate-stalled <lock.db>  runs the boot schema, whose stage 1 migration stalls inside
+#   migrate-stalled            runs the boot schema, whose stage 1 migration stalls inside
 #                              its own transaction at the third denial write: a temporary
-#                              trigger on this connection writes to <lock.db>, whose write
-#                              lock the test holds. It prints `denial <n> <device>` as each
-#                              denial write starts, and is killed there by the test.
+#                              trigger on this connection runs an unbounded computation
+#                              over a temporary table inside that INSERT, so the
+#                              transaction can neither commit nor end. It prints
+#                              `denial <n> <device>` as each denial write starts, and is
+#                              killed there by the test. Temporary objects take no lock
+#                              another connection could hold, so every earlier transaction
+#                              proceeds (an attached database's lock would be reserved by
+#                              each BEGIN IMMEDIATE and stall the first one).
 #   migrate                    runs the boot schema once and stops.
 #   boot                       runs the gateway's boot schema and boot observation, as a
 #                              gateway restart does, and stops.
@@ -32,6 +37,9 @@ Application.put_env(:tightbeam, :base_dir, base)
 
 alias Tightbeam.{DB, DeviceLifecycle, Schema}
 
+# The boot schema logs thousands of info lines; keep the output to what the test reads.
+Logger.configure(level: :warning)
+
 IO.puts("pid #{System.pid()}")
 
 {:ok, db} =
@@ -45,19 +53,33 @@ IO.puts("pid #{System.pid()}")
 denial = "legacy_pending_device_denied"
 
 case {mode, rest} do
-  {"migrate-stalled", [lock_db]} ->
-    {:ok, _} = DB.query(db, "PRAGMA busy_timeout = 600000")
-    {:ok, _} = DB.query(db, "ATTACH DATABASE ?1 AS lockdb", [lock_db])
+  {"migrate-stalled", []} ->
+    # Temporary objects live on one connection: every statement here must reach the
+    # writer, which runs the migration (a leading SELECT or WITH goes to a reader).
+    {:ok, _} = DB.query(db, "CREATE TEMP TABLE p15_spin (x INTEGER)")
 
+    {:ok, _} =
+      DB.query(db, """
+      INSERT INTO temp.p15_spin
+      WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000)
+      SELECT x FROM n
+      """)
+
+    # 1000^4 rows: far longer than the test waits before its SIGKILL.
     {:ok, _} =
       DB.query(db, """
       CREATE TEMP TRIGGER p15_stall AFTER INSERT ON main.lifecycle_events
       WHEN NEW.kind = '#{denial}'
         AND (SELECT COUNT(*) FROM main.lifecycle_events WHERE kind = '#{denial}') >= 3
-      BEGIN INSERT INTO lockdb.hold VALUES (1); END
+      BEGIN
+        SELECT COUNT(*) FROM temp.p15_spin a, temp.p15_spin b, temp.p15_spin c, temp.p15_spin d;
+      END
       """)
 
-    :erlang.trace_pattern({Tightbeam.EventLog, :lifecycle_in_txn, 4}, true, [:global])
+    # Code loads lazily here: a pattern set before EventLog is loaded matches nothing and
+    # is not applied when it loads, so load it first and require the one match.
+    Code.ensure_loaded!(Tightbeam.EventLog)
+    1 = :erlang.trace_pattern({Tightbeam.EventLog, :lifecycle_in_txn, 4}, true, [:global])
     :erlang.trace(:all, true, [:call, {:tracer, self()}])
 
     spawn(fn ->

@@ -286,17 +286,12 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     alerts_before = read(db, "SELECT * FROM owner_alerts ORDER BY 1")
     stop_supervised!(db)
 
-    # The test holds the write lock the stalled migration's third denial waits on.
-    lock_db = Path.join(tmp, "lock.db")
-    {:ok, lock} = Exqlite.Sqlite3.open(lock_db)
-    :ok = Exqlite.Sqlite3.execute(lock, "CREATE TABLE hold (x)")
-    :ok = Exqlite.Sqlite3.execute(lock, "BEGIN IMMEDIATE")
-
-    # A gateway database life runs the migration and is killed (SIGKILL) inside its
-    # transaction, after two denial writes and before any commit.
+    # A gateway database life runs the migration, which its own temporary trigger holds
+    # inside the transaction at the third denial write; it is killed (SIGKILL) there,
+    # after two denial writes and before any commit.
     # The only signal in this test: the child's own BEAM pid, while its Port is open
     # and no exit of it has been reported, and the stall holds it inside its transaction.
-    port = launch(plan, ["migrate-stalled", lock_db])
+    port = launch(plan, ["migrate-stalled"])
     [_, os_pid] = await_line(port, log, ~r/\Apid (\d+)\z/)
     await_line(port, log, ~r/\Adenial 3 /)
 
@@ -308,8 +303,6 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     end
 
     assert await_exit(port, log) != 0
-    :ok = Exqlite.Sqlite3.execute(lock, "ROLLBACK")
-    :ok = Exqlite.Sqlite3.close(lock)
 
     # Reopened: neither the S5 records nor any denial survived.
     db = open_base!(plan, "after_kill")
