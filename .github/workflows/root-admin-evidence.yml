@@ -1,0 +1,154 @@
+# Stage 1 P5c-H (stage1-v12 P5c-H and §6.3; F1 erratum 1 rev 4 §1c.2): the one
+# real-root step for `tightbeam root-admin`, outside every suite. It is acceptance
+# evidence for P5c only: never a required check or merge gate, never on a persistent
+# host or with George's sudo, dispatched by hand with an exact candidate SHA. It runs
+# no `mix test` and no `cargo test`. Its run URL, SHA, image and summary are recorded
+# on the stage 1 card; a red result is a finding, never retried or waived silently.
+name: root-admin-evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact 40-hex candidate commit whose release CLI is evidenced"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  root-admin-evidence:
+    name: root-admin evidence (P5c-H)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      ROOT: /tmp/tb-evidence
+    steps:
+      - name: Refuse anything but a disposable GitHub-hosted runner
+        if: runner.environment != 'github-hosted'
+        run: |
+          echo "root-admin evidence runs only on a GitHub-hosted runner" >&2
+          exit 1
+
+      - name: Validate the exact candidate SHA
+        run: '[[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          persist-credentials: false
+
+      - name: Verify the exact checkout
+        run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+
+      - name: Install BEAM (pinned, as ci.yml)
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the release CLI, with no seam feature
+        run: |
+          cargo build --release --locked --manifest-path cli/Cargo.toml
+          if grep -a -q -F "tightbeam-root-admin-test-seam" cli/target/release/tightbeam; then
+            echo "the release CLI carries the root-admin test seam" >&2
+            exit 1
+          fi
+          mkdir -p "$ROOT/bin"
+          install -m 0755 cli/target/release/tightbeam "$ROOT/bin/tightbeam"
+
+      - name: Compile the base-preparation script's environment
+        env:
+          MIX_ENV: test
+        run: |
+          mix deps.get
+          mix compile
+
+      - name: Create tbowner (the database owner) and tbprobe (no sudoers entry)
+        run: |
+          sudo useradd --create-home --shell /bin/bash tbowner
+          sudo useradd --create-home --shell /bin/bash tbprobe
+          test "$(id -un)" != tbowner
+          if sudo -l -U tbprobe | grep -q "may run"; then
+            echo "tbprobe has a sudoers entry" >&2
+            exit 1
+          fi
+          # Read access for tbowner's boot-observation run; nothing it can write.
+          sudo chmod o+rx /home/runner /home/runner/work
+          sudo chmod -R o+rX "$GITHUB_WORKSPACE" /home/runner/work/_temp 2>/dev/null || true
+
+      - name: Prepare a throwaway base owned by tbowner, with no gateway running
+        env:
+          MIX_ENV: test
+        run: |
+          mix run scripts/root_admin_evidence.exs prepare "$ROOT"
+          sudo chown -R tbowner:tbowner "$ROOT/base"
+          echo "OWNER_UID=$(id -u tbowner)" >> "$GITHUB_ENV"
+          echo "OWNER_GID=$(id -g tbowner)" >> "$GITHUB_ENV"
+          python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" > "$ROOT/before.txt"
+
+      - name: (A1) Not root, as tbowner without sudo, refuses and changes nothing
+        run: |
+          set +e
+          out=$(sleep 3 | sudo -u tbowner -H env TIGHTBEAM_BASE_DIR="$ROOT/base" \
+            script -qec "$ROOT/bin/tightbeam root-admin pairing-code --user george" /dev/null 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          test "$status" -ne 0
+          echo "$out" | grep -q "needs root"
+          python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" | diff "$ROOT/before.txt" -
+
+      - name: (A2) sudo -n with no rule, as tbprobe, refuses and changes nothing
+        run: |
+          set +e
+          out=$(sudo -u tbprobe -H sudo -n env TIGHTBEAM_BASE_DIR="$ROOT/base" \
+            "$ROOT/bin/tightbeam" root-admin pairing-code --user george 2>&1 < /dev/null)
+          status=$?
+          set -e
+          echo "$out"
+          test "$status" -ne 0
+          echo "$out" | grep -qiE "password is required|not in the sudoers|not allowed"
+          python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" | diff "$ROOT/before.txt" -
+
+      - name: (A6) Real root through sudo, on a real pseudo-terminal, gateway stopped
+        run: |
+          # The terminal capture holds the code and the secret: it goes to files only,
+          # never to the log, until the check step redacts it.
+          for action in pairing-code recovery-enroll; do
+            sleep 5 | script -qec \
+              "sudo env TIGHTBEAM_BASE_DIR=$ROOT/base $ROOT/bin/tightbeam root-admin $action --user george" \
+              "$ROOT/$action.capture" > /dev/null
+          done
+
+      - name: (A6, A7, A8, A11) Check the records, verifiers, ownership and redacted terminals
+        run: |
+          sudo -u tbowner -H python3 scripts/root_admin_evidence_check.py real-root \
+            "$ROOT/base" "$(id -un)" "$OWNER_UID" "$OWNER_GID" \
+            "$ROOT/pairing-code.capture" "$ROOT/recovery-enroll.capture" | tee "$ROOT/real-root.txt"
+
+      - name: (A9) Boot observation as tbowner, then the alert and wake check
+        env:
+          MIX_ENV: test
+        run: |
+          sudo -u tbowner -H env PATH="$PATH" MIX_ENV=test \
+            mix run --no-compile --no-deps-check scripts/root_admin_evidence.exs observe "$ROOT"
+          sudo -u tbowner -H python3 scripts/root_admin_evidence_check.py alerts \
+            "$ROOT/base" "$(id -un)" | tee "$ROOT/alerts.txt"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## root-admin evidence (P5c-H)"
+            echo "- candidate: \`$CANDIDATE_SHA\`"
+            echo "- image: \`$ImageOS\` \`$ImageVersion\`"
+            echo "- invoking account (SUDO_USER): \`$(id -un)\`; database owner: tbowner \`${OWNER_UID:-?}:${OWNER_GID:-?}\`"
+            echo '```'
+            cat "$ROOT/real-root.txt" "$ROOT/alerts.txt" 2>/dev/null | grep -E "^(A[0-9]+ ok|FAIL)" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
