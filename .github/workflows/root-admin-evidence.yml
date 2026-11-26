@@ -89,7 +89,7 @@ jobs:
           sudo chown -R tbowner:tbowner "$ROOT/base"
           echo "OWNER_UID=$(id -u tbowner)" >> "$GITHUB_ENV"
           echo "OWNER_GID=$(id -g tbowner)" >> "$GITHUB_ENV"
-          python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" > "$ROOT/before.txt"
+          sudo -u tbowner -H python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" > "$ROOT/before.txt"
 
       - name: (A1) Not root, as tbowner without sudo, refuses and changes nothing
         run: |
@@ -101,7 +101,7 @@ jobs:
           echo "$out"
           test "$status" -ne 0
           echo "$out" | grep -q "needs root"
-          python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" | diff "$ROOT/before.txt" -
+          sudo -u tbowner -H python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" | diff "$ROOT/before.txt" -
 
       - name: (A2) sudo -n with no rule, as tbprobe, refuses and changes nothing
         run: |
@@ -113,7 +113,7 @@ jobs:
           echo "$out"
           test "$status" -ne 0
           echo "$out" | grep -qiE "password is required|not in the sudoers|not allowed"
-          python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" | diff "$ROOT/before.txt" -
+          sudo -u tbowner -H python3 scripts/root_admin_evidence_check.py snapshot "$ROOT/base" | diff "$ROOT/before.txt" -
 
       - name: (A6) Real root through sudo, on a real pseudo-terminal, gateway stopped
         run: |
