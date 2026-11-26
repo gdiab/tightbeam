@@ -292,6 +292,7 @@ defmodule Tightbeam.UserAdmin do
   defp context_in_txn(txn),
     do: %{
       creations: creations_in_txn(txn),
+      created: created_in_txn(txn),
       acted: acted_as_in_txn(txn),
       devices: devices_in_txn(txn)
     }
@@ -320,12 +321,44 @@ defmodule Tightbeam.UserAdmin do
     end)
   end
 
-  defp creation_for(creations, user_id) do
+  # Stage 1 R-c: the creation record a user-creating path other than `add-user`
+  # writes in the user's own transaction, as a `user_created` lifecycle record whose
+  # subject is the user: a gated `approve-device` naming a new user (with the issuing
+  # device) and the local first-user CLI path. The earliest one per user counts.
+  defp created_in_txn(txn) do
+    txn
+    |> Txn.q("""
+    SELECT id, ts, subject, detail FROM lifecycle_events
+    WHERE kind = 'user_created' ORDER BY id
+    """)
+    |> Enum.reduce(%{}, fn [id, ts, user_id, detail], acc ->
+      detail = decode_detail(detail)
+
+      Map.put_new(acc, user_id, %{
+        "recordId" => id,
+        "at" => ts,
+        "via" => detail["via"],
+        "issuingDeviceId" => detail["issuingDeviceId"],
+        "issuingUserId" => detail["issuingUserId"]
+      })
+    end)
+  end
+
+  defp decode_detail(detail) when is_binary(detail) do
+    case JSON.decode(detail) do
+      {:ok, %{} = map} -> map
+      _ -> %{}
+    end
+  end
+
+  defp decode_detail(_detail), do: %{}
+
+  defp creation_for(context, user_id) do
     needle = ~s("userId" => ) <> inspect(user_id)
 
-    Enum.find_value(creations, fn {payload, creation} ->
+    Enum.find_value(context.creations, fn {payload, creation} ->
       if String.contains?(payload, needle), do: creation
-    end)
+    end) || Map.get(context.created, user_id)
   end
 
   # C2: activity is the count of accepted audit events acting as `user:<id>`.
@@ -351,7 +384,7 @@ defmodule Tightbeam.UserAdmin do
 
   defp row([user_id, is_admin, created_at, removed_at, removed_by], context, owned) do
     device_counts = Map.get(context.devices, user_id, %{})
-    creation = creation_for(context.creations, user_id)
+    creation = creation_for(context, user_id)
     no_activity = %{"count" => 0, "firstAt" => nil, "lastAt" => nil}
 
     base = %{

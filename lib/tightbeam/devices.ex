@@ -300,6 +300,16 @@ defmodule Tightbeam.Devices do
   end
 
   @doc false
+  # Stage 1 R-c: the user a gated `approve-device` names, created non-admin in the
+  # command's own transaction under the shared insertion rule. The caller has
+  # authorized the call and checked that no row, removed or not, holds the id, and
+  # writes the creation record in the same transaction.
+  def create_code_user_in_txn(%Txn{} = txn, user_id) do
+    insert_user(txn, user_id, false)
+    :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+  end
+
+  @doc false
   def promote_user_with_firehose(db, user_id, call),
     do: promote_user_with_firehose(db, user_id, true, call)
 

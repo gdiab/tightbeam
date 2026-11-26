@@ -840,7 +840,25 @@ defmodule Tightbeam.UserAuthenticatedGrantsTest do
         "SELECT deviceId, userId, claimedName, status, token, platform, model, createdAt FROM devices ORDER BY 1"
       )
 
-    assert unchanged == before.devices
+    # Stage 1 v12 K18 / S5.1: unchanged, except that the legacy pending row (visitor)
+    # is denied with its token cleared.
+    expected =
+      Enum.map(before.devices, fn
+        [device_id, user_id, name, "pending", _token, platform, model, created_at] ->
+          [device_id, user_id, name, "denied", nil, platform, model, created_at]
+
+        row ->
+          row
+      end)
+
+    assert Enum.any?(before.devices, &(Enum.at(&1, 3) == "pending"))
+    assert unchanged == expected
+
+    assert {:ok, [["visitor"]]} =
+             DB.query(
+               db,
+               "SELECT subject FROM lifecycle_events WHERE kind = 'legacy_pending_device_denied'"
+             )
 
     # A restart: a fresh socket on the same rows signs in with the stored token and
     # a user command works at once.

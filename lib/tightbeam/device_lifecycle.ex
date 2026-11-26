@@ -33,6 +33,8 @@ defmodule Tightbeam.DeviceLifecycle do
   @delivery_deadline_ms 600_000
   @max_outstanding 5
   @max_name_length 64
+  @legacy_denial_kind "legacy_pending_device_denied"
+  @not_recorded "not recorded"
 
   @code_shape ~r/\A(?<name>.*\S)\s+(?<code>TB-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4})\z/iu
 
@@ -162,6 +164,7 @@ defmodule Tightbeam.DeviceLifecycle do
           [@shape, now()]
         )
 
+        deny_legacy_pending_in_txn(txn)
         validate!(txn)
 
       [[sql]] ->
@@ -196,6 +199,120 @@ defmodule Tightbeam.DeviceLifecycle do
 
     :ok
   end
+
+  # S5.1: in the migration's own transaction, every device still `pending` is denied
+  # by the same statement that reads it, with one denial record each. The gateway
+  # recorded no network origin for these rows, so none is inferred; platform and
+  # model are the client's own claims and are kept apart, labelled as such. No alert.
+  defp deny_legacy_pending_in_txn(txn) do
+    denied_at = now()
+
+    txn
+    |> Txn.q("""
+    UPDATE devices SET status = 'denied', token = NULL WHERE status = 'pending'
+    RETURNING deviceId, userId, claimedName, platform, model, createdAt
+    """)
+    |> Enum.each(fn [device_id, user_id, claimed_name, platform, model, created_at] ->
+      Txn.q(
+        txn,
+        """
+        INSERT INTO device_versions (deviceId, rowVersion) VALUES (?1, ?2)
+        ON CONFLICT(deviceId) DO UPDATE
+        SET rowVersion = MAX(excluded.rowVersion, device_versions.rowVersion + 1)
+        """,
+        [device_id, denied_at]
+      )
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        @legacy_denial_kind,
+        device_id,
+        JSON.encode!(%{
+          deviceId: device_id,
+          userId: user_id,
+          claimedName: claimed_name,
+          networkOrigin: @not_recorded,
+          clientReported: %{platform: reported(platform), model: reported(model)},
+          createdAt: created_at,
+          deniedAt: denied_at,
+          actor: "stage1-migration"
+        })
+      )
+    end)
+  end
+
+  defp reported(value) when is_binary(value) and value != "", do: value
+  defp reported(_value), do: @not_recorded
+
+  @doc """
+  S5.1's install receipt: every legacy pending device the migration denied, generated
+  from the denial records, ordered by user id and then creation time, with the count
+  or "none". Claimed names are client-chosen text, shown literally (control
+  characters escaped) and cut to #{@max_name_length} characters.
+  """
+  @spec legacy_denial_receipt(DB.server()) :: String.t()
+  def legacy_denial_receipt(db \\ DB) do
+    {:ok, rows} =
+      DB.query(db, "SELECT detail FROM lifecycle_events WHERE kind = ?1 ORDER BY id", [
+        @legacy_denial_kind
+      ])
+
+    denials =
+      rows
+      |> Enum.map(fn [detail] -> JSON.decode!(detail) end)
+      |> Enum.sort_by(&{&1["userId"], &1["createdAt"], &1["deviceId"]})
+
+    case denials do
+      [] ->
+        "Legacy pending devices denied: none"
+
+      denials ->
+        count = length(denials)
+        noun = if count == 1, do: "device", else: "devices"
+
+        Enum.join(
+          ["#{count} legacy pending #{noun} denied" | Enum.map(denials, &receipt_line/1)],
+          "\n"
+        )
+    end
+  end
+
+  defp receipt_line(denial) do
+    reported = denial["clientReported"] || %{}
+
+    Enum.join(
+      [
+        literal(denial["userId"]),
+        literal(denial["claimedName"]),
+        "origin: #{denial["networkOrigin"]}",
+        "client-reported: platform #{literal(reported["platform"])}, " <>
+          "model #{literal(reported["model"])}",
+        iso_seconds(denial["createdAt"])
+      ],
+      " | "
+    )
+  end
+
+  # Literal text for a one-line plain-text receipt: control characters escaped, at most
+  # the S2.2 name length, never interpreted.
+  defp literal(nil), do: ""
+
+  defp literal(text) do
+    text
+    |> String.slice(0, @max_name_length)
+    |> String.replace(~r/[[:cntrl:]]/u, fn <<codepoint::utf8>> ->
+      "\\u" <> String.pad_leading(Integer.to_string(codepoint, 16), 4, "0")
+    end)
+  end
+
+  defp iso_seconds(ms) when is_integer(ms) do
+    case DateTime.from_unix(ms, :millisecond) do
+      {:ok, at} -> at |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+      _ -> Integer.to_string(ms)
+    end
+  end
+
+  defp iso_seconds(other), do: inspect(other)
 
   defp column_info(txn, column),
     do: Enum.find(Txn.q(txn, "PRAGMA table_info(devices)"), &(Enum.at(&1, 1) == column))
@@ -263,9 +380,11 @@ defmodule Tightbeam.DeviceLifecycle do
         with :ok <- GrantAuth.authorize_in_txn(txn, call),
              %{user_id: issuer} <- GrantAuth.device_user_in_txn(txn, call),
              target = target_user || issuer,
-             :ok <- active_user_in_txn(txn, target) do
+             {:ok, created?} <- code_user_in_txn(txn, target) do
           issued_at = now()
           expires_at = issued_at + @code_ttl_ms
+
+          if created?, do: user_created_in_txn(txn, target, issuer, call, id, issued_at)
 
           insert_code_in_txn(
             txn,
@@ -364,12 +483,39 @@ defmodule Tightbeam.DeviceLifecycle do
     :ok
   end
 
-  defp active_user_in_txn(txn, user_id) do
+  # R-a, R-c: the code's user exists before the code is issued. A user the gated
+  # command names that has no row yet is created here, at code issue; the later
+  # pairing never creates one. A removed user's id is not reusable.
+  defp code_user_in_txn(txn, user_id) do
     case Txn.q(txn, "SELECT removedAt FROM users WHERE userId = ?1", [user_id]) do
-      [[nil]] -> :ok
-      [[_removed]] -> Tightbeam.UserAdmin.removed_refusal(user_id)
-      [] -> %{code: "user_not_found", message: "no user #{user_id}"}
+      [[nil]] ->
+        {:ok, false}
+
+      [[_removed]] ->
+        Tightbeam.UserAdmin.removed_refusal(user_id)
+
+      [] ->
+        :ok = Tightbeam.Devices.create_code_user_in_txn(txn, user_id)
+        {:ok, true}
     end
+  end
+
+  # R-c: the creation record `users` reads as this user's creation provenance,
+  # naming the issuing device. It is written only with the user, in one transaction.
+  defp user_created_in_txn(txn, user_id, issuer, call, code_id, at) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "user_created",
+      user_id,
+      JSON.encode!(%{
+        userId: user_id,
+        via: "approve-device",
+        issuingDeviceId: GrantAuth.auth_device_id(call),
+        issuingUserId: issuer,
+        codeId: code_id,
+        at: at
+      })
+    )
   end
 
   ## S1.1 enrolment

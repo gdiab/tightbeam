@@ -72,6 +72,22 @@ fn create_first_in(
             |row| row.get(0),
         )
         .map_err(|error| format!("cannot read first user: {error}"))?;
+    // Stage 1 R-c: the creation record `users` reads as this user's creation
+    // provenance, written with the user or not at all.
+    let detail = serde_json::json!({
+        "userId": user_id,
+        "via": "local-first-user",
+        "isAdmin": is_admin,
+        "at": created_at,
+    })
+    .to_string();
+    transaction
+        .execute(
+            "INSERT INTO lifecycle_events (ts, kind, subject, detail) \
+             VALUES (?1, 'user_created', ?2, ?3)",
+            params![created_at, user_id, detail],
+        )
+        .map_err(|error| format!("cannot record the first user's creation: {error}"))?;
     transaction
         .commit()
         .map_err(|error| format!("cannot commit first user: {error}"))?;
@@ -120,6 +136,13 @@ mod tests {
                      userId TEXT PRIMARY KEY,
                      isAdmin INTEGER NOT NULL DEFAULT 0,
                      createdAt INTEGER NOT NULL
+                   );
+                   CREATE TABLE lifecycle_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     ts INTEGER NOT NULL,
+                     kind TEXT NOT NULL,
+                     subject TEXT NOT NULL,
+                     detail TEXT
                    );"#,
             )
             .unwrap();
@@ -167,6 +190,43 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM devices", [], |row| row.get(0))
             .unwrap();
         assert_eq!((users, devices), (1, 0));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Stage 1 R-c: the first user's creation record is written in the user's own
+    /// transaction; when it cannot be written, no user is created either.
+    #[test]
+    fn local_first_user_writes_its_creation_record_in_the_same_transaction() {
+        let (root, path) = database();
+        assert!(matches!(
+            create_first_in(&path, "george", false, 9),
+            Ok(FirstUser::Created { .. })
+        ));
+        let connection = Connection::open(&path).unwrap();
+        let (ts, subject, detail): (i64, String, String) = connection
+            .query_row(
+                "SELECT ts, subject, detail FROM lifecycle_events WHERE kind = 'user_created'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!((ts, subject.as_str()), (9, "george"));
+        assert_eq!(detail["via"], "local-first-user");
+        assert_eq!(detail["userId"], "george");
+        fs::remove_dir_all(&root).unwrap();
+
+        let (root, path) = database();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE lifecycle_events;")
+            .unwrap();
+        assert!(create_first_in(&path, "george", false, 9).is_err());
+        let users: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(users, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
