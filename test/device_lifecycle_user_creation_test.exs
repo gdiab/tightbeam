@@ -164,8 +164,11 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
   ## P15
 
   # One run of test/support/legacy_denial_runtime.exs: its own OS process and BEAM,
-  # the real database owner on the file-backed base. Every line it prints is appended
-  # to `log`, which the test prints if it ends without finishing (P15's on_exit).
+  # the real database owner on the file-backed base. The child halts when this Port
+  # closes (its standard input reaches EOF), so it cannot outlive the test process
+  # that owns the Port, whether the test passes, fails or times out; nothing here
+  # signals a process by a remembered pid. Every line the child prints is appended to
+  # `log`, which the test prints if it ends without finishing (P15's on_exit).
   defp launch(plan, args) do
     env =
       Enum.map(plan.env, fn {k, v} -> {to_charlist(k), if(v, do: to_charlist(v), else: false)} end)
@@ -178,21 +181,6 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
       args: plan.args ++ args,
       env: env
     ])
-  end
-
-  # The subprocess's first line is its OS pid. Until its exit is observed, it is killed
-  # when the test ends, so a failed or timed-out test leaves nothing running; once its
-  # exit is observed (`await_exit/3`), the pid is never signalled again.
-  defp await_pid!(port, ctx) do
-    [_, os_pid] = await_line(port, ctx.log, ~r/\Apid (\d+)\z/)
-    exited = Path.join(ctx.tmp, "exited-#{os_pid}")
-
-    on_exit(fn ->
-      unless File.exists?(exited),
-        do: System.cmd("kill", ["-KILL", os_pid], stderr_to_stdout: true)
-    end)
-
-    {os_pid, exited}
   end
 
   defp await_line(port, log, pattern) do
@@ -216,31 +204,29 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     end
   end
 
-  # The rest of the subprocess's output, then its exit status.
-  defp await_exit(port, log, exited) do
+  # The rest of the child's output, then its exit status.
+  defp await_exit(port, log) do
     receive do
       {^port, {:data, {:eol, line}}} ->
         File.write!(log, line <> "\n", [:append])
-        await_exit(port, log, exited)
+        await_exit(port, log)
 
       {^port, {:data, {:noeol, part}}} ->
         File.write!(log, part, [:append])
-        await_exit(port, log, exited)
+        await_exit(port, log)
 
       {^port, {:exit_status, status}} ->
-        File.write!(exited, "")
         status
     after
       120_000 -> flunk("subprocess did not exit within 120 s:\n" <> File.read!(log))
     end
   end
 
-  defp run!(plan, ctx, mode, expected) do
+  defp run!(plan, log, mode, expected) do
     port = launch(plan, [mode])
-    {_os_pid, exited} = await_pid!(port, ctx)
-    await_line(port, ctx.log, ~r/\A#{expected}\z/)
-    status = await_exit(port, ctx.log, exited)
-    assert status == 0, "#{mode} exited #{status}:\n" <> File.read!(ctx.log)
+    await_line(port, log, ~r/\A#{expected}\z/)
+    status = await_exit(port, log)
+    assert status == 0, "#{mode} exited #{status}:\n" <> File.read!(log)
   end
 
   defp open_base!(plan, id) do
@@ -274,13 +260,18 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
 
     # Every subprocess line, printed if the test ends without finishing: a failed
     # assertion, a helper's own timeout or ExUnit's.
-    ctx = %{tmp: tmp, log: Path.join(tmp, "p15-subprocess.log")}
+    log = Path.join(tmp, "p15-subprocess.log")
     done = Path.join(tmp, "p15-finished")
-    File.write!(ctx.log, "")
+    File.write!(log, "")
 
     on_exit(fn ->
       unless File.exists?(done) do
-        output = with {:error, _} <- File.read(ctx.log), do: "(no subprocess log)"
+        output =
+          case File.read(log) do
+            {:ok, contents} -> contents
+            {:error, reason} -> "(subprocess log unreadable: #{inspect(reason)})"
+          end
+
         IO.puts("P15 did not finish; subprocess output:\n" <> output)
       end
     end)
@@ -303,11 +294,20 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
 
     # A gateway database life runs the migration and is killed (SIGKILL) inside its
     # transaction, after two denial writes and before any commit.
+    # The only signal in this test: the child's own BEAM pid, while its Port is open
+    # and no exit of it has been reported, and the stall holds it inside its transaction.
     port = launch(plan, ["migrate-stalled", lock_db])
-    {os_pid, exited} = await_pid!(port, ctx)
-    await_line(port, ctx.log, ~r/\Adenial 3 /)
-    assert {_, 0} = System.cmd("kill", ["-KILL", os_pid])
-    assert await_exit(port, ctx.log, exited) != 0
+    [_, os_pid] = await_line(port, log, ~r/\Apid (\d+)\z/)
+    await_line(port, log, ~r/\Adenial 3 /)
+
+    receive do
+      {^port, {:exit_status, status}} ->
+        flunk("stalled migration exited #{status}:\n" <> File.read!(log))
+    after
+      0 -> assert {_, 0} = System.cmd("kill", ["-KILL", os_pid])
+    end
+
+    assert await_exit(port, log) != 0
     :ok = Exqlite.Sqlite3.execute(lock, "ROLLBACK")
     :ok = Exqlite.Sqlite3.close(lock)
 
@@ -323,13 +323,13 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     stop_supervised!(db)
 
     # The rerun, in a fresh gateway database life, denies every legacy pending row.
-    run!(plan, ctx, "migrate", "migrate: ok")
+    run!(plan, log, "migrate", "migrate: ok")
     db = open_base!(plan, "after_rerun")
     assert_denied!(db, seeded, before, alerts_before)
     stop_supervised!(db)
 
     # A gateway restart (boot schema and boot observation) writes no further denial.
-    run!(plan, ctx, "boot", "boot: ok")
+    run!(plan, log, "boot", "boot: ok")
     db = open_base!(plan, "after_restart")
     assert denial_count(db) == length(@pending)
     assert read(db, "SELECT COUNT(*) FROM devices WHERE status = 'pending'") == [[0]]

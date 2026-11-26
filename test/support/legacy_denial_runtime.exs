@@ -11,9 +11,19 @@
 #   boot                       runs the gateway's boot schema and boot observation, as a
 #                              gateway restart does, and stops.
 #
-# Its first line is `pid <os pid>`, so the test kills this BEAM itself.
+# Its first line is `pid <os pid>`, so the test can SIGKILL this BEAM (not a wrapper)
+# while the stall holds it.
 
 [payload, base, mode | rest] = System.argv()
+
+# The test's Port owns this BEAM's lifetime: when the Port closes (the test finished,
+# failed or timed out), standard input reaches EOF and this BEAM halts at once, even
+# while its migration is stalled.
+spawn(fn ->
+  _ = IO.read(:stdio, :eof)
+  :erlang.halt(1, flush: false)
+end)
+
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 {:ok, _} = Application.ensure_all_started(:exqlite)
 {:ok, _} = Application.ensure_all_started(:crypto)

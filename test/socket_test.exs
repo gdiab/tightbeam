@@ -58,44 +58,49 @@ defmodule Tightbeam.Wire.SocketTest do
   defmodule MainSeedFailureDB do
     use GenServer
 
-    def start_link({name, db, error}),
-      do: GenServer.start_link(__MODULE__, {db, error}, name: name)
+    def start_link({name, db, error, parent}),
+      do: GenServer.start_link(__MODULE__, {db, error, parent}, name: name)
 
     def init(state), do: {:ok, state}
 
     # Stage 1 S2.3: device auth first runs DeviceLifecycle.sign_in/2's delivery
     # transaction, before the personal Main seed. That one transaction reaches the
-    # real database; every other transaction fails with the seed error.
-    def handle_call({:db_call, _envelope, {:transaction, fun}} = request, _from, {db, error}) do
-      if sign_in?(fun),
-        do: {:reply, GenServer.call(db, request), {db, error}},
-        else: {:reply, {:error, error}, {db, error}}
+    # real database; every other transaction, including any other DeviceLifecycle
+    # one, fails with the seed error. Each decision is reported to the test.
+    def handle_call({:db_call, _envelope, {:transaction, fun}} = request, _from, state),
+      do: {:reply, transaction(fun, request, state), state}
+
+    def handle_call({:db_call, envelope, request}, _from, {db, _error, _parent} = state) do
+      {:reply, GenServer.call(db, {:db_call, envelope, request}), state}
     end
 
-    def handle_call({:db_call, envelope, request}, _from, {db, error}) do
-      {:reply, GenServer.call(db, {:db_call, envelope, request}), {db, error}}
+    def handle_call({:transaction, fun} = request, _from, state),
+      do: {:reply, transaction(fun, request, state), state}
+
+    def handle_call(request, _from, {db, _error, _parent} = state) do
+      {:reply, GenServer.call(db, request), state}
     end
 
-    def handle_call({:transaction, fun} = request, _from, {db, error}) do
-      if sign_in?(fun),
-        do: {:reply, GenServer.call(db, request), {db, error}},
-        else: {:reply, {:error, error}, {db, error}}
+    defp transaction(fun, request, {db, error, parent}) do
+      {module, name} = origin(fun)
+      sign_in? = module == Tightbeam.DeviceLifecycle and String.starts_with?(name, "-sign_in/2-")
+      send(parent, {__MODULE__, if(sign_in?, do: :passed, else: :injected), module, name})
+      if sign_in?, do: GenServer.call(db, request), else: {:error, error}
     end
 
-    def handle_call(request, _from, {db, error}) do
-      {:reply, GenServer.call(db, request), {db, error}}
-    end
-
-    # The transaction's own callback, unwrapped from the DB client's envelope, was
-    # written in Tightbeam.DeviceLifecycle: S2.3's sign-in.
-    defp sign_in?(fun) do
+    # Where the transaction's own callback, unwrapped from the DB client's envelope,
+    # was compiled: its module and its name, which for a closure is
+    # `-<enclosing function>/<arity>-fun-<n>-`.
+    defp origin(fun) do
       callback =
         case Tightbeam.DBObservation.transaction_metadata(fun) do
           {:ok, _envelope, original} -> original
           :none -> fun
         end
 
-      :erlang.fun_info(callback, :module) == {:module, Tightbeam.DeviceLifecycle}
+      {:module, module} = :erlang.fun_info(callback, :module)
+      {:name, name} = :erlang.fun_info(callback, :name)
+      {module, Atom.to_string(name)}
     end
   end
 
@@ -1060,7 +1065,7 @@ defmodule Tightbeam.Wire.SocketTest do
     }
 
     proxy = :main_seed_failure_db
-    start_supervised!({MainSeedFailureDB, {proxy, ctx.db, error}})
+    start_supervised!({MainSeedFailureDB, {proxy, ctx.db, error, self()}})
     deps = %{ctx.deps | db: proxy}
     {:ok, state} = Socket.init(deps)
     auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
@@ -1076,6 +1081,17 @@ defmodule Tightbeam.Wire.SocketTest do
 
     assert Org.get(ctx.db, Org.personal_session_key(device.user_id)) == nil
     assert map_size(:sys.get_state(ctx.registry).conns) == 0
+
+    # The fixture admitted exactly sign_in/2's transaction, and the personal Main seed
+    # (Socket's own transaction) received the injected error.
+    assert_received {MainSeedFailureDB, :passed, Tightbeam.DeviceLifecycle, "-sign_in/2-" <> _}
+    assert_received {MainSeedFailureDB, :injected, Tightbeam.Wire.Socket, _}
+    refute_received {MainSeedFailureDB, :passed, _, _}
+
+    # Any other DeviceLifecycle transaction is refused by the fixture.
+    assert_raise MatchError, fn -> Tightbeam.DeviceLifecycle.expire_due(proxy) end
+
+    assert_received {MainSeedFailureDB, :injected, Tightbeam.DeviceLifecycle, "-expire_due/" <> _}
   end
 
   test "a removal committed after the device lookup refuses auth with no seed or registration",
