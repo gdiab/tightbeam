@@ -2,7 +2,9 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
   @moduledoc """
   Stage 1 (stage1-v12) S5.1 and §6.2: legacy pending devices denied at the migration
   and listed in the install receipt (P15, P16), and user creation only by gated,
-  audited paths (P17, R-a, R-c), on an isolated in-memory database.
+  audited paths (P17, R-a, R-c), on an isolated in-memory database. P15 runs on a
+  file-backed base: the migration is killed mid-transaction in its own OS process, then
+  the base is reopened, migrated again and restarted, each in a fresh process.
   """
 
   use Tightbeam.TestCase, async: false
@@ -36,6 +38,12 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     start_supervised!({PairingAdmission, name: admission})
     on_exit(fn -> Application.put_env(:tightbeam, :pairing_unfreeze_path, @absent) end)
 
+    Map.merge(%{db: db, admission: admission}, seed!(db))
+  end
+
+  # Two allowlisted devices with tokens (george an admin) and a session that can raise
+  # a decision.
+  defp seed!(db) do
     george = TestDevices.paired!(db, "george", admin: true, device_id: "iphone")
     guest = TestDevices.paired!(db, "guest", device_id: "guest-phone")
 
@@ -52,7 +60,7 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
         model: Model.new("fable")
       })
 
-    %{db: db, admission: admission, george: george, guest: guest, raiser: raiser}
+    %{george: george, guest: guest, raiser: raiser}
   end
 
   defp read(db, sql, params \\ []) do
@@ -155,33 +163,127 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
 
   ## P15
 
-  test "P15: the migration denies every legacy pending row once, all or nothing", ctx do
-    db = ctx.db
-    legacy_fixture!(ctx)
+  # One run of test/support/legacy_denial_runtime.exs: its own OS process and BEAM,
+  # the real database owner on the file-backed base.
+  defp launch(plan, args) do
+    env =
+      Enum.map(plan.env, fn {k, v} -> {to_charlist(k), if(v, do: to_charlist(v), else: false)} end)
+
+    Port.open({:spawn_executable, plan.executable}, [
+      :binary,
+      :exit_status,
+      :stderr_to_stdout,
+      {:line, 8192},
+      args: plan.args ++ args,
+      env: env
+    ])
+  end
+
+  defp await_line(port, pattern, seen \\ []) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        case Regex.run(pattern, line) do
+          nil -> await_line(port, pattern, [line | seen])
+          match -> match
+        end
+
+      {^port, {:data, {:noeol, _}}} ->
+        await_line(port, pattern, seen)
+
+      {^port, {:exit_status, status}} ->
+        flunk(
+          "exited #{status} before #{inspect(pattern)}:\n" <> Enum.join(Enum.reverse(seen), "\n")
+        )
+    after
+      120_000 -> flunk("no #{inspect(pattern)}:\n" <> Enum.join(Enum.reverse(seen), "\n"))
+    end
+  end
+
+  defp run!(plan, mode, expected) do
+    port = launch(plan, [mode])
+    await_line(port, ~r/\A#{expected}\z/)
+    assert_receive {^port, {:exit_status, 0}}, 120_000
+  end
+
+  defp open_base!(plan, id) do
+    db = :"p15_#{id}_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {DB,
+         path: Path.join(plan.base, "state.db"),
+         name: db,
+         guard_inputs: [],
+         payload_root: plan.payload,
+         base_lock: false},
+        id: db
+      )
+    )
+
+    db
+  end
+
+  defp denial_count(db),
+    do: hd(hd(read(db, "SELECT COUNT(*) FROM lifecycle_events WHERE kind = ?1", [@denial])))
+
+  @tag :tmp_dir
+  test "P15: a migration killed mid-transaction leaves nothing; the rerun denies once, the restart adds nothing",
+       %{tmp_dir: tmp} do
+    plan = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "legacy_denial_runtime.exs")
+    File.mkdir_p!(plan.base)
+
+    # The fixture, on a file-backed base returned to its shape before stage 1.
+    db = open_base!(plan, "seed")
+    :ok = Schema.ensure_all(db)
+    seeded = Map.put(seed!(db), :db, db)
+    legacy_fixture!(seeded)
     to_pre_stage1!(db)
     before = history(db)
     alerts_before = read(db, "SELECT * FROM owner_alerts ORDER BY 1")
+    stop_supervised!(db)
 
-    # A run killed mid-transaction, after two denial records: nothing of it remains.
-    read(db, """
-    CREATE TRIGGER p15_kill BEFORE INSERT ON lifecycle_events
-    WHEN NEW.kind = '#{@denial}'
-      AND (SELECT COUNT(*) FROM lifecycle_events WHERE kind = '#{@denial}') >= 2
-    BEGIN SELECT RAISE(ABORT, 'p15 killed mid-migration'); END
-    """)
+    # The test holds the write lock the stalled migration's third denial waits on.
+    lock_db = Path.join(tmp, "lock.db")
+    {:ok, lock} = Exqlite.Sqlite3.open(lock_db)
+    :ok = Exqlite.Sqlite3.execute(lock, "CREATE TABLE hold (x)")
+    :ok = Exqlite.Sqlite3.execute(lock, "BEGIN IMMEDIATE")
 
-    assert Exception.message(catch_error(DeviceLifecycle.ensure_schema(db))) =~ "p15 killed"
+    # A gateway database life runs the migration and is killed (SIGKILL) inside its
+    # transaction, after two denial writes and before any commit.
+    port = launch(plan, ["migrate-stalled", lock_db])
+    [_, os_pid] = await_line(port, ~r/\Apid (\d+)\z/)
+    await_line(port, ~r/\Adenial 3 /)
+    assert {_, 0} = System.cmd("kill", ["-KILL", os_pid])
+    assert_receive {^port, {:exit_status, status}} when status != 0, 60_000
+    :ok = Exqlite.Sqlite3.execute(lock, "ROLLBACK")
+    :ok = Exqlite.Sqlite3.close(lock)
+
+    # Reopened: neither the S5 records nor any denial survived.
+    db = open_base!(plan, "after_kill")
 
     assert read(db, "SELECT name FROM sqlite_master WHERE name = 'device_lifecycle_migration'") ==
              []
 
     assert read(db, "SELECT name FROM sqlite_master WHERE name = 'pairing_codes'") == []
-    assert denials(db) == []
+    assert denial_count(db) == 0
     assert history(db) == before
+    stop_supervised!(db)
 
-    read(db, "DROP TRIGGER p15_kill")
-    :ok = DeviceLifecycle.ensure_schema(db)
+    # The rerun, in a fresh gateway database life, denies every legacy pending row.
+    run!(plan, "migrate", "migrate: ok")
+    db = open_base!(plan, "after_rerun")
+    assert_denied!(db, seeded, before, alerts_before)
+    stop_supervised!(db)
 
+    # A gateway restart (boot schema and boot observation) writes no further denial.
+    run!(plan, "boot", "boot: ok")
+    db = open_base!(plan, "after_restart")
+    assert denial_count(db) == length(@pending)
+    assert read(db, "SELECT COUNT(*) FROM devices WHERE status = 'pending'") == [[0]]
+    assert read(db, "SELECT * FROM owner_alerts ORDER BY 1") == alerts_before
+  end
+
+  defp assert_denied!(db, seeded, before, alerts_before) do
     # No pending rows; each former pending row is denied, token cleared, nothing else.
     assert read(db, "SELECT COUNT(*) FROM devices WHERE status = 'pending'") == [[0]]
 
@@ -200,7 +302,7 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     assert history(db).decisions == before.decisions
 
     # Each allowlisted token still authenticates.
-    for device <- [ctx.george, ctx.guest] do
+    for device <- [seeded.george, seeded.guest] do
       assert Devices.by_token(db, device.token).device_id == device.device_id
       assert :ok = DeviceLifecycle.sign_in(db, device.token)
     end
@@ -238,11 +340,6 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
 
     # The migration sends no per-row alert.
     assert read(db, "SELECT * FROM owner_alerts ORDER BY 1") == alerts_before
-
-    # A restart writes no new denial record.
-    :ok = Schema.ensure_all(db)
-    :ok = DeviceLifecycle.ensure_schema(db)
-    assert length(denials(db)) == length(@pending)
   end
 
   ## P16
