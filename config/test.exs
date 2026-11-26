@@ -1,5 +1,10 @@
 import Config
 
+authoritative_gate_claim =
+  if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
+    %{expected_node: System.get_env("TIGHTBEAM_GATE_NODE")}
+  end
+
 suite_nonce =
   12
   |> :crypto.strong_rand_bytes()
@@ -81,6 +86,10 @@ config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp
 config :tightbeam, :test_tripwire_log, tripwire_log
 config :tightbeam, :port, 0
+
+if authoritative_gate_claim do
+  config :tightbeam, :authoritative_gate_claim, authoritative_gate_claim
+end
 
 # Core fix (A) C6a: tests point the unfreeze-file reader at fixtures. Only this
 # environment compiles the override; by default the hatch reads a path that does

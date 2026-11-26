@@ -105,6 +105,25 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
              ])
   end
 
+  test "config scrub preserves the authoritative gate claim for fail-closed validation" do
+    executable = System.find_executable("elixir")
+
+    {capture, status} =
+      System.cmd(
+        executable,
+        ["-S", "mix", "test", "--no-compile", "test/base_dir_test.exs"],
+        env: [
+          {"TIGHTBEAM_AUTHORITATIVE_GATE", "1"},
+          {"TIGHTBEAM_GATE_NODE", "tightbeam_mix_gate_deliberate_mismatch"}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert capture =~ "This authoritative Mix gate is not isolated"
+    assert capture =~ "suite node is"
+  end
+
   defp occupy_or_observe_production_port! do
     case :gen_tcp.listen(@production_port, [
            :binary,
