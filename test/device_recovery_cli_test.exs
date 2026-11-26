@@ -747,7 +747,8 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
 
     Org.create(db, %{
       session_key: Org.personal_session_key(ada.user_id),
-      display_name: "Main",
+      # Display names are unique across the organization (option-2 base).
+      display_name: "Main #{ada.user_id}",
       kind: "main",
       is_built_in: true,
       owner_user_id: ada.user_id,

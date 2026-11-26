@@ -164,7 +164,8 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
   ## P15
 
   # One run of test/support/legacy_denial_runtime.exs: its own OS process and BEAM,
-  # the real database owner on the file-backed base.
+  # the real database owner on the file-backed base. Every line it prints is appended
+  # to `log`, which the test prints if it ends without finishing (P15's on_exit).
   defp launch(plan, args) do
     env =
       Enum.map(plan.env, fn {k, v} -> {to_charlist(k), if(v, do: to_charlist(v), else: false)} end)
@@ -179,30 +180,67 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     ])
   end
 
-  defp await_line(port, pattern, seen \\ []) do
+  # The subprocess's first line is its OS pid. Until its exit is observed, it is killed
+  # when the test ends, so a failed or timed-out test leaves nothing running; once its
+  # exit is observed (`await_exit/3`), the pid is never signalled again.
+  defp await_pid!(port, ctx) do
+    [_, os_pid] = await_line(port, ctx.log, ~r/\Apid (\d+)\z/)
+    exited = Path.join(ctx.tmp, "exited-#{os_pid}")
+
+    on_exit(fn ->
+      unless File.exists?(exited),
+        do: System.cmd("kill", ["-KILL", os_pid], stderr_to_stdout: true)
+    end)
+
+    {os_pid, exited}
+  end
+
+  defp await_line(port, log, pattern) do
     receive do
       {^port, {:data, {:eol, line}}} ->
+        File.write!(log, line <> "\n", [:append])
+
         case Regex.run(pattern, line) do
-          nil -> await_line(port, pattern, [line | seen])
+          nil -> await_line(port, log, pattern)
           match -> match
         end
 
-      {^port, {:data, {:noeol, _}}} ->
-        await_line(port, pattern, seen)
+      {^port, {:data, {:noeol, part}}} ->
+        File.write!(log, part, [:append])
+        await_line(port, log, pattern)
 
       {^port, {:exit_status, status}} ->
-        flunk(
-          "exited #{status} before #{inspect(pattern)}:\n" <> Enum.join(Enum.reverse(seen), "\n")
-        )
+        flunk("subprocess exited #{status} before #{inspect(pattern)}:\n" <> File.read!(log))
     after
-      120_000 -> flunk("no #{inspect(pattern)}:\n" <> Enum.join(Enum.reverse(seen), "\n"))
+      120_000 -> flunk("no #{inspect(pattern)} within 120 s:\n" <> File.read!(log))
     end
   end
 
-  defp run!(plan, mode, expected) do
+  # The rest of the subprocess's output, then its exit status.
+  defp await_exit(port, log, exited) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        File.write!(log, line <> "\n", [:append])
+        await_exit(port, log, exited)
+
+      {^port, {:data, {:noeol, part}}} ->
+        File.write!(log, part, [:append])
+        await_exit(port, log, exited)
+
+      {^port, {:exit_status, status}} ->
+        File.write!(exited, "")
+        status
+    after
+      120_000 -> flunk("subprocess did not exit within 120 s:\n" <> File.read!(log))
+    end
+  end
+
+  defp run!(plan, ctx, mode, expected) do
     port = launch(plan, [mode])
-    await_line(port, ~r/\A#{expected}\z/)
-    assert_receive {^port, {:exit_status, 0}}, 120_000
+    {_os_pid, exited} = await_pid!(port, ctx)
+    await_line(port, ctx.log, ~r/\A#{expected}\z/)
+    status = await_exit(port, ctx.log, exited)
+    assert status == 0, "#{mode} exited #{status}:\n" <> File.read!(ctx.log)
   end
 
   defp open_base!(plan, id) do
@@ -226,11 +264,26 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
   defp denial_count(db),
     do: hd(hd(read(db, "SELECT COUNT(*) FROM lifecycle_events WHERE kind = ?1", [@denial])))
 
+  # The sibling CLI test's bound: several fresh BEAMs, each running the boot schema.
   @tag :tmp_dir
+  @tag timeout: 600_000
   test "P15: a migration killed mid-transaction leaves nothing; the rerun denies once, the restart adds nothing",
        %{tmp_dir: tmp} do
     plan = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "legacy_denial_runtime.exs")
     File.mkdir_p!(plan.base)
+
+    # Every subprocess line, printed if the test ends without finishing: a failed
+    # assertion, a helper's own timeout or ExUnit's.
+    ctx = %{tmp: tmp, log: Path.join(tmp, "p15-subprocess.log")}
+    done = Path.join(tmp, "p15-finished")
+    File.write!(ctx.log, "")
+
+    on_exit(fn ->
+      unless File.exists?(done) do
+        output = with {:error, _} <- File.read(ctx.log), do: "(no subprocess log)"
+        IO.puts("P15 did not finish; subprocess output:\n" <> output)
+      end
+    end)
 
     # The fixture, on a file-backed base returned to its shape before stage 1.
     db = open_base!(plan, "seed")
@@ -251,10 +304,10 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     # A gateway database life runs the migration and is killed (SIGKILL) inside its
     # transaction, after two denial writes and before any commit.
     port = launch(plan, ["migrate-stalled", lock_db])
-    [_, os_pid] = await_line(port, ~r/\Apid (\d+)\z/)
-    await_line(port, ~r/\Adenial 3 /)
+    {os_pid, exited} = await_pid!(port, ctx)
+    await_line(port, ctx.log, ~r/\Adenial 3 /)
     assert {_, 0} = System.cmd("kill", ["-KILL", os_pid])
-    assert_receive {^port, {:exit_status, status}} when status != 0, 60_000
+    assert await_exit(port, ctx.log, exited) != 0
     :ok = Exqlite.Sqlite3.execute(lock, "ROLLBACK")
     :ok = Exqlite.Sqlite3.close(lock)
 
@@ -270,17 +323,18 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     stop_supervised!(db)
 
     # The rerun, in a fresh gateway database life, denies every legacy pending row.
-    run!(plan, "migrate", "migrate: ok")
+    run!(plan, ctx, "migrate", "migrate: ok")
     db = open_base!(plan, "after_rerun")
     assert_denied!(db, seeded, before, alerts_before)
     stop_supervised!(db)
 
     # A gateway restart (boot schema and boot observation) writes no further denial.
-    run!(plan, "boot", "boot: ok")
+    run!(plan, ctx, "boot", "boot: ok")
     db = open_base!(plan, "after_restart")
     assert denial_count(db) == length(@pending)
     assert read(db, "SELECT COUNT(*) FROM devices WHERE status = 'pending'") == [[0]]
     assert read(db, "SELECT * FROM owner_alerts ORDER BY 1") == alerts_before
+    File.write!(done, "")
   end
 
   defp assert_denied!(db, seeded, before, alerts_before) do

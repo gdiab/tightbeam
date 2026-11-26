@@ -35,10 +35,11 @@ defmodule Tightbeam.DeviceLifecycleTest do
     george = TestDevices.paired!(db, "george", admin: true, device_id: "iphone")
     guest = TestDevices.paired!(db, "guest", device_id: "guest-phone")
 
+    # Display names are unique across the organization (option-2 base): one per user.
     for user <- ["george", "guest"] do
       Org.create(db, %{
         session_key: Org.personal_session_key(user),
-        display_name: "Main",
+        display_name: "Main #{user}",
         kind: "main",
         is_built_in: true,
         owner_user_id: user,

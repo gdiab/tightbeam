@@ -63,20 +63,39 @@ defmodule Tightbeam.Wire.SocketTest do
 
     def init(state), do: {:ok, state}
 
-    def handle_call({:db_call, _envelope, {:transaction, _fun}}, _from, {db, error}) do
-      {:reply, {:error, error}, {db, error}}
+    # Stage 1 S2.3: device auth first runs DeviceLifecycle.sign_in/2's delivery
+    # transaction, before the personal Main seed. That one transaction reaches the
+    # real database; every other transaction fails with the seed error.
+    def handle_call({:db_call, _envelope, {:transaction, fun}} = request, _from, {db, error}) do
+      if sign_in?(fun),
+        do: {:reply, GenServer.call(db, request), {db, error}},
+        else: {:reply, {:error, error}, {db, error}}
     end
 
     def handle_call({:db_call, envelope, request}, _from, {db, error}) do
       {:reply, GenServer.call(db, {:db_call, envelope, request}), {db, error}}
     end
 
-    def handle_call({:transaction, _fun}, _from, {db, error}) do
-      {:reply, {:error, error}, {db, error}}
+    def handle_call({:transaction, fun} = request, _from, {db, error}) do
+      if sign_in?(fun),
+        do: {:reply, GenServer.call(db, request), {db, error}},
+        else: {:reply, {:error, error}, {db, error}}
     end
 
     def handle_call(request, _from, {db, error}) do
       {:reply, GenServer.call(db, request), {db, error}}
+    end
+
+    # The transaction's own callback, unwrapped from the DB client's envelope, was
+    # written in Tightbeam.DeviceLifecycle: S2.3's sign-in.
+    defp sign_in?(fun) do
+      callback =
+        case Tightbeam.DBObservation.transaction_metadata(fun) do
+          {:ok, _envelope, original} -> original
+          :none -> fun
+        end
+
+      :erlang.fun_info(callback, :module) == {:module, Tightbeam.DeviceLifecycle}
     end
   end
 
