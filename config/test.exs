@@ -205,6 +205,12 @@ config :tightbeam,
        :base_dir,
        base
 
+# Review att_71361b76: every test-environment build (which now always runs inside
+# scripts/test_sandbox.sh, erratum 3) builds exqlite from its vendored SQLite
+# source, so elixir_make's precompiled-NIF downloader is never invoked, cache or
+# no cache. config/config.exs already does this for nested builds.
+config :exqlite, force_build: true
+
 config :tightbeam, :autostart, false
 config :tightbeam, :local_host_name, "testhost"
 config :tightbeam, :fixture_harness, true
