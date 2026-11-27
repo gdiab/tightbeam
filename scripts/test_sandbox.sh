@@ -199,37 +199,38 @@ GITCONFIG
 # elixir_make cache. Never ~/.hex (it can hold an API key), other Mix
 # configuration, provider or harness homes, or any credential file.
 copy_regular() {
-  # copy_regular <source> <target>: copy, then refuse any symlink in the copy.
+  # copy_regular <source> <target>: copy, refuse anything in the copy that is not
+  # a regular file or a directory (a symlink, fifo, socket or device), then make
+  # the whole copy read-only for the run.
   mkdir -p "$(dirname -- "$2")"
   cp -R -- "$1" "$2"
-  if [ -n "$(find "$2" -type l -print -quit)" ]; then
-    refuse "seeded build material $1 contains a symlink"
+  if [ -n "$(find "$2" ! -type d ! -type f -print -quit)" ]; then
+    refuse "seeded build material $1 contains something other than regular files and directories"
   fi
+  chmod -R a-w -- "$2"
 }
 real_mix_home=${MIX_HOME:-$real_home/.mix}
 for archive in "$real_mix_home"/archives/hex-*; do
   [ -e "$archive" ] || continue
   copy_regular "$archive" "$root/home/.mix/archives/$(basename -- "$archive")"
-  chmod -R a-w "$root/home/.mix/archives/$(basename -- "$archive")"
 done
 for rebar in "$real_mix_home"/elixir/*/rebar3; do
   [ -f "$rebar" ] || continue
   [ -L "$rebar" ] && refuse "rebar3 at $rebar is a symlink"
   version_dir=$(basename -- "$(dirname -- "$rebar")")
-  mkdir -p "$root/home/.mix/elixir/$version_dir"
-  cp -- "$rebar" "$root/home/.mix/elixir/$version_dir/rebar3"
+  copy_regular "$rebar" "$root/home/.mix/elixir/$version_dir/rebar3"
 done
 if [ -d "$real_home/.cache/elixir_make" ]; then
   copy_regular "$real_home/.cache/elixir_make" "$root/home/.cache/elixir_make"
 fi
 
-# One Cargo home per run, shared by the Mix suite and cargo test (C15): regular
-# file copies of the registry and git caches only (writable, since Cargo unpacks
-# sources and keeps its lock there; the real caches are never written), used
-# offline. It holds no
-# credentials.toml, credentials or config.toml. Every crate the run builds
-# (the CLI and each native extension) must already be in the caches: offline, a
-# missing crate refuses and nothing is fetched.
+# One Cargo home per run, shared by the Mix suite and cargo test (C15): read-only
+# regular-file copies of the registry and git caches, used offline. It holds no
+# credentials.toml, credentials or config.toml. Only the Cargo home's own root
+# stays writable, for Cargo's lock and bookkeeping files; nothing seeded is
+# writable. Every crate the run builds (the CLI and each native extension) must
+# already be unpacked in the caches: offline, a missing crate refuses and
+# nothing is fetched.
 real_cargo_home=${CARGO_HOME:-$real_home/.cargo}
 for cache in registry git; do
   [ -d "$real_cargo_home/$cache" ] && copy_regular "$real_cargo_home/$cache" "$root/cargo/$cache"

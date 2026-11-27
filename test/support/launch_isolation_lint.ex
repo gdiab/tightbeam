@@ -74,20 +74,28 @@ defmodule Tightbeam.LaunchIsolationLint do
         "stale #{@allowlist} entry: #{entry.file} #{entry.function} #{entry.kind}"
       end
 
-    # The reviewer field names the reviewing session and its verdict; an entry
-    # still awaiting review is not reviewed (reviewer finding B4).
+    # The reviewer field names the reviewing session and its verdict: a
+    # Tightbeam session id (s_ and 8 hex digits) and a verdict attest id (att_ and
+    # at least 8 hex digits). Anything else, including an entry still awaiting
+    # review, is not attributable (reviewer findings B4 and, on 2a49ae5e, B3).
     malformed =
-      for entry <- allowlist,
-          not (is_binary(entry[:reason]) and entry.reason != "" and
-                 is_binary(entry[:reviewer]) and entry.reviewer != "" and
-                 not (entry.reviewer =~ ~r/pending/i)) do
+      for entry <- allowlist, not reviewed_entry?(entry) do
         "#{@allowlist} entry #{entry.file} #{entry.function} needs a reason and a reviewer " <>
-          "that is not pending"
+          "naming a reviewing session (s_…) and its verdict (att_…), not pending"
       end
 
     fatal = for f <- fatal, do: "#{f.file}:#{f.line} #{f.kind}; it cannot be allowlisted"
 
     Enum.sort(unlisted ++ compile ++ stale ++ malformed ++ fatal)
+  end
+
+  @doc "Whether an allowlist entry has a reason and an attributable review."
+  def reviewed_entry?(entry) do
+    reviewer = entry[:reviewer]
+
+    is_binary(entry[:reason]) and String.trim(entry.reason) != "" and is_binary(reviewer) and
+      Regex.match?(~r/\bs_[0-9a-f]{8}\b/, reviewer) and
+      Regex.match?(~r/\batt_[0-9a-f]{8}/, reviewer) and not Regex.match?(~r/pending/i, reviewer)
   end
 
   @doc "The relative paths the lint parses, for `root`."

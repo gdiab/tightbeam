@@ -385,8 +385,10 @@ defmodule Tightbeam.TestIsolation do
   defp forbidden_resolution(env) do
     dirs = env |> Map.get("PATH", "") |> String.split(":", trim: true)
 
+    # An absent tool is the safe state: only a name that resolves is judged.
     for tool <- Preflight.forbidden_tools(),
         found = Enum.find_value(dirs, &executable(Path.join(&1, tool))),
+        is_binary(found),
         not acceptable_stand_in?(tool, found) do
       "#{tool} resolves to #{found}"
     end
@@ -395,6 +397,8 @@ defmodule Tightbeam.TestIsolation do
   defp executable(path) do
     if Preflight.file_type(path) == :regular, do: path
   end
+
+  defp acceptable_stand_in?(_tool, found) when not is_binary(found), do: true
 
   defp acceptable_stand_in?(tool, found) do
     real = Preflight.canonical(found)

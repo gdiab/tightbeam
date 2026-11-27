@@ -134,8 +134,9 @@ reviewer =
       "test session-connect composes explicit organization identity with automatic session identity",
     kind: "{:spawn_executable, _} port",
     reason:
-      "runs assemble.sh inside a git-archive capture of HEAD in the sandbox, proving a clean-source package",
-    reviewer: reviewer
+      "the CLI session-connect launch from the test's own fixture session tree: the spawn tuple is an argument of Tightbeam.FixtureSession.port_open/2, which checks the session file (inside the sandbox, loopback, exactly the recorded URL), the cwd, the executable and the env before its own allowlisted Port.open",
+    reviewer:
+      "s_73d9b4b6 (F1 code review asg_5151637a on 2a49ae5e, verdict att_e9661b84, B3: the session-connect tuple is checked by FixtureSession before the allowlisted Port.open)"
   },
 
   # Tests of the CLI's own session discovery run it from inside their fixture
@@ -177,15 +178,15 @@ reviewer =
   },
 
   # F1 erratum 2 (wi_34a7be66): the config-time launch and the suite-phase
-  # preflight child. Each awaits this subject's independent code review; the
-  # contract text that sanctions it is named.
+  # preflight child, each found supportable by the code review named.
   %{
     file: "config/test.exs",
     function: "top level",
     kind: "System.cmd",
     reason:
       "the repair's rustc --print sysroot query, the one launch under config/ (erratum 2 C6): a toolbox binary, no credential, before any test",
-    reviewer: "sanctioned by F1 erratum 2 C6 (PO-bound att_8a1bd48f); checked in this subject's code review"
+    reviewer:
+      "s_73d9b4b6 (F1 code review asg_5151637a on 2a49ae5e, verdict att_e9661b84, B3: C6 expressly sanctions this rustc sysroot query)"
   },
   %{
     file: "test/test_isolation_test.exs",
@@ -193,6 +194,7 @@ reviewer =
     kind: "System.cmd",
     reason:
       "T7 (erratum 2 C2, C9): runs the suite-phase preflight in a child VM with one injected fault; same shape as preflight_child/3",
-    reviewer: "same shape as the reviewed preflight_child/3 entry; checked in this subject's code review"
+    reviewer:
+      "s_73d9b4b6 (F1 code review asg_5151637a on 2a49ae5e, verdict att_e9661b84, B3: T7 sanctions this suite-preflight child)"
   }
 ]

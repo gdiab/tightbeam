@@ -340,6 +340,8 @@ defmodule Tightbeam.TestSandboxPreflight do
   `<TIGHTBEAM_TEST_ROOT>/tripwire-bin` under the sandbox root that only logs its
   name and exits 97. Erratum 2 C3, C4 accept it in place of `nil`.
   """
+  def repair_tripwire?(path, _root, _test_root) when not is_binary(path), do: false
+
   def repair_tripwire?(path, root, test_root) do
     dir = is_binary(test_root) && Path.join(test_root, "tripwire-bin")
 
@@ -383,8 +385,10 @@ defmodule Tightbeam.TestSandboxPreflight do
       end
 
     exposed =
+      # An absent tool is the safe state: only a name that resolves is judged.
       for tool <- @forbidden_tools,
           found = System.find_executable(tool),
+          is_binary(found),
           not (tool == "ssh" and ssh_tripwire?(found, root)),
           not repair_tripwire?(found, root, test_root),
           do: "#{tool} resolves to #{found}"

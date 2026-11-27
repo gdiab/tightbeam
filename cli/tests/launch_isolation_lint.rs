@@ -204,6 +204,24 @@ pub fn undone_isolation(root: &Path) -> Vec<String> {
 }
 
 /// Allowlist entries: `path | exact trimmed source line | reason | reviewer`.
+/// Whether a reviewer field names a reviewing session and its verdict.
+pub fn reviewed(reviewer: &str) -> bool {
+    let token = |prefix: &str, min: usize, exact: bool| {
+        reviewer.match_indices(prefix).any(|(at, _)| {
+            let before_ok = reviewer[..at]
+                .chars()
+                .last()
+                .map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_');
+            let hex: String = reviewer[at + prefix.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                .collect();
+            before_ok && hex.len() >= min && (!exact || hex.len() == min)
+        })
+    };
+    token("s_", 8, true) && token("att_", 8, false) && !reviewer.to_lowercase().contains("pending")
+}
+
 fn allowlist(root: &Path) -> BTreeSet<(String, String)> {
     std::fs::read_to_string(root.join(ALLOWLIST))
         .unwrap_or_default()
@@ -215,11 +233,12 @@ fn allowlist(root: &Path) -> BTreeSet<(String, String)> {
                 fields.len() == 4 && fields.iter().all(|f| !f.trim().is_empty()),
                 "malformed allowlist entry (path | line | reason | reviewer): {line}"
             );
-            // The reviewer names the reviewing session and its verdict; an
-            // entry still awaiting review is not reviewed.
+            // The reviewer names the reviewing session (s_ and 8 hex digits)
+            // and its verdict attest (att_ and at least 8 hex digits); an entry
+            // still awaiting review, or an unattributable claim, is not reviewed.
             assert!(
-                !fields[3].to_lowercase().contains("pending"),
-                "allowlist entry not yet reviewed: {line}"
+                reviewed(fields[3]),
+                "allowlist entry not attributably reviewed: {line}"
             );
             (fields[0].trim().to_owned(), fields[1].trim().to_owned())
         })
@@ -336,4 +355,22 @@ fn the_lint_catches_a_raw_cli_launch() {
         "production code outside #[cfg(test)] is not a test launch"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_allowlist_reviewer_must_name_a_session_and_its_verdict() {
+    for bad in [
+        "fixture",
+        "checked in this subject's code review",
+        "s_0123abcd",
+        "att_0123abcd",
+        "xs_0123abcd att_0123abcd",
+        "s_0123abcde att_0123abcd",
+        "s_0123abcd (pending) att_0123abcd",
+    ] {
+        assert!(!reviewed(bad), "{bad}");
+    }
+    assert!(reviewed(
+        "s_ccb14ac2 (F1 code review asg_fcccc59a, verdict att_b15f3a6f-6bec-4793-945e-54a7f2347ab0)"
+    ));
 }

@@ -822,4 +822,65 @@ defmodule Tightbeam.TestIsolationTest do
       assert LaunchIsolationLint.violations(TestIsolation.repo()) == []
     end
   end
+
+  describe "review B1 and B3 on 2a49ae5e" do
+    test "B1: an absent forbidden tool is the safe state in the preflight and the helper" do
+      root = TestIsolation.sandbox_root()
+      test_root = System.get_env("TIGHTBEAM_TEST_ROOT")
+      refute TestSandboxPreflight.repair_tripwire?(nil, root, test_root)
+
+      # The suite-phase preflight passes with every forbidden name absent or a
+      # tripwire (the normal sandbox state).
+      assert {output, 0} = suite_preflight_child([], root)
+      assert output =~ "PREFLIGHT-PASSED"
+
+      # A guarded launch whose PATH resolves none of the forbidden names runs.
+      assert {"ok\n", 0} =
+               TestIsolation.cmd("sh", ["-c", "echo ok"],
+                 cd: scratch!("b1"),
+                 env: [{"PATH", TestIsolation.toolbox()}]
+               )
+
+      # A present forbidden name is still refused, naming it.
+      bin = scratch!("b1-bin")
+      File.write!(Path.join(bin, "gh"), "#!/bin/sh\nexit 0\n")
+      File.chmod!(Path.join(bin, "gh"), 0o755)
+
+      {output, 78} =
+        preflight_child(scratch!("b1-pre"), [{"PATH", bin <> ":" <> System.fetch_env!("PATH")}])
+
+      assert output =~ "gh resolves to"
+    end
+
+    test "B3: an allowlist reviewer must name a session and its verdict" do
+      base = %{file: "test/x_test.exs", function: "test x", kind: "System.cmd", reason: "r"}
+
+      for reviewer <- [
+            "fixture",
+            "checked in this subject's code review",
+            "sanctioned by F1 erratum 2 C6 (PO-bound att_8a1bd48f)",
+            "s_0123abcd",
+            "s_0123abcd (pending, att_0123abcd)",
+            ""
+          ] do
+        refute LaunchIsolationLint.reviewed_entry?(Map.put(base, :reviewer, reviewer)), reviewer
+      end
+
+      assert LaunchIsolationLint.reviewed_entry?(
+               Map.put(base, :reviewer, "s_0123abcd (code review asg_x, verdict att_0123abcd)")
+             )
+
+      refute LaunchIsolationLint.reviewed_entry?(
+               base |> Map.put(:reason, " ") |> Map.put(:reviewer, "s_0123abcd att_0123abcd")
+             )
+
+      violations =
+        LaunchIsolationLint.violations_in(
+          %{"test/x_test.exs" => "defmodule X do\n  def x, do: :ok\nend\n"},
+          [Map.put(base, :reviewer, "fixture")]
+        )
+
+      assert Enum.any?(violations, &(&1 =~ "naming a reviewing session (s_…) and its verdict"))
+    end
+  end
 end
