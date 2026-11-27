@@ -66,7 +66,7 @@ fi
 
 : >"$root/.tightbeam-test-sandbox"
 mkdir -p "$root/home" "$root/xdg/config" "$root/xdg/data" "$root/xdg/state" \
-  "$root/xdg/cache" "$root/bin" "$root/tmp" "$root/home/.mix" "$root/hex" "$root/cargo"
+  "$root/home/.cache" "$root/bin" "$root/tmp" "$root/home/.mix" "$root/hex" "$root/cargo"
 
 # Toolbox: each entry is a real install, never a mise or rustup shim (a shim
 # needs the real HOME to dispatch). Resolution happens here, before the swap.
@@ -220,6 +220,8 @@ for rebar in "$real_mix_home"/elixir/*/rebar3; do
   version_dir=$(basename -- "$(dirname -- "$rebar")")
   copy_regular "$rebar" "$root/home/.mix/elixir/$version_dir/rebar3"
 done
+# XDG_CACHE_HOME is <root>/home/.cache, so elixir_make (which looks there) reads
+# this seeded copy instead of downloading a precompiled NIF.
 if [ -d "$real_home/.cache/elixir_make" ]; then
   copy_regular "$real_home/.cache/elixir_make" "$root/home/.cache/elixir_make"
 fi
@@ -296,7 +298,7 @@ env -i \
   XDG_CONFIG_HOME="$root/xdg/config" \
   XDG_DATA_HOME="$root/xdg/data" \
   XDG_STATE_HOME="$root/xdg/state" \
-  XDG_CACHE_HOME="$root/xdg/cache" \
+  XDG_CACHE_HOME="$root/home/.cache" \
   PATH="$root/bin:$repo/cli/target/release" \
   TMPDIR="$root/tmp" \
   LANG="${LANG:-C.UTF-8}" \
