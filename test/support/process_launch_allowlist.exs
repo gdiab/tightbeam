@@ -139,6 +139,18 @@ reviewer =
       "s_73d9b4b6 (F1 code review asg_5151637a on 2a49ae5e, verdict att_e9661b84, B3: the session-connect tuple is checked by FixtureSession before the allowlisted Port.open)"
   },
 
+  # The CLI's own refusal of a non-loopback credential-health endpoint, which
+  # the helper will not launch with (F1 applicability ruling art_38dc3377).
+  %{
+    file: "test/credential_health_cli_test.exs",
+    function: "defp invoke_unrouted/3",
+    kind: "System.cmd",
+    reason:
+      "exactly two raw CLI launches with the reserved never-routed endpoints http://192.0.2.1 (RFC 5737) and http://gateway-host.invalid (RFC 6761), any other host refused in the function; cwd, executable and env are the ones invoke/3 uses, checked by the helper with a loopback stand-in for the URL; the test keeps exit 1, unavailable, endpoint nil, endpointSource env, no contact and the canary check (ruling art_38dc3377, PO binding att_02565514)",
+    reviewer:
+      "s_de276cd7 (spec review asg_e476e12c of ruling art_38dc3377, verdict att_e3b83d23-7f70-40a1-a44a-ca5b117515e9); PO binding att_02565514-54f7-4226-932d-7668256eba8d (s_6d19a1ee)"
+  },
+
   # Tests of the CLI's own session discovery run it from inside their fixture
   # session trees through Tightbeam.FixtureSession (reviewer ruling on
   # session_cli): the session file must be inside the sandbox, loopback, and

@@ -348,13 +348,16 @@ defmodule Tightbeam.CredentialHealthCliTest do
 
     File.rm!(Path.join(ctx.cwd, ".tightbeam-session"))
 
-    for refused <- [
-          "http://localhost:#{server.port}",
-          "http://gateway-host.local:#{server.port}",
-          "http://10.0.0.1:#{server.port}"
+    # The isolation helper launches only with a loopback TIGHTBEAM_URL, so the
+    # two non-loopback cases run through invoke_unrouted/3 with reserved,
+    # never-routed endpoints (F1 art_38dc3377, PO att_02565514).
+    for {refused, launch} <- [
+          {"http://localhost:#{server.port}", &invoke/3},
+          {"http://gateway-host.invalid:#{server.port}", &invoke_unrouted/3},
+          {"http://192.0.2.1:#{server.port}", &invoke_unrouted/3}
         ] do
       result =
-        invoke(ctx, [],
+        launch.(ctx, [],
           TIGHTBEAM_URL: refused,
           TIGHTBEAM_TOKEN: @token
         )
@@ -531,6 +534,42 @@ defmodule Tightbeam.CredentialHealthCliTest do
   end
 
   defp invoke(ctx, args, overrides \\ []) do
+    # Some cases run inside a fixture session tree, so the launch goes through
+    # Tightbeam.FixtureSession (F1 wi_34a7be66, art_b5ff92cd class C); with no
+    # session ancestor it applies Tightbeam.TestIsolation's checks.
+    capture_cli(ctx, args, invocation_env(ctx, overrides), fn command, argv, opts ->
+      Tightbeam.FixtureSession.cmd(command, argv, opts)
+    end)
+  end
+
+  # F1 (wi_34a7be66) applicability ruling art_38dc3377, PO binding att_02565514:
+  # the only raw CLI launches in this file, so the test can show the CLI itself
+  # refuses a non-loopback endpoint, which the isolation helper will not launch
+  # with. Only the two reserved, never-routed endpoints are accepted (192.0.2.1,
+  # RFC 5737 TEST-NET-1; gateway-host.invalid, RFC 6761), so nothing live can be
+  # reached even if the CLI's refusal regressed. Every other input is the one
+  # invoke/3 would use, checked by the helper itself with the URL replaced by a
+  # loopback stand-in, and the launch carries the helper's GIT_CONFIG_NOSYSTEM.
+  @unrouted_hosts ["192.0.2.1", "gateway-host.invalid"]
+
+  defp invoke_unrouted(ctx, args, overrides) do
+    url = URI.parse(Keyword.fetch!(overrides, :TIGHTBEAM_URL))
+
+    unless url.host in @unrouted_hosts,
+      do: flunk("invoke_unrouted/3 takes only #{inspect(@unrouted_hosts)}, not #{url.host}")
+
+    stand_in = Keyword.put(overrides, :TIGHTBEAM_URL, "http://127.0.0.1:#{url.port}")
+
+    capture_cli(ctx, args, invocation_env(ctx, overrides), fn command, argv, opts ->
+      cwd = Tightbeam.TestIsolation.cwd!(Keyword.fetch!(opts, :cd))
+      Tightbeam.TestIsolation.executable!(command, cwd)
+      Tightbeam.TestIsolation.env!(invocation_env(ctx, stand_in))
+      env = [{"GIT_CONFIG_NOSYSTEM", "1"} | Keyword.fetch!(opts, :env)]
+      System.cmd(command, argv, opts |> Keyword.put(:cd, cwd) |> Keyword.put(:env, env))
+    end)
+  end
+
+  defp invocation_env(ctx, overrides) do
     env = [
       {"HOME", ctx.home},
       {"TIGHTBEAM_URL", nil},
@@ -540,23 +579,23 @@ defmodule Tightbeam.CredentialHealthCliTest do
       {"CANARY_UNRELATED_ENV", "CANARY_ENV_VALUE_R4M2"}
     ]
 
-    env =
-      Enum.reduce(overrides, env, fn {name, value}, env ->
-        key = Atom.to_string(name)
-        List.keystore(env, key, 0, {key, value})
-      end)
+    Enum.reduce(overrides, env, fn {name, value}, env ->
+      key = Atom.to_string(name)
+      List.keystore(env, key, 0, {key, value})
+    end)
+  end
 
+  # Runs the CLI through a /bin/sh capture wrapper with `launch` (a System.cmd/3
+  # shape) and checks that the unrelated canary never leaks.
+  defp capture_cli(ctx, args, env, launch) do
     capture =
       Path.join(ctx.root, "credential-health-capture-#{System.unique_integer([:positive])}")
 
     stdout_path = capture <> ".stdout"
     stderr_path = capture <> ".stderr"
 
-    # Some cases run inside a fixture session tree, so the launch goes through
-    # Tightbeam.FixtureSession (F1 wi_34a7be66, art_b5ff92cd class C); with no
-    # session ancestor it applies Tightbeam.TestIsolation's checks.
     {_shell_output, status} =
-      Tightbeam.FixtureSession.cmd(
+      launch.(
         "/bin/sh",
         [
           "-c",
