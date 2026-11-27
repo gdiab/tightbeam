@@ -2842,9 +2842,25 @@ defmodule Tightbeam.ConformanceTest do
   # rebar3 and the elixir_make cache from its HOME (F1 erratum 2 C15). They are
   # copied from the launcher-seeded sandbox home, never the real one, as
   # read-only regular files (F1 wi_34a7be66, art_b5ff92cd class F).
+  #
+  # The copies stay read-only for the test. Afterwards (on_exit runs once the
+  # test process, and so the nested suite it waited for, has finished) the
+  # exact home is removed, so the suite root's own removal at exit is not left
+  # with unwritable directories (CI 45980603605; grant att_a4777065).
   defp fresh_sandbox_home! do
-    home = Path.join(System.tmp_dir!(), "nested-suite-home-#{System.unique_integer([:positive])}")
+    root = Tightbeam.TestSandboxPreflight.canonical(System.tmp_dir!())
+
+    home =
+      Path.join(root, "nested-suite-home-#{System.unique_integer([:positive])}")
+
     File.mkdir_p!(home)
+    home = Tightbeam.TestSandboxPreflight.canonical(home)
+
+    unless home != root and Tightbeam.TestSandboxPreflight.inside?(home, root),
+      do: flunk("nested suite home #{home} is not inside the suite tmp root #{root}")
+
+    # Registered before seeding, so a failure while seeding is cleaned up too.
+    on_exit(fn -> remove_nested_home!(home) end)
     seeded = Path.join(Tightbeam.TestIsolation.sandbox_root(), "home")
 
     for source <-
@@ -2870,5 +2886,31 @@ defmodule Tightbeam.ConformanceTest do
     end
 
     home
+  end
+
+  # The same teardown as Tightbeam.TestCase's tmp_dir removal: owner access is
+  # restored on every directory first, walking by lstat without following
+  # symlinks, so nothing outside `home` is touched; File.rm_rf!/1 removes links,
+  # not their targets. Any failure raises.
+  defp remove_nested_home!(home) do
+    make_removable!(home)
+    File.rm_rf!(home)
+  end
+
+  defp make_removable!(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory, mode: mode}} ->
+        File.chmod!(path, Bitwise.bor(mode, 0o700))
+        path |> File.ls!() |> Enum.each(&make_removable!(Path.join(path, &1)))
+
+      {:ok, _not_a_directory} ->
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "read file stats", path: path
+    end
   end
 end
