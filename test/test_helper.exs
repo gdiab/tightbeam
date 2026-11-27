@@ -1,5 +1,11 @@
+# F1 (wi_34a7be66): this is the first executable code in the suite, before any
+# process launch or application start. It refuses unless scripts/test_sandbox.sh
+# built the sandbox this VM booted in, so no test can resolve a live gateway or a
+# real credential. There is deliberately no switch that skips it.
+Tightbeam.TestSandboxPreflight.enforce!(Path.expand("..", __DIR__))
+
 # An authoritative run must come through scripts/verify_mix.sh.  Focused developer
-# runs do not set this marker and remain ordinary `mix test test/file.exs` commands.
+# runs (scripts/test_sandbox.sh mix test test/file.exs) do not set this marker.
 # The wrapper names this VM through argv instead of an inherited Erlang flag, forces
 # OS-owned port allocation, and supplies the expected name so this seam can prove it
 # received the isolated invocation rather than merely trusting a marker.
@@ -56,7 +62,7 @@ if authoritative_gate_claim = Application.get_env(:tightbeam, :authoritative_gat
     :directory = File.lstat!(directory).type
     candidate = System.fetch_env!("CANDIDATE_SHA")
     true = Regex.match?(~r/\A[0-9a-f]{40}\z/, candidate)
-    {executable, 0} = System.cmd("/bin/ps", ["-p", System.pid(), "-o", "comm="])
+    {executable, 0} = Tightbeam.TestIsolation.cmd("/bin/ps", ["-p", System.pid(), "-o", "comm="])
     executable = Tightbeam.LiveBaseAdmission.canonical!(String.trim(executable))
     "beam.smp" = Path.basename(executable)
 
@@ -108,7 +114,7 @@ missing =
     # identity gets {:conflict, []} — a conflict with no conflicting paths.
     result =
       try do
-        System.cmd("git", ["var", "GIT_COMMITTER_IDENT"], stderr_to_stdout: true)
+        Tightbeam.TestIsolation.cmd("git", ["var", "GIT_COMMITTER_IDENT"], stderr_to_stdout: true)
       rescue
         _ -> {"", :git_missing}
       end

@@ -9,7 +9,7 @@ mod test_isolation;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Same-group protection must run before SIGSTOP: a caller inside the recorded group must
@@ -36,7 +36,7 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
             identity = identity_path.display(),
         ),
     );
-    let mut harness = Command::new(binary)
+    let mut harness = test_isolation::command(binary)
         .args([
             "harness-exec",
             &identity_path.to_string_lossy(),
@@ -102,7 +102,7 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
     let identity_path = dir.join("leader.identity");
     let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
 
-    let mut harness = Command::new(binary)
+    let mut harness = test_isolation::command(binary)
         .args([
             "harness-exec",
             &identity_path.to_string_lossy(),
@@ -119,7 +119,7 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
 
     let leader_identity = await_identity(&identity_path);
 
-    let floor = Command::new(binary)
+    let floor = test_isolation::command(binary)
         .args([
             "harness-group",
             &leader_identity.pgid.to_string(),
@@ -139,7 +139,7 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
         "stderr must name the boot mismatch"
     );
 
-    let cleanup = Command::new(binary)
+    let cleanup = test_isolation::command(binary)
         .args([
             "harness-group",
             &leader_identity.pgid.to_string(),

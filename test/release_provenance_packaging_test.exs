@@ -1,8 +1,6 @@
 defmodule Tightbeam.ReleaseProvenancePackagingTest do
   use ExUnit.Case, async: true
 
-  @script Path.expand("../packaging/write-release-provenance.sh", __DIR__)
-
   test "workflow dispatch on a tag-shaped ref emits no release provenance" do
     {root, destination} = fixture()
 
@@ -103,6 +101,10 @@ defmodule Tightbeam.ReleaseProvenancePackagingTest do
     ]
 
     env = Enum.map(keys, fn key -> {key, Map.get(overrides, key)} end)
-    System.cmd("sh", [@script, destination], env: env, stderr_to_stdout: true)
+
+    Tightbeam.TestIsolation.run_script!("packaging/write-release-provenance.sh", [destination],
+      env: env,
+      stderr_to_stdout: true
+    )
   end
 end

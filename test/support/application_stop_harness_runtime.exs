@@ -209,7 +209,9 @@ await.(
 await.(
   await,
   fn ->
-    case System.cmd("/bin/ps", ["-p", Integer.to_string(escape_pid), "-o", "comm="],
+    case Tightbeam.TestIsolation.cmd(
+           "/bin/ps",
+           ["-p", Integer.to_string(escape_pid), "-o", "comm="],
            stderr_to_stdout: true
          ) do
       {command, 0} -> Path.basename(String.trim(command)) == "sleep"
@@ -247,7 +249,9 @@ end
   )
 
 alive? = fn ->
-  case System.cmd("/bin/kill", ["-0", Integer.to_string(escape_pid)], stderr_to_stdout: true) do
+  case Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(escape_pid)],
+         stderr_to_stdout: true
+       ) do
     {_output, 0} -> true
     {_output, _status} -> false
   end
@@ -313,6 +317,8 @@ try do
       IO.puts("application-stop-harness-cleanup: ok")
   end
 after
-  if alive?.(), do: System.cmd("/bin/kill", ["-KILL", Integer.to_string(escape_pid)])
+  if alive?.(),
+    do: Tightbeam.TestIsolation.cmd("/bin/kill", ["-KILL", Integer.to_string(escape_pid)])
+
   GenServer.stop(evidence_db)
 end

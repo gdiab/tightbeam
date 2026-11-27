@@ -27,7 +27,7 @@ fn each_prepublication_failure_is_terminal_and_attributed() {
             std::env::temp_dir().join(format!("launch-failure-{}-{step}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let path = dir.join("launch.identity");
-        let output = Command::new(std::env::current_exe().unwrap())
+        let output = crate::test_isolation::command(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "harness_process::launch_tests::launcher_probe",
@@ -52,7 +52,7 @@ fn record_write_failure_exits_nonzero_and_names_the_failed_step() {
     let dir = std::env::temp_dir().join(format!("launch-record-failure-{}", std::process::id()));
     fs::create_dir(&dir).unwrap();
     fs::write(dir.join("launch.identity.failed.pending"), "occupied").unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
+    let output = crate::test_isolation::command(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "harness_process::launch_tests::launcher_probe",

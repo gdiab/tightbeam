@@ -6,7 +6,7 @@ defmodule Tightbeam.GuardRuntimeFixture do
     %{executable: executable, args: args, env: env} = prepare!(tmp, script)
 
     {output, status} =
-      System.cmd(executable, args ++ Keyword.get(opts, :args, []),
+      Tightbeam.TestIsolation.cmd(executable, args ++ Keyword.get(opts, :args, []),
         env: env,
         stderr_to_stdout: true
       )

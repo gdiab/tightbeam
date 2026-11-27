@@ -1,0 +1,8 @@
+# Reviewed exceptions to the Rust launch rule (F1, wi_34a7be66, L1b).
+# One entry per launch site in Rust test code that does not go through
+# src/test_isolation.rs. Format: path | exact trimmed source line | reason | reviewer
+# A stale entry (matching no code) fails tests/launch_isolation_lint.rs.
+tests/test_isolation_decoy.rs | let mut command = Command::new(CLI); | T10 positive control: the deliberately unguarded CLI launch that must reach the test-owned decoy listener, proving the guarded case is not vacuous. It runs only toward the decoy. | s_ccb14ac2 (F1 code review asg_fcccc59a, verdict att_b15f3a6f-6bec-4793-945e-54a7f2347ab0)
+tests/test_isolation_decoy.rs | .current_dir(cwd); | T10 positive control (same raw launch): runs in a decoy session tree or a fresh sandbox dir. | s_ccb14ac2 (F1 code review asg_fcccc59a, verdict att_b15f3a6f-6bec-4793-945e-54a7f2347ab0)
+tests/test_isolation_decoy.rs | .env_clear() | T10 positive control and guard check (same raw launches above): the raw CLI launch and the guard-refusal child start from a minimal environment on purpose, with only PATH and a scratch HOME set explicitly. | s_ccb14ac2 (asg_fcccc59a follow-up verdict; entry added for B2)
+tests/test_isolation_decoy.rs | let output = Command::new(std::env::current_exe().unwrap()) | T10 guard check: re-runs this test binary without the sandbox marker so guard() must refuse. The child launches nothing. | s_ccb14ac2 (F1 code review asg_fcccc59a, verdict att_b15f3a6f-6bec-4793-945e-54a7f2347ab0)

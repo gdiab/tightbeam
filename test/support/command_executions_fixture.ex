@@ -9,7 +9,7 @@ defmodule Tightbeam.CommandExecutionsFixture do
       Tightbeam.GuardRuntimeFixture.prepare!(tmp, "command_executions_runtime.exs")
 
     {output, status} =
-      System.cmd(executable, args ++ [Integer.to_string(scenario)],
+      Tightbeam.TestIsolation.cmd(executable, args ++ [Integer.to_string(scenario)],
         env: env,
         stderr_to_stdout: true
       )
@@ -155,7 +155,7 @@ defmodule Tightbeam.CommandExecutionsFixture do
       )
 
     {_output, 0} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         "/bin/sh",
         ["-c", ~S(printf secret | "$0" command-exec "$1"), @helper, row.prepared_path]
       )
@@ -417,7 +417,9 @@ defmodule Tightbeam.CommandExecutionsFixture do
     row = CommandExecutions.prepare(ctx.db, attrs(ctx, "exec-failure", ["/no/such/tb-command"]))
 
     {output, 10} =
-      System.cmd(@helper, ["command-exec", row.prepared_path], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(@helper, ["command-exec", row.prepared_path],
+        stderr_to_stdout: true
+      )
 
     assert output =~ ~s("state":"not_started")
     settled = CommandExecutions.refresh(ctx.db, row.execution_id)
@@ -426,7 +428,9 @@ defmodule Tightbeam.CommandExecutionsFixture do
     refute File.exists?(row.started_path)
 
     {duplicate, 1} =
-      System.cmd(@helper, ["command-exec", row.prepared_path], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(@helper, ["command-exec", row.prepared_path],
+        stderr_to_stdout: true
+      )
 
     assert duplicate =~ "execution already consumed"
   end
@@ -439,7 +443,9 @@ defmodule Tightbeam.CommandExecutionsFixture do
       )
 
     {output, 1} =
-      System.cmd(@helper, ["command-exec", row.prepared_path], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(@helper, ["command-exec", row.prepared_path],
+        stderr_to_stdout: true
+      )
 
     assert output =~ "prepared execution is pinned to host another-host, not testhost"
     refute File.exists?(row.claim_path)
@@ -487,7 +493,7 @@ defmodule Tightbeam.CommandExecutionsFixture do
     adapter =
       spawn(fn ->
         port =
-          Port.open({:spawn_executable, @helper}, [
+          Tightbeam.TestIsolation.port_open({:spawn_executable, @helper}, [
             :binary,
             :exit_status,
             args: ["command-exec", row.prepared_path]
@@ -543,7 +549,7 @@ defmodule Tightbeam.CommandExecutionsFixture do
 
   defp execute(ctx, key, command) do
     row = CommandExecutions.prepare(ctx.db, attrs(ctx, key, command))
-    {_output, 0} = System.cmd(@helper, ["command-exec", row.prepared_path])
+    {_output, 0} = Tightbeam.TestIsolation.cmd(@helper, ["command-exec", row.prepared_path])
     assert eventually(fn -> File.exists?(row.terminal_path) end)
     CommandExecutions.refresh(ctx.db, row.execution_id)
   end

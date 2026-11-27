@@ -118,7 +118,9 @@ defmodule PortableToplinesFixture do
 
   def sqlite!(sqlite, path, command) do
     {output, status} =
-      System.cmd(sqlite, ["-init", "/dev/null", "-bail", path, command], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(sqlite, ["-init", "/dev/null", "-bail", path, command],
+        stderr_to_stdout: true
+      )
 
     assert status == 0, output
     output
@@ -126,7 +128,7 @@ defmodule PortableToplinesFixture do
 
   def assert_portable!(sqlite, path, target) do
     {out, status} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         sqlite,
         [
           "-init",
@@ -154,7 +156,7 @@ defmodule PortableToplinesFixture do
     for table <- @tables, into: %{} do
       # Compare durable values, not physical rowids reassigned by .dump.
       {output, status} =
-        System.cmd(
+        Tightbeam.TestIsolation.cmd(
           sqlite,
           ["-init", "/dev/null", "-bail", "-json", path, "SELECT * FROM #{table};"],
           stderr_to_stdout: true
@@ -192,7 +194,7 @@ sqlite =
   end
 
 sqlite = sqlite || raise "standard bare sqlite3 CLI is required for portable schema proof"
-{version, 0} = System.cmd(sqlite, ["--version"])
+{version, 0} = Tightbeam.TestIsolation.cmd(sqlite, ["--version"])
 IO.puts("bare sqlite3: #{String.trim(version)}")
 path = Path.join(base, "state.db")
 db = :portable_toplines
@@ -235,7 +237,7 @@ try do
   stop.()
 
   {failure, code} =
-    System.cmd(
+    Tightbeam.TestIsolation.cmd(
       sqlite,
       [
         "-init",

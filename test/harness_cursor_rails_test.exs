@@ -11,7 +11,7 @@ defmodule Tightbeam.Harness.CursorRailsTest do
   # stdin rides in an env var so no fixture quoting can leak into the script.
   defp run_hook(%{"command" => command}, stdin_json) do
     {out, 0} =
-      System.cmd("sh", ["-c", "printf '%s' \"$HOOK_STDIN\" | ( #{command} )"],
+      Tightbeam.TestIsolation.cmd("sh", ["-c", "printf '%s' \"$HOOK_STDIN\" | ( #{command} )"],
         env: [{"HOOK_STDIN", stdin_json}],
         stderr_to_stdout: false
       )

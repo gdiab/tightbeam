@@ -282,11 +282,15 @@ mod tests {
         }
 
         fn spawn(base: &Path, mode: &str) -> std::process::Child {
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture"])
-                .env(CHILD_BASE, base)
-                .env(CHILD_MODE, mode)
-                .spawn()
+            crate::test_isolation::reexec(
+                TEST,
+                &[
+                    (CHILD_BASE, base.as_os_str()),
+                    (CHILD_MODE, std::ffi::OsStr::new(mode)),
+                ],
+            )
+            .arg("--nocapture")
+            .spawn()
                 .unwrap()
         }
 

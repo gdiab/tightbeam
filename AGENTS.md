@@ -73,14 +73,34 @@ data shows whether the event path ever drops anything.
   configuration, stay; take one you believe is wrong to its owner. Adding a
   gate, check or process step needs the user's approval.
 - Repository commands. Run those whose checks that rule keeps:
-  - Elixir: `mix format --check-formatted` and `scripts/verify_mix.sh`.
-  - Rust, from `cli/`: `cargo fmt --check` and `cargo test`.
-- The canonical gate handles environment hygiene. For ad-hoc Mix runs outside the
-  script, such as `mix test path/to/file.exs`, use `env -u NAME` to remove every
-  inherited `TIGHTBEAM_*` and `RELEASE_*` variable.
-  The canonical gate removes inherited `TIGHTBEAM_*` variables before setting its
-  test-specific values. Keep stripping both prefixes: that proof covers
-  only config, while `RELEASE_ROOT` is read directly from the environment in `lib/`.
+  - Elixir: `mix format --check-formatted` and `scripts/verify_mix.sh` (it runs
+    the Mix suite and `cargo test`).
+  - Rust, from `cli/`: `cargo fmt --check`.
+- Every local suite runs inside the test sandbox, `scripts/test_sandbox.sh`
+  (`scripts/test_sandbox.sh mix test path/to_test.exs`,
+  `scripts/test_sandbox.sh cargo test --manifest-path cli/Cargo.toml`), and only
+  from a checkout outside any Tightbeam session tree; otherwise run on hosted CI.
+  A test that sees an ancestor `.tightbeam-session`, the real HOME or a
+  credential variable reaches the live gateway with a real credential
+  (wi_34a7be66), so the suite and the Rust test guard refuse to run anywhere
+  else, and nothing switches that off. The sandbox lives under your `TMPDIR`
+  (or `/tmp`), so a `TMPDIR` inside a session tree also makes the run refuse.
+  Fetch crates first (`cargo fetch` in `cli/`): the sandbox runs cargo offline.
+- Tests launch processes only through `Tightbeam.TestIsolation` (Mix) or
+  `test_isolation` (Rust), and run files outside `test/` only with
+  `Tightbeam.TestIsolation.run_script!/3` and a literal path. The launch lints
+  fail on anything else unless it is a reviewed entry in
+  `test/support/process_launch_allowlist.exs` or
+  `cli/tests/fixtures/launch_allowlist.txt`. Real harness tools (`codex`,
+  `claude`, `cursor-agent`, `pi`, `harklight-agent`, `gh`, `ssh`, `op`) never
+  resolve in the sandbox: tests use fixture binaries. A program named by path
+  must be a toolbox tool, a repository file, an OTP launcher or a sandbox
+  fixture; prefer the bare name. A Rust test never strips the environment
+  `test_isolation::command` set (`env_clear`, `env_remove("HOME"|"PATH")`).
+  Allowlist entries name their reviewer and verdict, never "pending".
+- The sandbox pins `TIGHTBEAM_PORT=0` and passes `TIGHTBEAM_GATE_NODE` only as
+  the `tightbeam_mix_gate_` name `scripts/verify_mix.sh` makes for its run; the
+  launcher and the preflight refuse anything else (b0, asg_b30d5c78).
 - Make the requested change first, then run the focused checks that exercise it.
   Do not run a full-suite baseline before writing code; an untouched-tree replay
   delays the change without proving its result.

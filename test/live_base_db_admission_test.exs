@@ -50,7 +50,7 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
     target = Path.join(cli_dir, "target/cli-integration")
 
     {output, status} =
-      System.cmd("cargo", ["build", "--release"],
+      Tightbeam.TestIsolation.cmd("cargo", ["build", "--release"],
         cd: cli_dir,
         env: [{"CARGO_TARGET_DIR", target}],
         stderr_to_stdout: true

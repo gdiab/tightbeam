@@ -22,7 +22,7 @@ mod test_isolation;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// A tree three deep, so passing needs a transitive walk and not a look at the leader's
@@ -66,7 +66,7 @@ fn a_detached_grandchild_does_not_outlive_the_floor() {
         ),
     );
 
-    let mut harness = Command::new(binary)
+    let mut harness = test_isolation::command(binary)
         .args([
             "harness-exec",
             &leader_identity.to_string_lossy(),
@@ -97,7 +97,7 @@ fn a_detached_grandchild_does_not_outlive_the_floor() {
         "the escapee was gone before the floor fired"
     );
 
-    let floor = Command::new(binary)
+    let floor = test_isolation::command(binary)
         .args([
             "harness-group",
             &leader_identity.pgid.to_string(),

@@ -639,7 +639,7 @@ defmodule Tightbeam.CredentialsTest do
     script = Path.join(ctx.base, "synthetic-ssh")
     fifo = Path.join(ctx.base, "stalled-presence")
     marker = Path.join(ctx.base, "presence-pid")
-    {"", 0} = System.cmd("mkfifo", [fifo])
+    {"", 0} = Tightbeam.TestIsolation.cmd("mkfifo", [fifo])
 
     File.write!(
       script,
@@ -675,7 +675,7 @@ defmodule Tightbeam.CredentialsTest do
     assert {:unavailable, %{reason: :lifecycle_changed}} = Task.await(caller, 1_000)
 
     pid = File.read!(marker)
-    assert {_, code} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
+    assert {_, code} = Tightbeam.TestIsolation.cmd("kill", ["-0", pid], stderr_to_stdout: true)
     assert code != 0
   end
 
@@ -743,7 +743,7 @@ defmodule Tightbeam.CredentialsTest do
     fifo = Path.join(ctx.base, "stalled-command")
     marker = Path.join(ctx.base, "command-pid")
     File.mkdir_p!(ctx.base)
-    {"", 0} = System.cmd("mkfifo", [fifo])
+    {"", 0} = Tightbeam.TestIsolation.cmd("mkfifo", [fifo])
     File.write!(script, "#!/bin/sh\nprintf '%s' \"$$\" > '#{marker}'\nread line < '#{fifo}'\n")
     File.chmod!(script, 0o700)
 
@@ -767,7 +767,7 @@ defmodule Tightbeam.CredentialsTest do
 
     assert File.exists?(marker)
     pid = File.read!(marker)
-    assert {_, code} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
+    assert {_, code} = Tightbeam.TestIsolation.cmd("kill", ["-0", pid], stderr_to_stdout: true)
     assert code != 0
     assert :sys.get_state(server).status_reads == %{}
   end
@@ -1262,7 +1262,7 @@ defmodule Tightbeam.CredentialsTest do
         |> Enum.drop(6)
         |> Enum.join(" ")
 
-      System.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
     end
 
     {:ok, server} =
@@ -2420,7 +2420,7 @@ defmodule Tightbeam.CredentialsTest do
       ssh: "worker",
       sh: fn command ->
         [executable | args] = Enum.drop(command, 6)
-        System.cmd(executable, args, stderr_to_stdout: true)
+        Tightbeam.TestIsolation.cmd(executable, args, stderr_to_stdout: true)
       end
     )
   end
@@ -2505,6 +2505,6 @@ defmodule Tightbeam.CredentialsTest do
 
   defp run_remote_command(command) do
     remote_command = command |> Enum.drop(6) |> Enum.join(" ")
-    System.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
+    Tightbeam.TestIsolation.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
   end
 end

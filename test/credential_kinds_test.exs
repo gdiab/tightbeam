@@ -1373,7 +1373,9 @@ defmodule Tightbeam.CredentialKindsTest do
         });
         """
 
-        {output, 0} = System.cmd("node", ["--no-warnings", "-e", mock_fetch <> script | args])
+        {output, 0} =
+          Tightbeam.TestIsolation.cmd("node", ["--no-warnings", "-e", mock_fetch <> script | args])
+
         decoded = JSON.decode!(output)
 
         response = %{

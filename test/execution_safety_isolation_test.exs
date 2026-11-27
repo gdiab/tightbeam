@@ -29,7 +29,7 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
     write_tool!(fake_bin, "cargo", "exit 0")
     write_tool!(fake_bin, "erl", "printf '28.5\\n'")
     write_tool!(fake_bin, "mix", "exit 0")
-    write_tool!(fake_bin, "elixir", concurrent_elixir_fixture())
+    write_tool!(fake_bin, "elixir", concurrent_elixir_fixture(started_file))
 
     wrapper = Path.expand("../scripts/verify_mix.sh", __DIR__)
 
@@ -38,7 +38,6 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
       {"LANG", "C.UTF-8"},
       {"LC_ALL", nil},
       {"LC_CTYPE", nil},
-      {"GATE_STARTED_FILE", started_file},
       {"TIGHTBEAM_BASE_DIR", "/sentinel/prod/base"},
       {"TIGHTBEAM_ADVERTISED_URL", "https://prod.invalid"},
       {"TIGHTBEAM_FUTURE_PRODUCTION_INPUT", "must-be-scrubbed"},
@@ -192,18 +191,21 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
     File.chmod!(path, 0o755)
   end
 
-  defp concurrent_elixir_fixture do
+  # The gate runs elixir inside the test sandbox, whose environment carries only
+  # an allowlist, so the fixture names its shared file in its own body.
+  defp concurrent_elixir_fixture(started_file) do
     """
     if [ "${1:-}" = "--version" ]; then
       printf 'Elixir 1.19.5 (compiled with Erlang/OTP 28)\\n'
       exit 0
     fi
 
-    printf '%s\\n' "$TIGHTBEAM_GATE_NODE" >> "$GATE_STARTED_FILE"
+    started_file=#{started_file}
+    printf '%s\\n' "$TIGHTBEAM_GATE_NODE" >> "$started_file"
     waits=0
     started=0
     while [ "$waits" -lt 500 ]; do
-      started=$(wc -l < "$GATE_STARTED_FILE")
+      started=$(wc -l < "$started_file")
       [ "$started" -ge 2 ] && break
       waits=$((waits + 1))
       sleep 0.01

@@ -2341,12 +2341,16 @@ defmodule Tightbeam.HarklightWakesTest do
     assert calls =~ listen_call
 
     assert {_, 0} =
-             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+             Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(pid)],
+               stderr_to_stdout: true
+             )
 
     :ok = stop_supervised(HarklightWakes)
 
     assert {_, status} =
-             System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+             Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(pid)],
+               stderr_to_stdout: true
+             )
 
     assert status != 0
     start_supervised!({HarklightWakes, db: db})

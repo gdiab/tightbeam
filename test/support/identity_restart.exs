@@ -18,7 +18,7 @@ Application.put_env(:tightbeam, :base_dir, base)
 {:ok, _} = Application.ensure_all_started(:crypto)
 
 git = fn args ->
-  {output, 0} = System.cmd("git", args, cd: dir, stderr_to_stdout: true)
+  {output, 0} = Tightbeam.TestIsolation.cmd("git", args, cd: dir, stderr_to_stdout: true)
   String.trim_trailing(output)
 end
 
@@ -105,7 +105,7 @@ cli_env = [{"TIGHTBEAM_URL", "http://127.0.0.1:#{port}"}, {"TIGHTBEAM_TOKEN", fi
 
 cli = fn args, user ->
   {output, status} =
-    System.cmd(binary, args ++ ["--as-user", user],
+    Tightbeam.TestIsolation.cmd(binary, args ++ ["--as-user", user],
       cd: base,
       env: cli_env,
       stderr_to_stdout: true
@@ -159,7 +159,9 @@ case phase do
              "incoming guidance"
 
     {denial, status} =
-      System.cmd(binary, ["identity", "relearn", "--abort", "--as-user", "recovery-reader"],
+      Tightbeam.TestIsolation.cmd(
+        binary,
+        ["identity", "relearn", "--abort", "--as-user", "recovery-reader"],
         cd: base,
         env: cli_env,
         stderr_to_stdout: true

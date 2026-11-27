@@ -730,7 +730,9 @@ defmodule Tightbeam.LateRulingHandoffTest do
   end
 
   defp git_head! do
-    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], stderr_to_stdout: true)
+    {commit, 0} =
+      Tightbeam.TestIsolation.cmd("git", ["rev-parse", "HEAD"], stderr_to_stdout: true)
+
     String.trim(commit)
   end
 

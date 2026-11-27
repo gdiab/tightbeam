@@ -2,7 +2,6 @@
 mod test_isolation;
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
 use std::{fs, time::SystemTime};
 
 fn executable(path: &std::path::Path, body: &str) {
@@ -65,7 +64,7 @@ fn doctor_exits_nonzero_when_no_registered_harness_cli_is_runnable() {
     executable(&path.join("ps"), "#!/bin/sh\nexit 0\n");
     executable(&path.join("lsof"), "#!/bin/sh\nexit 0\n");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    let output = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args(["doctor", "--base-dir", base_dir.to_str().unwrap()])
         .env("PATH", &path)
         .output()
@@ -95,7 +94,7 @@ fn doctor_reports_banked_oauth_corruption_after_ps_failure() {
     executable(&path.join("ps"), "#!/bin/sh\nexit 1\n");
     bank_captured_hollow_anthropic(&base_dir);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    let output = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args(["doctor", "--json", "--base-dir", base_dir.to_str().unwrap()])
         .env("PATH", &path)
         .output()
@@ -147,7 +146,7 @@ fn doctor_reports_ordinary_ps_failure_as_structured_data_and_fails() {
     executable(&path.join("uname"), "#!/bin/sh\nprintf 'test-host\\n'\n");
     executable(&path.join("ps"), "#!/bin/sh\nexit 1\n");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    let output = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args(["doctor", "--json", "--base-dir", base_dir.to_str().unwrap()])
         .env("PATH", &path)
         .output()
@@ -194,7 +193,7 @@ fn doctor_uses_absolute_lsof_and_fails_closed_when_it_cannot_collect() {
         "#!/bin/sh\nprintf used > \"$TIGHTBEAM_TEST_PATH_LSOF_MARKER\"\nexit 0\n",
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    let output = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args(["doctor", "--json", "--base-dir", base_dir.to_str().unwrap()])
         .env("PATH", &path)
         .env("TIGHTBEAM_TEST_PATH_LSOF_MARKER", &path_lsof_marker)

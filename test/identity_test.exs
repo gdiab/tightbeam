@@ -534,10 +534,14 @@ defmodule Tightbeam.IdentityTest do
     # pass below is the substrate supplying an identity rather than one leaking in
     # from the developer's machine.
     File.write!(Path.join(dir, "scratch.md"), "probe")
-    {_, 0} = System.cmd("git", ["-C", dir, "add", "scratch.md"], stderr_to_stdout: true)
+
+    {_, 0} =
+      Tightbeam.TestIsolation.cmd("git", ["-C", dir, "add", "scratch.md"], stderr_to_stdout: true)
 
     {output, status} =
-      System.cmd("git", ["-C", dir, "commit", "-m", "unaided"], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("git", ["-C", dir, "commit", "-m", "unaided"],
+        stderr_to_stdout: true
+      )
 
     # STAGED first, so this fails for want of a committer and not for want of a
     # change. An unstaged probe exits non-zero with "nothing to commit", which would
@@ -545,7 +549,11 @@ defmodule Tightbeam.IdentityTest do
     assert status != 0
     assert output =~ "user.useConfigOnly" or output =~ "tell me who you are"
 
-    {_, 0} = System.cmd("git", ["-C", dir, "reset", "scratch.md"], stderr_to_stdout: true)
+    {_, 0} =
+      Tightbeam.TestIsolation.cmd("git", ["-C", dir, "reset", "scratch.md"],
+        stderr_to_stdout: true
+      )
+
     File.rm!(Path.join(dir, "scratch.md"))
 
     assert edit!(ctx.base, "coder", :guidance, "no-identity-edit", "user:flynn")
@@ -632,7 +640,7 @@ defmodule Tightbeam.IdentityTest do
     db = start_supervised!({DB, path: ":memory:", name: DB})
 
     # Rail containment requires canonical write roots, including macOS /var aliases.
-    {root, 0} = System.cmd("/bin/realpath", [ctx.root])
+    {root, 0} = Tightbeam.TestIsolation.cmd("realpath", [ctx.root])
     ctx = %{ctx | base: Path.join(String.trim(root), "runtime")}
 
     for path <- ["rails/scripts", "rules"], do: File.mkdir_p!(Path.join(ctx.source, path))
@@ -1189,7 +1197,7 @@ defmodule Tightbeam.IdentityTest do
         ],
         else: []
 
-    case System.cmd("git", args, cd: dir, env: env, stderr_to_stdout: true) do
+    case Tightbeam.TestIsolation.cmd("git", args, cd: dir, env: env, stderr_to_stdout: true) do
       {output, 0} -> String.trim_trailing(output)
       {output, status} -> raise "git failed #{status}: #{output}"
     end

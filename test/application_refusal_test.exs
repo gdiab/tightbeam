@@ -27,7 +27,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
   # suite. The subprocess below finds the build current and only boots.
   setup_all do
     {out, status} =
-      System.cmd(System.find_executable("mix") || "mix", ["compile"],
+      Tightbeam.TestIsolation.cmd(System.find_executable("mix") || "mix", ["compile"],
         cd: File.cwd!(),
         env: [{"MIX_ENV", "prod"}],
         stderr_to_stdout: true
@@ -78,12 +78,25 @@ defmodule Tightbeam.ApplicationRefusalTest do
       end
     end
 
-    [bin, "/usr/bin", "/bin"]
+    # The system tools come from the test sandbox's toolbox (F1, wi_34a7be66),
+    # minus its fixture harness CLI, never from /usr/bin and /bin.
+    system = Path.join(System.tmp_dir!(), "tb-system-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(system)
+    on_exit_rm(system)
+    toolbox = Tightbeam.TestIsolation.toolbox()
+
+    for tool <- File.ls!(toolbox), tool not in ["fixture", "tightbeam"] do
+      File.ln_s!(Path.join(toolbox, tool), Path.join(system, tool))
+    end
+
+    [bin, system]
   end
 
   defp boot_with(env, path, tmp) do
     {output, status} =
-      System.cmd(System.find_executable("elixir"), ["-S", "mix", "run", "--no-halt"],
+      Tightbeam.TestIsolation.cmd(
+        System.find_executable("elixir"),
+        ["-S", "mix", "run", "--no-halt"],
         cd: File.cwd!(),
         stderr_to_stdout: true,
         env:

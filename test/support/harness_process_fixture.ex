@@ -19,7 +19,7 @@ defmodule Tightbeam.HarnessProcessFixture do
       Tightbeam.GuardRuntimeFixture.prepare!(tmp, "harness_process_runtime.exs")
 
     {output, status} =
-      System.cmd(executable, args ++ [Integer.to_string(scenario)],
+      Tightbeam.TestIsolation.cmd(executable, args ++ [Integer.to_string(scenario)],
         env: env,
         stderr_to_stdout: true
       )
@@ -423,7 +423,14 @@ defmodule Tightbeam.HarnessProcessFixture do
       Task.async(fn ->
         Process.sleep(100)
         [executable | args] = Keyword.fetch!(opts, :cmd)
-        port = Port.open({:spawn_executable, executable}, [:binary, :exit_status, {:args, args}])
+
+        port =
+          Tightbeam.TestIsolation.port_open({:spawn_executable, executable}, [
+            :binary,
+            :exit_status,
+            {:args, args}
+          ])
+
         send(owner, {:delayed_port, port})
 
         receive do
@@ -1227,7 +1234,9 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert :ok = Tightbeam.LaneManager.reconcile(manager)
     assert eventually(fn -> :sys.get_state(manager).park_recovery == nil end)
     assert HarnessProcess.parked?(ctx.db, key)
-    assert {_, 0} = System.cmd("/bin/kill", ["-0", child], stderr_to_stdout: true)
+
+    assert {_, 0} =
+             Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", child], stderr_to_stdout: true)
 
     assert %{state: "kill_failed", resolved_at: nil, kill_sent_at: nil} =
              Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == row.launch_id))
@@ -1236,7 +1245,7 @@ defmodule Tightbeam.HarnessProcessFixture do
              Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == serving.launch_id))
 
     assert {_, 0} =
-             System.cmd("/bin/kill", ["-0", Integer.to_string(serving.os_pid)],
+             Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(serving.os_pid)],
                stderr_to_stdout: true
              )
 
@@ -1255,7 +1264,10 @@ defmodule Tightbeam.HarnessProcessFixture do
     File.touch!(Path.join(ctx.test_dir, "leave-child"))
 
     assert eventually(fn ->
-             elem(System.cmd("/bin/kill", ["-0", child], stderr_to_stdout: true), 1) != 0
+             elem(
+               Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", child], stderr_to_stdout: true),
+               1
+             ) != 0
            end)
 
     assert :ok = Tightbeam.LaneManager.reconcile(manager)
@@ -1292,7 +1304,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert eventually(fn -> match?({^port, _}, {port, %{state: "running"}}) end)
 
     {output, exit} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         @helper,
         [
           "harness-group",
@@ -1340,7 +1352,7 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     task =
       Task.async(fn ->
-        System.cmd("/bin/sh", [helper], stderr_to_stdout: true)
+        Tightbeam.TestIsolation.cmd("/bin/sh", [helper], stderr_to_stdout: true)
       end)
 
     assert {:ok, {_output, _exit}} =
@@ -1448,16 +1460,22 @@ defmodule Tightbeam.HarnessProcessFixture do
     refute Map.has_key?(metadata, "present_but_unverified")
 
     assert eventually(fn ->
-             elem(System.cmd("/bin/kill", ["-0", same_group], stderr_to_stdout: true), 1) != 0
+             elem(
+               Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", same_group],
+                 stderr_to_stdout: true
+               ),
+               1
+             ) != 0
            end)
 
-    assert {_, 0} = System.cmd("/bin/kill", ["-0", detached], stderr_to_stdout: true)
+    assert {_, 0} =
+             Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", detached], stderr_to_stdout: true)
 
     assert %{state: "killed", resolved_at: resolved_at} =
              Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == row.launch_id))
 
     assert is_integer(resolved_at)
-    System.cmd("/bin/kill", ["-KILL", detached], stderr_to_stdout: true)
+    Tightbeam.TestIsolation.cmd("/bin/kill", ["-KILL", detached], stderr_to_stdout: true)
   end
 
   defp scenario(35, ctx) do
@@ -1927,7 +1945,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     [executable | args] = Keyword.fetch!(opts, :cmd)
 
     port =
-      Port.open({:spawn_executable, executable}, [
+      Tightbeam.TestIsolation.port_open({:spawn_executable, executable}, [
         :binary,
         :exit_status,
         {:args, args}
@@ -1982,7 +2000,10 @@ defmodule Tightbeam.HarnessProcessFixture do
   end
 
   defp kill_fixture_group(process_group_id) do
-    System.cmd("/bin/kill", ["-KILL", "--", "-#{process_group_id}"], stderr_to_stdout: true)
+    Tightbeam.TestIsolation.cmd("/bin/kill", ["-KILL", "--", "-#{process_group_id}"],
+      stderr_to_stdout: true
+    )
+
     :ok
   end
 

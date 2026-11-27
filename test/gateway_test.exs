@@ -4764,7 +4764,11 @@ defmodule Tightbeam.GatewayTest do
     [launcher | launcher_args] = Keyword.fetch!(launch_opts, :cmd)
 
     _port =
-      Port.open({:spawn_executable, launcher}, [:binary, :exit_status, {:args, launcher_args}])
+      Tightbeam.TestIsolation.port_open({:spawn_executable, launcher}, [
+        :binary,
+        :exit_status,
+        {:args, launcher_args}
+      ])
 
     :ok =
       Tightbeam.HarnessProcess.capture_identity(
@@ -7860,10 +7864,13 @@ defmodule Tightbeam.GatewayTest do
     statute = Enum.find(statutes, &(&1.name == "demo-example"))
     assert statute.pattern == "TIGHTBEAM_KUNGFU_TEMPLATE_PLACEHOLDER_NEVER_MATCHES"
 
-    assert {"2\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
+    assert {"2\n", 0} =
+             Tightbeam.TestIsolation.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
 
     assert {"kungfu-scaffold: demo|user:flynn|user-flynn@tightbeam.local\n", 0} =
-             System.cmd("git", ["log", "-1", "--format=%s|%an|%ae"], cd: identity_dir)
+             Tightbeam.TestIsolation.cmd("git", ["log", "-1", "--format=%s|%an|%ae"],
+               cd: identity_dir
+             )
 
     before = Map.new(expected_relatives, &{&1, File.read!(Path.join(identity_dir, &1))})
 
@@ -7877,8 +7884,11 @@ defmodule Tightbeam.GatewayTest do
                  end
 
     assert Map.new(expected_relatives, &{&1, File.read!(Path.join(identity_dir, &1))}) == before
-    assert {"2\n", 0} = System.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
-    assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+
+    assert {"2\n", 0} =
+             Tightbeam.TestIsolation.cmd("git", ["rev-list", "--count", "HEAD"], cd: identity_dir)
+
+    assert {"", 0} = Tightbeam.TestIsolation.cmd("git", ["status", "--short"], cd: identity_dir)
   end
 
   test "invalid spawn overrides fail before spinup or any session side effect", ctx do

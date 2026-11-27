@@ -558,7 +558,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     File.write!(script, "printf 'ready\\n'\nIFS= read -r release\nexit 0\n")
 
     probe =
-      Port.open({:spawn_executable, ~c"/bin/sh"}, [
+      Tightbeam.TestIsolation.port_open({:spawn_executable, ~c"/bin/sh"}, [
         :binary,
         :exit_status,
         args: [String.to_charlist(script)]
@@ -569,7 +569,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
       {:os_pid, probe_pid} = Port.info(probe, :os_pid)
 
       finished =
-        Port.open({:spawn_executable, ~c"/bin/sh"}, [
+        Tightbeam.TestIsolation.port_open({:spawn_executable, ~c"/bin/sh"}, [
           :exit_status,
           args: [~c"-c", ~c"exit 0"]
         ])
@@ -623,7 +623,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
           {"FIREHOSE_PAIRED_DEVICES", Map.get(plan, :paired_devices)}
         ]
 
-    Port.open({:spawn_executable, String.to_charlist(plan.executable)}, [
+    Tightbeam.TestIsolation.port_open({:spawn_executable, String.to_charlist(plan.executable)}, [
       :binary,
       :exit_status,
       :stderr_to_stdout,
@@ -687,12 +687,19 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     if info = Port.info(port, :os_pid) do
       {:os_pid, pid} = info
       assert pid > 1
-      System.cmd("kill", ["-TERM", Integer.to_string(pid)], stderr_to_stdout: true)
+
+      Tightbeam.TestIsolation.cmd("kill", ["-TERM", Integer.to_string(pid)],
+        stderr_to_stdout: true
+      )
 
       case exit!(port, plan, phase, System.monotonic_time(:millisecond) + 2_000) do
         :timeout ->
           {:os_pid, ^pid} = Port.info(port, :os_pid)
-          System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+
+          Tightbeam.TestIsolation.cmd("kill", ["-KILL", Integer.to_string(pid)],
+            stderr_to_stdout: true
+          )
+
           assert is_integer(exit!(port, plan, phase))
 
         status ->

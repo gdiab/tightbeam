@@ -12,7 +12,7 @@ mod test_isolation;
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::{fs, thread};
 
 const PARSED_PREFIX: &str = "tightbeam rail-exec child exit:";
@@ -41,7 +41,7 @@ fn script(name: &str, body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 fn rail_exec(script_path: &std::path::Path, input: Vec<u8>) -> (i32, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    let mut child = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args([
             "rail-exec",
             "--profile",

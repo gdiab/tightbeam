@@ -553,7 +553,9 @@ defmodule Tightbeam.ConformanceSupport do
     cli_dir = Path.expand("../cli/target/release", __DIR__)
 
     {output, status} =
-      System.cmd("sh", ["-c", "printf '%s' \"$TB_CONFORMANCE_INPUT\" | " <> command],
+      Tightbeam.TestIsolation.cmd(
+        "sh",
+        ["-c", "printf '%s' \"$TB_CONFORMANCE_INPUT\" | " <> command],
         env: [
           {"TB_CONFORMANCE_INPUT", input},
           {"PATH", cli_dir <> ":" <> System.get_env("PATH", "")}
@@ -1985,7 +1987,10 @@ defmodule Tightbeam.ConformanceSupport do
 
     unless executable?(binary) do
       {output, status} =
-        System.cmd("cargo", ["build", "--release"], cd: cli_dir, stderr_to_stdout: true)
+        Tightbeam.TestIsolation.cmd("cargo", ["build", "--release"],
+          cd: cli_dir,
+          stderr_to_stdout: true
+        )
 
       assert status == 0, output
     end
@@ -2055,7 +2060,9 @@ defmodule Tightbeam.ConformanceSupport do
   defp script_mode(_kase), do: "git\n"
 
   defp git!(workdir, args) do
-    {output, status} = System.cmd("git", args, cd: workdir, stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.cmd("git", args, cd: workdir, stderr_to_stdout: true)
+
     assert status == 0, "git #{Enum.join(args, " ")} failed: #{output}"
   end
 
@@ -2253,7 +2260,7 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp fixture_refs do
     repo = Path.expand("..", __DIR__)
-    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+    {commit, 0} = Tightbeam.TestIsolation.cmd("git", ["rev-parse", "HEAD"], cd: repo)
 
     [
       %{
@@ -2744,10 +2751,12 @@ defmodule Tightbeam.ConformanceTest do
     assert File.regular?(dependency)
 
     {output, status} =
-      System.cmd("mix", ["test", dependency, "--trace"],
+      Tightbeam.TestIsolation.cmd("mix", ["test", dependency, "--trace"],
         cd: Path.expand("."),
         stderr_to_stdout: true,
-        env: [{"MIX_ENV", "test"}]
+        # A fresh sandbox HOME: the nested suite's own preflight refuses the
+        # parent's HOME once tests have written a .tightbeam there.
+        env: [{"MIX_ENV", "test"}, {"HOME", fresh_sandbox_home!()}]
       )
 
     assert status == 0, output
@@ -2827,5 +2836,11 @@ defmodule Tightbeam.ConformanceTest do
     after
       File.rm_rf!(root)
     end
+  end
+
+  defp fresh_sandbox_home! do
+    home = Path.join(System.tmp_dir!(), "nested-suite-home-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(home)
+    home
   end
 end

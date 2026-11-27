@@ -836,19 +836,20 @@ mod tests {
             return true;
         }
         let root = std::env::var_os("TIGHTBEAM_TEST_ROOT").expect("test isolation root");
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                &format!("child_process::tests::{test}"),
-                "--nocapture",
-            ])
-            .env(&variable, "1")
-            .env(EXPECTED_ROOT, root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
+        let exact = format!("child_process::tests::{test}");
+        let status = crate::test_isolation::reexec(
+            &exact,
+            &[
+                (variable.as_str(), std::ffi::OsStr::new("1")),
+                (EXPECTED_ROOT, root.as_os_str()),
+            ],
+        )
+        .arg("--nocapture")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
         assert!(status.success(), "isolated regression {test} failed");
         false
     }
@@ -868,7 +869,7 @@ mod tests {
             return;
         }
 
-        let status = Command::new(std::env::current_exe().unwrap())
+        let status = crate::test_isolation::command(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--nocapture"])
             .env(MODE, "child")
             .env("TIGHTBEAM_URL", "http://must-be-scrubbed.invalid")
@@ -893,7 +894,7 @@ mod tests {
         forward_to_active_group(libc::SIGTERM);
         assert_eq!(forwarding.caught(), Some(libc::SIGTERM));
 
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", "while :; do sleep 1; done"])
             .stdin(Stdio::null())
@@ -936,7 +937,7 @@ mod tests {
             return;
         }
 
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", "exit 0"])
             .stdin(Stdio::null())
@@ -990,7 +991,7 @@ mod tests {
             return;
         }
 
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args(["-c", "sleep 5"])
             .stdin(Stdio::null())
@@ -1298,7 +1299,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
 
-        let mut command = Command::new("/bin/sh");
+        let mut command = crate::test_isolation::command("/bin/sh");
         command
             .args([
                 "-c",
@@ -1346,7 +1347,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         // Absence from the process table, not elapsed time -- the same reason as the
         // watchdog's grandchild check.
-        let listed = Command::new("ps")
+        let listed = crate::test_isolation::command("ps")
             .args(["-o", "pid=", "-p", child.trim()])
             .output()
             .expect("ps must run, or this test learned nothing");

@@ -30,7 +30,7 @@ defmodule Tightbeam.ArchetypesTest do
     identity_dir = Path.join(ctx.base_dir, "identity")
 
     for ref <- ["tightbeam/upstream", "main", "tightbeam/live"] do
-      assert {oid, 0} = System.cmd("git", ["rev-parse", ref], cd: identity_dir)
+      assert {oid, 0} = Tightbeam.TestIsolation.cmd("git", ["rev-parse", ref], cd: identity_dir)
       assert String.trim(oid) != ""
     end
 
@@ -98,7 +98,7 @@ defmodule Tightbeam.ArchetypesTest do
              ]
 
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
-    assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+    assert {"", 0} = Tightbeam.TestIsolation.cmd("git", ["status", "--short"], cd: identity_dir)
   end
 
   test "the neutral default's elected baseline skills prescribe no bundle archetype before learn" do
@@ -1173,7 +1173,7 @@ defmodule Tightbeam.ArchetypesTest do
     do: Enum.map(scaffold_templates(), &String.replace(&1, "<name>", name))
 
   defp git!(dir, args) do
-    case System.cmd("git", args, cd: dir, stderr_to_stdout: true) do
+    case Tightbeam.TestIsolation.cmd("git", args, cd: dir, stderr_to_stdout: true) do
       {output, 0} -> String.trim_trailing(output)
       {output, status} -> raise "git failed #{status}: #{output}"
     end

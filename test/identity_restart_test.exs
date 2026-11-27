@@ -16,7 +16,7 @@ defmodule Tightbeam.IdentityRestartTest do
 
     for phase <- ["conflict", "abort", "resolve", "normal"] do
       {output, status} =
-        System.cmd(fixture.executable, fixture.args ++ [phase, binary],
+        Tightbeam.TestIsolation.cmd(fixture.executable, fixture.args ++ [phase, binary],
           env: fixture.env,
           stderr_to_stdout: true
         )

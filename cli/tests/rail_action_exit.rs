@@ -2,10 +2,10 @@
 mod test_isolation;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn classify(input: &str) -> i32 {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+    let mut child = test_isolation::command(env!("CARGO_BIN_EXE_tightbeam"))
         .args(["rail-action", "git-stash"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

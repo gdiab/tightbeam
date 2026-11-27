@@ -449,7 +449,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
           send(parent, {:cleanup_command, executable, args, timeout})
           {"", 0}
         else
-          System.cmd(executable, args, stderr_to_stdout: true)
+          Tightbeam.TestIsolation.cmd(executable, args, stderr_to_stdout: true)
         end
       end
     )

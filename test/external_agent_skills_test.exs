@@ -95,7 +95,7 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
   end
 
   test "every shipped external skill names only commands and flags the compiled CLI has" do
-    {help, 0} = System.cmd(release_cli(), ["--help"], stderr_to_stdout: true)
+    {help, 0} = Tightbeam.TestIsolation.cmd(release_cli(), ["--help"], stderr_to_stdout: true)
 
     for name <- shipped_skill_names() do
       bytes = skill_bytes(name)
@@ -109,7 +109,8 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
       assert commands != []
 
       for command <- commands do
-        {output, status} = System.cmd(release_cli(), [command, "--help"], stderr_to_stdout: true)
+        {output, status} =
+          Tightbeam.TestIsolation.cmd(release_cli(), [command, "--help"], stderr_to_stdout: true)
 
         assert status == 0,
                "#{name} names `tightbeam #{command}`, which the CLI refuses: #{output}"
@@ -130,7 +131,11 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
       assert skill_bytes(name) =~ "\nWritten for Tightbeam #{version}. "
     end
 
-    {output, status} = System.cmd("python3", [verify_script()], stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.run_script!("scripts/verify_external_skills.py", [],
+        stderr_to_stdout: true
+      )
+
     assert status == 0, output
     assert output =~ "written for #{version}"
   end
@@ -151,7 +156,11 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
       "---\nname: tightbeam-cli\n---\n\nWritten for Tightbeam 9.9.8. Read wi_0123abcd first.\n"
     )
 
-    {output, status} = System.cmd("python3", [verify_script(), root], stderr_to_stdout: true)
+    {output, status} =
+      Tightbeam.TestIsolation.run_script!("scripts/verify_external_skills.py", [root],
+        stderr_to_stdout: true
+      )
+
     assert status == 1
     assert output =~ "written for 9.9.8 but this release is 9.9.9"
     assert output =~ "record identifier wi_0123abcd"
@@ -164,7 +173,7 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
       marker = if name == "--help", do: "tightbeam --help", else: "tightbeam #{name}"
       assert cli =~ marker
 
-      {output, status} = System.cmd(release_cli(), argv, stderr_to_stdout: true)
+      {output, status} = Tightbeam.TestIsolation.cmd(release_cli(), argv, stderr_to_stdout: true)
       assert status == 0, "compiled CLI refused #{Enum.join(argv, " ")}: #{output}"
     end
 
@@ -177,12 +186,14 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     # in this external-agent workflow. Help must work; an incomplete ask must
     # still refuse before dispatch.
     {help, status} =
-      System.cmd(release_cli(), ["ask", "--help"], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd(release_cli(), ["ask", "--help"], stderr_to_stdout: true)
 
     assert status == 0
     assert help =~ "ask (--session"
 
-    {invalid, status} = System.cmd(release_cli(), ["ask"], stderr_to_stdout: true)
+    {invalid, status} =
+      Tightbeam.TestIsolation.cmd(release_cli(), ["ask"], stderr_to_stdout: true)
+
     assert status != 0
     assert invalid =~ "usage: tightbeam ask"
     assert cli =~ "`decision_pending`"
@@ -238,7 +249,6 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     |> List.flatten()
   end
 
-  defp verify_script, do: Path.join(repo_root(), "scripts/verify_external_skills.py")
   defp skill_path(name), do: Application.app_dir(:tightbeam, "priv/skills/#{name}/SKILL.md")
   defp release_cli, do: Path.join(repo_root(), "cli/target/release/tightbeam")
   defp repo_root, do: Path.expand("..", __DIR__)
