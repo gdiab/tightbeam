@@ -1017,6 +1017,9 @@ defmodule Tightbeam.TestIsolationTest do
       assert check.(root, env, TestIsolation.repo(), home) == root
       assert check.(root, env, home, home) == root
 
+      # (d) the suite paths are checked only when set (review att_61a67f96 B1).
+      assert check.(root, %{"HOME" => home}, home, home) == root
+
       refused = fn value, env, cwd, reason ->
         error = assert_raise TestIsolation.Refusal, fn -> check.(value, env, cwd, home) end
         assert error.message =~ reason
@@ -1047,6 +1050,16 @@ defmodule Tightbeam.TestIsolationTest do
         "does not contain TIGHTBEAM_TEST_ROOT"
       )
 
+      # ...and, once set, must be an absolute path inside the root.
+      refused.(root, Map.put(env, "TMPDIR", scratch!("g-tmp")), home, "does not contain TMPDIR")
+
+      refused.(
+        root,
+        Map.put(env, "TIGHTBEAM_BASE_DIR", "base"),
+        home,
+        "does not contain TIGHTBEAM_BASE_DIR"
+      )
+
       # (a) a symlinked path to the root.
       link = Path.join(scratch!("g-link"), "root")
       File.ln_s!(root, link)
@@ -1060,6 +1073,22 @@ defmodule Tightbeam.TestIsolationTest do
       # (c) no marker.
       File.rm!(Path.join(root, ".tightbeam-test-sandbox"))
       refused.(root, env, home, "has no regular sandbox marker")
+    end
+
+    test "a present but empty inherited root refuses, with no fallback to HOME" do
+      root = fake_root!()
+      home = Path.join(root, "home")
+
+      # Positive control: with the variable absent, this HOME is a valid route.
+      assert TestIsolation.child_root!(%{"HOME" => home}, home, home) == root
+
+      # Review att_61a67f96 B2: present, even empty, it is the only route.
+      error =
+        assert_raise TestIsolation.Refusal, fn ->
+          TestIsolation.child_root!(%{"HOME" => home, "TIGHTBEAM_TEST_SANDBOX" => ""}, home, home)
+        end
+
+      assert error.message =~ "is not a canonical absolute path"
     end
 
     test "a nested suite accepts only an enclosing suite's validated repair directories" do

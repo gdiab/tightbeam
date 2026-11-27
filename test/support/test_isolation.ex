@@ -45,7 +45,7 @@ defmodule Tightbeam.TestIsolation do
 
     * from an inherited TIGHTBEAM_TEST_SANDBOX, which its launcher set to its
       own validated root and which this VM validates itself before trusting
-      it (see inherited_root!/1); once the variable is present there is no
+      it (see child_root!/3); once the variable is present there is no
       other route;
     * otherwise from its own HOME: HOME must be `<root>/home` with the sandbox
       marker at `<root>`.
@@ -55,27 +55,35 @@ defmodule Tightbeam.TestIsolation do
   def sandbox_root do
     with nil <- Preflight.recorded_root(),
          nil <- :persistent_term.get({__MODULE__, :inherited_root}, nil) do
-      case System.get_env("TIGHTBEAM_TEST_SANDBOX") do
-        value when is_binary(value) and value != "" ->
-          root = inherited_root!(value)
-          :persistent_term.put({__MODULE__, :inherited_root}, root)
-          root
+      root = child_root!(System.get_env(), File.cwd!(), System.user_home!())
 
-        _ ->
-          home = System.get_env("HOME")
-          root = home && Path.dirname(home)
+      if Map.has_key?(System.get_env(), "TIGHTBEAM_TEST_SANDBOX"),
+        do: :persistent_term.put({__MODULE__, :inherited_root}, root)
 
-          if is_binary(home) and Path.basename(home) == "home" and
-               File.regular?(Path.join(root, ".tightbeam-test-sandbox")),
-             do: root,
-             else: refuse!("no test sandbox found; tests run only inside scripts/test_sandbox.sh")
-      end
+      root
     end
   end
 
-  # The child's own check of the root its launcher passed down.
-  defp inherited_root!(value) do
-    check_inherited_root!(value, System.get_env(), File.cwd!(), System.user_home!())
+  @doc """
+  The root of a VM with no recorded root, from its environment `env`, cwd and
+  VM home. A present TIGHTBEAM_TEST_SANDBOX, even an empty one, is validated
+  and is the only route (review att_61a67f96 B2); only when it is absent is
+  the root taken from HOME.
+  """
+  def child_root!(env, cwd, user_home) do
+    case Map.fetch(env, "TIGHTBEAM_TEST_SANDBOX") do
+      {:ok, value} ->
+        check_inherited_root!(value, env, cwd, user_home)
+
+      :error ->
+        home = env["HOME"]
+        root = home && Path.dirname(home)
+
+        if is_binary(home) and Path.basename(home) == "home" and
+             File.regular?(Path.join(root, ".tightbeam-test-sandbox")),
+           do: root,
+           else: refuse!("no test sandbox found; tests run only inside scripts/test_sandbox.sh")
+    end
   end
 
   @doc """
@@ -90,17 +98,22 @@ defmodule Tightbeam.TestIsolation do
   def check_inherited_root!(value, env, cwd, user_home) do
     refuse = fn why -> refuse!("inherited TIGHTBEAM_TEST_SANDBOX=#{value} " <> why) end
 
-    unless Path.type(value) == :absolute and Preflight.canonical(value) == value,
-      do: refuse.("is not a canonical absolute path")
+    unless is_binary(value) and Path.type(value) == :absolute and
+             Preflight.canonical(value) == value,
+           do: refuse.("is not a canonical absolute path")
 
-    contained =
-      [{"HOME", env["HOME"]}, {"the VM home", user_home}] ++
-        for name <- ~w(TIGHTBEAM_TEST_ROOT TIGHTBEAM_BASE_DIR TIGHTBEAM_HOME TMPDIR),
-            path = env[name],
-            do: {name, path}
+    # HOME and the VM home are always required; each suite path only when it is
+    # set, and then as an absolute path inside the root (review att_61a67f96 B1).
+    required = [{"HOME", env["HOME"]}, {"the VM home", user_home}]
 
-    for {name, path} <- contained,
-        not (is_binary(path) and Preflight.inside?(path, value)),
+    present =
+      ~w(TIGHTBEAM_TEST_ROOT TIGHTBEAM_BASE_DIR TIGHTBEAM_HOME TMPDIR)
+      |> Enum.filter(&Map.has_key?(env, &1))
+      |> Enum.map(&{&1, env[&1]})
+
+    for {name, path} <- required ++ present,
+        not (is_binary(path) and Path.type(path) == :absolute and
+               Preflight.inside?(path, value)),
         do: refuse.("does not contain #{name} #{inspect(path)}")
 
     cwd = Preflight.canonical(cwd)
