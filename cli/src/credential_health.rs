@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -52,19 +52,49 @@ struct ServerResponse {
 }
 
 pub fn run(args: &[String]) -> i32 {
+    #[allow(deprecated)]
+    let home = std::env::home_dir().unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    run_with(
+        args,
+        |name| std::env::var(name).ok(),
+        &cwd,
+        &home,
+        exchange,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// The whole command over an injected environment, directories, exchange and output
+/// streams: the seam the F2-7 tests drive (wi_34a7be66). `exchange` is called at most
+/// once, only when discovery found an endpoint.
+fn run_with<F, X>(
+    args: &[String],
+    get_env: F,
+    cwd: &Path,
+    home: &Path,
+    mut exchange: X,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32
+where
+    F: Fn(&str) -> Option<String>,
+    X: FnMut(ResolvedEndpoint, Option<String>) -> Option<ServerResponse>,
+{
     let expect_instance = match parse_args(args) {
         Ok(expect_instance) => expect_instance,
         Err(()) => {
-            eprintln!("{USAGE}");
+            writeln!(stderr, "{USAGE}").expect("failed printing to stderr");
             return 2;
         }
     };
 
-    let (discovery, stderr) = discover();
+    let (discovery, line) = discover_with(get_env, cwd, home);
     // F2-7d/F2-7e: at most one fixed line (a refusal or the override notice), before
     // any request. It names variables only.
-    if let Some(line) = stderr {
-        eprintln!("{line}");
+    if let Some(line) = line {
+        writeln!(stderr, "{line}").expect("failed printing to stderr");
     }
     let response = discovery
         .endpoint
@@ -72,7 +102,9 @@ pub fn run(args: &[String]) -> i32 {
         .and_then(|endpoint| exchange(endpoint.clone(), discovery.token.clone()));
     let (result, instance, version) = outcome(&discovery, expect_instance.as_deref(), response);
 
-    println!("{}", report(&discovery, &result, instance, version));
+    // As println!/eprintln! did: a failed write to either stream panics.
+    writeln!(stdout, "{}", report(&discovery, &result, instance, version))
+        .expect("failed printing to stdout");
     exit_status(&result)
 }
 
@@ -131,13 +163,6 @@ fn parse_args(args: &[String]) -> Result<Option<String>, ()> {
         }
         _ => Err(()),
     }
-}
-
-fn discover() -> (Discovery, Option<String>) {
-    #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_default();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    discover_with(|name| std::env::var(name).ok(), &cwd, &home)
 }
 
 /// The discovery and the one stderr line, if any, for F2-7c's outcome. Which F2-1 row
@@ -772,9 +797,11 @@ mod tests {
     }
 
     // F2 v6, F2-7 (wi_34a7be66): credential-health resolves through dispatch's shared
-    // selection. Each case asserts the discovery (and so whether any request can be
-    // made: none without an endpoint), the one stderr line, and for the no-request rows
-    // the whole R10.1 object and the exit status.
+    // selection. Every H case runs the whole command (`run_with`) with a recording
+    // exchange and asserts the complete five-key stdout object, the exact stderr lines,
+    // the exit status, and the exact requests made (zero or one), with the token sent.
+
+    const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn fixture(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -805,25 +832,89 @@ mod tests {
         move |name: &str| map.get(name).cloned()
     }
 
-    fn port_of(discovery: &Discovery) -> Option<u16> {
-        discovery.endpoint.as_ref().map(|endpoint| endpoint.port)
+    /// What one command run observably did.
+    #[derive(Debug, PartialEq)]
+    struct Run {
+        status: i32,
+        stdout: Value,
+        stderr: Vec<String>,
+        /// Each request made: host, port and the bearer token sent.
+        requests: Vec<(String, u16, Option<String>)>,
     }
 
-    /// A row with no endpoint makes no request: its whole output is fixed.
-    fn assert_unavailable(discovery: &Discovery, source: EndpointSource) {
-        assert_eq!(discovery.endpoint, None, "no request");
-        let (result, instance, version) = outcome(discovery, Some("expected"), None);
-        assert_eq!(exit_status(&result), 1);
-        assert_eq!(
-            report(discovery, &result, instance, version),
-            json!({
-                "result": "unavailable",
-                "endpoint": null,
-                "endpointSource": source.wire_name(),
-                "instance": null,
-                "version": null,
-            })
+    /// Run the command; every request is recorded and answered `ok` for instance
+    /// `answer_id` (an instance the case does or does not expect).
+    fn run_command<F>(args: &[&str], get_env: F, cwd: &Path, home: &Path, answer_id: &str) -> Run
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let mut requests = Vec::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = run_with(
+            &args,
+            get_env,
+            cwd,
+            home,
+            |endpoint: ResolvedEndpoint, token: Option<String>| {
+                requests.push((endpoint.host.clone(), endpoint.port, token));
+                Some(ServerResponse {
+                    result: "ok".to_owned(),
+                    instance: json!({"id": answer_id, "host": "fixture"}),
+                    version: "0.1.16".to_owned(),
+                })
+            },
+            &mut stdout,
+            &mut stderr,
         );
+        let stdout = String::from_utf8(stdout).unwrap();
+        let stdout = match stdout.lines().collect::<Vec<_>>()[..] {
+            [] => Value::Null,
+            [line] => serde_json::from_str(line).unwrap(),
+            _ => panic!("more than one stdout line: {stdout}"),
+        };
+        let stderr = String::from_utf8(stderr)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        Run {
+            status,
+            stdout,
+            stderr,
+            requests,
+        }
+    }
+
+    /// The `ok` object for an answered request to `127.0.0.1:port`.
+    fn ok(port: u16, source: &str, id: &str) -> Value {
+        json!({
+            "result": "ok",
+            "endpoint": {"host": "127.0.0.1", "port": port},
+            "endpointSource": source,
+            "instance": {"id": id, "host": "fixture"},
+            "version": "0.1.16",
+        })
+    }
+
+    fn unavailable(source: &str) -> Value {
+        json!({
+            "result": "unavailable",
+            "endpoint": null,
+            "endpointSource": source,
+            "instance": null,
+            "version": null,
+        })
+    }
+
+    /// One request, to `127.0.0.1:port`, carrying `token`.
+    fn one(port: u16, token: &str) -> Vec<(String, u16, Option<String>)> {
+        vec![("127.0.0.1".to_owned(), port, Some(token.to_owned()))]
+    }
+
+    fn lines(line: &str) -> Vec<String> {
+        vec![line.to_owned()]
     }
 
     const NOTICE_PAIR: &str = "tightbeam: notice: using TIGHTBEAM_URL and TIGHTBEAM_TOKEN (explicit); ignoring the session file";
@@ -836,19 +927,19 @@ mod tests {
         session_file(&root, "http://127.0.0.1:12001", "session-token");
         let work = root.join("a/b");
         fs::create_dir_all(&work).unwrap();
-        let (discovery, stderr) = discover_with(
-            env_of(vec![
-                ("TIGHTBEAM_URL", "http://127.0.0.1:12002".to_owned()),
-                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
-            ]),
-            &work,
-            &root,
+        let env = env_of(vec![
+            ("TIGHTBEAM_URL", "http://127.0.0.1:12002".to_owned()),
+            ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+        ]);
+        assert_eq!(
+            run_command(&[], env, &work, &root, ID),
+            Run {
+                status: 0,
+                stdout: ok(12002, "env", ID),
+                stderr: lines(NOTICE_PAIR),
+                requests: one(12002, "pair-token"),
+            }
         );
-        assert_eq!(discovery.source, EndpointSource::Env);
-        assert_eq!(port_of(&discovery), Some(12002));
-        assert_eq!(discovery.token.as_deref(), Some("pair-token"));
-        assert_eq!(discovery.implicit_instance, None);
-        assert_eq!(stderr.as_deref(), Some(NOTICE_PAIR));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -856,18 +947,19 @@ mod tests {
     fn f2_h2_a_pair_equal_to_the_session_keeps_the_session_silently() {
         let root = fixture("h2");
         session_file(&root, "ws://127.0.0.1:12003/", "same-token");
-        let (discovery, stderr) = discover_with(
-            env_of(vec![
-                ("TIGHTBEAM_URL", "http://127.0.0.1:12003".to_owned()),
-                ("TIGHTBEAM_TOKEN", "same-token".to_owned()),
-            ]),
-            &root,
-            &root,
+        let env = env_of(vec![
+            ("TIGHTBEAM_URL", "http://127.0.0.1:12003".to_owned()),
+            ("TIGHTBEAM_TOKEN", "same-token".to_owned()),
+        ]);
+        assert_eq!(
+            run_command(&[], env, &root, &root, ID),
+            Run {
+                status: 0,
+                stdout: ok(12003, "config", ID),
+                stderr: vec![],
+                requests: one(12003, "same-token"),
+            }
         );
-        assert_eq!(discovery.source, EndpointSource::Config);
-        assert_eq!(port_of(&discovery), Some(12003));
-        assert_eq!(discovery.token.as_deref(), Some("same-token"));
-        assert_eq!(stderr, None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -878,31 +970,29 @@ mod tests {
         session_file(&work, "http://127.0.0.1:12004", "session-token");
         let base = root.join("base");
         gateway_json(&base, r#"{"port":12005,"cliToken":"base-token"}"#);
-        let (discovery, stderr) = discover_with(
-            env_of(vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())]),
-            &work,
-            &root,
-        );
-        assert_eq!(discovery.source, EndpointSource::Env);
+        let implicit = instance_id(&base).unwrap();
+        let env = || env_of(vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())]);
         assert_eq!(
-            discovery
-                .endpoint
-                .as_ref()
-                .map(|e| (e.host.as_str(), e.port)),
-            Some(("127.0.0.1", 12005))
+            run_command(&[], env(), &work, &root, &implicit),
+            Run {
+                status: 0,
+                stdout: ok(12005, "env", &implicit),
+                stderr: lines(NOTICE_BASE),
+                requests: one(12005, "base-token"),
+            }
         );
-        assert_eq!(discovery.token.as_deref(), Some("base-token"));
-        assert_eq!(discovery.implicit_instance, instance_id(&base));
-        assert_eq!(stderr.as_deref(), Some(NOTICE_BASE));
         // A foreign instance at that port is a mismatch.
-        let foreign = ServerResponse {
-            result: "ok".to_owned(),
-            instance: json!({"id": "f".repeat(64), "host": "elsewhere"}),
-            version: "0.1.16".to_owned(),
-        };
+        let foreign = "f".repeat(64);
+        let mut mismatch = ok(12005, "env", &foreign);
+        mismatch["result"] = json!("instance_mismatch");
         assert_eq!(
-            outcome(&discovery, None, Some(foreign)).0,
-            "instance_mismatch"
+            run_command(&[], env(), &work, &root, &foreign),
+            Run {
+                status: 1,
+                stdout: mismatch,
+                stderr: lines(NOTICE_BASE),
+                requests: one(12005, "base-token"),
+            }
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -923,14 +1013,17 @@ mod tests {
             if let Some(contents) = contents {
                 gateway_json(&base, contents);
             }
-            let (discovery, stderr) = discover_with(
-                env_of(vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())]),
-                &work,
-                &root,
+            let env = env_of(vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())]);
+            assert_eq!(
+                run_command(&[], env, &work, &root, ID),
+                Run {
+                    status: 1,
+                    stdout: unavailable("env"),
+                    stderr: vec![],
+                    requests: vec![],
+                },
+                "{label}"
             );
-            assert_unavailable(&discovery, EndpointSource::Env);
-            assert_eq!(discovery.token, None, "{label}: the session is never used");
-            assert_eq!(stderr, None, "{label}");
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -942,89 +1035,114 @@ mod tests {
         session_file(&work, "http://127.0.0.1:12007", "session-token");
         let base = root.join("base");
         gateway_json(&base, r#"{"port":12008,"cliToken":"base-token"}"#);
-        let (discovery, stderr) = discover_with(
-            env_of(vec![
-                ("TIGHTBEAM_URL", "http://127.0.0.1:12009".to_owned()),
-                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
-                ("TIGHTBEAM_BASE_DIR", base.display().to_string()),
-            ]),
-            &work,
-            &root,
+        let env = env_of(vec![
+            ("TIGHTBEAM_URL", "http://127.0.0.1:12009".to_owned()),
+            ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+            ("TIGHTBEAM_BASE_DIR", base.display().to_string()),
+        ]);
+        assert_eq!(
+            run_command(&[], env, &work, &root, ID),
+            Run {
+                status: 0,
+                stdout: ok(12009, "env", ID),
+                stderr: lines(NOTICE_PAIR),
+                requests: one(12009, "pair-token"),
+            }
         );
-        assert_eq!(discovery.source, EndpointSource::Env);
-        assert_eq!(port_of(&discovery), Some(12009));
-        assert_eq!(stderr.as_deref(), Some(NOTICE_PAIR));
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn f2_h6_h7a_h7e_h8_non_explicit_settings_keep_the_session() {
         let root = fixture("h6");
-        for (session_url, lone_url) in [
-            ("http://127.0.0.1:12010", None),
-            ("http://127.0.0.1:12010", Some("http://127.0.0.1:12010")),
-            ("ws://127.0.0.1:1/", Some("http://127.0.0.1:1")),
-            ("wss://127.0.0.1:1", Some("https://127.0.0.1:1/")),
+        for (session_url, lone_url, port) in [
+            // H6 and H8: only gateway-injected variables, or none.
+            ("http://127.0.0.1:12010", None, 12010),
+            // H7a: a lone URL equal to the session's.
+            (
+                "http://127.0.0.1:12010",
+                Some("http://127.0.0.1:12010"),
+                12010,
+            ),
+            // H7e: websocket session URLs with the injected http(s) form.
+            ("ws://127.0.0.1:1/", Some("http://127.0.0.1:1"), 1),
+            ("wss://127.0.0.1:1", Some("https://127.0.0.1:1/"), 1),
         ] {
             session_file(&root, session_url, "session-token");
-            let mut vars = vec![
-                ("TIGHTBEAM_HOME", root.join("home").display().to_string()),
-                ("TIGHTBEAM_MACHINE", "m".to_owned()),
-                ("TIGHTBEAM_LINEAGE", "l".to_owned()),
-            ];
-            if let Some(url) = lone_url {
-                vars.push(("TIGHTBEAM_URL", url.to_owned()));
+            for injected in [true, false] {
+                let mut vars = vec![];
+                if injected {
+                    vars.push(("TIGHTBEAM_HOME", root.join("home").display().to_string()));
+                    vars.push(("TIGHTBEAM_MACHINE", "m".to_owned()));
+                    vars.push(("TIGHTBEAM_LINEAGE", "l".to_owned()));
+                }
+                if let Some(url) = lone_url {
+                    vars.push(("TIGHTBEAM_URL", url.to_owned()));
+                }
+                assert_eq!(
+                    run_command(&[], env_of(vars), &root, &root, ID),
+                    Run {
+                        status: 0,
+                        stdout: ok(port, "config", ID),
+                        stderr: vec![],
+                        requests: one(port, "session-token"),
+                    },
+                    "{session_url} {lone_url:?} injected={injected}"
+                );
             }
-            let (discovery, stderr) = discover_with(env_of(vars), &root, &root);
-            assert_eq!(discovery.source, EndpointSource::Config, "{session_url}");
-            assert_eq!(discovery.token.as_deref(), Some("session-token"));
-            assert_eq!(stderr, None, "{session_url}");
         }
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn f2_h7b_h7c_h7d_h11_incomplete_explicit_settings_beside_a_session_are_refused() {
+        use crate::dispatch::Incomplete;
         let root = fixture("h7");
         session_file(&root, "http://127.0.0.1:12011", "session-token");
         let different = || ("TIGHTBEAM_URL", "http://127.0.0.1:12012".to_owned());
-        for (vars, line) in [
-            (
-                vec![different()],
-                crate::dispatch::Incomplete::UrlWithoutToken,
-            ),
+        for (vars, refusal) in [
+            (vec![different()], Incomplete::UrlWithoutToken),
             (
                 vec![("TIGHTBEAM_TOKEN", "lone".to_owned())],
-                crate::dispatch::Incomplete::TokenWithoutUrl,
+                Incomplete::TokenWithoutUrl,
             ),
             (
                 vec![("TIGHTBEAM_TOKEN", String::new())],
-                crate::dispatch::Incomplete::TokenWithoutUrl,
+                Incomplete::TokenWithoutUrl,
             ),
             (
                 vec![different(), ("TIGHTBEAM_TOKEN", String::new())],
-                crate::dispatch::Incomplete::UrlWithoutToken,
+                Incomplete::UrlWithoutToken,
             ),
             (
                 vec![("TIGHTBEAM_BASE_DIR", String::new())],
-                crate::dispatch::Incomplete::EmptyBaseDir,
+                Incomplete::EmptyBaseDir,
             ),
         ] {
-            let (discovery, stderr) = discover_with(env_of(vars), &root, &root);
-            // Even with --expect-instance, the outcome is only `unavailable`.
-            assert_unavailable(&discovery, EndpointSource::Env);
-            assert_eq!(stderr.as_deref(), Some(line.line()));
+            // Also with --expect-instance (H7b): the outcome is only `unavailable`.
+            for args in [&[][..], &["--expect-instance", "x"][..]] {
+                assert_eq!(
+                    run_command(args, env_of(vars.clone()), &root, &root, ID),
+                    Run {
+                        status: 1,
+                        stdout: unavailable("env"),
+                        stderr: lines(refusal.line()),
+                        requests: vec![],
+                    },
+                    "{refusal:?} {args:?}"
+                );
+            }
         }
         assert_eq!(
-            crate::dispatch::Incomplete::TokenWithoutUrl.line(),
+            Incomplete::TokenWithoutUrl.line(),
             "tightbeam: incomplete explicit endpoint: TIGHTBEAM_TOKEN is set but TIGHTBEAM_URL is not; set both, or unset TIGHTBEAM_TOKEN"
         );
         assert_eq!(
-            crate::dispatch::Incomplete::UrlWithoutToken.line(),
+            Incomplete::UrlWithoutToken.line(),
             "tightbeam: incomplete explicit endpoint: TIGHTBEAM_URL is set but TIGHTBEAM_TOKEN is empty or unset; set both, or unset TIGHTBEAM_URL"
         );
         assert_eq!(
-            crate::dispatch::Incomplete::EmptyBaseDir.line(),
+            Incomplete::EmptyBaseDir.line(),
             "tightbeam: incomplete explicit endpoint: TIGHTBEAM_BASE_DIR is set but empty; set it to a directory, or unset it"
         );
         fs::remove_dir_all(root).unwrap();
@@ -1037,6 +1155,8 @@ mod tests {
         gateway_json(&home_var, r#"{"port":12013,"cliToken":"home-token"}"#);
         let default_dir = root.join(".tightbeam");
         gateway_json(&default_dir, r#"{"port":12014,"cliToken":"default-token"}"#);
+        let home_id = instance_id(&home_var).unwrap();
+        let default_id = instance_id(&default_dir).unwrap();
         for lone in [
             vec![("TIGHTBEAM_URL", "http://127.0.0.1:12015".to_owned())],
             vec![("TIGHTBEAM_TOKEN", "lone".to_owned())],
@@ -1044,28 +1164,51 @@ mod tests {
                 ("TIGHTBEAM_URL", "http://127.0.0.1:12015".to_owned()),
                 ("TIGHTBEAM_TOKEN", String::new()),
             ],
+            // H9: nothing explicit, no session.
             vec![],
         ] {
             let mut with_home = lone.clone();
             with_home.push(("TIGHTBEAM_HOME", home_var.display().to_string()));
-            let (discovery, stderr) = discover_with(env_of(with_home), &root, &root);
-            assert_eq!(discovery.source, EndpointSource::Env);
-            assert_eq!(port_of(&discovery), Some(12013));
-            assert_eq!(stderr, None);
-
-            let (discovery, stderr) = discover_with(env_of(lone), &root, &root);
-            assert_eq!(discovery.source, EndpointSource::Default);
-            assert_eq!(port_of(&discovery), Some(12014));
-            assert_eq!(stderr, None);
+            assert_eq!(
+                run_command(&[], env_of(with_home), &root, &root, &home_id),
+                Run {
+                    status: 0,
+                    stdout: ok(12013, "env", &home_id),
+                    stderr: vec![],
+                    requests: one(12013, "home-token"),
+                },
+                "{lone:?}"
+            );
+            assert_eq!(
+                run_command(&[], env_of(lone.clone()), &root, &root, &default_id),
+                Run {
+                    status: 0,
+                    stdout: ok(12014, "default", &default_id),
+                    stderr: vec![],
+                    requests: one(12014, "default-token"),
+                },
+                "{lone:?}"
+            );
         }
         // H11b: an empty base-dir variable with no session file is today's environment
-        // selection of that path; only the seam is exercised (see the test above).
-        let env = env_of(vec![("TIGHTBEAM_BASE_DIR", String::new())]);
+        // selection of the empty path (resolved against the process directory, which
+        // holds no gateway.json here): `env`, unavailable, no request.
+        let env = || env_of(vec![("TIGHTBEAM_BASE_DIR", String::new())]);
         assert_eq!(
-            crate::dispatch::select(&env, &root, &root),
+            crate::dispatch::select(&env(), &root, &root),
             crate::dispatch::Selection::Fallthrough
         );
-        assert_eq!(resolve_gateway_base(&env, &root).1, EndpointSource::Env);
+        assert_eq!(resolve_gateway_base(&env(), &root).1, EndpointSource::Env);
+        assert!(!Path::new("gateway.json").exists());
+        assert_eq!(
+            run_command(&[], env(), &root, &root, ID),
+            Run {
+                status: 1,
+                stdout: unavailable("env"),
+                stderr: vec![],
+                requests: vec![],
+            }
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1074,35 +1217,37 @@ mod tests {
         let root = fixture("h10");
         fs::write(root.join(".tightbeam-session"), "not-json").unwrap();
         // H10a: an explicit pair is used, with the "unreadable" notice.
-        let (discovery, stderr) = discover_with(
-            env_of(vec![
-                ("TIGHTBEAM_URL", "http://127.0.0.1:12016".to_owned()),
-                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
-            ]),
-            &root,
-            &root,
-        );
-        assert_eq!(discovery.source, EndpointSource::Env);
-        assert_eq!(port_of(&discovery), Some(12016));
+        let env = env_of(vec![
+            ("TIGHTBEAM_URL", "http://127.0.0.1:12016".to_owned()),
+            ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+        ]);
         assert_eq!(
-            stderr.as_deref(),
-            Some(
-                "tightbeam: notice: using TIGHTBEAM_URL and TIGHTBEAM_TOKEN (explicit); ignoring the unreadable session file"
-            )
+            run_command(&[], env, &root, &root, ID),
+            Run {
+                status: 0,
+                stdout: ok(12016, "env", ID),
+                stderr: lines(
+                    "tightbeam: notice: using TIGHTBEAM_URL and TIGHTBEAM_TOKEN (explicit); ignoring the unreadable session file"
+                ),
+                requests: one(12016, "pair-token"),
+            }
         );
-        // H10b: nothing explicit.
-        let (discovery, stderr) = discover_with(env_of(vec![]), &root, &root);
-        assert_unavailable(&discovery, EndpointSource::Config);
-        assert_eq!(stderr, None);
-        // H10c (N1), verbatim: "add H10c (lone URL + malformed session ->
-        // unavailable/config/no stderr)".
-        let (discovery, stderr) = discover_with(
-            env_of(vec![("TIGHTBEAM_URL", "http://127.0.0.1:12017".to_owned())]),
-            &root,
-            &root,
-        );
-        assert_unavailable(&discovery, EndpointSource::Config);
-        assert_eq!(stderr, None);
+        // H10b: nothing explicit; H10c (N1), verbatim: "add H10c (lone URL + malformed
+        // session -> unavailable/config/no stderr)".
+        for vars in [
+            vec![],
+            vec![("TIGHTBEAM_URL", "http://127.0.0.1:12017".to_owned())],
+        ] {
+            assert_eq!(
+                run_command(&[], env_of(vars), &root, &root, ID),
+                Run {
+                    status: 1,
+                    stdout: unavailable("config"),
+                    stderr: vec![],
+                    requests: vec![],
+                }
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1110,19 +1255,31 @@ mod tests {
     fn f2_h12_the_command_has_no_identity_flag() {
         let root = fixture("h12");
         session_file(&root, "http://127.0.0.1:12018", "session-token");
-        let (discovery, stderr) = discover_with(
+        let env = || {
             env_of(vec![
                 ("TIGHTBEAM_URL", "http://127.0.0.1:12019".to_owned()),
                 ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
-            ]),
-            &root,
-            &root,
+            ])
+        };
+        assert_eq!(
+            run_command(&[], env(), &root, &root, ID),
+            Run {
+                status: 0,
+                stdout: ok(12019, "env", ID),
+                stderr: lines(NOTICE_PAIR),
+                requests: one(12019, "pair-token"),
+            }
         );
-        assert_eq!(discovery.source, EndpointSource::Env);
-        assert_eq!(port_of(&discovery), Some(12019));
-        assert_eq!(stderr.as_deref(), Some(NOTICE_PAIR));
-        // `--as x` is a usage error (exit 2 in run), decided before any discovery.
-        assert_eq!(parse_args(&["--as".to_owned(), "x".to_owned()]), Err(()));
+        // `--as x` is a usage error: exit 2, the usage line, no output, no request.
+        assert_eq!(
+            run_command(&["--as", "x"], env(), &root, &root, ID),
+            Run {
+                status: 2,
+                stdout: Value::Null,
+                stderr: lines(USAGE),
+                requests: vec![],
+            }
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1141,38 +1298,89 @@ mod tests {
             &base,
             r#"{"port":12021,"cliToken":"CANARY_BASE_TOKEN","note":"CANARY_GATEWAY_JSON"}"#,
         );
-        let pair = || {
-            vec![
-                (
-                    "TIGHTBEAM_URL",
-                    "http://127.0.0.1:12022/CANARY_PAIR_URL".to_owned(),
-                ),
-                ("TIGHTBEAM_TOKEN", "CANARY_PAIR_TOKEN".to_owned()),
-            ]
+        let implicit = instance_id(&base).unwrap();
+        let refused = |incomplete: crate::dispatch::Incomplete| Run {
+            status: 1,
+            stdout: unavailable("env"),
+            stderr: lines(incomplete.line()),
+            requests: vec![],
         };
-        let cases: Vec<Vec<(&'static str, String)>> = vec![
-            pair(),
-            vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())],
-            vec![(
-                "TIGHTBEAM_BASE_DIR",
-                root.join("CANARY_MISSING").display().to_string(),
-            )],
-            vec![(
-                "TIGHTBEAM_URL",
-                "http://127.0.0.1:1/CANARY_LONE_URL".to_owned(),
-            )],
-            vec![("TIGHTBEAM_TOKEN", "CANARY_LONE_TOKEN".to_owned())],
-            vec![("TIGHTBEAM_BASE_DIR", String::new())],
-            vec![],
+        let cases: Vec<(Vec<(&'static str, String)>, &str, Run)> = vec![
+            (
+                vec![
+                    (
+                        "TIGHTBEAM_URL",
+                        "http://127.0.0.1:12022/CANARY_PAIR_URL".to_owned(),
+                    ),
+                    ("TIGHTBEAM_TOKEN", "CANARY_PAIR_TOKEN".to_owned()),
+                ],
+                ID,
+                Run {
+                    status: 0,
+                    stdout: ok(12022, "env", ID),
+                    stderr: lines(NOTICE_PAIR),
+                    requests: one(12022, "CANARY_PAIR_TOKEN"),
+                },
+            ),
+            (
+                vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())],
+                &implicit,
+                Run {
+                    status: 0,
+                    stdout: ok(12021, "env", &implicit),
+                    stderr: lines(NOTICE_BASE),
+                    requests: one(12021, "CANARY_BASE_TOKEN"),
+                },
+            ),
+            (
+                vec![(
+                    "TIGHTBEAM_BASE_DIR",
+                    root.join("CANARY_MISSING").display().to_string(),
+                )],
+                ID,
+                Run {
+                    status: 1,
+                    stdout: unavailable("env"),
+                    stderr: vec![],
+                    requests: vec![],
+                },
+            ),
+            (
+                vec![(
+                    "TIGHTBEAM_URL",
+                    "http://127.0.0.1:1/CANARY_LONE_URL".to_owned(),
+                )],
+                ID,
+                refused(crate::dispatch::Incomplete::UrlWithoutToken),
+            ),
+            (
+                vec![("TIGHTBEAM_TOKEN", "CANARY_LONE_TOKEN".to_owned())],
+                ID,
+                refused(crate::dispatch::Incomplete::TokenWithoutUrl),
+            ),
+            (
+                vec![("TIGHTBEAM_BASE_DIR", String::new())],
+                ID,
+                refused(crate::dispatch::Incomplete::EmptyBaseDir),
+            ),
+            (
+                vec![],
+                ID,
+                Run {
+                    status: 0,
+                    stdout: ok(12020, "config", ID),
+                    stderr: vec![],
+                    requests: one(12020, "CANARY_SESSION_TOKEN"),
+                },
+            ),
         ];
-        for vars in cases {
-            let (discovery, stderr) = discover_with(env_of(vars), &work, &root);
-            let (result, instance, version) = outcome(&discovery, None, None);
-            let stdout = report(&discovery, &result, instance, version).to_string();
-            for printed in [stdout.as_str(), stderr.as_deref().unwrap_or("")] {
+        for (vars, answer_id, expected) in cases {
+            let run = run_command(&[], env_of(vars), &work, &root, answer_id);
+            for printed in [run.stdout.to_string(), run.stderr.join("\n")] {
                 assert!(!printed.contains("CANARY"), "{printed}");
                 assert!(!printed.contains(".tightbeam-session"), "{printed}");
             }
+            assert_eq!(run, expected);
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -1182,26 +1390,30 @@ mod tests {
         let fixture_dir = fixture("h16");
         let root = fixture_dir.join("root");
         let home = root.join("home");
-        gateway_json(
-            &home.join(".tightbeam"),
-            r#"{"port":12023,"cliToken":"root-default"}"#,
-        );
+        let default_dir = home.join(".tightbeam");
+        gateway_json(&default_dir, r#"{"port":12023,"cliToken":"root-default"}"#);
+        let default_id = instance_id(&default_dir).unwrap();
         let outside = fixture_dir.join("outside");
         session_file(&outside, "http://127.0.0.1:12024", "outside-session");
         let work = outside.join("work");
         fs::create_dir_all(&work).unwrap();
         for vars in [
+            // H16: nothing explicit.
             vec![],
             // H17: a lone URL different from that session's is no refusal (ii).
             vec![("TIGHTBEAM_URL", "http://127.0.0.1:12025".to_owned())],
         ] {
             let mut vars = vars;
             vars.push(("TIGHTBEAM_TEST_ROOT", root.display().to_string()));
-            let (discovery, stderr) = discover_with(env_of(vars), &work, &home);
-            assert_eq!(discovery.source, EndpointSource::Default);
-            assert_eq!(port_of(&discovery), Some(12023));
-            assert_eq!(discovery.token.as_deref(), Some("root-default"));
-            assert_eq!(stderr, None);
+            assert_eq!(
+                run_command(&[], env_of(vars), &work, &home, &default_id),
+                Run {
+                    status: 0,
+                    stdout: ok(12023, "default", &default_id),
+                    stderr: vec![],
+                    requests: one(12023, "root-default"),
+                }
+            );
         }
         fs::remove_dir_all(fixture_dir).unwrap();
     }
@@ -1217,40 +1429,49 @@ mod tests {
         let root_var = || ("TIGHTBEAM_TEST_ROOT", root.display().to_string());
 
         // H18: the session file is outside the root, so there is nothing to override.
-        let (discovery, stderr) = discover_with(
-            env_of(vec![
-                ("TIGHTBEAM_URL", "http://127.0.0.1:12027".to_owned()),
-                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
-                root_var(),
-            ]),
-            &work,
-            &root,
+        let env = env_of(vec![
+            ("TIGHTBEAM_URL", "http://127.0.0.1:12027".to_owned()),
+            ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+            root_var(),
+        ]);
+        assert_eq!(
+            run_command(&[], env, &work, &root, ID),
+            Run {
+                status: 0,
+                stdout: ok(12027, "env", ID),
+                stderr: vec![],
+                requests: one(12027, "pair-token"),
+            }
         );
-        assert_eq!(discovery.source, EndpointSource::Env);
-        assert_eq!(port_of(&discovery), Some(12027));
-        assert_eq!(stderr, None);
 
         // H20: the test root alone is not explicit: a session inside it is used.
         session_file(&root, "http://127.0.0.1:12028", "inside-root");
-        let (discovery, stderr) = discover_with(env_of(vec![root_var()]), &work, &root);
-        assert_eq!(discovery.source, EndpointSource::Config);
-        assert_eq!(discovery.token.as_deref(), Some("inside-root"));
-        assert_eq!(stderr, None);
+        assert_eq!(
+            run_command(&[], env_of(vec![root_var()]), &work, &root, ID),
+            Run {
+                status: 0,
+                stdout: ok(12028, "config", ID),
+                stderr: vec![],
+                requests: one(12028, "inside-root"),
+            }
+        );
 
         // H19: a base outside the root is F1's refused path: unavailable, no fallback.
         let outside_base = fixture_dir.join("outside-base");
         gateway_json(&outside_base, r#"{"port":12029,"cliToken":"outside-base"}"#);
-        let (discovery, stderr) = discover_with(
-            env_of(vec![
-                ("TIGHTBEAM_BASE_DIR", outside_base.display().to_string()),
-                root_var(),
-            ]),
-            &work,
-            &root,
+        let env = env_of(vec![
+            ("TIGHTBEAM_BASE_DIR", outside_base.display().to_string()),
+            root_var(),
+        ]);
+        assert_eq!(
+            run_command(&[], env, &work, &root, ID),
+            Run {
+                status: 1,
+                stdout: unavailable("env"),
+                stderr: vec![],
+                requests: vec![],
+            }
         );
-        assert_unavailable(&discovery, EndpointSource::Env);
-        assert_eq!(discovery.token, None);
-        assert_eq!(stderr, None);
         fs::remove_dir_all(fixture_dir).unwrap();
     }
 
@@ -1314,9 +1535,16 @@ mod tests {
                 session_file(&root, "http://127.0.0.1:12032", "session-token");
             }
             for (vars, notice) in [(pair(), NOTICE_PAIR), (base(), NOTICE_BASE)] {
-                let (discovery, stderr) = discover_with(env_of(vars), &work, &root);
-                assert_unavailable(&discovery, EndpointSource::Env);
-                assert_eq!(stderr.as_deref(), with_session.then_some(notice));
+                assert_eq!(
+                    run_command(&[], env_of(vars), &work, &root, ID),
+                    Run {
+                        status: 1,
+                        stdout: unavailable("env"),
+                        stderr: if with_session { lines(notice) } else { vec![] },
+                        requests: vec![],
+                    },
+                    "session={with_session} {notice}"
+                );
             }
         }
         fs::remove_dir_all(root).unwrap();

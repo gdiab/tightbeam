@@ -106,6 +106,18 @@ defmodule Tightbeam.DiscoveryPrecedenceTest do
     {Enum.drop(lines, -1), JSON.decode!(List.last(lines))}
   end
 
+  # The decoy answers 503, so a request that reaches it is `unavailable` with that
+  # endpoint (F2-7c), and the command exits 1.
+  defp unavailable_at(decoy, source) do
+    %{
+      "result" => "unavailable",
+      "endpoint" => %{"host" => "127.0.0.1", "port" => decoy.port},
+      "endpointSource" => source,
+      "instance" => nil,
+      "version" => nil
+    }
+  end
+
   @base_notice "tightbeam: notice: using TIGHTBEAM_BASE_DIR (explicit); ignoring the session file"
 
   describe "P14/P15: dispatch at the process boundary" do
@@ -149,7 +161,7 @@ defmodule Tightbeam.DiscoveryPrecedenceTest do
       tree = session_tree!(a)
       base = gateway_host_base!(scratch!("f2-h14-base"), b)
 
-      {output, _status} =
+      {output, status} =
         FixtureSession.cmd(@cli, ["credential-health"],
           cd: tree.inner,
           env: [{"TIGHTBEAM_BASE_DIR", base}],
@@ -157,26 +169,23 @@ defmodule Tightbeam.DiscoveryPrecedenceTest do
         )
 
       Process.sleep(200)
-      assert accepts(b) >= 1, output
+      assert accepts(b) == 1, output
       assert accepts(a) == 0, output
-      {stderr, stdout} = credential_health_output(output)
-      assert stderr == [@base_notice]
-      assert stdout["endpointSource"] == "env"
-      assert stdout["endpoint"] == %{"host" => "127.0.0.1", "port" => b.port}
+      assert status == 1, output
+      assert credential_health_output(output) == {[@base_notice], unavailable_at(b, "env")}
     end
 
     test "H15: with nothing explicit the session's listener is used" do
       a = decoy!()
       tree = session_tree!(a)
 
-      {output, _status} =
+      {output, status} =
         FixtureSession.cmd(@cli, ["credential-health"], cd: tree.inner, stderr_to_stdout: true)
 
       Process.sleep(200)
-      assert accepts(a) >= 1, output
-      {stderr, stdout} = credential_health_output(output)
-      assert stderr == []
-      assert stdout["endpointSource"] == "config"
+      assert accepts(a) == 1, output
+      assert status == 1, output
+      assert credential_health_output(output) == {[], unavailable_at(a, "config")}
     end
 
     test "H23: under a test root that excludes the session, the base is used with no notice" do
@@ -186,7 +195,7 @@ defmodule Tightbeam.DiscoveryPrecedenceTest do
       root = Path.join(tree.root, "work")
       base = gateway_host_base!(Path.join(root, "base"), b)
 
-      {output, _status} =
+      {output, status} =
         FixtureSession.cmd(@cli, ["credential-health"],
           cd: tree.inner,
           env: [{"TIGHTBEAM_BASE_DIR", base}, {"TIGHTBEAM_TEST_ROOT", root}],
@@ -194,11 +203,10 @@ defmodule Tightbeam.DiscoveryPrecedenceTest do
         )
 
       Process.sleep(200)
-      assert accepts(b) >= 1, output
+      assert accepts(b) == 1, output
       assert accepts(a) == 0, output
-      {stderr, stdout} = credential_health_output(output)
-      assert stderr == []
-      assert stdout["endpointSource"] == "env"
+      assert status == 1, output
+      assert credential_health_output(output) == {[], unavailable_at(b, "env")}
     end
   end
 
