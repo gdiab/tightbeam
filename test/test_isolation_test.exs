@@ -883,4 +883,28 @@ defmodule Tightbeam.TestIsolationTest do
       assert Enum.any?(violations, &(&1 =~ "naming a reviewing session (s_…) and its verdict"))
     end
   end
+
+  # CI 45949853409 (macOS): BSD chmod reads a "--" placed after the mode as a file
+  # name, where GNU chmod accepts it, so the launcher failed only on macOS. A
+  # "--" before the mode is portable; after it, never.
+  test "the repository's shell scripts use chmod syntax both BSD and GNU accept" do
+    scripts =
+      Path.wildcard(Path.join(TestIsolation.repo(), "{scripts,packaging}/**/*.sh"))
+
+    violations =
+      for path <- scripts,
+          {line, number} <- path |> File.read!() |> String.split("\n") |> Enum.with_index(1),
+          code = line |> String.split("#", parts: 2) |> hd(),
+          not String.starts_with?(String.trim_leading(line), "#"),
+          [_, rest] <- Regex.scan(~r/(?:^|[\s;&|(`])chmod\s+([^;&|`)\n]*)/, code),
+          tokens = String.split(rest),
+          {options, after_options} =
+            Enum.split_while(tokens, &(String.starts_with?(&1, "-") and &1 != "--")),
+          _ = options,
+          match?([mode, "--" | _] when mode != "--", after_options) do
+        "#{Path.relative_to(path, TestIsolation.repo())}:#{number}: #{String.trim(line)}"
+      end
+
+    assert violations == [], "chmod with -- after the mode:\n" <> Enum.join(violations, "\n")
+  end
 end

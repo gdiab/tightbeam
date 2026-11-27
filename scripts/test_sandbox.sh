@@ -54,8 +54,10 @@ esac
 root=$(mktemp -d "${TMPDIR:-/tmp}/tightbeam-test-sandbox.XXXXXXXX")
 root=$(CDPATH= cd -- "$root" && pwd -P)
 cleanup() {
-  # Seeded Mix archives are read-only; make them removable first.
-  chmod -R u+w -- "$root" 2>/dev/null || :
+  # Seeded Mix archives are read-only; make them removable first. $root is the
+  # absolute, canonical mktemp directory (pwd -P above), so it can never be taken
+  # for an option. No "--" after the mode: BSD chmod (macOS) reads it as a file.
+  chmod -R u+w "$root" 2>/dev/null || :
   rm -rf -- "$root"
 }
 trap cleanup EXIT HUP INT TERM
@@ -201,13 +203,19 @@ GITCONFIG
 copy_regular() {
   # copy_regular <source> <target>: copy, refuse anything in the copy that is not
   # a regular file or a directory (a symlink, fifo, socket or device), then make
-  # the whole copy read-only for the run.
+  # the whole copy read-only for the run. The target is always inside the
+  # sandbox root, which is absolute, so no operand can be taken for an option.
+  case "$2" in
+    "$root"/*) ;;
+    *) refuse "seeded build material target $2 is outside the sandbox root" ;;
+  esac
   mkdir -p "$(dirname -- "$2")"
   cp -R -- "$1" "$2"
   if [ -n "$(find "$2" ! -type d ! -type f -print -quit)" ]; then
     refuse "seeded build material $1 contains something other than regular files and directories"
   fi
-  chmod -R a-w -- "$2"
+  # No "--" after the mode: BSD chmod (macOS) reads it as a file name.
+  chmod -R a-w "$2"
 }
 real_mix_home=${MIX_HOME:-$real_home/.mix}
 for archive in "$real_mix_home"/archives/hex-*; do
