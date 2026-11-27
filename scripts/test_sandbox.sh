@@ -290,6 +290,16 @@ for name in LC_ALL LC_CTYPE TERM TIGHTBEAM_AUTHORITATIVE_GATE TIGHTBEAM_GATE_NOD
   fi
 done
 
+# Build scripts (libsqlite3-sys, for one) copy files out of the read-only Cargo
+# caches into the repository's target directories, and the copies keep the
+# read-only mode. Each run has a new Cargo home path, so the next run re-runs
+# those scripts and could not overwrite its own earlier output. Build outputs
+# are not seeded material (erratum 2 C15 binds the caches, which stay
+# read-only), so give the owner write access back on them before the run.
+for target_dir in "$repo/cli/target" "$repo"/native/*/target; do
+  [ -d "$target_dir" ] && find "$target_dir" ! -perm -u+w -exec chmod u+w {} +
+done
+
 # The command runs as a child so the EXIT/signal trap removes the sandbox and the
 # <repo>/tmp link afterwards, whatever the outcome.
 status=0
