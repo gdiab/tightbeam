@@ -307,7 +307,6 @@ env -i \
   GIT_CONFIG_NOSYSTEM=1 \
   CARGO_HOME="$root/cargo" \
   CARGO_NET_OFFLINE=true \
-  CARGO_TARGET_DIR="$repo/cli/target" \
   TIGHTBEAM_TEST_SANDBOX="$root" \
   TIGHTBEAM_PORT=0 \
   "$@" || status=$?
