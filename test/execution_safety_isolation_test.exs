@@ -31,10 +31,24 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
     write_tool!(fake_bin, "mix", "exit 0")
     write_tool!(fake_bin, "elixir", concurrent_elixir_fixture(started_file))
 
+    # F1 applicability ruling art_575c7d8c (PO att_46714284): the fake toolchain
+    # builds nothing, so each gate's launcher runs get empty test-owned homes and
+    # seed nothing through the unchanged C15 path, rather than copying the
+    # suite's whole Cargo registry four times.
+    empty_homes =
+      for name <- ~w(home mix-home cargo-home), into: %{} do
+        dir = Path.join(fixture_dir, name)
+        File.mkdir_p!(dir)
+        {name, dir}
+      end
+
     wrapper = Path.expand("../scripts/verify_mix.sh", __DIR__)
 
     env = [
       {"PATH", fake_bin <> ":/usr/bin:/bin"},
+      {"HOME", empty_homes["home"]},
+      {"MIX_HOME", empty_homes["mix-home"]},
+      {"CARGO_HOME", empty_homes["cargo-home"]},
       {"LANG", "C.UTF-8"},
       {"LC_ALL", nil},
       {"LC_CTYPE", nil},
@@ -79,6 +93,8 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
       assert capture =~ "TIGHTBEAM_GATE_NODE=#{node}\n"
       assert capture =~ "TIGHTBEAM_PORT=0\n"
       assert capture =~ "Authoritative Mix gate: node=#{node} port=0\n"
+      assert capture =~ "SEEDED_CARGO_ENTRIES=0\n"
+      assert capture =~ "SEEDED_MIX_ENTRIES=0\n"
 
       for production_name <- [
             "TIGHTBEAM_BASE_DIR=",
@@ -233,6 +249,10 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
 
     printf 'RUNS_OVERLAPPED=2\\n'
     printf 'CHILD_RUN_NODE=%s\\n' "$TIGHTBEAM_GATE_NODE"
+    # What this gate's sandbox was seeded with (C15): the launcher's own Cargo
+    # and Mix homes, inside its root.
+    printf 'SEEDED_CARGO_ENTRIES=%s\\n' "$(find "$CARGO_HOME" -mindepth 1 | wc -l | tr -d ' ')"
+    printf 'SEEDED_MIX_ENTRIES=%s\\n' "$(find "$MIX_HOME" -mindepth 1 | wc -l | tr -d ' ')"
     env | sort
     """
   end
