@@ -1455,9 +1455,13 @@ COMMANDS:
       and reports the version each replaced copy was written for. Start a
       fresh agent session afterwards.
 
-DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
-  TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
-  <TIGHTBEAM_BASE_DIR|TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
+DISCOVERY: explicit settings win over a session file. The CLI uses the first
+  of: TIGHTBEAM_URL + TIGHTBEAM_TOKEN; $TIGHTBEAM_BASE_DIR/gateway.json; the
+  nearest .tightbeam-session walking up from cwd; then
+  <TIGHTBEAM_HOME|~/.tightbeam>/gateway.json. An explicit setting that fails is
+  an error, never a fallback. With a session file present, incomplete explicit
+  settings are refused. When an explicit setting overrides a session file, one
+  notice on stderr names the session file.
 
 DURATIONS (for --after and --fallback-after): <n>ms | <n>s | <n>m | <n>h
   (e.g. 30s, 5m, 2h).

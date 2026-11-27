@@ -60,31 +60,40 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
 
-    let discovery = discover();
+    let (discovery, stderr) = discover();
+    // F2-7d/F2-7e: at most one fixed line (a refusal or the override notice), before
+    // any request. It names variables only.
+    if let Some(line) = stderr {
+        eprintln!("{line}");
+    }
     let response = discovery
         .endpoint
         .as_ref()
         .and_then(|endpoint| exchange(endpoint.clone(), discovery.token.clone()));
     let (result, instance, version) = outcome(&discovery, expect_instance.as_deref(), response);
 
-    let endpoint = discovery.endpoint.map(|endpoint| {
+    println!("{}", report(&discovery, &result, instance, version));
+    exit_status(&result)
+}
+
+/// The R10.1 result object: exactly five keys.
+fn report(discovery: &Discovery, result: &str, instance: Value, version: Value) -> Value {
+    let endpoint = discovery.endpoint.as_ref().map(|endpoint| {
         json!({
             "host": endpoint.host,
             "port": endpoint.port,
         })
     });
+    json!({
+        "result": result,
+        "endpoint": endpoint,
+        "endpointSource": discovery.source.wire_name(),
+        "instance": instance,
+        "version": version,
+    })
+}
 
-    println!(
-        "{}",
-        json!({
-            "result": result,
-            "endpoint": endpoint,
-            "endpointSource": discovery.source.wire_name(),
-            "instance": instance,
-            "version": version,
-        })
-    );
-
+fn exit_status(result: &str) -> i32 {
     if result == "ok" { 0 } else { 1 }
 }
 
@@ -124,29 +133,62 @@ fn parse_args(args: &[String]) -> Result<Option<String>, ()> {
     }
 }
 
-fn discover() -> Discovery {
+fn discover() -> (Discovery, Option<String>) {
     #[allow(deprecated)]
     let home = std::env::home_dir().unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     discover_with(|name| std::env::var(name).ok(), &cwd, &home)
 }
 
-fn discover_with<F>(get_env: F, cwd: &Path, home: &Path) -> Discovery
+/// The discovery and the one stderr line, if any, for F2-7c's outcome. Which F2-1 row
+/// applies, the agreement rule, refusals (i)-(iii), no fallback and the override all
+/// come from `dispatch`'s selection (F2-7a), whose session walk and base carry F1's
+/// test-root bound; this command only reads the source chosen, under its own contract
+/// (F2-7b). Its output is decided by the kind of outcome: no selection error text,
+/// which may carry a path, reaches it (F2-7e).
+fn discover_with<F>(get_env: F, cwd: &Path, home: &Path) -> (Discovery, Option<String>)
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(discovery) = session_discovery(cwd) {
-        return discovery;
-    }
+    use crate::dispatch::Selection;
 
-    let url = get_env("TIGHTBEAM_URL").filter(|value| !value.is_empty());
-    let token = get_env("TIGHTBEAM_TOKEN").filter(|value| !value.is_empty());
-    if let (Some(url), Some(token)) = (url, token) {
-        return discovery_from_url(&url, Some(token), EndpointSource::Env, None);
+    match crate::dispatch::select(&get_env, cwd, home) {
+        Selection::ExplicitPair {
+            url,
+            token,
+            overridden,
+        } => (
+            discovery_from_url(&url, Some(token), EndpointSource::Env, None),
+            overridden.map(|overridden| overridden.notice_without_path()),
+        ),
+        // No fallback: a base whose gateway.json is missing or unusable is
+        // `unavailable`, with no notice.
+        Selection::ExplicitBase {
+            base_dir,
+            overridden,
+        } => match usable_gateway_discovery(&base_dir, EndpointSource::Env) {
+            Some(discovery) => (
+                discovery,
+                overridden.map(|overridden| overridden.notice_without_path()),
+            ),
+            None => (unavailable(EndpointSource::Env), None),
+        },
+        Selection::Refused(incomplete) => (
+            unavailable(EndpointSource::Env),
+            Some(incomplete.line().to_owned()),
+        ),
+        Selection::Session { read, .. } => match read {
+            Ok(pair) => (
+                discovery_from_url(&pair.url, Some(pair.token), EndpointSource::Config, None),
+                None,
+            ),
+            Err(_) => (unavailable(EndpointSource::Config), None),
+        },
+        Selection::Fallthrough => {
+            let (base_dir, source) = resolve_gateway_base(&get_env, home);
+            (gateway_discovery(&base_dir, source), None)
+        }
     }
-
-    let (base_dir, source) = resolve_gateway_base(&get_env, home);
-    gateway_discovery(&base_dir, source)
 }
 
 // Only crate::base_dir reads the base-dir variables. Under its current contract it
@@ -176,40 +218,17 @@ where
     (base_dir, source)
 }
 
-fn session_discovery(cwd: &Path) -> Option<Discovery> {
-    for directory in cwd.ancestors() {
-        let path = directory.join(".tightbeam-session");
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Some(unavailable(EndpointSource::Config)),
-        }
-        let config = fs::read_to_string(path)
-            .ok()
-            .and_then(|encoded| serde_json::from_str::<Value>(&encoded).ok());
-        return Some(match config {
-            Some(config) => match (
-                config.get("url").and_then(Value::as_str),
-                config.get("token").and_then(Value::as_str),
-            ) {
-                (Some(url), Some(token)) => {
-                    discovery_from_url(url, Some(token.to_owned()), EndpointSource::Config, None)
-                }
-                _ => unavailable(EndpointSource::Config),
-            },
-            None => unavailable(EndpointSource::Config),
-        });
-    }
-    None
+fn gateway_discovery(base_dir: &Path, source: EndpointSource) -> Discovery {
+    usable_gateway_discovery(base_dir, source).unwrap_or_else(|| unavailable(source))
 }
 
-fn gateway_discovery(base_dir: &Path, source: EndpointSource) -> Discovery {
+/// The base's `gateway.json` as this command reads it, or `None` when it is missing,
+/// unreadable, malformed or without a usable `url` or port (F2-7c's no-request row).
+/// A `url` that is not loopback is still usable here: it yields no endpoint (R2.1).
+fn usable_gateway_discovery(base_dir: &Path, source: EndpointSource) -> Option<Discovery> {
     let config = fs::read_to_string(base_dir.join("gateway.json"))
         .ok()
-        .and_then(|encoded| serde_json::from_str::<Value>(&encoded).ok());
-    let Some(config) = config else {
-        return unavailable(source);
-    };
+        .and_then(|encoded| serde_json::from_str::<Value>(&encoded).ok())?;
     let token = config
         .get("cliToken")
         .and_then(Value::as_str)
@@ -221,28 +240,21 @@ fn gateway_discovery(base_dir: &Path, source: EndpointSource) -> Discovery {
         .and_then(Value::as_str)
         .filter(|url| !url.is_empty())
     {
-        return discovery_from_url(url, token, source, None);
+        return Some(discovery_from_url(url, token, source, None));
     }
 
-    let Some(port) = config
+    let port = config
         .get("port")
         .and_then(Value::as_u64)
-        .and_then(|port| u16::try_from(port).ok())
-    else {
-        return unavailable(source);
-    };
-    let Ok(canonical) = fs::canonicalize(base_dir) else {
-        return unavailable(source);
-    };
-    let Some(implicit_instance) = instance_id(&canonical) else {
-        return unavailable(source);
-    };
-    discovery_from_url(
+        .and_then(|port| u16::try_from(port).ok())?;
+    let canonical = fs::canonicalize(base_dir).ok()?;
+    let implicit_instance = instance_id(&canonical)?;
+    Some(discovery_from_url(
         &format!("http://127.0.0.1:{port}"),
         token,
         source,
         Some(implicit_instance),
-    )
+    ))
 }
 
 fn discovery_from_url(
@@ -525,33 +537,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discovery_order_and_source_classes_match_the_standard_client() {
-        let root = std::env::temp_dir().join(format!(
-            "tightbeam-credential-health-{}",
-            std::process::id()
-        ));
-        let work = root.join("work/session");
-        fs::create_dir_all(&work).unwrap();
-        fs::write(
-            work.parent().unwrap().join(".tightbeam-session"),
-            r#"{"url":"http://127.0.0.2:12000/path","token":"session-token"}"#,
-        )
-        .unwrap();
-        let vars = HashMap::from([
-            ("TIGHTBEAM_URL", "http://127.0.0.1:13000"),
-            ("TIGHTBEAM_TOKEN", "env-token"),
-        ]);
-        let discovery = discover_with(
-            |name| vars.get(name).map(|value| (*value).to_owned()),
-            &work,
-            &root,
-        );
-        assert_eq!(discovery.source, EndpointSource::Config);
-        assert_eq!(discovery.endpoint.unwrap().port, 12000);
-        assert_eq!(discovery.token.as_deref(), Some("session-token"));
-        fs::remove_dir_all(root).unwrap();
-    }
+    // M11 (F2 v6 §5): the pre-F2 tests `discovery_order_and_source_classes_match_the_
+    // standard_client` (a session beat an explicit pair) and `malformed_nearest_session_
+    // file_stops_discovery_without_env_fallback` (a malformed session beat an explicit
+    // pair) asserted the order F2-7a removes. H1/H2 and H10a/H10b below replace them.
 
     #[test]
     fn gateway_host_discovery_binds_the_canonical_base_without_disclosing_it() {
@@ -566,11 +555,12 @@ mod tests {
         )
         .unwrap();
 
-        let discovery = discover_with(
+        let (discovery, stderr) = discover_with(
             |name| (name == "TIGHTBEAM_BASE_DIR").then(|| root.display().to_string()),
             &root,
             &root,
         );
+        assert_eq!(stderr, None);
         assert_eq!(discovery.source, EndpointSource::Env);
         assert_eq!(discovery.endpoint.unwrap().host, "127.0.0.1");
         assert_eq!(discovery.token.as_deref(), Some("organization-token"));
@@ -708,31 +698,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_nearest_session_file_stops_discovery_without_env_fallback() {
-        let root = std::env::temp_dir().join(format!(
-            "tightbeam-credential-health-shadow-{}",
-            std::process::id()
-        ));
-        let work = root.join("work");
-        fs::create_dir_all(&work).unwrap();
-        fs::write(root.join(".tightbeam-session"), "not-json").unwrap();
-
-        let discovery = discover_with(
-            |name| match name {
-                "TIGHTBEAM_URL" => Some("http://127.0.0.1:12000".to_owned()),
-                "TIGHTBEAM_TOKEN" => Some("must-not-be-used".to_owned()),
-                _ => None,
-            },
-            &work,
-            &root,
-        );
-        assert_eq!(discovery.source, EndpointSource::Config);
-        assert_eq!(discovery.endpoint, None);
-        assert_eq!(discovery.token, None);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn session_token_must_be_a_string_and_preserves_the_existing_empty_string() {
         let root = std::env::temp_dir().join(format!(
             "tightbeam-credential-health-session-token-{}",
@@ -746,7 +711,8 @@ mod tests {
             r#"{"url":"http://127.0.0.1:12000","token":7}"#,
         ] {
             fs::write(root.join(".tightbeam-session"), encoded).unwrap();
-            let discovery = discover_with(|_| None, &work, &root);
+            let (discovery, stderr) = discover_with(|_| None, &work, &root);
+            assert_eq!(stderr, None);
             assert_eq!(discovery.source, EndpointSource::Config);
             assert_eq!(discovery.endpoint, None);
             assert_eq!(discovery.token, None);
@@ -757,7 +723,7 @@ mod tests {
             r#"{"url":"http://127.0.0.1:12000","token":""}"#,
         )
         .unwrap();
-        let discovery = discover_with(|_| None, &work, &root);
+        let (discovery, _) = discover_with(|_| None, &work, &root);
         assert_eq!(discovery.endpoint.unwrap().port, 12000);
         assert_eq!(discovery.token.as_deref(), Some(""));
         fs::remove_dir_all(root).unwrap();
@@ -803,5 +769,556 @@ mod tests {
         assert!(validate_response(duplicate).is_none());
         assert!(validate_response(&valid.replace("aaaaaaaa", "AAAAAAAA")).is_none());
         assert!(validate_response(&valid.replace("testhost", "testhost\nsecret")).is_none());
+    }
+
+    // F2 v6, F2-7 (wi_34a7be66): credential-health resolves through dispatch's shared
+    // selection. Each case asserts the discovery (and so whether any request can be
+    // made: none without an endpoint), the one stderr line, and for the no-request rows
+    // the whole R10.1 object and the exit status.
+
+    fn fixture(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam-f2-{label}-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn session_file(dir: &Path, url: &str, token: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join(".tightbeam-session"),
+            json!({"url": url, "token": token}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn gateway_json(dir: &Path, contents: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("gateway.json"), contents).unwrap();
+    }
+
+    fn env_of(pairs: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<&'static str, String> = pairs.into_iter().collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    fn port_of(discovery: &Discovery) -> Option<u16> {
+        discovery.endpoint.as_ref().map(|endpoint| endpoint.port)
+    }
+
+    /// A row with no endpoint makes no request: its whole output is fixed.
+    fn assert_unavailable(discovery: &Discovery, source: EndpointSource) {
+        assert_eq!(discovery.endpoint, None, "no request");
+        let (result, instance, version) = outcome(discovery, Some("expected"), None);
+        assert_eq!(exit_status(&result), 1);
+        assert_eq!(
+            report(discovery, &result, instance, version),
+            json!({
+                "result": "unavailable",
+                "endpoint": null,
+                "endpointSource": source.wire_name(),
+                "instance": null,
+                "version": null,
+            })
+        );
+    }
+
+    const NOTICE_PAIR: &str = "tightbeam: notice: using TIGHTBEAM_URL and TIGHTBEAM_TOKEN (explicit); ignoring the session file";
+    const NOTICE_BASE: &str =
+        "tightbeam: notice: using TIGHTBEAM_BASE_DIR (explicit); ignoring the session file";
+
+    #[test]
+    fn f2_h1_an_explicit_pair_wins_over_a_different_session_with_one_notice() {
+        let root = fixture("h1");
+        session_file(&root, "http://127.0.0.1:12001", "session-token");
+        let work = root.join("a/b");
+        fs::create_dir_all(&work).unwrap();
+        let (discovery, stderr) = discover_with(
+            env_of(vec![
+                ("TIGHTBEAM_URL", "http://127.0.0.1:12002".to_owned()),
+                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+            ]),
+            &work,
+            &root,
+        );
+        assert_eq!(discovery.source, EndpointSource::Env);
+        assert_eq!(port_of(&discovery), Some(12002));
+        assert_eq!(discovery.token.as_deref(), Some("pair-token"));
+        assert_eq!(discovery.implicit_instance, None);
+        assert_eq!(stderr.as_deref(), Some(NOTICE_PAIR));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h2_a_pair_equal_to_the_session_keeps_the_session_silently() {
+        let root = fixture("h2");
+        session_file(&root, "ws://127.0.0.1:12003/", "same-token");
+        let (discovery, stderr) = discover_with(
+            env_of(vec![
+                ("TIGHTBEAM_URL", "http://127.0.0.1:12003".to_owned()),
+                ("TIGHTBEAM_TOKEN", "same-token".to_owned()),
+            ]),
+            &root,
+            &root,
+        );
+        assert_eq!(discovery.source, EndpointSource::Config);
+        assert_eq!(port_of(&discovery), Some(12003));
+        assert_eq!(discovery.token.as_deref(), Some("same-token"));
+        assert_eq!(stderr, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h3_an_explicit_base_wins_with_its_implicit_instance_and_a_notice() {
+        let root = fixture("h3");
+        let work = root.join("tree");
+        session_file(&work, "http://127.0.0.1:12004", "session-token");
+        let base = root.join("base");
+        gateway_json(&base, r#"{"port":12005,"cliToken":"base-token"}"#);
+        let (discovery, stderr) = discover_with(
+            env_of(vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())]),
+            &work,
+            &root,
+        );
+        assert_eq!(discovery.source, EndpointSource::Env);
+        assert_eq!(
+            discovery
+                .endpoint
+                .as_ref()
+                .map(|e| (e.host.as_str(), e.port)),
+            Some(("127.0.0.1", 12005))
+        );
+        assert_eq!(discovery.token.as_deref(), Some("base-token"));
+        assert_eq!(discovery.implicit_instance, instance_id(&base));
+        assert_eq!(stderr.as_deref(), Some(NOTICE_BASE));
+        // A foreign instance at that port is a mismatch.
+        let foreign = ServerResponse {
+            result: "ok".to_owned(),
+            instance: json!({"id": "f".repeat(64), "host": "elsewhere"}),
+            version: "0.1.16".to_owned(),
+        };
+        assert_eq!(
+            outcome(&discovery, None, Some(foreign)).0,
+            "instance_mismatch"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h4_and_h4b_an_unusable_explicit_base_is_unavailable_without_fallback() {
+        // H4b (N3), verbatim: "malformed/port-less gateway.json under an explicit base".
+        let root = fixture("h4");
+        let work = root.join("tree");
+        session_file(&work, "http://127.0.0.1:12006", "session-token");
+        for (label, contents) in [
+            ("missing", None),
+            ("malformed", Some("{")),
+            ("portless", Some(r#"{"cliToken":"base-token"}"#)),
+        ] {
+            let base = root.join(label);
+            fs::create_dir_all(&base).unwrap();
+            if let Some(contents) = contents {
+                gateway_json(&base, contents);
+            }
+            let (discovery, stderr) = discover_with(
+                env_of(vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())]),
+                &work,
+                &root,
+            );
+            assert_unavailable(&discovery, EndpointSource::Env);
+            assert_eq!(discovery.token, None, "{label}: the session is never used");
+            assert_eq!(stderr, None, "{label}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h5_the_pair_wins_over_the_base_and_the_session() {
+        let root = fixture("h5");
+        let work = root.join("tree");
+        session_file(&work, "http://127.0.0.1:12007", "session-token");
+        let base = root.join("base");
+        gateway_json(&base, r#"{"port":12008,"cliToken":"base-token"}"#);
+        let (discovery, stderr) = discover_with(
+            env_of(vec![
+                ("TIGHTBEAM_URL", "http://127.0.0.1:12009".to_owned()),
+                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+                ("TIGHTBEAM_BASE_DIR", base.display().to_string()),
+            ]),
+            &work,
+            &root,
+        );
+        assert_eq!(discovery.source, EndpointSource::Env);
+        assert_eq!(port_of(&discovery), Some(12009));
+        assert_eq!(stderr.as_deref(), Some(NOTICE_PAIR));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h6_h7a_h7e_h8_non_explicit_settings_keep_the_session() {
+        let root = fixture("h6");
+        for (session_url, lone_url) in [
+            ("http://127.0.0.1:12010", None),
+            ("http://127.0.0.1:12010", Some("http://127.0.0.1:12010")),
+            ("ws://127.0.0.1:1/", Some("http://127.0.0.1:1")),
+            ("wss://127.0.0.1:1", Some("https://127.0.0.1:1/")),
+        ] {
+            session_file(&root, session_url, "session-token");
+            let mut vars = vec![
+                ("TIGHTBEAM_HOME", root.join("home").display().to_string()),
+                ("TIGHTBEAM_MACHINE", "m".to_owned()),
+                ("TIGHTBEAM_LINEAGE", "l".to_owned()),
+            ];
+            if let Some(url) = lone_url {
+                vars.push(("TIGHTBEAM_URL", url.to_owned()));
+            }
+            let (discovery, stderr) = discover_with(env_of(vars), &root, &root);
+            assert_eq!(discovery.source, EndpointSource::Config, "{session_url}");
+            assert_eq!(discovery.token.as_deref(), Some("session-token"));
+            assert_eq!(stderr, None, "{session_url}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h7b_h7c_h7d_h11_incomplete_explicit_settings_beside_a_session_are_refused() {
+        let root = fixture("h7");
+        session_file(&root, "http://127.0.0.1:12011", "session-token");
+        let different = || ("TIGHTBEAM_URL", "http://127.0.0.1:12012".to_owned());
+        for (vars, line) in [
+            (
+                vec![different()],
+                crate::dispatch::Incomplete::UrlWithoutToken,
+            ),
+            (
+                vec![("TIGHTBEAM_TOKEN", "lone".to_owned())],
+                crate::dispatch::Incomplete::TokenWithoutUrl,
+            ),
+            (
+                vec![("TIGHTBEAM_TOKEN", String::new())],
+                crate::dispatch::Incomplete::TokenWithoutUrl,
+            ),
+            (
+                vec![different(), ("TIGHTBEAM_TOKEN", String::new())],
+                crate::dispatch::Incomplete::UrlWithoutToken,
+            ),
+            (
+                vec![("TIGHTBEAM_BASE_DIR", String::new())],
+                crate::dispatch::Incomplete::EmptyBaseDir,
+            ),
+        ] {
+            let (discovery, stderr) = discover_with(env_of(vars), &root, &root);
+            // Even with --expect-instance, the outcome is only `unavailable`.
+            assert_unavailable(&discovery, EndpointSource::Env);
+            assert_eq!(stderr.as_deref(), Some(line.line()));
+        }
+        assert_eq!(
+            crate::dispatch::Incomplete::TokenWithoutUrl.line(),
+            "tightbeam: incomplete explicit endpoint: TIGHTBEAM_TOKEN is set but TIGHTBEAM_URL is not; set both, or unset TIGHTBEAM_TOKEN"
+        );
+        assert_eq!(
+            crate::dispatch::Incomplete::UrlWithoutToken.line(),
+            "tightbeam: incomplete explicit endpoint: TIGHTBEAM_URL is set but TIGHTBEAM_TOKEN is empty or unset; set both, or unset TIGHTBEAM_URL"
+        );
+        assert_eq!(
+            crate::dispatch::Incomplete::EmptyBaseDir.line(),
+            "tightbeam: incomplete explicit endpoint: TIGHTBEAM_BASE_DIR is set but empty; set it to a directory, or unset it"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h7f_h9_h11b_without_a_session_incomplete_settings_keep_todays_row_4() {
+        let root = fixture("h7f");
+        let home_var = root.join("home-var");
+        gateway_json(&home_var, r#"{"port":12013,"cliToken":"home-token"}"#);
+        let default_dir = root.join(".tightbeam");
+        gateway_json(&default_dir, r#"{"port":12014,"cliToken":"default-token"}"#);
+        for lone in [
+            vec![("TIGHTBEAM_URL", "http://127.0.0.1:12015".to_owned())],
+            vec![("TIGHTBEAM_TOKEN", "lone".to_owned())],
+            vec![
+                ("TIGHTBEAM_URL", "http://127.0.0.1:12015".to_owned()),
+                ("TIGHTBEAM_TOKEN", String::new()),
+            ],
+            vec![],
+        ] {
+            let mut with_home = lone.clone();
+            with_home.push(("TIGHTBEAM_HOME", home_var.display().to_string()));
+            let (discovery, stderr) = discover_with(env_of(with_home), &root, &root);
+            assert_eq!(discovery.source, EndpointSource::Env);
+            assert_eq!(port_of(&discovery), Some(12013));
+            assert_eq!(stderr, None);
+
+            let (discovery, stderr) = discover_with(env_of(lone), &root, &root);
+            assert_eq!(discovery.source, EndpointSource::Default);
+            assert_eq!(port_of(&discovery), Some(12014));
+            assert_eq!(stderr, None);
+        }
+        // H11b: an empty base-dir variable with no session file is today's environment
+        // selection of that path; only the seam is exercised (see the test above).
+        let env = env_of(vec![("TIGHTBEAM_BASE_DIR", String::new())]);
+        assert_eq!(
+            crate::dispatch::select(&env, &root, &root),
+            crate::dispatch::Selection::Fallthrough
+        );
+        assert_eq!(resolve_gateway_base(&env, &root).1, EndpointSource::Env);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h10a_h10b_h10c_a_malformed_session() {
+        let root = fixture("h10");
+        fs::write(root.join(".tightbeam-session"), "not-json").unwrap();
+        // H10a: an explicit pair is used, with the "unreadable" notice.
+        let (discovery, stderr) = discover_with(
+            env_of(vec![
+                ("TIGHTBEAM_URL", "http://127.0.0.1:12016".to_owned()),
+                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+            ]),
+            &root,
+            &root,
+        );
+        assert_eq!(discovery.source, EndpointSource::Env);
+        assert_eq!(port_of(&discovery), Some(12016));
+        assert_eq!(
+            stderr.as_deref(),
+            Some(
+                "tightbeam: notice: using TIGHTBEAM_URL and TIGHTBEAM_TOKEN (explicit); ignoring the unreadable session file"
+            )
+        );
+        // H10b: nothing explicit.
+        let (discovery, stderr) = discover_with(env_of(vec![]), &root, &root);
+        assert_unavailable(&discovery, EndpointSource::Config);
+        assert_eq!(stderr, None);
+        // H10c (N1), verbatim: "add H10c (lone URL + malformed session ->
+        // unavailable/config/no stderr)".
+        let (discovery, stderr) = discover_with(
+            env_of(vec![("TIGHTBEAM_URL", "http://127.0.0.1:12017".to_owned())]),
+            &root,
+            &root,
+        );
+        assert_unavailable(&discovery, EndpointSource::Config);
+        assert_eq!(stderr, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h12_the_command_has_no_identity_flag() {
+        let root = fixture("h12");
+        session_file(&root, "http://127.0.0.1:12018", "session-token");
+        let (discovery, stderr) = discover_with(
+            env_of(vec![
+                ("TIGHTBEAM_URL", "http://127.0.0.1:12019".to_owned()),
+                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+            ]),
+            &root,
+            &root,
+        );
+        assert_eq!(discovery.source, EndpointSource::Env);
+        assert_eq!(port_of(&discovery), Some(12019));
+        assert_eq!(stderr.as_deref(), Some(NOTICE_PAIR));
+        // `--as x` is a usage error (exit 2 in run), decided before any discovery.
+        assert_eq!(parse_args(&["--as".to_owned(), "x".to_owned()]), Err(()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h13_no_value_or_session_path_reaches_stdout_or_stderr() {
+        let root = fixture("h13-CANARY_ROOT");
+        let work = root.join("CANARY_SESSION_DIR/inner");
+        session_file(
+            &root.join("CANARY_SESSION_DIR"),
+            "http://127.0.0.1:12020/CANARY_SESSION_URL",
+            "CANARY_SESSION_TOKEN",
+        );
+        fs::create_dir_all(&work).unwrap();
+        let base = root.join("CANARY_BASE");
+        gateway_json(
+            &base,
+            r#"{"port":12021,"cliToken":"CANARY_BASE_TOKEN","note":"CANARY_GATEWAY_JSON"}"#,
+        );
+        let pair = || {
+            vec![
+                (
+                    "TIGHTBEAM_URL",
+                    "http://127.0.0.1:12022/CANARY_PAIR_URL".to_owned(),
+                ),
+                ("TIGHTBEAM_TOKEN", "CANARY_PAIR_TOKEN".to_owned()),
+            ]
+        };
+        let cases: Vec<Vec<(&'static str, String)>> = vec![
+            pair(),
+            vec![("TIGHTBEAM_BASE_DIR", base.display().to_string())],
+            vec![(
+                "TIGHTBEAM_BASE_DIR",
+                root.join("CANARY_MISSING").display().to_string(),
+            )],
+            vec![(
+                "TIGHTBEAM_URL",
+                "http://127.0.0.1:1/CANARY_LONE_URL".to_owned(),
+            )],
+            vec![("TIGHTBEAM_TOKEN", "CANARY_LONE_TOKEN".to_owned())],
+            vec![("TIGHTBEAM_BASE_DIR", String::new())],
+            vec![],
+        ];
+        for vars in cases {
+            let (discovery, stderr) = discover_with(env_of(vars), &work, &root);
+            let (result, instance, version) = outcome(&discovery, None, None);
+            let stdout = report(&discovery, &result, instance, version).to_string();
+            for printed in [stdout.as_str(), stderr.as_deref().unwrap_or("")] {
+                assert!(!printed.contains("CANARY"), "{printed}");
+                assert!(!printed.contains(".tightbeam-session"), "{printed}");
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn f2_h16_h17_outside_the_test_root_there_is_no_ambient_session() {
+        let fixture_dir = fixture("h16");
+        let root = fixture_dir.join("root");
+        let home = root.join("home");
+        gateway_json(
+            &home.join(".tightbeam"),
+            r#"{"port":12023,"cliToken":"root-default"}"#,
+        );
+        let outside = fixture_dir.join("outside");
+        session_file(&outside, "http://127.0.0.1:12024", "outside-session");
+        let work = outside.join("work");
+        fs::create_dir_all(&work).unwrap();
+        for vars in [
+            vec![],
+            // H17: a lone URL different from that session's is no refusal (ii).
+            vec![("TIGHTBEAM_URL", "http://127.0.0.1:12025".to_owned())],
+        ] {
+            let mut vars = vars;
+            vars.push(("TIGHTBEAM_TEST_ROOT", root.display().to_string()));
+            let (discovery, stderr) = discover_with(env_of(vars), &work, &home);
+            assert_eq!(discovery.source, EndpointSource::Default);
+            assert_eq!(port_of(&discovery), Some(12023));
+            assert_eq!(discovery.token.as_deref(), Some("root-default"));
+            assert_eq!(stderr, None);
+        }
+        fs::remove_dir_all(fixture_dir).unwrap();
+    }
+
+    #[test]
+    fn f2_h18_h19_h20_explicit_sources_and_the_test_root() {
+        let fixture_dir = fixture("h18");
+        let root = fixture_dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        session_file(&fixture_dir, "http://127.0.0.1:12026", "above-root");
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let root_var = || ("TIGHTBEAM_TEST_ROOT", root.display().to_string());
+
+        // H18: the session file is outside the root, so there is nothing to override.
+        let (discovery, stderr) = discover_with(
+            env_of(vec![
+                ("TIGHTBEAM_URL", "http://127.0.0.1:12027".to_owned()),
+                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+                root_var(),
+            ]),
+            &work,
+            &root,
+        );
+        assert_eq!(discovery.source, EndpointSource::Env);
+        assert_eq!(port_of(&discovery), Some(12027));
+        assert_eq!(stderr, None);
+
+        // H20: the test root alone is not explicit: a session inside it is used.
+        session_file(&root, "http://127.0.0.1:12028", "inside-root");
+        let (discovery, stderr) = discover_with(env_of(vec![root_var()]), &work, &root);
+        assert_eq!(discovery.source, EndpointSource::Config);
+        assert_eq!(discovery.token.as_deref(), Some("inside-root"));
+        assert_eq!(stderr, None);
+
+        // H19: a base outside the root is F1's refused path: unavailable, no fallback.
+        let outside_base = fixture_dir.join("outside-base");
+        gateway_json(&outside_base, r#"{"port":12029,"cliToken":"outside-base"}"#);
+        let (discovery, stderr) = discover_with(
+            env_of(vec![
+                ("TIGHTBEAM_BASE_DIR", outside_base.display().to_string()),
+                root_var(),
+            ]),
+            &work,
+            &root,
+        );
+        assert_unavailable(&discovery, EndpointSource::Env);
+        assert_eq!(discovery.token, None);
+        assert_eq!(stderr, None);
+        fs::remove_dir_all(fixture_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f2_n3_a_session_reached_through_a_symlink_out_of_the_root_is_not_ambient() {
+        // Review att_ea3769db N3 (PO-required, att_824b22b5): a session reached through a
+        // symlink inside the root that points outside it. The shared selection applies
+        // F1's canonical containment, so it is not ambient.
+        use std::os::unix::fs::symlink;
+        let fixture_dir = fixture("n3");
+        let root = fixture_dir.join("root");
+        let outside = fixture_dir.join("outside");
+        session_file(&outside, "http://127.0.0.1:12030", "outside-session");
+        fs::create_dir_all(outside.join("work")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        let work = root.join("link/work");
+        let root_var = ("TIGHTBEAM_TEST_ROOT", root.display().to_string());
+
+        let env = env_of(vec![root_var.clone()]);
+        assert_eq!(
+            crate::dispatch::select(&env, &work, &root),
+            crate::dispatch::Selection::Fallthrough
+        );
+        // Not ambient, so neither a capture nor a refusal (ii) nor a notice.
+        let (discovery, stderr) = discover_with(
+            env_of(vec![
+                ("TIGHTBEAM_URL", "http://127.0.0.1:12031".to_owned()),
+                root_var,
+            ]),
+            &work,
+            &root,
+        );
+        assert_ne!(discovery.token.as_deref(), Some("outside-session"));
+        assert_ne!(discovery.source, EndpointSource::Config);
+        assert_eq!(stderr, None);
+        fs::remove_dir_all(fixture_dir).unwrap();
+    }
+
+    #[test]
+    fn f2_h21_h22_non_loopback_explicit_sources_are_never_contacted() {
+        // H21 and H22 (N2), verbatim: "non-loopback pair and base-url cases".
+        let root = fixture("h21");
+        let work = root.join("tree");
+        fs::create_dir_all(&work).unwrap();
+        let satellite = root.join("satellite");
+        gateway_json(
+            &satellite,
+            r#"{"url":"ws://10.0.0.1:1","cliToken":"base-token"}"#,
+        );
+        let pair = || {
+            vec![
+                ("TIGHTBEAM_URL", "http://10.0.0.1:1".to_owned()),
+                ("TIGHTBEAM_TOKEN", "pair-token".to_owned()),
+            ]
+        };
+        let base = || vec![("TIGHTBEAM_BASE_DIR", satellite.display().to_string())];
+        for with_session in [false, true] {
+            if with_session {
+                session_file(&root, "http://127.0.0.1:12032", "session-token");
+            }
+            for (vars, notice) in [(pair(), NOTICE_PAIR), (base(), NOTICE_BASE)] {
+                let (discovery, stderr) = discover_with(env_of(vars), &work, &root);
+                assert_unavailable(&discovery, EndpointSource::Env);
+                assert_eq!(stderr.as_deref(), with_session.then_some(notice));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }
