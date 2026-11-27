@@ -220,6 +220,14 @@ for rebar in "$real_mix_home"/elixir/*/rebar3; do
   version_dir=$(basename -- "$(dirname -- "$rebar")")
   copy_regular "$rebar" "$root/home/.mix/elixir/$version_dir/rebar3"
 done
+# The containers that hold the seeded copies are read-only too, so nothing can
+# be added beside them for the run.
+[ -d "$root/home/.mix/archives" ] && chmod a-w "$root/home/.mix/archives"
+for version_dir in "$root"/home/.mix/elixir/*; do
+  [ -d "$version_dir" ] && chmod a-w "$version_dir"
+done
+[ -d "$root/home/.mix/elixir" ] && chmod a-w "$root/home/.mix/elixir"
+
 # XDG_CACHE_HOME is <root>/home/.cache, so elixir_make (which looks there) reads
 # this seeded copy instead of downloading a precompiled NIF.
 if [ -d "$real_home/.cache/elixir_make" ]; then
