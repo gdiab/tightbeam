@@ -105,8 +105,10 @@ defmodule Tightbeam.TestCase do
   with no symlink (F1 wi_34a7be66, b0 att_124bee40 (5); interpretation
   art_b5ff92cd class A). A test asking for a tmp_dir gets a fresh one physically
   inside the suite's test root instead, so a fixture's HOME, base and child test
-  root stay together there (`GuardRuntimeFixture`). Setup for async modules that
-  do not use this template: `setup {Tightbeam.TestCase, :sandbox_tmp_dir}`.
+  root stay together there (`GuardRuntimeFixture`). Like ExUnit's, it is created
+  before the test and removed after it; removing either directory fails closed.
+  Setup for async modules that do not use this template:
+  `setup {Tightbeam.TestCase, :sandbox_tmp_dir}`.
   """
   def sandbox_tmp_dir(%{tmp_dir: exunit_tmp} = context) when is_binary(exunit_tmp) do
     root = Application.fetch_env!(:tightbeam, :test_suite_tmp)
@@ -125,11 +127,40 @@ defmodule Tightbeam.TestCase do
            ),
            do: raise("test tmp_dir #{canonical} is not inside the test sandbox")
 
-    File.rmdir(exunit_tmp)
+    # Registered first, so it runs after every teardown the test or the
+    # template registers later (on_exit runs in reverse order).
+    on_exit(fn -> remove_tmp_dir!(canonical) end)
+    File.rmdir!(exunit_tmp)
     [tmp_dir: canonical]
   end
 
   def sandbox_tmp_dir(_context), do: []
+
+  # Owner access is restored on every directory first (a test may leave one
+  # read-only), walking without following symlinks, so nothing outside `dir` is
+  # touched; File.rm_rf!/1 removes links, not their targets. A test that removed
+  # its own tmp_dir leaves nothing to do; any other failure raises.
+  defp remove_tmp_dir!(dir) do
+    make_removable!(dir)
+    File.rm_rf!(dir)
+  end
+
+  defp make_removable!(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory, mode: mode}} ->
+        File.chmod!(path, Bitwise.bor(mode, 0o700))
+        path |> File.ls!() |> Enum.each(&make_removable!(Path.join(path, &1)))
+
+      {:ok, _not_a_directory} ->
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "read file stats", path: path
+    end
+  end
 
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db) do
