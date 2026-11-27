@@ -347,7 +347,10 @@ defmodule Tightbeam.TestSandboxPreflight do
 
     is_binary(dir) and is_binary(root) and inside?(test_root, root) and
       canonical(Path.dirname(path)) == canonical(dir) and
-      match?({:ok, "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then" <> _}, File.read(path)) and
+      match?(
+        {:ok, "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then" <> _},
+        File.read(path)
+      ) and
       String.ends_with?(File.read!(path), "\nexit 97\n")
   end
 
@@ -384,8 +387,8 @@ defmodule Tightbeam.TestSandboxPreflight do
              else: ["tightbeam resolves to #{found}, not this repository's build or a tripwire"]
       end
 
+    # An absent tool is the safe state: only a name that resolves is judged.
     exposed =
-      # An absent tool is the safe state: only a name that resolves is judged.
       for tool <- @forbidden_tools,
           found = System.find_executable(tool),
           is_binary(found),

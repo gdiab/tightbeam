@@ -200,7 +200,11 @@ defmodule Tightbeam.CliIntegrationTest do
     args = ["session-connect", "--session", ctx.worker.session_key]
 
     assert {error, 1} =
-             Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.outside, env: env, stderr_to_stdout: true)
+             Tightbeam.FixtureSession.cmd(ctx.binary, args,
+               cd: ctx.outside,
+               env: env,
+               stderr_to_stdout: true
+             )
 
     assert error =~ "organization credential requires exactly one of --as-user or --as-process"
     refute_received {:cli_call, _}
@@ -262,7 +266,9 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "retirement withdrawal crosses the CLI wire and requires a reason", ctx do
-    run = fn args -> Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+    run = fn args ->
+      Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+    end
 
     target =
       Org.create(ctx.db, %{
@@ -320,7 +326,9 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do
-    run = fn args -> Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+    run = fn args ->
+      Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+    end
 
     assert {created, 0} =
              run.(["work-item-create", "--title", "reparent wire", "--as-user", "flynn"])
@@ -392,7 +400,11 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "session rename uses stable keys and preserves history, assignment, and ownership", ctx do
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
-    run = fn args -> Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    run = fn args ->
+      Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+    end
+
     owner_id = ctx.session.owner_user_id
 
     {:appended, history} =
@@ -544,7 +556,9 @@ defmodule Tightbeam.CliIntegrationTest do
        deliver: fn _ -> flunk("wire admission must not deliver an unrelated wake") end}
     )
 
-    run = fn args -> Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+    run = fn args ->
+      Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+    end
 
     assert {assigned, 0} =
              run.(["assign", "--session", "cli-holder", "--subject", "R1 wire proof"])
@@ -615,7 +629,10 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     other_dir = session_workdir!(ctx, ctx.worker)
-    assert {refused, 1} = Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: other_dir, stderr_to_stdout: true)
+
+    assert {refused, 1} =
+             Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: other_dir, stderr_to_stdout: true)
+
     assert refused =~ "not_authorized"
 
     assert {malformed, 1} =
@@ -870,7 +887,9 @@ defmodule Tightbeam.CliIntegrationTest do
     ids =
       for {key, subject} <- [{"cli-holder", "A"}, {"cli-worker", "R"}, {"cli-worker", "V"}] do
         {output, 0} =
-          Tightbeam.FixtureSession.cmd(ctx.binary, ["assign", "--session", key, "--subject", subject],
+          Tightbeam.FixtureSession.cmd(
+            ctx.binary,
+            ["assign", "--session", key, "--subject", subject],
             cd: ctx.workdir,
             stderr_to_stdout: true
           )
@@ -1084,7 +1103,9 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     {_, 0} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["revoke-assignment", resolver, "--reason", "Resolver disposition"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["revoke-assignment", resolver, "--reason", "Resolver disposition"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -1125,7 +1146,8 @@ defmodule Tightbeam.CliIntegrationTest do
     {version, 0} = Tightbeam.FixtureSession.cmd(ctx.binary, ["version"], cd: ctx.workdir)
     version = String.trim(version)
 
-    {listed, 0} = Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    {listed, 0} =
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
 
     assert version != ""
     assert listed =~ "cli-holder"
@@ -1264,7 +1286,10 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers), revision: "test-identity-revision")
-    run = fn args -> Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    run = fn args ->
+      Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+    end
 
     assert {created, 0} =
              run.([
@@ -1543,7 +1568,9 @@ defmodule Tightbeam.CliIntegrationTest do
       }
     )
 
-    {auth, 1} = Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    {auth, 1} =
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
     assert auth =~ "auth_failed"
     refute auth =~ "incompatible_cli"
 
@@ -1560,7 +1587,9 @@ defmodule Tightbeam.CliIntegrationTest do
       }
     )
 
-    {network, 1} = Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    {network, 1} =
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
     refute network =~ "auth_failed"
     refute network =~ "incompatible_cli"
     assert network =~ "Connection refused" or network =~ "connection refused"
@@ -1603,7 +1632,10 @@ defmodule Tightbeam.CliIntegrationTest do
     [html, nested, truncated] =
       Enum.map(replies, fn _reply ->
         {output, status} =
-          Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+          Tightbeam.FixtureSession.cmd(ctx.binary, ["list"],
+            cd: ctx.workdir,
+            stderr_to_stdout: true
+          )
 
         assert status != 0, output
         output
@@ -1691,7 +1723,10 @@ defmodule Tightbeam.CliIntegrationTest do
     [undecodable, refusal, bare] =
       Enum.map(replies, fn _reply ->
         {output, status} =
-          Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+          Tightbeam.FixtureSession.cmd(ctx.binary, ["list"],
+            cd: ctx.workdir,
+            stderr_to_stdout: true
+          )
 
         assert status != 0, output
         refute output =~ "SENTINEL"
@@ -1771,7 +1806,9 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     {output, status} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-create", "--title", "crash", "--as-user", "flynn"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "crash", "--as-user", "flynn"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -1921,7 +1958,9 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "real CLI discovers a session token, dispatches, and loses access at retire", ctx do
-    {listed, 0} = Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    {listed, 0} =
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
     assert listed =~ "cli-holder"
     assert_receive {:cli_call, %{origin: "agent:cli-holder", principal: {:session, "cli-holder"}}}
 
@@ -1959,7 +1998,10 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{origin: "agent:cli-holder", principal: {:session, "cli-holder"}}}
 
     Org.retire(ctx.db, ctx.session.session_key, "user:flynn", 1_000)
-    {refused, 1} = Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
+    {refused, 1} =
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
     assert refused =~ "auth_failed"
   end
 
@@ -2146,7 +2188,9 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {attested, 0} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["attest", assignment_id, "--kind", "completion", "--note", "ready"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["attest", assignment_id, "--kind", "completion", "--note", "ready"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -2193,7 +2237,9 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {revoked, 0} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["revoke-assignment", dispatch_id, "--reason", "CLI disposition"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["revoke-assignment", dispatch_id, "--reason", "CLI disposition"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -2204,7 +2250,9 @@ defmodule Tightbeam.CliIntegrationTest do
                     %{verb: "revoke-assignment", params: %{assignment_id: ^dispatch_id}}}
 
     {listed, 0} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["assignments", "--session", "cli-worker", "--state", "all"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["assignments", "--session", "cli-worker", "--state", "all"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3249,7 +3297,9 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "work-item-get", params: %{work_item_id: ^work_item_id}}}
 
     {pairing, 1} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-create", "--title", "x", "--spec-ref", "spec.md"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "x", "--spec-ref", "spec.md"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3523,7 +3573,9 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call, %{verb: "work-item-create"}}
 
     {priority_only, 0} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-update", work_item_id, "--priority", "5"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--priority", "5"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3542,7 +3594,9 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {metadata_only, 0} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-update", work_item_id, "--title", "After"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--title", "After"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3593,7 +3647,9 @@ defmodule Tightbeam.CliIntegrationTest do
                     %{verb: "work-item-update", params: %{work_item_id: ^work_item_id}}}
 
     {cleared, 0} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-update", work_item_id, "--clear-spec-ref"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--clear-spec-ref"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3612,7 +3668,9 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {incomplete, 1} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["work-item-update", work_item_id, "--spec-ref", "next.md"],
+      Tightbeam.FixtureSession.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--spec-ref", "next.md"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -3743,7 +3801,9 @@ defmodule Tightbeam.CliIntegrationTest do
           ["topline", "tl_probe", "--under", "wi_probe"],
           ["topline-placement-list", "--history"]
         ] do
-      {output, status} = Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      {output, status} =
+        Tightbeam.FixtureSession.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+
       assert status != 0
       assert output =~ "does not accept"
       refute_receive {:cli_call, _call}

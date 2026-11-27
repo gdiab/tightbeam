@@ -498,7 +498,9 @@ defmodule Tightbeam.LaunchIsolationLint do
         [fatal(file, meta, "privilege-raising launch of #{inspect(command)}")]
 
       is_binary(command) and Path.basename(command) in @shell_tools and is_list(args) ->
-        for arg <- args, is_binary(arg), String.match?(arg, privilege_word()),
+        for arg <- args,
+            is_binary(arg),
+            String.match?(arg, privilege_word()),
             do: fatal(file, meta, "privilege-raising tool inside a shell command string")
 
       is_list(args) and match?([first | _] when is_binary(first), args) and
