@@ -673,16 +673,23 @@ mod tests {
 
     #[test]
     fn test_root_bounds_the_default_without_changing_its_source_class() {
-        let root = PathBuf::from("/tmp/isolated");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_credential_root_{unique}"));
         let home = root.join("home");
+        let default = home.join(".tightbeam");
+        fs::create_dir_all(&default).unwrap();
         let env = |name: &str| match name {
             "TIGHTBEAM_TEST_ROOT" => Some(root.display().to_string()),
             _ => None,
         };
 
         let (base_dir, source) = resolve_gateway_base(&env, &home);
-        assert_eq!(base_dir, home.join(".tightbeam"));
+        assert_eq!(base_dir, default);
         assert_eq!(source, EndpointSource::Default);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

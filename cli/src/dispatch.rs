@@ -2229,14 +2229,19 @@ fn discover_session_from_bounded(
     cwd: &Path,
     test_root: Option<String>,
 ) -> Result<Option<Endpoint>, String> {
-    let test_root = test_root.map(PathBuf::from);
-
-    if test_root
-        .as_ref()
-        .is_some_and(|root| !cwd.starts_with(root))
-    {
-        return Ok(None);
-    }
+    let mut cwd = cwd.to_path_buf();
+    let test_root = match test_root.map(PathBuf::from) {
+        Some(root) => {
+            let Some((canonical_cwd, canonical_root)) =
+                crate::base_dir::canonical_dirs_within_test_root(&cwd, &root)
+            else {
+                return Ok(None);
+            };
+            cwd = canonical_cwd;
+            Some(canonical_root)
+        }
+        None => None,
+    };
 
     for directory in cwd.ancestors().take_while(|directory| {
         test_root
@@ -4319,14 +4324,19 @@ fn current_session_key_from_bounded(
     cwd: &Path,
     test_root: Option<String>,
 ) -> Result<String, String> {
-    let test_root = test_root.map(PathBuf::from);
-
-    if test_root
-        .as_ref()
-        .is_some_and(|root| !cwd.starts_with(root))
-    {
-        return Err("session identity unavailable outside the test root".to_owned());
-    }
+    let mut cwd = cwd.to_path_buf();
+    let test_root = match test_root.map(PathBuf::from) {
+        Some(root) => {
+            let Some((canonical_cwd, canonical_root)) =
+                crate::base_dir::canonical_dirs_within_test_root(&cwd, &root)
+            else {
+                return Err("session identity unavailable outside the test root".to_owned());
+            };
+            cwd = canonical_cwd;
+            Some(canonical_root)
+        }
+        None => None,
+    };
 
     for directory in cwd.ancestors().take_while(|directory| {
         test_root
@@ -7101,6 +7111,72 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_root_alias_bounds_both_session_marker_walks_by_canonical_directory() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!("tightbeam_cli_alias_bound_{unique}"));
+        let root = fixture.join("root");
+        let alias = fixture.join("root-alias");
+        let cwd = root.join("work");
+        let outside = fixture.join("outside");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&root, &alias).unwrap();
+        fs::write(
+            cwd.join(".tightbeam-session"),
+            r#"{"url":"https://fixture.invalid","token":"synthetic","sessionKey":"agent:test"}"#,
+        )
+        .unwrap();
+
+        let bound = Some(alias.display().to_string());
+        assert!(
+            discover_session_from_bounded(&cwd, bound.clone())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            current_session_key_from_bounded(&cwd, bound.clone()),
+            Ok("agent:test".to_owned())
+        );
+
+        for refused in [
+            outside.clone(),
+            fixture.join("root-evil"),
+            root.join("missing"),
+        ] {
+            if refused == fixture.join("root-evil") {
+                fs::create_dir_all(&refused).unwrap();
+            }
+            assert_eq!(
+                discover_session_from_bounded(&refused, bound.clone()),
+                Ok(None)
+            );
+            assert_eq!(
+                current_session_key_from_bounded(&refused, bound.clone()),
+                Err("session identity unavailable outside the test root".to_owned())
+            );
+        }
+
+        symlink(&outside, root.join("escape")).unwrap();
+        let escaped = root.join("escape");
+        assert_eq!(
+            discover_session_from_bounded(&escaped, bound.clone()),
+            Ok(None)
+        );
+        assert_eq!(
+            current_session_key_from_bounded(&escaped, bound),
+            Err("session identity unavailable outside the test root".to_owned())
+        );
+
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     // MIRROR of `a_satellite_url_written_as_a_websocket_scheme_dispatches_over_http`,

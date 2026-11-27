@@ -7,11 +7,9 @@ config :tightbeam, :escalation_decision_deadline_ms, 86_400_000
 # download while leaving ordinary production compilation unchanged.
 if test_root = System.get_env("TIGHTBEAM_TEST_ROOT") do
   home = System.fetch_env!("HOME")
-  expanded_root = Path.expand(test_root)
-  expanded_home = Path.expand(home)
+  Code.require_file("test_root_path.exs", __DIR__)
 
-  unless expanded_home == expanded_root or
-           String.starts_with?(expanded_home, expanded_root <> "/") do
+  unless Tightbeam.TestRootPath.existing_directory_within?(home, test_root) do
     raise "test isolation refuses a production build outside its synthetic home"
   end
 

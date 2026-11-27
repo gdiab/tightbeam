@@ -34,7 +34,28 @@
 //! was already `dispatch`'s. Treating empty as unset would be a third rule, and a
 //! rule the gateway does not share is the whole defect being fixed here.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+/// Canonicalize two existing directories and retain them only when `path` is
+/// the root itself or one of its descendants. `Path::starts_with` compares
+/// components, after `canonicalize` has resolved every alias and symlink.
+/// Missing, unreadable, non-directory, and escaping paths all refuse closed.
+pub(crate) fn canonical_dirs_within_test_root(
+    path: &Path,
+    root: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    let root = fs::canonicalize(root).ok()?;
+    let path = fs::canonicalize(path).ok()?;
+
+    if !root.is_dir() || !path.is_dir() || (path != root && !path.starts_with(&root)) {
+        return None;
+    }
+
+    Some((path, root))
+}
 
 /// Resolve `base_dir` from the process environment.
 pub fn resolve() -> PathBuf {
@@ -55,7 +76,9 @@ where
         .unwrap_or_else(|| default_in(home_dir));
 
     match get_env("TIGHTBEAM_TEST_ROOT").map(PathBuf::from) {
-        Some(root) if !selected.starts_with(&root) => root.join("refused-outside-test-root"),
+        Some(root) if canonical_dirs_within_test_root(&selected, &root).is_none() => {
+            root.join("refused-outside-test-root")
+        }
         _ => selected,
     }
 }
@@ -149,6 +172,68 @@ mod tests {
             ),
             PathBuf::from("/tmp/isolated/refused-outside-test-root")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_root_accepts_a_symlink_alias_of_the_same_physical_root() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!("tightbeam_test_root_alias_{unique}"));
+        let root = fixture.join("root");
+        let alias = fixture.join("root-alias");
+        let base = root.join("app");
+        std::fs::create_dir_all(&base).unwrap();
+        symlink(&root, &alias).unwrap();
+
+        let resolved = resolve_with(
+            &env(&[
+                ("TIGHTBEAM_BASE_DIR", base.to_str().unwrap()),
+                ("TIGHTBEAM_TEST_ROOT", alias.to_str().unwrap()),
+            ]),
+            Path::new("/home/someone"),
+        );
+
+        assert_eq!(resolved, base);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_root_canonical_containment_refuses_every_escape_and_unresolved_path() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!("tightbeam_test_root_edges_{unique}"));
+        let root = fixture.join("root");
+        let alias = fixture.join("root-alias");
+        let inside = root.join("inside");
+        let outside = fixture.join("outside");
+        let near_miss = fixture.join("root-evil");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&near_miss).unwrap();
+        symlink(&root, &alias).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        symlink(root.join("missing-target"), root.join("broken")).unwrap();
+
+        assert!(canonical_dirs_within_test_root(&inside, &alias).is_some());
+        assert!(canonical_dirs_within_test_root(&outside, &alias).is_none());
+        assert!(canonical_dirs_within_test_root(&near_miss, &root).is_none());
+        assert!(canonical_dirs_within_test_root(&root.join("missing"), &root).is_none());
+        assert!(canonical_dirs_within_test_root(&root.join("broken"), &root).is_none());
+        assert!(canonical_dirs_within_test_root(&root.join("escape"), &root).is_none());
+
+        std::fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
