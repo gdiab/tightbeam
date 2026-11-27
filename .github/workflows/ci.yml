@@ -209,8 +209,10 @@ jobs:
       # wi_34a7be66), so every crate, dev-dependencies included, is fetched here.
       - name: cargo fetch (suite prerequisite)
         if: env.FULL_SUITE == 'true'
-        working-directory: cli
-        run: cargo fetch
+        run: |
+          cargo fetch --manifest-path cli/Cargo.toml
+          cargo fetch --locked --manifest-path native/topline_unicode/Cargo.toml
+          cargo fetch --locked --manifest-path native/tightbeam_native/Cargo.toml
 
       # mix test AND cargo test, both inside scripts/test_sandbox.sh: neither may
       # run with the runner's real HOME, environment or PATH.

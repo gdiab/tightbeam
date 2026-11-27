@@ -249,7 +249,12 @@ class ExactHeadCI(unittest.TestCase):
         test_job = self.jobs['test']
         release_job = self.jobs['release']
         self.assertIn("if: env.FULL_SUITE == 'true'\n        run: scripts/verify_mix.sh", test_job)
-        self.assertIn("if: env.FULL_SUITE == 'true'\n        working-directory: cli\n        run: cargo test", test_job)
+        # F1 r3 L1b: cargo test runs inside scripts/verify_mix.sh, through the test
+        # sandbox, so the full Rust suite still gates packaging; its crates are
+        # fetched first because the sandbox runs cargo offline.
+        self.assertIn("if: env.FULL_SUITE == 'true'\n        run: |\n          cargo fetch --manifest-path cli/Cargo.toml", test_job)
+        verify = (WORKFLOW.parents[2] / 'scripts/verify_mix.sh').read_text()
+        self.assertIn('"$script_dir/test_sandbox.sh" cargo test --manifest-path cli/Cargo.toml', verify)
         self.assertIn('    needs: test', release_job)
 
     def test_docs_dispatch_is_hosted_read_only_and_subject_bound(self):

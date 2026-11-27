@@ -85,7 +85,6 @@ data shows whether the event path ever drops anything.
   (wi_34a7be66), so the suite and the Rust test guard refuse to run anywhere
   else, and nothing switches that off. The sandbox lives under your `TMPDIR`
   (or `/tmp`), so a `TMPDIR` inside a session tree also makes the run refuse.
-  Fetch crates first (`cargo fetch` in `cli/`): the sandbox runs cargo offline.
 - Tests launch processes only through `Tightbeam.TestIsolation` (Mix) or
   `test_isolation` (Rust), and run files outside `test/` only with
   `Tightbeam.TestIsolation.run_script!/3` and a literal path. The launch lints
@@ -101,6 +100,19 @@ data shows whether the event path ever drops anything.
 - The sandbox pins `TIGHTBEAM_PORT=0` and passes `TIGHTBEAM_GATE_NODE` only as
   the `tightbeam_mix_gate_` name `scripts/verify_mix.sh` makes for its run; the
   launcher and the preflight refuse anything else (b0, asg_b30d5c78).
+- No test launches a privilege-raising tool (`sudo`, `su`, `doas`, `pkexec`) or is
+  tagged, skipped or selected on `CI`, `GITHUB_ACTIONS`, a `RUNNER_*` variable or
+  a privilege probe; the launch lint refuses both and they cannot be
+  allowlisted. P5c's real-root evidence comes only from the dispatched hosted
+  `root-admin-evidence` workflow, which is not a merge gate (F1 erratum 1 rev 4).
+- The suite still runs with the invoking account's own privileges: on a hosted
+  runner that account has passwordless sudo, and on Sirius `gd` is
+  root-equivalent through docker and lxd. F1 keeps tests from using them; it does
+  not take them away.
+- The sandbox seeds only the Hex archive, the versioned rebar3, the elixir_make
+  cache and one Cargo home (copied registry and git caches, no credentials) from
+  the real home (F1 erratum 2 C15). Fetch every crate the run builds first,
+  including `native/*`: the sandbox runs cargo offline.
 - Make the requested change first, then run the focused checks that exercise it.
   Do not run a full-suite baseline before writing code; an untouched-tree replay
   delays the change without proving its result.
