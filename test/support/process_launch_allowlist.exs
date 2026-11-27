@@ -134,7 +134,7 @@ reviewer =
       "test session-connect composes explicit organization identity with automatic session identity",
     kind: "{:spawn_executable, _} port",
     reason:
-      "the spawn tuple this test hands to Tightbeam.FixtureSession.port_open/2, which runs the checks",
+      "runs assemble.sh inside a git-archive capture of HEAD in the sandbox, proving a clean-source package",
     reviewer: reviewer
   },
 
@@ -174,5 +174,25 @@ reviewer =
     reason:
       "runs assemble.sh inside a git-archive capture of HEAD in the sandbox, proving a clean-source package",
     reviewer: reviewer
+  },
+
+  # F1 erratum 2 (wi_34a7be66): the config-time launch and the suite-phase
+  # preflight child. Each awaits this subject's independent code review; the
+  # contract text that sanctions it is named.
+  %{
+    file: "config/test.exs",
+    function: "top level",
+    kind: "System.cmd",
+    reason:
+      "the repair's rustc --print sysroot query, the one launch under config/ (erratum 2 C6): a toolbox binary, no credential, before any test",
+    reviewer: "sanctioned by F1 erratum 2 C6 (PO-bound att_8a1bd48f); checked in this subject's code review"
+  },
+  %{
+    file: "test/test_isolation_test.exs",
+    function: "defp suite_preflight_child/2",
+    kind: "System.cmd",
+    reason:
+      "T7 (erratum 2 C2, C9): runs the suite-phase preflight in a child VM with one injected fault; same shape as preflight_child/3",
+    reviewer: "same shape as the reviewed preflight_child/3 entry; checked in this subject's code review"
   }
 ]

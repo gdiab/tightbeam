@@ -553,7 +553,7 @@ defmodule Tightbeam.CredentialHealthCliTest do
     stderr_path = capture <> ".stderr"
 
     {_shell_output, status} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         "/bin/sh",
         [
           "-c",

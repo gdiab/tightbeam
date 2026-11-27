@@ -844,7 +844,7 @@ defmodule Tightbeam.OperationalReceiptsTest do
 
   defp refs do
     repo = Path.expand("..", __DIR__)
-    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+    {commit, 0} = Tightbeam.TestIsolation.cmd("git", ["rev-parse", "HEAD"], cd: repo)
 
     [
       %{

@@ -27,7 +27,7 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     release_dir = Path.join(build_root, "tightbeam/release")
 
     {out, status} =
-      System.cmd(mix, ["release", "--overwrite", "--path", release_dir],
+      Tightbeam.TestIsolation.cmd(mix, ["release", "--overwrite", "--path", release_dir],
         env: [{"MIX_ENV", "prod"}, {"TIGHTBEAM_COOKIE_MODE", nil}],
         stderr_to_stdout: true
       )
@@ -71,7 +71,7 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
 
   defp run_eval(launcher, env \\ [{"RELEASE_COOKIE", nil}]) do
     expr = ~s{IO.puts("TBCOOKIE=" <> (System.get_env("RELEASE_COOKIE") || "nil"))}
-    System.cmd(launcher, ["eval", expr], env: env, stderr_to_stdout: true)
+    Tightbeam.TestIsolation.cmd(launcher, ["eval", expr], env: env, stderr_to_stdout: true)
   end
 
   # The cookie the REAL launcher resolves and exports, for the given child env.
@@ -189,7 +189,7 @@ defmodule Tightbeam.ReleaseCookieResolutionTest do
     """
 
     {out, status} =
-      System.cmd(ctx.launcher, ["eval", expr],
+      Tightbeam.TestIsolation.cmd(ctx.launcher, ["eval", expr],
         env: [{"RELEASE_COOKIE", nil}],
         stderr_to_stdout: true
       )

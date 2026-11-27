@@ -284,7 +284,7 @@ cursor_bundle_installed? =
       false
 
     launcher ->
-      case System.cmd("realpath", [launcher], stderr_to_stdout: true) do
+      case Tightbeam.TestIsolation.cmd("realpath", [launcher], stderr_to_stdout: true) do
         {canonical, 0} ->
           canonical
           |> String.trim()

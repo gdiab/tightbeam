@@ -2231,7 +2231,7 @@ defmodule Tightbeam.ModelCatalogTest do
         send(parent, {:probe, argv})
 
         if command == "sh" do
-          System.cmd(command, args,
+          Tightbeam.TestIsolation.cmd(command, args,
             env: [
               {"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")},
               {"CATALOG_BODY", body_path}
@@ -2281,7 +2281,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
       sh = fn [command | args] ->
         if command == "sh" do
-          System.cmd(command, args,
+          Tightbeam.TestIsolation.cmd(command, args,
             env: [{"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")}]
           )
         else

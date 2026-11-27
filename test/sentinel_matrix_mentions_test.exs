@@ -243,7 +243,7 @@ defmodule Tightbeam.SentinelMatrixMentionsTest do
     watcher = Path.expand("../priv/kungfu/sentinels/sentinels/matrix", __DIR__)
 
     {output, status} =
-      System.cmd(System.find_executable("python3"), [watcher],
+      Tightbeam.TestIsolation.cmd(System.find_executable("python3"), [watcher],
         stderr_to_stdout: true,
         env: [
           {"PATH", bin <> ":" <> System.get_env("PATH", "")},

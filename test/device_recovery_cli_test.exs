@@ -100,7 +100,7 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
 
     linger = Keyword.get(opts, :linger, 2)
 
-    System.cmd("sh", ["-c", tty_pipeline(command, input, delay, linger)],
+    Tightbeam.TestIsolation.cmd("sh", ["-c", tty_pipeline(command, input, delay, linger)],
       cd: cwd,
       env: env(ctx) ++ Keyword.get(opts, :env, []),
       stderr_to_stdout: true
@@ -179,7 +179,7 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     File.write!(secret_file, ctx.secret <> "\n")
 
     {output, status} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         "sh",
         ["-c", "#{@cli} recover-admin --user george < #{shell_quote(secret_file)}"],
         cd: ctx.base,
@@ -287,7 +287,7 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
         tty_pipeline("#{@cli} recover-admin --user george", ctx.secret, "0.2", 5)
 
       port =
-        Port.open({:spawn_executable, "/bin/sh"}, [
+        Tightbeam.TestIsolation.port_open({:spawn_executable, "/bin/sh"}, [
           :binary,
           :exit_status,
           args: ["-c", script],
@@ -300,8 +300,8 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
 
       Process.sleep(delay_ms)
       {:os_pid, pid} = Port.info(port, :os_pid)
-      System.cmd("pkill", ["-KILL", "-P", Integer.to_string(pid)])
-      System.cmd("kill", ["-KILL", Integer.to_string(pid)])
+      Tightbeam.TestIsolation.cmd("pkill", ["-KILL", "-P", Integer.to_string(pid)])
+      Tightbeam.TestIsolation.cmd("kill", ["-KILL", Integer.to_string(pid)])
       flush_port(port)
 
       # Atomic: either the whole recovery committed with its event, or nothing did.
@@ -412,7 +412,7 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
       command =
         "#{shell_quote(@cli)} recover-admin --user george; touch #{shell_quote(marker)}"
 
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         "sh",
         ["-c", tty_pipeline(command, "TBR-AAAAA-BBBBB-CCCCC-DDDDD", "0.15", "0.4")],
         cd: ctx.base,
@@ -535,7 +535,7 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-c", "(sleep 5) | #{script}"],
+        Tightbeam.TestIsolation.cmd("sh", ["-c", "(sleep 5) | #{script}"],
           cd: ctx.base,
           env: env(ctx),
           stderr_to_stdout: true
@@ -544,7 +544,7 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
 
     pid = await_pidfile(pidfile, 50)
     Process.sleep(1_000)
-    {_, 0} = System.cmd("kill", ["-#{signal}", pid])
+    {_, 0} = Tightbeam.TestIsolation.cmd("kill", ["-#{signal}", pid])
     {output, _status} = Task.await(task, 30_000)
     assert output =~ "Recovery secret for george:", output
 
@@ -590,7 +590,7 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     target = Path.expand("../cli/target/root-admin-seam", __DIR__)
 
     {out, status} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         cargo,
         [
           "build",
@@ -679,7 +679,7 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
 
     # (A5) Root with no controlling terminal: refused, and no gateway_host_actions row.
     {output, status} =
-      System.cmd(seam, ["root-admin", "pairing-code", "--user", "george"],
+      Tightbeam.TestIsolation.cmd(seam, ["root-admin", "pairing-code", "--user", "george"],
         cd: ctx.base,
         env: env(ctx) ++ hostile,
         stderr_to_stdout: true

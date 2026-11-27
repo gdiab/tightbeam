@@ -108,7 +108,7 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
     executable = System.find_executable("elixir")
 
     {capture, status} =
-      System.cmd(
+      Tightbeam.TestIsolation.cmd(
         executable,
         ["-S", "mix", "test", "--no-compile", "test/base_dir_test.exs"],
         env: [

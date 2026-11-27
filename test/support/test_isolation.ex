@@ -12,8 +12,9 @@ defmodule Tightbeam.TestIsolation do
   #          realpath is re-checked per call for any .tightbeam-session in its
   #          whole ancestry.
   #   env  - what the child would see (inherited plus declared) is validated:
-  #          PATH entries only the toolbox, the repository CLI build, or dirs in
-  #          the sandbox; bare tightbeam resolves to the repo build or a test
+  #          PATH entries only the toolbox, the repository CLI build, the
+  #          repository's fixture harness CLI (the repair's PATH, erratum 2 C3),
+  #          or dirs in the sandbox (the repair's tripwire and tool wrappers); bare tightbeam resolves to the repo build or a test
   #          fixture; TIGHTBEAM_URL loopback only; path-valued TIGHTBEAM_*, HOME
   #          and XDG_* inside the sandbox; TIGHTBEAM_TOKEN only beside such an
   #          endpoint. Variables a test inherited through System.put_env that
@@ -428,6 +429,7 @@ defmodule Tightbeam.TestIsolation do
 
     real == real_root(toolbox()) or
       inside?(real, Path.join(@repo, "cli/target")) or
+      real == real_root(Path.join(@repo, "priv/harness_cli")) or
       real in Enum.map(Preflight.vm_bin_dirs(), &real_root/1) or
       scratch?(real)
   end

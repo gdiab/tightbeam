@@ -173,7 +173,7 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
     env =
       Enum.map(plan.env, fn {k, v} -> {to_charlist(k), if(v, do: to_charlist(v), else: false)} end)
 
-    Port.open({:spawn_executable, plan.executable}, [
+    Tightbeam.TestIsolation.port_open({:spawn_executable, plan.executable}, [
       :binary,
       :exit_status,
       :stderr_to_stdout,
@@ -299,7 +299,7 @@ defmodule Tightbeam.DeviceLifecycleUserCreationTest do
       {^port, {:exit_status, status}} ->
         flunk("stalled migration exited #{status}:\n" <> File.read!(log))
     after
-      0 -> assert {_, 0} = System.cmd("kill", ["-KILL", os_pid])
+      0 -> assert {_, 0} = Tightbeam.TestIsolation.cmd("kill", ["-KILL", os_pid])
     end
 
     assert await_exit(port, log) != 0

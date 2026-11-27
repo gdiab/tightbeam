@@ -1628,7 +1628,7 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
     [legacy] = Enum.filter(HarnessProcess.list(ctx.db), &(&1.launch_id == launch_id))
-    {boot_identity, 0} = System.cmd(@helper, ["boot-identity"])
+    {boot_identity, 0} = Tightbeam.TestIsolation.cmd(@helper, ["boot-identity"])
 
     File.write!(
       legacy.identity_path,
@@ -1920,7 +1920,7 @@ defmodule Tightbeam.HarnessProcessFixture do
   end
 
   defp process_alive?(pid) when is_integer(pid) do
-    case System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+    case Tightbeam.TestIsolation.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
       {_, 0} -> true
       _ -> false
     end

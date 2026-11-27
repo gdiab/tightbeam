@@ -809,7 +809,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       {:os_pid, os_pid} = Port.info(:sys.get_state(Adapter.conn(adapter)).port, :os_pid)
       killed_at = System.monotonic_time(:millisecond)
-      {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(os_pid)])
+      {_, 0} = Tightbeam.TestIsolation.cmd("kill", ["-KILL", Integer.to_string(os_pid)])
 
       # Both are the transport-loss forms the gateway settles as harness_exited.
       assert {:error, reason} = Task.await(caller, 30_000)

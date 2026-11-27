@@ -71,7 +71,7 @@ defmodule Tightbeam.PackagingTest do
     launcher = Path.join(@repo_root, "packaging/tightbeam-gateway")
 
     {out, status} =
-      System.cmd("sh", ["-c", ~s(exec "$0" remote < /dev/null), launcher],
+      Tightbeam.TestIsolation.cmd("sh", ["-c", ~s(exec "$0" remote < /dev/null), launcher],
         env: [{"TIGHTBEAM_BASE_DIR", nil}, {"RELEASE_COOKIE", nil}],
         stderr_to_stdout: true
       )
@@ -256,7 +256,7 @@ defmodule Tightbeam.PackagingTest do
     final = temporary <> ".final.tgz"
 
     {output, status} =
-      System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
 
     assert status == 1, output
 

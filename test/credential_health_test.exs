@@ -34,7 +34,7 @@ defmodule Tightbeam.CredentialHealthTest do
 
     # The positive control's rail runs under containment, which refuses a write root
     # with a symlink component. macOS's temp dir sits beneath one (/var), so resolve it.
-    {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
+    {tmp, 0} = Tightbeam.TestIsolation.cmd("/bin/realpath", [System.tmp_dir!()])
     base_dir = Path.join(String.trim(tmp), "tightbeam-credential-health-#{suffix}")
 
     File.mkdir_p!(base_dir)
