@@ -172,10 +172,18 @@ defmodule Tightbeam.Acp.Conn do
     # env (which carries TIGHTBEAM_HOME/MACHINE/LINEAGE) win by coming last. A
     # spawned session must resolve its OWN instance, never the ambient one — the
     # RELEASE_NODE-wins vector that let a test teardown reach production.
+    #
+    # F2-5b (wi_34a7be66): an inherited TIGHTBEAM_URL goes too. A local agent is
+    # never given one, and beside its session file a lone URL would make the CLI
+    # refuse every call as an incomplete explicit endpoint. A remote agent's URL
+    # travels as an ssh argument, not through this environment. (TIGHTBEAM_TOKEN
+    # and TIGHTBEAM_BASE_DIR are production-identity names: this scrub removes them.)
     scrub =
       for {name, _value} <- System.get_env(),
           Tightbeam.ProductionIdentityEnv.production_identity?(name),
           do: {String.to_charlist(name), false}
+
+    scrub = [{~c"TIGHTBEAM_URL", false} | scrub]
 
     provided = Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
 

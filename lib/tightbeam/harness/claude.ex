@@ -124,7 +124,8 @@ defmodule Tightbeam.Harness.Claude do
       [
         cmd:
           ["ssh" | Support.ssh_opts()] ++
-            [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+            [target.host_config.ssh, "exec", "env" | Support.remote_env_unset()] ++
+            remote_env ++ [binary],
         env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
       ]
     end

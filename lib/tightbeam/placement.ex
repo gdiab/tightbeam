@@ -33,8 +33,9 @@ defmodule Tightbeam.Placement do
      {pi, "pi-session:" <> sessionKey, host}.
      - local: exactly the previous behavior (local binary path, local home
        from Homes.project, env in the local Port).
-     - remote: cmd is SSH-WRAPPED — ["ssh", dest, "exec", "env", "K=V"...,
-       binary] — because a remote process ignores the local Port env, ALL
+     - remote: cmd is SSH-WRAPPED — ["ssh", dest, "exec", "env", "-u",
+       "TIGHTBEAM_TOKEN", "-u", "TIGHTBEAM_BASE_DIR", "K=V"..., binary] (F2-5c)
+       — because a remote process ignores the local Port env, ALL
        agent env (harness home var, TIGHTBEAM_URL, PATH with the
        remote cli_bin) is embedded in the remote command line. The home var
        points at the REMOTE home path (remote base_dir). stderr_path stays
@@ -979,6 +980,26 @@ defmodule Tightbeam.Placement do
     end
   end
 
+  # F2-5e (wi_34a7be66): the write path refuses every name unreserved_env_name/1
+  # refuses, including every TIGHTBEAM_* name, but a row written before that rule, or
+  # by anything but the API, would still reach a spawned agent: a TIGHTBEAM_URL and
+  # TIGHTBEAM_TOKEN pair or a TIGHTBEAM_BASE_DIR there outranks the agent's own
+  # session file in CLI discovery. The read side drops such rows too, and logs each
+  # dropped name, never its value.
+  defp reserved_overlay_row?(%{name: name}, host, harness) do
+    case unreserved_env_name(name) do
+      :ok ->
+        false
+
+      {:error, _reason} ->
+        Logger.warning(
+          "dropping env overlay #{name} for #{harness}@#{host}: Tightbeam reserves it; it is never passed to an agent"
+        )
+
+        true
+    end
+  end
+
   defp unreserved_env_name(name) do
     credential_env_names = Enum.flat_map(Harness.all(), & &1.credential_env_vars())
 
@@ -1373,6 +1394,7 @@ defmodule Tightbeam.Placement do
       |> Map.get(:db, DB)
       |> env_overlays(host, module.wire_name())
       |> Enum.reject(&(&1.name == "GH_CONFIG_DIR"))
+      |> Enum.reject(&reserved_overlay_row?(&1, host, module.wire_name()))
       |> Enum.map(&{&1.name, &1.value})
 
     path = adapter_path(config, host_config)

@@ -200,6 +200,11 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert_receive {:catalog_probe, argv}
     serialized = Enum.join(argv, " ")
     assert serialized =~ "AGENT_CLI_CREDENTIAL_STORE=memory"
+    # F2-5c (wi_34a7be66) E3, cursor's string form: the -u options come right after
+    # env, before any assignment.
+    assert serialized =~
+             "exec env -u TIGHTBEAM_TOKEN -u TIGHTBEAM_BASE_DIR AGENT_CLI_CREDENTIAL_STORE=memory "
+
     assert serialized =~ "CURSOR_API_KEY=\"$(cat "
     assert serialized =~ "cursor-agent' --list-models"
     refute serialized =~ "secret"
