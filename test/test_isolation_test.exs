@@ -59,6 +59,14 @@ defmodule Tightbeam.TestIsolationTest do
   # A directory two levels below a .tightbeam-session that names the decoy.
   defp session_tree!(decoy, parent) do
     File.mkdir_p!(parent)
+
+    # PO N2 (att_8a1bd48f): the repair bounds the CLI's session discovery at
+    # TIGHTBEAM_TEST_ROOT, so a raw positive control finds a decoy only inside it.
+    if test_root = System.get_env("TIGHTBEAM_TEST_ROOT") do
+      assert TestSandboxPreflight.inside?(parent, test_root),
+             "decoy #{parent} must lie inside TIGHTBEAM_TEST_ROOT #{test_root}"
+    end
+
     session = Path.join(parent, ".tightbeam-session")
     File.write!(session, ~s({"url":"http://127.0.0.1:#{decoy.port}","token":"decoy-token"}))
     inner = Path.join([parent, "a", "b"])
@@ -153,13 +161,53 @@ defmodule Tightbeam.TestIsolationTest do
     assert accepts(decoy) >= 1, "positive control with the decoy HOME: #{output}"
   end
 
-  test "T5: PATH resolves tightbeam to this repository's build and no harness tool" do
-    assert TestSandboxPreflight.canonical(System.find_executable("tightbeam")) ==
-             TestSandboxPreflight.canonical(cli())
+  test "T5: bare tightbeam and every harness tool resolve to nothing installed" do
+    root = TestIsolation.sandbox_root()
+    test_root = System.get_env("TIGHTBEAM_TEST_ROOT")
+    tightbeam = System.find_executable("tightbeam")
+
+    # Erratum 2 C4: the repository's build or the repair's tripwire, never an
+    # installed CLI.
+    assert TestSandboxPreflight.canonical(tightbeam) == TestSandboxPreflight.canonical(cli()) or
+             TestSandboxPreflight.repair_tripwire?(tightbeam, root, test_root),
+           "tightbeam resolves to #{tightbeam}"
 
     for tool <- TestSandboxPreflight.forbidden_tools(),
         tool != "ssh",
-        do: assert(System.find_executable(tool) == nil, "#{tool} must not resolve")
+        found = System.find_executable(tool),
+        do:
+          assert(
+            TestSandboxPreflight.repair_tripwire?(found, root, test_root),
+            "#{tool} resolves to #{found}, not a tripwire"
+          )
+
+    # The suite's own tripwires log into the suite and fail it after the run, so
+    # the fail-closed behaviour is shown on a byte-identical copy logging here.
+    if TestSandboxPreflight.repair_tripwire?(tightbeam, root, test_root) do
+      copy_dir = scratch!("t5-tripwire")
+      log = Path.join(copy_dir, "forbidden-execution")
+      suite_log = Application.fetch_env!(:tightbeam, :test_tripwire_log)
+      quoted = fn path -> "'" <> String.replace(path, "'", "'\"'\"'") <> "'" end
+
+      File.write!(
+        Path.join(copy_dir, "tightbeam"),
+        String.replace(File.read!(tightbeam), quoted.(suite_log), quoted.(log))
+      )
+
+      File.chmod!(Path.join(copy_dir, "tightbeam"), 0o755)
+      decoy = decoy!()
+
+      {_output, status} =
+        TestIsolation.cmd("sh", ["-c", "tightbeam list"],
+          cd: scratch!("t5-cwd"),
+          env: [{"PATH", copy_dir <> ":" <> System.fetch_env!("PATH")}],
+          stderr_to_stdout: true
+        )
+
+      assert status == 97
+      assert File.read!(log) == "tightbeam\n"
+      assert accepts(decoy) == 0
+    end
 
     # ssh resolves only to the launcher's tripwire, which refuses every use.
     ssh = System.find_executable("ssh")
@@ -628,6 +676,150 @@ defmodule Tightbeam.TestIsolationTest do
       violations = LaunchIsolationLint.violations_in(sources, listed)
       assert Enum.count(violations, &(&1 =~ "runs at compile time")) == 2
       assert Enum.any?(violations, &(&1 =~ "stale"))
+    end
+  end
+
+  # Erratum 2 C2, C9: the suite variables and the marker after the repair's setup.
+  @suite_preflight_script ~S"""
+  [repo, recorded] = System.argv()
+  if recorded != "", do: :persistent_term.put({Tightbeam.TestSandboxPreflight, :sandbox_root}, recorded)
+  Tightbeam.TestSandboxPreflight.enforce!(repo, :suite)
+  IO.puts("PREFLIGHT-PASSED")
+  """
+
+  defp suite_preflight_child(env, recorded) do
+    paths = Enum.flat_map(:code.get_path(), &["-pa", to_string(&1)])
+    env = [{"HOME", scratch!("child-home")} | env]
+
+    System.cmd(
+      System.find_executable("elixir"),
+      paths ++ ["-e", @suite_preflight_script, TestIsolation.repo(), recorded],
+      cd: scratch!("t7-suite"),
+      env: env,
+      stderr_to_stdout: true
+    )
+  end
+
+  describe "T7 (erratum 2): the repair's suite variables and the marker's lifetime" do
+    test "a path-valued suite variable outside the sandbox is refused" do
+      for name <- ~w(TIGHTBEAM_TEST_ROOT TIGHTBEAM_BASE_DIR CODEX_HOME RUSTC) do
+        {output, 78} = preflight_child(scratch!("t7"), [{name, "/"}])
+        assert output =~ "#{name} / is outside the sandbox", name
+      end
+    end
+
+    test "after the scrub, the suite check needs the recorded marker, unchanged" do
+      root = TestIsolation.sandbox_root()
+      assert {output, 0} = suite_preflight_child([], root)
+      assert output =~ "PREFLIGHT-PASSED"
+
+      {output, 78} = suite_preflight_child([], "")
+      assert output =~ "the first sandbox check did not run"
+
+      {output, 78} = suite_preflight_child([], scratch!("other-root"))
+      assert output =~ "TIGHTBEAM_TEST_SANDBOX changed after the first check"
+
+      {output, 78} = suite_preflight_child([{"TIGHTBEAM_TEST_SANDBOX", nil}], root)
+      assert output =~ "TIGHTBEAM_TEST_SANDBOX is not set"
+    end
+  end
+
+  test "T15: a sudo stand-in on PATH is refused, naming it" do
+    bin = scratch!("t15-bin")
+    File.write!(Path.join(bin, "sudo"), "#!/bin/sh\nexit 0\n")
+    File.chmod!(Path.join(bin, "sudo"), 0o755)
+
+    {output, 78} =
+      preflight_child(scratch!("t15"), [{"PATH", bin <> ":" <> System.fetch_env!("PATH")}])
+
+    assert output =~ "sudo resolves to"
+
+    # Positive control: the same child without the stand-in passes.
+    assert {output, 0} = preflight_child(scratch!("t15-base"), [])
+    assert output =~ "PREFLIGHT-PASSED"
+  end
+
+  test "T17: the release CLI refuses root-admin to a non-root account, whatever its environment" do
+    # GITHUB_* is a credential prefix the helper never passes, so CI stands in for
+    # the runner-identity variables.
+    hostile = [{"SUDO_USER", "george"}, {"CI", "true"}, {"RUNNER_OS", "Linux"}]
+
+    {output, status} =
+      TestIsolation.cmd(cli(), ["root-admin", "pairing-code", "--user", "george"],
+        cd: scratch!("t17"),
+        env: hostile,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert output =~ "needs root"
+    refute File.read!(cli()) =~ "tightbeam-root-admin-test-seam"
+  end
+
+  describe "T13 and T18 (erratum 1 rev 4): privilege launches and environment gates" do
+    test "T13: every privilege-raising launch shape fails and cannot be listed" do
+      source = ~S"""
+      defmodule PrivilegeTest do
+        use ExUnit.Case, async: true
+
+        test "escalates" do
+          System.cmd("sudo", ["-n", "true"])
+          System.cmd("/usr/bin/sudo", ["-n", "true"])
+          Tightbeam.TestIsolation.cmd("sh", ["-c", "sudo -n true"])
+          prefix = ["sudo", "-n", "env"]
+          on_tty(:ctx, ["root-admin"], "", prefix: ["sudo", "-n"])
+          assert ["/usr/bin/sudo", "-n", "-H"] == argv()
+        end
+      end
+      """
+
+      violations = LaunchIsolationLint.violations_in(%{"test/privilege_test.exs" => source}, [])
+      assert Enum.any?(violations, &(&1 =~ ~s(privilege-raising launch of "sudo")))
+      assert Enum.any?(violations, &(&1 =~ ~s(privilege-raising launch of "/usr/bin/sudo")))
+      assert Enum.any?(violations, &(&1 =~ "inside a shell command string"))
+      assert Enum.any?(violations, &(&1 =~ "argument vector bound to prefix"))
+      assert Enum.any?(violations, &(&1 =~ "as a launch prefix (prefix:)"))
+      refute Enum.any?(violations, &(&1 =~ "privilege_test.exs:10 "))
+
+      listed = [
+        %{
+          file: "test/privilege_test.exs",
+          function: :fatal,
+          kind: ~s(privilege-raising launch of "sudo"),
+          reason: "an attempt to list a privilege launch",
+          reviewer: "fixture"
+        }
+      ]
+
+      violations = LaunchIsolationLint.violations_in(%{"test/privilege_test.exs" => source}, listed)
+      assert Enum.any?(violations, &(&1 =~ ~s(privilege-raising launch of "sudo")))
+    end
+
+    test "T18: tags, skips and selection on CI or a privilege probe fail" do
+      source = ~S"""
+      defmodule GateTest do
+        use ExUnit.Case, async: true
+        @tag if(System.get_env("CI") == "true", do: [], else: [skip: "CI only"])
+        @moduletag skip: System.get_env("GITHUB_ACTIONS") == nil
+        @root_capable match?({_, 0}, System.cmd("sudo", ["-n", "true"]))
+
+        test "gated" do
+          ExUnit.configure(exclude: if(System.get_env("RUNNER_OS"), do: [], else: [:x]))
+          assert System.get_env("CI") in [nil, "true"]
+        end
+      end
+      """
+
+      violations = LaunchIsolationLint.violations_in(%{"test/gate_test.exs" => source}, [])
+      assert Enum.any?(violations, &(&1 =~ "module attribute @tag depends on CI"))
+      assert Enum.any?(violations, &(&1 =~ "module attribute @moduletag depends on GITHUB_ACTIONS"))
+      assert Enum.any?(violations, &(&1 =~ "module attribute @root_capable depends on a privilege probe"))
+      assert Enum.any?(violations, &(&1 =~ "ExUnit.configure options depends on RUNNER_OS"))
+      refute Enum.any?(violations, &(&1 =~ "gate_test.exs:9 "))
+    end
+
+    test "the real tree has no privilege launch or environment gate" do
+      assert LaunchIsolationLint.violations(TestIsolation.repo()) == []
     end
   end
 end

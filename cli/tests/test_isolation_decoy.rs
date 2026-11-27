@@ -3,7 +3,7 @@
 //! outside the sandbox. Every guarded case is paired with a raw launch of the same
 //! CLI that DOES reach the decoy, so a mis-wired decoy cannot pass vacuously. The
 //! only gateway anywhere here is a listener this test owns; it counts TCP accepts.
-#[path = "../src/test_isolation.rs"]
+#[path = "support/test_isolation.rs"]
 mod test_isolation;
 
 use std::io::Write;
@@ -214,4 +214,59 @@ fn t10_guard_refuses_outside_the_sandbox() {
         text.contains("TIGHTBEAM_TEST_SANDBOX is not set"),
         "the refusal names the missing sandbox: {text}"
     );
+}
+
+// F1 erratum 2 C9 (4): the isolation constructor reads the marker before its
+// scrub and aborts, naming the reason, when it is missing or names no marker.
+#[test]
+fn t7_constructor_aborts_on_a_marker_without_its_file() {
+    test_isolation::guard();
+    let home = test_isolation::fresh_dir("marker-home");
+    let bogus = test_isolation::fresh_dir("no-marker");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "t10_guard_child_mode", "--nocapture"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("TIGHTBEAM_TEST_SANDBOX", &bogus)
+        .env("F1_GUARD_CHILD", "1")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(101), "the constructor aborts: {text}");
+    assert!(
+        text.contains("has no .tightbeam-test-sandbox marker"),
+        "the refusal names the missing marker: {text}"
+    );
+}
+
+// F1 erratum 2 C10: a re-exec carries only an established protocol and its
+// declared controls.
+#[test]
+fn t7_reexec_refuses_an_unknown_protocol_or_an_undeclared_control() {
+    let unknown = std::panic::catch_unwind(|| {
+        test_isolation::reexec("some_module::tests::not_a_protocol", &[])
+    });
+    assert!(unknown.is_err(), "an unknown protocol is refused");
+
+    let undeclared = std::panic::catch_unwind(|| {
+        test_isolation::reexec(
+            "child_process::tests::anything",
+            &[("TIGHTBEAM_URL", std::ffi::OsStr::new("http://127.0.0.1:1"))],
+        )
+    });
+    assert!(undeclared.is_err(), "an undeclared control is refused");
+
+    let declared = test_isolation::reexec(
+        "child_process::tests::anything",
+        &[("TIGHTBEAM_ISOLATED_ANYTHING", std::ffi::OsStr::new("1"))],
+    );
+    let envs: Vec<_> = declared.get_envs().map(|(k, _)| k.to_owned()).collect();
+    assert!(envs.iter().any(|k| k == "TIGHTBEAM_ISOLATED_ANYTHING"));
+    assert!(envs.iter().any(|k| k == "TIGHTBEAM_RUST_TEST_PARENT_PID"));
+    assert!(!envs.iter().any(|k| k == "TIGHTBEAM_URL"));
 }
