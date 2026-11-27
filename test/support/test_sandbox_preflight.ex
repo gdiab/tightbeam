@@ -346,13 +346,85 @@ defmodule Tightbeam.TestSandboxPreflight do
     dir = is_binary(test_root) && Path.join(test_root, "tripwire-bin")
 
     is_binary(dir) and is_binary(root) and inside?(test_root, root) and
-      canonical(Path.dirname(path)) == canonical(dir) and
+      (canonical(Path.dirname(path)) == canonical(dir) or
+         enclosing_repair_dir?(Path.dirname(path), root, test_root)) and
       match?(
         {:ok, "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then" <> _},
         File.read(path)
       ) and
       String.ends_with?(File.read!(path), "\nexit 97\n")
   end
+
+  # Ruling art_1adf97db section 3 (erratum 2 C3): a nested MIX_ENV=test suite
+  # inherits its enclosing suite's repair directories on PATH. One is accepted
+  # only as `<A>/tripwire-bin` or `<A>/tool-bin` of an enclosing suite root A:
+  # a strict ancestor of this suite's test root, inside the sandbox root, of
+  # the repair's suite-root shape, holding exactly the repair's own files.
+  @suite_root_shape ~r/\Atightbeam-test-\d+-[A-Za-z0-9_-]+\z/
+  @tripwire_shape ~r/\A#!\/bin\/sh\nif \[ "\$#" = 1 \] && \[ "\$1" = --version \]; then printf 'synthetic 1\.0\\n'; exit 0; fi\nprintf '%s\\n' '([^'\n]+)' >> '((?:[^']|'"'"')+)'\nexit 97\n\z/
+  @tool_wrapper_shape ~r/\A#!\/bin\/sh\nexec '((?:[^']|'"'"')+)' "\$@"\n\z/
+
+  @doc "Whether `dir` is an enclosing suite's validated repair directory."
+  def enclosing_repair_dir?(dir, root, test_root) do
+    dir = canonical(dir)
+    suite = Path.dirname(dir)
+
+    is_binary(root) and is_binary(test_root) and inside?(test_root, root) and
+      Path.basename(dir) in ["tripwire-bin", "tool-bin"] and
+      suite != canonical(test_root) and suite != canonical(root) and
+      inside?(test_root, suite) and inside?(suite, root) and
+      Regex.match?(@suite_root_shape, Path.basename(suite)) and
+      repair_dir_contents?(Path.basename(dir), dir, suite)
+  end
+
+  defp repair_dir_contents?("tripwire-bin", dir, suite) do
+    log = canonical(Path.join(suite, "forbidden-execution"))
+
+    case File.ls(dir) do
+      {:ok, [_ | _] = names} ->
+        Enum.all?(names, fn name ->
+          path = Path.join(dir, name)
+
+          with {:ok, %File.Stat{type: :regular}} <- File.lstat(path),
+               {:ok, bytes} <- File.read(path),
+               [_, ^name, quoted_log] <- Regex.run(@tripwire_shape, bytes) do
+            canonical(unquote_sh(quoted_log)) == log
+          else
+            _ -> false
+          end
+        end)
+
+      _ ->
+        false
+    end
+  end
+
+  defp repair_dir_contents?("tool-bin", dir, _suite) do
+    case File.ls(dir) do
+      {:ok, names} ->
+        Enum.sort(names) == ~w(cargo rustc rustdoc) and
+          Enum.all?(names, fn name ->
+            path = Path.join(dir, name)
+
+            with {:ok, %File.Stat{type: :regular}} <- File.lstat(path),
+                 {:ok, bytes} <- File.read(path),
+                 [_, quoted_target] <- Regex.run(@tool_wrapper_shape, bytes),
+                 target = unquote_sh(quoted_target),
+                 true <- Path.basename(target) == name,
+                 {:ok, %File.Stat{type: :regular}} <- File.lstat(target) do
+              true
+            else
+              _ -> false
+            end
+          end)
+
+      _ ->
+        false
+    end
+  end
+
+  # The repair single-quotes paths for sh, writing ' as '"'"'.
+  defp unquote_sh(quoted), do: String.replace(quoted, "'\"'\"'", "'")
 
   defp path_problems(repo, root, path, test_root) do
     # Erratum 2 C3: the repair's own PATH additions are accepted besides the
@@ -371,6 +443,7 @@ defmodule Tightbeam.TestSandboxPreflight do
     outside =
       for entry <- entries,
           not Enum.any?(allowed, &(canonical(entry) == canonical(&1))),
+          not enclosing_repair_dir?(entry, root, test_root),
           do: "PATH entry #{entry} is not the sandbox toolbox or the repository CLI build"
 
     tightbeam =

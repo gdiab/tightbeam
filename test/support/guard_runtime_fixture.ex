@@ -58,7 +58,10 @@ defmodule Tightbeam.GuardRuntimeFixture do
           base
         ]
 
-    preserved_test_env = ["TIGHTBEAM_TEST_TRIPWIRE_LOG"]
+    # F1 (wi_34a7be66) erratum 2 C9 (1) and amended b0 att_124bee40: like the
+    # repair's other scrubs, this one exempts the sandbox marker, which is set
+    # below from this VM's own validated root, never from its environment.
+    preserved_test_env = ["TIGHTBEAM_TEST_TRIPWIRE_LOG", "TIGHTBEAM_TEST_SANDBOX"]
 
     env =
       System.get_env()
@@ -70,12 +73,12 @@ defmodule Tightbeam.GuardRuntimeFixture do
       |> Enum.map(&{&1, nil})
 
     inherited_test_env =
-      Enum.flat_map(preserved_test_env, fn name ->
+      Enum.flat_map(preserved_test_env -- ["TIGHTBEAM_TEST_SANDBOX"], fn name ->
         case System.get_env(name) do
           nil -> []
           value -> [{name, value}]
         end
-      end)
+      end) ++ [{"TIGHTBEAM_TEST_SANDBOX", Tightbeam.TestIsolation.sandbox_root()}]
 
     env =
       env ++

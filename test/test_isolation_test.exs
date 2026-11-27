@@ -239,8 +239,11 @@ defmodule Tightbeam.TestIsolationTest do
     assert TestSandboxPreflight.ssh_tripwire?(launcher_ssh, root)
     assert {_, 255} = TestIsolation.cmd(launcher_ssh, ["example.invalid"], stderr_to_stdout: true)
 
+    # Erratum 2 C4: bare tightbeam is the repair's tripwire, so a test that
+    # needs the repository CLI names it by its absolute path (ruling
+    # art_1adf97db section 4, class J).
     {output, status} =
-      TestIsolation.cmd("sh", ["-c", "tightbeam list --as-process f1-decoy"],
+      TestIsolation.cmd(cli(), ["list", "--as-process", "f1-decoy"],
         cd: scratch!("t5"),
         stderr_to_stdout: true
       )
@@ -942,5 +945,153 @@ defmodule Tightbeam.TestIsolationTest do
       end
 
     assert violations == [], "chmod with -- after the mode:\n" <> Enum.join(violations, "\n")
+  end
+
+  # Ruling art_1adf97db (amended b0 att_124bee40) section 2: a directory shaped
+  # like a launcher root, mode 0700 with the marker, to exercise the child's
+  # own validation of an inherited root. It is test data, never a run's root.
+  defp fake_root! do
+    root = TestSandboxPreflight.canonical(scratch!("g-root"))
+    File.chmod!(root, 0o700)
+    File.write!(Path.join(root, ".tightbeam-test-sandbox"), "")
+    File.mkdir_p!(Path.join(root, "home"))
+    root
+  end
+
+  # Section 3: an enclosing suite root holding the repair's tripwire-bin and
+  # tool-bin exactly as config/test.exs writes them.
+  defp enclosing_suite! do
+    suite =
+      Path.join(TestSandboxPreflight.canonical(scratch!("i-enclosing")), "tightbeam-test-1-abc")
+
+    log = Path.join(suite, "forbidden-execution")
+    quoted = "'" <> String.replace(log, "'", "'\"'\"'") <> "'"
+    File.mkdir_p!(Path.join(suite, "tripwire-bin"))
+
+    for name <- ~w(tightbeam ssh) do
+      File.write!(
+        Path.join([suite, "tripwire-bin", name]),
+        "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf 'synthetic 1.0\\n'; exit 0; fi\nprintf '%s\\n' '#{name}' >> #{quoted}\nexit 97\n"
+      )
+    end
+
+    targets = scratch!("i-toolchain")
+    File.mkdir_p!(Path.join(suite, "tool-bin"))
+
+    for name <- ~w(cargo rustc rustdoc) do
+      target = Path.join(targets, name)
+      File.write!(target, "")
+      File.write!(Path.join([suite, "tool-bin", name]), "#!/bin/sh\nexec '#{target}' \"$@\"\n")
+    end
+
+    nested = Path.join(suite, "tightbeam-test-2-def")
+    File.mkdir_p!(nested)
+    %{suite: suite, nested: nested}
+  end
+
+  describe "G and I (ruling art_1adf97db): child-root inheritance and nested suites" do
+    test "a fixture child validates the root its launcher passed down and launches under it" do
+      Tightbeam.GuardRuntimeFixture.run!(
+        scratch!("g-child"),
+        "sandbox_root_runtime.exs",
+        "sandbox-root: " <> TestIsolation.sandbox_root()
+      )
+    end
+
+    test "a launch may pass down only this VM's own sandbox root" do
+      error =
+        assert_raise TestIsolation.Refusal, fn ->
+          TestIsolation.cmd("true", [], env: [{"TIGHTBEAM_TEST_SANDBOX", fake_root!()}])
+        end
+
+      assert error.message =~ "is not this VM's sandbox root"
+    end
+
+    test "the child accepts an inherited root only with its identity, containment and cwd" do
+      root = fake_root!()
+      home = Path.join(root, "home")
+      env = %{"HOME" => home, "TIGHTBEAM_TEST_ROOT" => home}
+      check = &TestIsolation.check_inherited_root!/4
+
+      # (e) the repository root, exactly, or inside the root.
+      assert check.(root, env, TestIsolation.repo(), home) == root
+      assert check.(root, env, home, home) == root
+
+      refused = fn value, env, cwd, reason ->
+        error = assert_raise TestIsolation.Refusal, fn -> check.(value, env, cwd, home) end
+        assert error.message =~ reason
+      end
+
+      # (e) a repository subdirectory, or anywhere else, is not the repository root.
+      refused.(
+        root,
+        env,
+        Path.join(TestIsolation.repo(), "test"),
+        "nor is that the repository root"
+      )
+
+      refused.(root, env, scratch!("g-elsewhere"), "nor is that the repository root")
+
+      # (e) a session ancestor refuses even inside the root.
+      File.mkdir_p!(Path.join(root, "s/inner"))
+      File.write!(Path.join(root, "s/.tightbeam-session"), "{}")
+      refused.(root, env, Path.join(root, "s/inner"), "is in its ancestry")
+
+      # (d) containment of HOME and the suite paths.
+      refused.(root, %{env | "HOME" => scratch!("g-home")}, home, "does not contain HOME")
+
+      refused.(
+        root,
+        %{env | "TIGHTBEAM_TEST_ROOT" => scratch!("g-test-root")},
+        home,
+        "does not contain TIGHTBEAM_TEST_ROOT"
+      )
+
+      # (a) a symlinked path to the root.
+      link = Path.join(scratch!("g-link"), "root")
+      File.ln_s!(root, link)
+      refused.(link, env, home, "is not a canonical absolute path")
+
+      # (b) writable by group or others.
+      File.chmod!(root, 0o770)
+      refused.(root, env, home, "writable by group or others")
+      File.chmod!(root, 0o700)
+
+      # (c) no marker.
+      File.rm!(Path.join(root, ".tightbeam-test-sandbox"))
+      refused.(root, env, home, "has no regular sandbox marker")
+    end
+
+    test "a nested suite accepts only an enclosing suite's validated repair directories" do
+      root = TestIsolation.sandbox_root()
+      %{suite: suite, nested: nested} = enclosing_suite!()
+      tripwires = Path.join(suite, "tripwire-bin")
+      tools = Path.join(suite, "tool-bin")
+
+      assert TestSandboxPreflight.enclosing_repair_dir?(tripwires, root, nested)
+      assert TestSandboxPreflight.enclosing_repair_dir?(tools, root, nested)
+      assert TestSandboxPreflight.repair_tripwire?(Path.join(tripwires, "ssh"), root, nested)
+
+      # Not a strict ancestor of the nested suite's test root.
+      refute TestSandboxPreflight.enclosing_repair_dir?(tripwires, root, suite)
+      refute TestSandboxPreflight.enclosing_repair_dir?(tripwires, root, scratch!("i-other"))
+
+      # Not of the repair's suite-root shape.
+      odd = Path.join(scratch!("i-odd"), "not-a-suite")
+      File.cp_r!(suite, odd)
+
+      refute TestSandboxPreflight.enclosing_repair_dir?(
+               Path.join(odd, "tripwire-bin"),
+               root,
+               Path.join(odd, "tightbeam-test-2-def")
+             )
+
+      # A tampered tripwire, or anything extra beside the tool wrappers.
+      File.write!(Path.join(tools, "extra"), "")
+      refute TestSandboxPreflight.enclosing_repair_dir?(tools, root, nested)
+      File.write!(Path.join(tripwires, "ssh"), "#!/bin/sh\nexec ssh \"$@\"\n")
+      refute TestSandboxPreflight.enclosing_repair_dir?(tripwires, root, nested)
+      refute TestSandboxPreflight.repair_tripwire?(Path.join(tripwires, "ssh"), root, nested)
+    end
   end
 end

@@ -40,22 +40,106 @@ defmodule Tightbeam.TestIsolation do
   @doc """
   The sandbox root. The suite VM uses only what its preflight recorded. A
   child VM (which runs no preflight, and whose environment library code may
-  have scrubbed) may locate it only from its own HOME: HOME must be
-  `<root>/home` with the sandbox marker at `<root>`. Nothing else is walked.
+  have scrubbed) finds it in one of two ways (b0 att_124bee40 as amended by
+  att_2963ce66; ruling art_1adf97db section 2):
+
+    * from an inherited TIGHTBEAM_TEST_SANDBOX, which its launcher set to its
+      own validated root and which this VM validates itself before trusting
+      it (see inherited_root!/1); once the variable is present there is no
+      other route;
+    * otherwise from its own HOME: HOME must be `<root>/home` with the sandbox
+      marker at `<root>`.
+
+  Nothing else is walked.
   """
   def sandbox_root do
-    case Preflight.recorded_root() do
-      root when is_binary(root) ->
-        root
+    with nil <- Preflight.recorded_root(),
+         nil <- :persistent_term.get({__MODULE__, :inherited_root}, nil) do
+      case System.get_env("TIGHTBEAM_TEST_SANDBOX") do
+        value when is_binary(value) and value != "" ->
+          root = inherited_root!(value)
+          :persistent_term.put({__MODULE__, :inherited_root}, root)
+          root
 
-      nil ->
-        home = System.get_env("HOME")
-        root = home && Path.dirname(home)
+        _ ->
+          home = System.get_env("HOME")
+          root = home && Path.dirname(home)
 
-        if is_binary(home) and Path.basename(home) == "home" and
-             File.regular?(Path.join(root, ".tightbeam-test-sandbox")),
-           do: root,
-           else: refuse!("no test sandbox found; tests run only inside scripts/test_sandbox.sh")
+          if is_binary(home) and Path.basename(home) == "home" and
+               File.regular?(Path.join(root, ".tightbeam-test-sandbox")),
+             do: root,
+             else: refuse!("no test sandbox found; tests run only inside scripts/test_sandbox.sh")
+      end
+    end
+  end
+
+  # The child's own check of the root its launcher passed down.
+  defp inherited_root!(value) do
+    check_inherited_root!(value, System.get_env(), File.cwd!(), System.user_home!())
+  end
+
+  @doc """
+  Validate `value` as a sandbox root a launcher passed down (ruling
+  art_1adf97db section 2.3), for a VM whose environment is `env`, whose cwd is
+  `cwd` and whose VM home is `user_home`; return it or raise naming why:
+  (a) canonical; (b) a directory this uid owns that group and others cannot
+  write; (c) a regular marker this uid owns; (d) HOME, the VM home and the
+  suite paths lie inside it; (e) the cwd lies inside it or is exactly the
+  repository root, with no session ancestor.
+  """
+  def check_inherited_root!(value, env, cwd, user_home) do
+    refuse = fn why -> refuse!("inherited TIGHTBEAM_TEST_SANDBOX=#{value} " <> why) end
+
+    unless Path.type(value) == :absolute and Preflight.canonical(value) == value,
+      do: refuse.("is not a canonical absolute path")
+
+    contained =
+      [{"HOME", env["HOME"]}, {"the VM home", user_home}] ++
+        for name <- ~w(TIGHTBEAM_TEST_ROOT TIGHTBEAM_BASE_DIR TIGHTBEAM_HOME TMPDIR),
+            path = env[name],
+            do: {name, path}
+
+    for {name, path} <- contained,
+        not (is_binary(path) and Preflight.inside?(path, value)),
+        do: refuse.("does not contain #{name} #{inspect(path)}")
+
+    cwd = Preflight.canonical(cwd)
+
+    unless Preflight.inside?(cwd, value) or cwd == Preflight.canonical(@repo),
+      do: refuse.("contains neither this VM's cwd #{cwd} nor is that the repository root")
+
+    if found = Preflight.session_ancestor(cwd),
+      do: refuse.("cannot be used from #{cwd}: #{found} is in its ancestry")
+
+    # Only now, with TMPDIR shown to lie inside the root, does the uid probe
+    # write there.
+    uid = own_uid!()
+
+    case File.lstat(value) do
+      {:ok, %File.Stat{type: :directory, uid: ^uid, mode: mode}} ->
+        if Bitwise.band(mode, 0o022) != 0, do: refuse.("is writable by group or others")
+
+      _ ->
+        refuse.("is not a directory owned by this user")
+    end
+
+    case File.lstat(Path.join(value, ".tightbeam-test-sandbox")) do
+      {:ok, %File.Stat{type: :regular, uid: ^uid}} -> :ok
+      _ -> refuse.("has no regular sandbox marker owned by this user")
+    end
+
+    value
+  end
+
+  # The BEAM has no getuid; the owner of a file this VM just created is its uid.
+  defp own_uid! do
+    probe = Path.join(System.tmp_dir!(), ".tightbeam-uid-#{System.unique_integer([:positive])}")
+    :ok = File.write(probe, "", [:exclusive])
+
+    try do
+      File.lstat!(probe).uid
+    after
+      File.rm(probe)
     end
   end
 
@@ -306,6 +390,14 @@ defmodule Tightbeam.TestIsolation do
   defp check_var("HOME", value, _env, _inherited?), do: sandbox_path("HOME", value)
 
   defp check_var("XDG_" <> _ = key, value, _env, _inherited?), do: sandbox_path(key, value)
+
+  # A child is only ever handed this VM's own validated root (amended b0
+  # att_124bee40, art_1adf97db section 2.2).
+  defp check_var("TIGHTBEAM_TEST_SANDBOX", value, _env, _inherited?) do
+    if value == sandbox_root(),
+      do: [],
+      else: ["TIGHTBEAM_TEST_SANDBOX=#{value} is not this VM's sandbox root #{sandbox_root()}"]
+  end
 
   defp check_var("TIGHTBEAM_URL", value, _env, _inherited?) do
     if loopback?(value), do: [], else: ["TIGHTBEAM_URL #{value} is not a loopback address"]

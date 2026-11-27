@@ -100,7 +100,11 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
 
     linger = Keyword.get(opts, :linger, 2)
 
-    Tightbeam.TestIsolation.cmd("sh", ["-c", tty_pipeline(command, input, delay, linger)],
+    # The P4 and P5c refusals run from inside a fixture session directory, so the
+    # launch goes through Tightbeam.FixtureSession (F1 wi_34a7be66, ruling
+    # art_1adf97db section 4, class H); with no session ancestor it applies
+    # Tightbeam.TestIsolation's checks.
+    Tightbeam.FixtureSession.cmd("sh", ["-c", tty_pipeline(command, input, delay, linger)],
       cd: cwd,
       env: env(ctx) ++ Keyword.get(opts, :env, []),
       stderr_to_stdout: true
@@ -161,9 +165,9 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     session_dir = Path.join(ctx.base, "session")
     File.mkdir_p!(Path.join(session_dir, "inner"))
 
-    File.write!(
+    Tightbeam.FixtureSession.write!(
       Path.join(session_dir, ".tightbeam-session"),
-      ~s({"url":"http://127.0.0.1:1","token":"x"})
+      %{url: "http://127.0.0.1:1", token: "x"}
     )
 
     {output, status} =
@@ -666,9 +670,9 @@ defmodule Tightbeam.DeviceRecoveryCliTest do
     session_dir = Path.join(ctx.base, "session")
     File.mkdir_p!(session_dir)
 
-    File.write!(
+    Tightbeam.FixtureSession.write!(
       Path.join(session_dir, ".tightbeam-session"),
-      ~s({"url":"http://127.0.0.1:1","token":"x"})
+      %{url: "http://127.0.0.1:1", token: "x"}
     )
 
     {output, status} = root_admin(ctx, seam, "pairing-code", cwd: session_dir, env: hostile)
