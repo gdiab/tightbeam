@@ -1,9 +1,9 @@
 defmodule Tightbeam.TestRootPath do
   @moduledoc false
 
-  # Both paths must already exist as directories. Resolve every link before
-  # comparing path components so an alias of the root is accepted while a link
-  # that leaves it, a sibling prefix, or an unresolved path refuses closed.
+  # Both paths must already exist as directories. Resolve components in filesystem
+  # order so `..` follows the physical parent of any preceding link. Comparing the
+  # resulting components accepts a root alias while every escape refuses closed.
   def existing_directory_within?(path, root) when is_binary(path) and is_binary(root) do
     with {:ok, canonical_path} <- canonical_existing(path),
          {:ok, canonical_root} <- canonical_existing(root),
@@ -17,28 +17,47 @@ defmodule Tightbeam.TestRootPath do
     end
   end
 
-  defp canonical_existing(path, links_left \\ 40)
-  defp canonical_existing(_path, 0), do: {:error, :excessive_links}
-  defp canonical_existing("/", _links_left), do: {:ok, "/"}
+  defp canonical_existing(path) do
+    case Path.split(path) do
+      ["/" | components] -> resolve_components("/", components, 40)
+      _ -> {:error, :not_absolute}
+    end
+  end
 
-  defp canonical_existing(path, links_left) do
-    expanded = Path.expand(path)
+  defp resolve_components(current, [], _links_left), do: {:ok, current}
 
-    with {:ok, parent} <- canonical_existing(Path.dirname(expanded), links_left) do
-      candidate = Path.join(parent, Path.basename(expanded))
+  defp resolve_components(current, ["." | rest], links_left),
+    do: resolve_components(current, rest, links_left)
 
-      case File.lstat(candidate) do
-        {:ok, %{type: :symlink}} ->
-          with {:ok, target} <- File.read_link(candidate) do
-            canonical_existing(Path.expand(target, parent), links_left - 1)
+  defp resolve_components("/", [".." | rest], links_left),
+    do: resolve_components("/", rest, links_left)
+
+  defp resolve_components(current, [".." | rest], links_left),
+    do: resolve_components(Path.dirname(current), rest, links_left)
+
+  defp resolve_components(current, [component | rest], links_left) do
+    candidate = Path.join(current, component)
+
+    case File.lstat(candidate) do
+      {:ok, %{type: :symlink}} when links_left == 0 ->
+        {:error, :excessive_links}
+
+      {:ok, %{type: :symlink}} ->
+        with {:ok, target} <- File.read_link(candidate) do
+          case Path.split(target) do
+            ["/" | target_components] ->
+              resolve_components("/", target_components ++ rest, links_left - 1)
+
+            target_components ->
+              resolve_components(current, target_components ++ rest, links_left - 1)
           end
+        end
 
-        {:ok, _stat} ->
-          {:ok, candidate}
+      {:ok, _stat} ->
+        resolve_components(candidate, rest, links_left)
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 end

@@ -218,12 +218,14 @@ mod tests {
         let alias = fixture.join("root-alias");
         let inside = root.join("inside");
         let outside = fixture.join("outside");
+        let outside_deep = outside.join("deep");
         let near_miss = fixture.join("root-evil");
         std::fs::create_dir_all(&inside).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&outside_deep).unwrap();
         std::fs::create_dir_all(&near_miss).unwrap();
         symlink(&root, &alias).unwrap();
-        symlink(&outside, root.join("escape")).unwrap();
+        symlink(&outside_deep, root.join("escape")).unwrap();
+        symlink("escape/..", root.join("target-dotdot")).unwrap();
         symlink(root.join("missing-target"), root.join("broken")).unwrap();
 
         assert!(canonical_dirs_within_test_root(&inside, &alias).is_some());
@@ -232,6 +234,8 @@ mod tests {
         assert!(canonical_dirs_within_test_root(&root.join("missing"), &root).is_none());
         assert!(canonical_dirs_within_test_root(&root.join("broken"), &root).is_none());
         assert!(canonical_dirs_within_test_root(&root.join("escape"), &root).is_none());
+        assert!(canonical_dirs_within_test_root(&root.join("escape/.."), &root).is_none());
+        assert!(canonical_dirs_within_test_root(&root.join("target-dotdot"), &root).is_none());
 
         std::fs::remove_dir_all(fixture).unwrap();
     }

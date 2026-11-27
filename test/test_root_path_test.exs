@@ -14,10 +14,12 @@ defmodule Tightbeam.TestRootPathTest do
     near_miss = Path.join(tmp_dir, "root-evil")
 
     File.mkdir_p!(inside)
-    File.mkdir_p!(outside)
+    outside_deep = Path.join(outside, "deep")
+    File.mkdir_p!(outside_deep)
     File.mkdir_p!(near_miss)
     File.ln_s!(root, alias_path)
-    File.ln_s!(outside, Path.join(root, "escape"))
+    File.ln_s!(outside_deep, Path.join(root, "escape"))
+    File.ln_s!("escape/..", Path.join(root, "target-dotdot"))
     File.ln_s!(Path.join(root, "missing-target"), Path.join(root, "broken"))
 
     assert Tightbeam.TestRootPath.existing_directory_within?(inside, alias_path)
@@ -26,5 +28,15 @@ defmodule Tightbeam.TestRootPathTest do
     refute Tightbeam.TestRootPath.existing_directory_within?(Path.join(root, "missing"), root)
     refute Tightbeam.TestRootPath.existing_directory_within?(Path.join(root, "broken"), root)
     refute Tightbeam.TestRootPath.existing_directory_within?(Path.join(root, "escape"), root)
+
+    refute Tightbeam.TestRootPath.existing_directory_within?(
+             Path.join(root, "escape/.."),
+             root
+           )
+
+    refute Tightbeam.TestRootPath.existing_directory_within?(
+             Path.join(root, "target-dotdot"),
+             root
+           )
   end
 end
