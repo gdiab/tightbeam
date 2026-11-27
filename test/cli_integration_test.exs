@@ -1263,7 +1263,7 @@ defmodule Tightbeam.CliIntegrationTest do
     digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
     {recorded, 0} =
-      System.cmd(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "artifact-record",
@@ -1289,7 +1289,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert recorded["contentSha256"] == digest
 
     {fetched, 0} =
-      System.cmd(ctx.binary, ["artifact-content-fetch", recorded["artifactId"]],
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["artifact-content-fetch", recorded["artifactId"]],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -1310,7 +1310,7 @@ defmodule Tightbeam.CliIntegrationTest do
              File.read!(Path.join(ctx.workdir, relative_path))
 
     {output, status} =
-      System.cmd(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "artifact-record",
@@ -1336,7 +1336,7 @@ defmodule Tightbeam.CliIntegrationTest do
     File.write!(capture_path, "actual bytes")
 
     {output, status} =
-      System.cmd(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "artifact-record",
@@ -1361,7 +1361,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "artifact file capture refuses conflicting content before dispatch", ctx do
     {output, status} =
-      System.cmd(
+      Tightbeam.FixtureSession.cmd(
         ctx.binary,
         [
           "artifact-record",
@@ -1384,16 +1384,16 @@ defmodule Tightbeam.CliIntegrationTest do
     refute_receive {:cli_call, _call}, 50
   end
 
-  test "artifact file capture clearly refuses missing and unreadable paths before dispatch", ctx do
+  test "artifact file capture clearly refuses missing and unreadable paths before dispatch",
+       ctx do
     missing_path = Path.join(ctx.workdir, "missing.bin")
     unreadable_path = Path.join(ctx.workdir, "unreadable.bin")
     File.write!(unreadable_path, "unreadable bytes")
     File.chmod!(unreadable_path, 0o000)
 
     for path <- [missing_path, unreadable_path] do
-
       {output, status} =
-        System.cmd(
+        Tightbeam.FixtureSession.cmd(
           ctx.binary,
           [
             "artifact-record",
