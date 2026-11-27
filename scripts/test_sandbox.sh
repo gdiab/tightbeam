@@ -54,6 +54,8 @@ esac
 root=$(mktemp -d "${TMPDIR:-/tmp}/tightbeam-test-sandbox.XXXXXXXX")
 root=$(CDPATH= cd -- "$root" && pwd -P)
 cleanup() {
+  # Seeded Mix archives are read-only; make them removable first.
+  chmod -R u+w -- "$root" 2>/dev/null || :
   rm -rf -- "$root"
 }
 trap cleanup EXIT HUP INT TERM
@@ -64,7 +66,7 @@ fi
 
 : >"$root/.tightbeam-test-sandbox"
 mkdir -p "$root/home" "$root/xdg/config" "$root/xdg/data" "$root/xdg/state" \
-  "$root/xdg/cache" "$root/bin" "$root/tmp" "$root/mix" "$root/hex" "$root/cargo"
+  "$root/xdg/cache" "$root/bin" "$root/tmp" "$root/home/.mix" "$root/hex" "$root/cargo"
 
 # Toolbox: each entry is a real install, never a mise or rustup shim (a shim
 # needs the real HOME to dispatch). Resolution happens here, before the swap.
@@ -167,7 +169,8 @@ ln -s "$repo/cli/target/release/tightbeam" "$root/bin/tightbeam"
 [ -e "$repo/priv/harness_cli/fixture" ] &&
   ln -s "$repo/priv/harness_cli/fixture" "$root/bin/fixture"
 
-for forbidden in gh ssh scp sftp op codex claude cursor-agent pi harklight-agent; do
+for forbidden in gh ssh scp sftp op codex claude cursor-agent pi harklight-agent \
+  sudo su doas pkexec; do
   [ ! -e "$root/bin/$forbidden" ] || refuse "toolbox would expose $forbidden"
 done
 
@@ -190,26 +193,52 @@ cat >"$root/gitconfig" <<'GITCONFIG'
 	defaultBranch = main
 GITCONFIG
 
-# Mix needs its archives (hex) to load hex deps; copy them, never point at the
-# real ~/.mix or ~/.hex (hex can hold an API key). Deps are fetched and compiled
-# before the sandbox, so everything runs offline.
+# F1 erratum 2 C15: seed the sandbox home with read-only regular-file copies of
+# exactly the build material the suite's setup (config/test.exs) needs, and
+# nothing else from the real home: the Hex archive, the versioned rebar3 and the
+# elixir_make cache. Never ~/.hex (it can hold an API key), other Mix
+# configuration, provider or harness homes, or any credential file.
+copy_regular() {
+  # copy_regular <source> <target>: copy, then refuse any symlink in the copy.
+  mkdir -p "$(dirname -- "$2")"
+  cp -R -- "$1" "$2"
+  if [ -n "$(find "$2" -type l -print -quit)" ]; then
+    refuse "seeded build material $1 contains a symlink"
+  fi
+}
 real_mix_home=${MIX_HOME:-$real_home/.mix}
-if [ -d "$real_mix_home/archives" ]; then
-  cp -R "$real_mix_home/archives" "$root/mix/archives"
+for archive in "$real_mix_home"/archives/hex-*; do
+  [ -e "$archive" ] || continue
+  copy_regular "$archive" "$root/home/.mix/archives/$(basename -- "$archive")"
+  chmod -R a-w "$root/home/.mix/archives/$(basename -- "$archive")"
+done
+for rebar in "$real_mix_home"/elixir/*/rebar3; do
+  [ -f "$rebar" ] || continue
+  [ -L "$rebar" ] && refuse "rebar3 at $rebar is a symlink"
+  version_dir=$(basename -- "$(dirname -- "$rebar")")
+  mkdir -p "$root/home/.mix/elixir/$version_dir"
+  cp -- "$rebar" "$root/home/.mix/elixir/$version_dir/rebar3"
+done
+if [ -d "$real_home/.cache/elixir_make" ]; then
+  copy_regular "$real_home/.cache/elixir_make" "$root/home/.cache/elixir_make"
 fi
 
-# Cargo: no credentials.toml (the crates.io token lives at the CARGO_HOME root);
-# only the downloaded registry and git caches, used offline. Dependencies must
-# be fetched before the sandbox (`cargo fetch --manifest-path cli/Cargo.toml`).
+# One Cargo home per run, shared by the Mix suite and cargo test (C15): regular
+# file copies of the registry and git caches only (writable, since Cargo unpacks
+# sources and keeps its lock there; the real caches are never written), used
+# offline. It holds no
+# credentials.toml, credentials or config.toml. Every crate the run builds
+# (the CLI and each native extension) must already be in the caches: offline, a
+# missing crate refuses and nothing is fetched.
 real_cargo_home=${CARGO_HOME:-$real_home/.cargo}
 for cache in registry git; do
-  [ -d "$real_cargo_home/$cache" ] && ln -s "$real_cargo_home/$cache" "$root/cargo/$cache"
+  [ -d "$real_cargo_home/$cache" ] && copy_regular "$real_cargo_home/$cache" "$root/cargo/$cache"
 done
 
 # Smoke-run the toolchain under the sandbox environment; refuse if any fails.
 smoke() {
   if ! output=$(env -i HOME="$root/home" PATH="$root/bin:$repo/cli/target/release" \
-    LANG="${LANG:-C.UTF-8}" MIX_HOME="$root/mix" HEX_HOME="$root/hex" HEX_OFFLINE=1 \
+    LANG="${LANG:-C.UTF-8}" MIX_HOME="$root/home/.mix" HEX_HOME="$root/hex" HEX_OFFLINE=1 \
     CARGO_HOME="$root/cargo" CARGO_NET_OFFLINE=true TMPDIR="$root/tmp" \
     "$@" 2>&1); then
     printf '%s\n' "$output" | tail -20 >&2
@@ -271,7 +300,7 @@ env -i \
   TMPDIR="$root/tmp" \
   LANG="${LANG:-C.UTF-8}" \
   MIX_ENV="${MIX_ENV:-test}" \
-  MIX_HOME="$root/mix" \
+  MIX_HOME="$root/home/.mix" \
   HEX_HOME="$root/hex" \
   HEX_OFFLINE=1 \
   GIT_CONFIG_GLOBAL="$root/gitconfig" \
