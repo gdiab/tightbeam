@@ -12,6 +12,11 @@ defmodule Tightbeam.FixtureSession do
   # recorded for that file (the live gateway is on loopback too, so loopback
   # alone is not enough); then they apply the isolation helper's cwd and env
   # rules. A launch with no session ancestor goes to Tightbeam.TestIsolation.
+  #
+  # Such a launch does not inherit the suite's own TIGHTBEAM_BASE_DIR (the test
+  # setup's base): since F2 (wi_34a7be66) a set TIGHTBEAM_BASE_DIR is an explicit
+  # base that outranks the session file under test. A test that means an explicit
+  # base beside its session file declares one.
 
   alias Tightbeam.{TestIsolation, TestSandboxPreflight}
 
@@ -43,8 +48,15 @@ defmodule Tightbeam.FixtureSession do
       {session, cd} ->
         check!(session, cd)
         TestIsolation.executable!(command, cd)
-        TestIsolation.env!(Keyword.get(opts, :env, []))
-        System.cmd(command, args, opts)
+        declared = Keyword.get(opts, :env, [])
+        TestIsolation.env!(declared)
+
+        env =
+          if Enum.any?(declared, fn {key, _} -> to_string(key) == "TIGHTBEAM_BASE_DIR" end),
+            do: declared,
+            else: [{"TIGHTBEAM_BASE_DIR", nil} | declared]
+
+        System.cmd(command, args, Keyword.put(opts, :env, env))
     end
   end
 
@@ -66,7 +78,15 @@ defmodule Tightbeam.FixtureSession do
               do: {to_string(key), if(value in [false, nil], do: nil, else: to_string(value))}
 
         TestIsolation.env!(declared)
-        Port.open(name, opts)
+
+        env = with({:env, env} <- List.keyfind(opts, :env, 0), do: env) || []
+
+        env =
+          if Enum.any?(declared, fn {key, _} -> key == "TIGHTBEAM_BASE_DIR" end),
+            do: env,
+            else: [{~c"TIGHTBEAM_BASE_DIR", false} | env]
+
+        Port.open(name, List.keystore(opts, :env, 0, {:env, env}))
     end
   end
 

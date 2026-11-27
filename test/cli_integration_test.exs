@@ -209,10 +209,13 @@ defmodule Tightbeam.CliIntegrationTest do
     assert error =~ "organization credential requires exactly one of --as-user or --as-process"
     refute_received {:cli_call, _}
 
-    for {cwd, flags, origin, principal} <- [
-          {ctx.workdir, [], "agent:cli-holder", {:session, "cli-holder"}},
-          {ctx.outside, ["--as-user", "flynn"], "user:flynn", {:user, "flynn"}},
-          {ctx.outside, ["--as-process", "external-client"], "process:external-client",
+    # Automatic session identity is the workdir's session file with nothing
+    # explicit set: since F2 (wi_34a7be66) an explicit TIGHTBEAM_URL/TIGHTBEAM_TOKEN
+    # pair wins over an ambient session file, so that case passes no pair.
+    for {cwd, case_env, flags, origin, principal} <- [
+          {ctx.workdir, [], [], "agent:cli-holder", {:session, "cli-holder"}},
+          {ctx.outside, env, ["--as-user", "flynn"], "user:flynn", {:user, "flynn"}},
+          {ctx.outside, env, ["--as-process", "external-client"], "process:external-client",
            {:process, "external-client"}}
         ] do
       port =
@@ -224,7 +227,7 @@ defmodule Tightbeam.CliIntegrationTest do
           {:cd, cwd},
           {:args, args ++ flags},
           {:env,
-           Enum.map(env, fn {key, value} ->
+           Enum.map(case_env, fn {key, value} ->
              {String.to_charlist(key), String.to_charlist(value)}
            end)}
         ])
@@ -3441,21 +3444,24 @@ defmodule Tightbeam.CliIntegrationTest do
       JSON.encode!(%{port: ctx.port, cliToken: "tbc_cli_integration"})
     )
 
+    # The session identity is the workdir's session file with nothing explicit set:
+    # since F2 (wi_34a7be66) a set TIGHTBEAM_BASE_DIR would outrank it.
     calls = [
-      {ctx.workdir, [], "agent:cli-holder", {:session, "cli-holder"}},
-      {ctx.outside, ["--as-user", "fixture-user"], "user:fixture-user", {:user, "fixture-user"}},
-      {ctx.outside, ["--as-process", "fixture-process"], "process:fixture-process",
+      {ctx.workdir, nil, [], "agent:cli-holder", {:session, "cli-holder"}},
+      {ctx.outside, ctx.base_dir, ["--as-user", "fixture-user"], "user:fixture-user",
+       {:user, "fixture-user"}},
+      {ctx.outside, ctx.base_dir, ["--as-process", "fixture-process"], "process:fixture-process",
        {:process, "fixture-process"}}
     ]
 
-    for {cwd, flags, origin, principal} <- calls do
+    for {cwd, base_dir, flags, origin, principal} <- calls do
       {output, 0} =
         Tightbeam.FixtureSession.cmd(
           ctx.binary,
           ["harklight-retry", "--all"] ++ flags,
           cd: cwd,
           env: [
-            {"TIGHTBEAM_BASE_DIR", ctx.base_dir},
+            {"TIGHTBEAM_BASE_DIR", base_dir},
             {"TIGHTBEAM_URL", nil},
             {"TIGHTBEAM_TOKEN", nil}
           ],
