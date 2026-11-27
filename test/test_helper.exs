@@ -2,7 +2,7 @@
 # process launch or application start. It refuses unless scripts/test_sandbox.sh
 # built the sandbox this VM booted in, so no test can resolve a live gateway or a
 # real credential. There is deliberately no switch that skips it.
-Tightbeam.TestSandboxPreflight.enforce!(Path.expand("..", __DIR__))
+Tightbeam.TestSandboxPreflight.enforce!(Path.expand("..", __DIR__), :suite)
 
 # An authoritative run must come through scripts/verify_mix.sh.  Focused developer
 # runs (scripts/test_sandbox.sh mix test test/file.exs) do not set this marker.

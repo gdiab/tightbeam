@@ -20,9 +20,23 @@ defmodule Tightbeam.TestSandboxPreflight do
     TIGHTBEAM_AUTHORITATIVE_GATE TIGHTBEAM_GATE_NODE TIGHTBEAM_PORT
     DD36_DARWIN_DIAGNOSTIC_DIR RUNNER_TEMP CANDIDATE_SHA
     BINDIR EMU PROGNAME ROOTDIR PWD OLDPWD SHLVL _ __CF_USER_TEXT_ENCODING
+    TMP TEMP RUSTUP_HOME RUSTC RUSTDOC CODEX_HOME
+    TIGHTBEAM_TEST_ROOT TIGHTBEAM_BASE_DIR TIGHTBEAM_HOME TIGHTBEAM_TEST_TRIPWIRE_LOG
+    TIGHTBEAM_RUST_TEST_PARENT_PID
   )
 
-  @forbidden_tools ~w(gh ssh scp sftp op codex claude cursor-agent pi harklight-agent)
+  # F1 erratum 2 C2: the suite variables the repair's config/test.exs (and the
+  # Rust isolation constructor) set for themselves. Each is accepted only when it
+  # lies under the sandbox root.
+  @suite_paths ~w(
+    TMP TEMP RUSTUP_HOME RUSTC RUSTDOC CODEX_HOME CARGO_HOME XDG_CONFIG_HOME
+    GIT_CONFIG_GLOBAL TIGHTBEAM_TEST_ROOT TIGHTBEAM_BASE_DIR TIGHTBEAM_HOME
+    TIGHTBEAM_TEST_TRIPWIRE_LOG
+  )
+
+  # Erratum 1 rev 4 L2 (d) adds the privilege-raising tools.
+  @forbidden_tools ~w(gh ssh scp sftp op codex claude cursor-agent pi harklight-agent
+                      sudo su doas pkexec)
 
   # The node name scripts/verify_mix.sh makes for its own run: a fixed prefix
   # and mktemp's eight-character suffix. scripts/test_sandbox.sh refuses any
@@ -70,27 +84,35 @@ defmodule Tightbeam.TestSandboxPreflight do
   Every reason this VM is not inside a valid test sandbox, as strings. Empty
   means the suite may run. `repo` is the repository root.
   """
-  def problems(repo) do
+  #
+  # `phase` is `:first` for the first check in a VM (before the repair's
+  # config/test.exs has re-homed it), and `:suite` for the test_helper.exs check
+  # after that setup (F1 erratum 2 C7, C9).
+  def problems(repo, phase \\ :first) do
     env = System.get_env()
     root = env["TIGHTBEAM_TEST_SANDBOX"]
     home = env["HOME"]
 
-    sandbox_problems(root, home) ++
+    sandbox_problems(root, home, phase) ++
+      marker_problems(root, phase) ++
       session_problems(repo, home) ++
       env_problems(env) ++
+      suite_path_problems(env, root) ++
       passthrough_problems(env) ++
-      path_problems(repo, root, env["PATH"]) ++
+      path_problems(repo, root, env["PATH"], env["TIGHTBEAM_TEST_ROOT"]) ++
       home_problems(home)
   end
 
   @doc "Halt the VM with the named problems unless the sandbox is valid."
-  def enforce!(repo) do
-    case problems(repo) do
+  def enforce!(repo, phase \\ :first) do
+    case problems(repo, phase) do
       [] ->
-        :persistent_term.put(
-          {__MODULE__, :sandbox_root},
-          System.get_env("TIGHTBEAM_TEST_SANDBOX")
-        )
+        if phase == :first do
+          :persistent_term.put(
+            {__MODULE__, :sandbox_root},
+            System.get_env("TIGHTBEAM_TEST_SANDBOX")
+          )
+        end
 
         :ok
 
@@ -176,7 +198,7 @@ defmodule Tightbeam.TestSandboxPreflight do
     end)
   end
 
-  defp sandbox_problems(root, home) do
+  defp sandbox_problems(root, home, phase) do
     cond do
       not is_binary(root) or root == "" ->
         ["TIGHTBEAM_TEST_SANDBOX is not set (run through scripts/test_sandbox.sh)"]
@@ -188,15 +210,46 @@ defmodule Tightbeam.TestSandboxPreflight do
         user_home = System.user_home!()
 
         [
-          if(user_home != home,
+          # Erratum 2 C7: equality before the repair re-homes the VM; afterwards
+          # both homes must still lie in the sandbox.
+          if(phase == :first and user_home != home,
             do: "the VM's home #{user_home} is not $HOME #{inspect(home)}"
           ),
           if(not inside?(user_home, root),
             do: "the VM's home #{user_home} is outside the sandbox #{root}"
+          ),
+          if(phase == :suite and not (is_binary(home) and inside?(home, root)),
+            do: "$HOME #{inspect(home)} is outside the sandbox #{root}"
           )
         ]
         |> Enum.reject(&is_nil/1)
     end
+  end
+
+  # Erratum 2 C9 (3): after the repair's scrubs the marker must still be the one
+  # the first check validated and recorded.
+  defp marker_problems(_root, :first), do: []
+
+  defp marker_problems(root, :suite) do
+    case recorded_root() do
+      nil ->
+        ["the first sandbox check did not run in this VM (config/test.exs)"]
+
+      ^root ->
+        []
+
+      recorded ->
+        ["TIGHTBEAM_TEST_SANDBOX changed after the first check (was #{recorded})"]
+    end
+  end
+
+  # Erratum 2 C2: the repair's suite variables point inside the sandbox.
+  defp suite_path_problems(env, root) do
+    for name <- @suite_paths,
+        value = env[name],
+        is_binary(value),
+        not (is_binary(root) and inside?(value, root)),
+        do: "#{name} #{value} is outside the sandbox #{root}"
   end
 
   defp session_problems(repo, home) do
@@ -282,10 +335,31 @@ defmodule Tightbeam.TestSandboxPreflight do
     [Path.join(root, "bin"), erts]
   end
 
-  defp path_problems(repo, root, path) do
+  @doc """
+  Whether `path` is one of the repair's tripwires (config/test.exs): a file in
+  `<TIGHTBEAM_TEST_ROOT>/tripwire-bin` under the sandbox root that only logs its
+  name and exits 97. Erratum 2 C3, C4 accept it in place of `nil`.
+  """
+  def repair_tripwire?(path, root, test_root) do
+    dir = is_binary(test_root) && Path.join(test_root, "tripwire-bin")
+
+    is_binary(dir) and is_binary(root) and inside?(test_root, root) and
+      canonical(Path.dirname(path)) == canonical(dir) and
+      match?({:ok, "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then" <> _}, File.read(path)) and
+      String.ends_with?(File.read!(path), "\nexit 97\n")
+  end
+
+  defp path_problems(repo, root, path, test_root) do
+    # Erratum 2 C3: the repair's own PATH additions are accepted besides the
+    # toolbox and the repository CLI build.
+    repair_dirs =
+      if is_binary(test_root) and is_binary(root) and inside?(test_root, root),
+        do: [Path.join(test_root, "tripwire-bin"), Path.join(test_root, "tool-bin")],
+        else: []
+
     allowed =
       [Path.join(root || "/nonexistent", "bin"), Path.join(repo, "cli/target/release")] ++
-        vm_bin_dirs()
+        [Path.join(repo, "priv/harness_cli")] ++ repair_dirs ++ vm_bin_dirs()
 
     entries = String.split(path || "", ":", trim: true)
 
@@ -300,15 +374,19 @@ defmodule Tightbeam.TestSandboxPreflight do
           []
 
         found ->
-          if canonical(found) == canonical(Path.join(repo, "cli/target/release/tightbeam")),
-            do: [],
-            else: ["tightbeam resolves to #{found}, not this repository's build"]
+          # Erratum 2 C4: bare tightbeam never reaches an installed CLI; it is
+          # this repository's build or the repair's tripwire.
+          if canonical(found) == canonical(Path.join(repo, "cli/target/release/tightbeam")) or
+               repair_tripwire?(found, root, test_root),
+             do: [],
+             else: ["tightbeam resolves to #{found}, not this repository's build or a tripwire"]
       end
 
     exposed =
       for tool <- @forbidden_tools,
           found = System.find_executable(tool),
           not (tool == "ssh" and ssh_tripwire?(found, root)),
+          not repair_tripwire?(found, root, test_root),
           do: "#{tool} resolves to #{found}"
 
     outside ++ tightbeam ++ exposed

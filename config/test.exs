@@ -27,7 +27,10 @@ System.put_env("TMPDIR", suite_tmp)
 # shell that launched it. Keep every implicit home/base lookup inside the suite
 # root, and put fail-closed tripwires ahead of installed CLIs on PATH. Tripwires
 # record only the executable name: arguments may contain credentials.
+# F1 erratum 2 C9 (1): the scrub exempts exactly the launcher's sandbox marker,
+# which test_helper.exs re-checks after this setup.
 for name <- System.get_env() |> Map.keys(),
+    name != "TIGHTBEAM_TEST_SANDBOX",
     String.starts_with?(name, "TIGHTBEAM_") or
       String.starts_with?(name, "RELEASE_") or
       String.ends_with?(name, "_API_KEY") or
@@ -107,9 +110,22 @@ unless File.dir?(source_cargo_registry) do
   raise "test isolation requires an installed Cargo registry cache"
 end
 
-isolated_cargo_home = Path.join(home, ".cargo")
-File.mkdir_p!(isolated_cargo_home)
-copy_tool_dir!.(source_cargo_registry, Path.join(isolated_cargo_home, "registry"))
+# F1 erratum 2 C15: scripts/test_sandbox.sh provides one Cargo home per run, a
+# read-only regular-file copy of the registry and git caches under the sandbox.
+# Use it in place rather than copying it a second time; only a run outside the
+# launcher (which the preflight refuses) would fall through to a copy.
+sandbox_root = System.get_env("TIGHTBEAM_TEST_SANDBOX")
+
+isolated_cargo_home =
+  if is_binary(sandbox_root) and
+       String.starts_with?(Path.expand(source_cargo_home), Path.expand(sandbox_root) <> "/") do
+    Path.expand(source_cargo_home)
+  else
+    target = Path.join(home, ".cargo")
+    File.mkdir_p!(target)
+    copy_tool_dir!.(source_cargo_registry, Path.join(target, "registry"))
+    target
+  end
 
 # Nested test builds use the already-installed Rust toolchain directly. The
 # wrappers keep rustup and Cargo homes synthetic, and offline mode makes a

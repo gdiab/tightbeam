@@ -41,7 +41,9 @@ defmodule Tightbeam.LaunchIsolationLint do
       sources
       |> Enum.reject(fn {file, _} -> file == @isolation end)
       |> Enum.flat_map(fn {file, source} ->
-        launches(file, source) ++ script_executions(file, source)
+        launches(file, source) ++
+          script_executions(file, source) ++
+          privilege_launches(file, source) ++ environment_gates(file, source)
       end)
 
     keys = MapSet.new(allowlist, &{&1.file, &1.function, &1.kind})
@@ -90,8 +92,11 @@ defmodule Tightbeam.LaunchIsolationLint do
 
   @doc "The relative paths the lint parses, for `root`."
   def parse_set(root) do
+    # F1 erratum 2 C6 (and its N1): config evaluation runs before the preflight in
+    # test_helper.exs, so every config file joins the parse set.
     tests =
-      Path.wildcard(Path.join(root, "test/**/*.{ex,exs}"))
+      (Path.wildcard(Path.join(root, "test/**/*.{ex,exs}")) ++
+         Path.wildcard(Path.join(root, "config/*.exs")))
       |> Enum.map(&Path.relative_to(&1, root))
 
     follow(root, tests, MapSet.new(tests))
@@ -431,6 +436,142 @@ defmodule Tightbeam.LaunchIsolationLint do
       arg, acc -> walk(arg, ctx, acc)
     end)
   end
+
+  # F1 erratum 1 rev 4 L4: a privilege-raising launch can never be allowlisted:
+  # the tool as a launch's executable, as the first element of a prefix list
+  # handed to a launch or a launch helper (`prefix: ["sudo", ...]`), or as a word
+  # in a command string handed to a shell launch. An argument vector compared as
+  # data, or an executable name matched inside a test command runner, is not a
+  # launch.
+  @privilege_tools ~w(sudo su doas pkexec)
+  @shell_tools ~w(sh bash dash zsh)
+
+  @doc "Privilege-raising launches in one file (never allowlistable)."
+  def privilege_launches(file, source) do
+    case Code.string_to_quoted(source, file: file, columns: false) do
+      {:ok, ast} ->
+        {_ast, found} =
+          Macro.prewalk(ast, [], fn node, acc -> {node, privilege_node(node, file) ++ acc} end)
+
+        found
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  defp privilege_node({{:., meta, [module, fun]}, _, [command | rest]}, file) do
+    if launch_kind(module, fun) || match?({:__aliases__, _, [:Tightbeam, :TestIsolation]}, module) do
+      privilege_command(command, rest, meta, file)
+    else
+      prefix_option(rest, meta, file)
+    end
+  end
+
+  # A variable bound to an argument vector that starts with a privilege tool is a
+  # launch prefix in waiting (P5c's `sudo = ["sudo", "-n", ...]`).
+  defp privilege_node({:=, meta, [{var, _, ctx}, [first | _]]}, file)
+       when is_atom(var) and is_atom(ctx) and is_binary(first) do
+    if privilege_tool?(first),
+      do: [fatal(file, meta, "privilege-raising argument vector bound to #{var}")],
+      else: []
+  end
+
+  defp privilege_node({fun, meta, args}, file) when is_atom(fun) and is_list(args),
+    do: prefix_option(args, meta, file)
+
+  defp privilege_node(_node, _file), do: []
+
+  defp privilege_command(command, rest, meta, file) do
+    args = List.first(rest)
+
+    cond do
+      privilege_tool?(command) ->
+        [fatal(file, meta, "privilege-raising launch of #{inspect(command)}")]
+
+      is_binary(command) and Path.basename(command) in @shell_tools and is_list(args) ->
+        for arg <- args, is_binary(arg), String.match?(arg, privilege_word()),
+            do: fatal(file, meta, "privilege-raising tool inside a shell command string")
+
+      is_list(args) and match?([first | _] when is_binary(first), args) and
+          privilege_tool?(hd(args)) ->
+        [fatal(file, meta, "privilege-raising tool as a launched argument vector")]
+
+      true ->
+        prefix_option(rest, meta, file)
+    end
+  end
+
+  defp prefix_option(args, meta, file) do
+    for arg <- List.wrap(args),
+        is_list(arg),
+        {key, value} <- arg,
+        key in [:prefix, :wrapper, :exec_prefix],
+        match?([first | _] when is_binary(first), value),
+        privilege_tool?(hd(value)),
+        do: fatal(file, meta, "privilege-raising tool as a launch prefix (#{key}:)")
+  end
+
+  defp privilege_tool?(name) when is_binary(name), do: Path.basename(name) in @privilege_tools
+  defp privilege_tool?(_name), do: false
+
+  defp privilege_word, do: ~r/(^|[\s;&|(`'"])(?:\/usr\/bin\/|\/bin\/)?(sudo|su|doas|pkexec)(\s|$)/
+
+  # F1 erratum 1 rev 4 L4: no test is tagged, skipped, configured or selected on
+  # CI, GITHUB_ACTIONS, a RUNNER_* variable or a privilege probe. Such a gate
+  # silently drops coverage under the sandbox (it passes neither), so it is never
+  # allowlistable. Reads elsewhere (for example the authoritative-gate check in
+  # test_helper.exs) are not gates.
+  @doc "Environment or privilege gates in one file (never allowlistable)."
+  def environment_gates(file, source) do
+    case Code.string_to_quoted(source, file: file, columns: false) do
+      {:ok, ast} ->
+        {_ast, found} =
+          Macro.prewalk(ast, [], fn
+            {:@, meta, [{name, _, [value]}]} = node, acc when is_atom(name) ->
+              {node, gate_reads(value, meta, file, "module attribute @#{name}") ++ acc}
+
+            {{:., meta, [{:__aliases__, _, [:ExUnit]}, fun]}, _, args} = node, acc
+            when fun in [:start, :configure] ->
+              {node, gate_reads(args, meta, file, "ExUnit.#{fun} options") ++ acc}
+
+            node, acc ->
+              {node, acc}
+          end)
+
+        found
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  defp gate_reads(ast, meta, file, where) do
+    {_ast, found} =
+      Macro.prewalk(ast, [], fn
+        {{:., _, [{:__aliases__, _, [:System]}, fun]}, _, [name | _]} = node, acc
+        when fun in [:get_env, :fetch_env, :fetch_env!] and is_binary(name) ->
+          if gate_variable?(name),
+            do: {node, [fatal(file, meta, "#{where} depends on #{name}") | acc]},
+            else: {node, acc}
+
+        {{:., _, [module, fun]}, _, [command | _]} = node, acc ->
+          if launch_kind(module, fun) && privilege_tool?(command),
+            do: {node, [fatal(file, meta, "#{where} depends on a privilege probe") | acc]},
+            else: {node, acc}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    found
+  end
+
+  defp gate_variable?(name),
+    do: name in ["CI", "GITHUB_ACTIONS"] or String.starts_with?(name, "RUNNER_")
+
+  defp fatal(file, meta, kind),
+    do: %{file: file, line: Keyword.get(meta, :line, 0), kind: kind, function: :fatal}
 
   defp launch_kind({:__aliases__, _, [:System]}, :cmd), do: "System.cmd"
   defp launch_kind({:__aliases__, _, [:System]}, :shell), do: "System.shell"
