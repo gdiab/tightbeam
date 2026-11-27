@@ -89,7 +89,7 @@ defmodule Tightbeam.FixtureSession do
 
     url = session |> File.read!() |> JSON.decode!() |> Map.get("url")
 
-    unless is_binary(url) and URI.parse(url).host in ["127.0.0.1", "::1", "localhost"],
+    unless TestIsolation.loopback?(url),
       do: refuse!("#{session} names #{inspect(url)}, not a loopback address")
 
     unless is_binary(recorded) and url == recorded,

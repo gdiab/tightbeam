@@ -113,7 +113,10 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
         ["-S", "mix", "test", "--no-compile", "test/base_dir_test.exs"],
         env: [
           {"TIGHTBEAM_AUTHORITATIVE_GATE", "1"},
-          {"TIGHTBEAM_GATE_NODE", "tightbeam_mix_gate_deliberate_mismatch"}
+          # A name of the shape the sandbox preflight admits (b0 att_59831f46
+          # (2'); F1 art_b5ff92cd class F), so the claim reaches this repair
+          # check: the nested VM is unnamed, so its node never matches.
+          {"TIGHTBEAM_GATE_NODE", "tightbeam_mix_gate_Mismatch"}
         ],
         stderr_to_stdout: true
       )
@@ -131,7 +134,17 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
     refute Path.type(relative_home) == :absolute
     refute relative_home == ".." or String.starts_with?(relative_home, "../")
     assert [_ | _] = Path.wildcard(Path.join([home, ".mix", "archives", "hex-*"]))
-    assert File.dir?(Path.join([home, ".cargo", "registry"]))
+
+    # F1 erratum 2 C15: the run's one Cargo home is the launcher's <root>/cargo,
+    # used in place with no second copy under HOME (art_b5ff92cd class F).
+    cargo_home = System.fetch_env!("CARGO_HOME")
+
+    assert Tightbeam.TestSandboxPreflight.canonical(cargo_home) ==
+             Tightbeam.TestSandboxPreflight.canonical(
+               Path.join(Tightbeam.TestIsolation.sandbox_root(), "cargo")
+             )
+
+    assert File.dir?(Path.join(cargo_home, "registry"))
 
     tool_bin = Path.join(root, "tool-bin")
     assert Enum.all?(~w(cargo rustc rustdoc), &File.regular?(Path.join(tool_bin, &1)))
@@ -140,7 +153,9 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
           Path.wildcard(Path.join([home, ".mix", "**", "*"]), match_dot: true) ++
             Path.wildcard(Path.join([home, ".cache", "elixir_make", "**", "*"]),
               match_dot: true
-            ) ++ Path.wildcard(Path.join([home, ".cargo", "**", "*"]), match_dot: true) do
+            ) ++
+            Path.wildcard(Path.join([home, ".cargo", "**", "*"]), match_dot: true) ++
+            Path.wildcard(Path.join([cargo_home, "**", "*"]), match_dot: true) do
       refute File.lstat!(path).type == :symlink
     end
 
@@ -155,6 +170,10 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
           ".tightbeam-session"
         ] do
       refute File.exists?(Path.join(home, relative))
+    end
+
+    for name <- ~w(credentials credentials.toml config config.toml) do
+      refute File.exists?(Path.join(cargo_home, name))
     end
   end
 

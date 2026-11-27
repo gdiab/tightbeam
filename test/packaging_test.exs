@@ -256,7 +256,11 @@ defmodule Tightbeam.PackagingTest do
     final = temporary <> ".final.tgz"
 
     {output, status} =
-      Tightbeam.TestIsolation.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+      Tightbeam.TestIsolation.run_script!(
+        "packaging/finalize-artifact.sh",
+        [temporary, final, "0.1.6"],
+        stderr_to_stdout: true
+      )
 
     assert status == 1, output
 

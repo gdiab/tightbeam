@@ -57,12 +57,17 @@ defmodule Tightbeam.TestIsolationTest do
   defp accepts(decoy), do: :counters.get(decoy.counter, 1)
 
   # A directory two levels below a .tightbeam-session that names the decoy.
-  defp session_tree!(decoy, parent) do
+  # `control: :test_root_unset` is for a decoy that must lie outside the test
+  # root; its raw control then runs with TIGHTBEAM_TEST_ROOT unset (N2's second
+  # branch).
+  defp session_tree!(decoy, parent, opts \\ []) do
     File.mkdir_p!(parent)
 
     # PO N2 (att_8a1bd48f): the repair bounds the CLI's session discovery at
-    # TIGHTBEAM_TEST_ROOT, so a raw positive control finds a decoy only inside it.
-    if test_root = System.get_env("TIGHTBEAM_TEST_ROOT") do
+    # TIGHTBEAM_TEST_ROOT, so a raw positive control finds a decoy only inside it,
+    # or with it unset.
+    if (test_root = System.get_env("TIGHTBEAM_TEST_ROOT")) &&
+         Keyword.get(opts, :control) != :test_root_unset do
       assert TestSandboxPreflight.inside?(parent, test_root),
              "decoy #{parent} must lie inside TIGHTBEAM_TEST_ROOT #{test_root}"
     end
@@ -75,8 +80,8 @@ defmodule Tightbeam.TestIsolationTest do
   end
 
   # The deliberately unguarded launch every guarded case is measured against.
-  defp raw_cli(args, cd, home) do
-    System.cmd(cli(), args, cd: cd, env: [{"HOME", home}], stderr_to_stdout: true)
+  defp raw_cli(args, cd, home, env \\ []) do
+    System.cmd(cli(), args, cd: cd, env: [{"HOME", home} | env], stderr_to_stdout: true)
   end
 
   defp assert_refused_reaching_nothing(decoy, fun, names) do
@@ -126,7 +131,8 @@ defmodule Tightbeam.TestIsolationTest do
       Path.join(TestIsolation.repo(), "_build/f1-q1c-#{System.unique_integer([:positive])}")
 
     on_exit(fn -> File.rm_rf!(parent) end)
-    tree = session_tree!(decoy, parent)
+    # The scenario needs the decoy in the repository, outside the test root.
+    tree = session_tree!(decoy, parent, control: :test_root_unset)
 
     assert_refused_reaching_nothing(
       decoy,
@@ -134,7 +140,9 @@ defmodule Tightbeam.TestIsolationTest do
       tree.session
     )
 
-    {output, _status} = raw_cli(["list"], tree.inner, scratch!("raw-home"))
+    {output, _status} =
+      raw_cli(["list"], tree.inner, scratch!("raw-home"), [{"TIGHTBEAM_TEST_ROOT", nil}])
+
     assert accepts(decoy) >= 1, "positive control: #{output}"
   end
 
@@ -157,7 +165,14 @@ defmodule Tightbeam.TestIsolationTest do
     assert status != 0
     assert accepts(decoy) == 0, "the guarded child keeps the sandbox HOME: #{output}"
 
-    {output, _status} = raw_cli(args, scratch!("raw-cwd"), home)
+    # The suite's own base variables (the repair's, erratum 2 C2) would take
+    # precedence over HOME, so the control clears them to reach the fallback.
+    {output, _status} =
+      raw_cli(args, scratch!("raw-cwd"), home, [
+        {"TIGHTBEAM_BASE_DIR", nil},
+        {"TIGHTBEAM_HOME", nil}
+      ])
+
     assert accepts(decoy) >= 1, "positive control with the decoy HOME: #{output}"
   end
 
@@ -209,15 +224,20 @@ defmodule Tightbeam.TestIsolationTest do
       assert accepts(decoy) == 0
     end
 
-    # ssh resolves only to the launcher's tripwire, which refuses every use.
+    # Erratum 2 C3/C4: the repair's tripwire directory precedes the toolbox, so
+    # ssh resolves to the repair's tripwire under the sandbox root, never an
+    # installed ssh.
     ssh = System.find_executable("ssh")
 
-    assert TestSandboxPreflight.canonical(ssh) ==
-             TestSandboxPreflight.canonical(Path.join(TestIsolation.sandbox_root(), "bin/ssh"))
+    assert TestSandboxPreflight.repair_tripwire?(ssh, root, test_root),
+           "ssh resolves to #{ssh}, not the repair's tripwire"
 
-    assert File.read!(ssh) == TestSandboxPreflight.ssh_tripwire()
-    assert TestSandboxPreflight.ssh_tripwire?(ssh, TestIsolation.sandbox_root())
-    assert {_, 255} = TestIsolation.cmd(ssh, ["example.invalid"], stderr_to_stdout: true)
+    # b0 ruling (2): the launcher's own ssh stand-in in the toolbox stays the
+    # exact tripwire bytes and refuses every use.
+    launcher_ssh = Path.join(root, "bin/ssh")
+    assert File.read!(launcher_ssh) == TestSandboxPreflight.ssh_tripwire()
+    assert TestSandboxPreflight.ssh_tripwire?(launcher_ssh, root)
+    assert {_, 255} = TestIsolation.cmd(launcher_ssh, ["example.invalid"], stderr_to_stdout: true)
 
     {output, status} =
       TestIsolation.cmd("sh", ["-c", "tightbeam list --as-process f1-decoy"],
@@ -364,7 +384,10 @@ defmodule Tightbeam.TestIsolationTest do
           {[{"TIGHTBEAM_URL", "http://10.1.2.3:9"}], "not a loopback address"},
           {[{"TIGHTBEAM_BASE_DIR", "/production/base"}], "outside the sandbox"},
           {[{"HOME", "/"}], "outside the sandbox"},
-          {[{"TIGHTBEAM_TOKEN", "t"}], "TIGHTBEAM_TOKEN is set without"},
+          # The suite inherits the repair's sandbox base (erratum 2 C2), which is a
+          # test endpoint, so the case removes it to have no endpoint at all.
+          {[{"TIGHTBEAM_TOKEN", "t"}, {"TIGHTBEAM_BASE_DIR", nil}, {"TIGHTBEAM_HOME", nil}],
+           "TIGHTBEAM_TOKEN is set without"},
           {[
              {"GIT_CONFIG_COUNT", "1"},
              {"GIT_CONFIG_KEY_0", "credential.helper"},
@@ -791,7 +814,9 @@ defmodule Tightbeam.TestIsolationTest do
         }
       ]
 
-      violations = LaunchIsolationLint.violations_in(%{"test/privilege_test.exs" => source}, listed)
+      violations =
+        LaunchIsolationLint.violations_in(%{"test/privilege_test.exs" => source}, listed)
+
       assert Enum.any?(violations, &(&1 =~ ~s(privilege-raising launch of "sudo")))
     end
 
@@ -812,8 +837,17 @@ defmodule Tightbeam.TestIsolationTest do
 
       violations = LaunchIsolationLint.violations_in(%{"test/gate_test.exs" => source}, [])
       assert Enum.any?(violations, &(&1 =~ "module attribute @tag depends on CI"))
-      assert Enum.any?(violations, &(&1 =~ "module attribute @moduletag depends on GITHUB_ACTIONS"))
-      assert Enum.any?(violations, &(&1 =~ "module attribute @root_capable depends on a privilege probe"))
+
+      assert Enum.any?(
+               violations,
+               &(&1 =~ "module attribute @moduletag depends on GITHUB_ACTIONS")
+             )
+
+      assert Enum.any?(
+               violations,
+               &(&1 =~ "module attribute @root_capable depends on a privilege probe")
+             )
+
       assert Enum.any?(violations, &(&1 =~ "ExUnit.configure options depends on RUNNER_OS"))
       refute Enum.any?(violations, &(&1 =~ "gate_test.exs:9 "))
     end
@@ -871,7 +905,9 @@ defmodule Tightbeam.TestIsolationTest do
              )
 
       refute LaunchIsolationLint.reviewed_entry?(
-               base |> Map.put(:reason, " ") |> Map.put(:reviewer, "s_0123abcd att_0123abcd")
+               base
+               |> Map.put(:reason, " ")
+               |> Map.put(:reviewer, "s_0123abcd att_0123abcd")
              )
 
       violations =

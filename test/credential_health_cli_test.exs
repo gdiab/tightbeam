@@ -309,9 +309,9 @@ defmodule Tightbeam.CredentialHealthCliTest do
     session_dir = Path.join(ctx.cwd, "nested")
     File.mkdir_p!(session_dir)
 
-    File.write!(
+    Tightbeam.FixtureSession.write!(
       Path.join(ctx.cwd, ".tightbeam-session"),
-      JSON.encode!(%{url: "ws://user:CANARY_USERINFO@127.0.0.1:#{server.port}/private"})
+      %{url: "ws://user:CANARY_USERINFO@127.0.0.1:#{server.port}/private"}
     )
 
     result = invoke(%{ctx | cwd: session_dir}, [])
@@ -321,12 +321,12 @@ defmodule Tightbeam.CredentialHealthCliTest do
     refute result.output =~ "CANARY_USERINFO"
     refute_receive {:credential_health_request, "/agent/credential-health", _authorization}
 
-    File.write!(
+    Tightbeam.FixtureSession.write!(
       Path.join(ctx.cwd, ".tightbeam-session"),
-      JSON.encode!(%{
+      %{
         url: "ws://user:CANARY_USERINFO@127.0.0.1:#{server.port}/private",
         token: @token
-      })
+      }
     )
 
     result = invoke(%{ctx | cwd: session_dir}, [])
@@ -335,9 +335,9 @@ defmodule Tightbeam.CredentialHealthCliTest do
     refute result.output =~ "CANARY_USERINFO"
     assert_receive {:credential_health_request, "/agent/credential-health", ["Bearer " <> @token]}
 
-    File.write!(
+    Tightbeam.FixtureSession.write!(
       Path.join(ctx.cwd, ".tightbeam-session"),
-      JSON.encode!(%{url: "ws://127.0.0.1:#{server.port}", token: 7})
+      %{url: "ws://127.0.0.1:#{server.port}", token: 7}
     )
 
     result = invoke(%{ctx | cwd: session_dir}, [])
@@ -552,8 +552,11 @@ defmodule Tightbeam.CredentialHealthCliTest do
     stdout_path = capture <> ".stdout"
     stderr_path = capture <> ".stderr"
 
+    # Some cases run inside a fixture session tree, so the launch goes through
+    # Tightbeam.FixtureSession (F1 wi_34a7be66, art_b5ff92cd class C); with no
+    # session ancestor it applies Tightbeam.TestIsolation's checks.
     {_shell_output, status} =
-      Tightbeam.TestIsolation.cmd(
+      Tightbeam.FixtureSession.cmd(
         "/bin/sh",
         [
           "-c",

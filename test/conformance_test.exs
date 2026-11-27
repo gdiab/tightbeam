@@ -2838,9 +2838,37 @@ defmodule Tightbeam.ConformanceTest do
     end
   end
 
+  # The nested suite's config/test.exs takes the Hex archive, the versioned
+  # rebar3 and the elixir_make cache from its HOME (F1 erratum 2 C15). They are
+  # copied from the launcher-seeded sandbox home, never the real one, as
+  # read-only regular files (F1 wi_34a7be66, art_b5ff92cd class F).
   defp fresh_sandbox_home! do
     home = Path.join(System.tmp_dir!(), "nested-suite-home-#{System.unique_integer([:positive])}")
     File.mkdir_p!(home)
+    seeded = Path.join(Tightbeam.TestIsolation.sandbox_root(), "home")
+
+    for source <-
+          Path.wildcard(Path.join(seeded, ".mix/archives/hex-*")) ++
+            Path.wildcard(Path.join(seeded, ".mix/elixir/*/rebar3")) ++
+            Path.wildcard(Path.join(seeded, ".cache/elixir_make")) do
+      target = Path.join(home, Path.relative_to(source, seeded))
+      File.mkdir_p!(Path.dirname(target))
+      File.cp_r!(source, target)
+    end
+
+    copies =
+      Path.wildcard(Path.join(home, ".mix/**"), match_dot: true) ++
+        Path.wildcard(Path.join(home, ".cache/elixir_make")) ++
+        Path.wildcard(Path.join(home, ".cache/elixir_make/**"), match_dot: true)
+
+    for path <- copies do
+      case File.lstat!(path).type do
+        :directory -> File.chmod!(path, 0o555)
+        :regular -> File.chmod!(path, 0o444)
+        other -> flunk("seeded build material #{path} is a #{other}")
+      end
+    end
+
     home
   end
 end

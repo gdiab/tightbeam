@@ -5,6 +5,9 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
   alias Mix.Tasks.Tightbeam.Doctor
 
+  # F1 class A (art_b5ff92cd): tmp_dir inside the test sandbox.
+  setup {Tightbeam.TestCase, :sandbox_tmp_dir}
+
   setup do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-doctor-#{System.unique_integer([:positive])}")

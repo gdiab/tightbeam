@@ -457,12 +457,24 @@ defmodule Tightbeam.TestIsolation do
 
   defp path_valued?(value), do: String.starts_with?(value, ["/", "~", "./", "../"])
 
-  defp loopback?(url) do
+  @doc """
+  Whether a URL names this host's loopback: `localhost`, `::1` or any address in
+  127.0.0.0/8 (F1 r3 L3 "loopback"; art_b5ff92cd class F).
+  """
+  def loopback?(url) when is_binary(url) do
     case URI.parse(url) do
-      %URI{host: host} when host in ["127.0.0.1", "::1", "[::1]", "localhost"] -> true
-      _ -> false
+      %URI{host: host} when host in ["::1", "[::1]", "localhost"] ->
+        true
+
+      %URI{host: host} when is_binary(host) ->
+        match?({:ok, {127, _, _, _}}, :inet.parse_strict_address(String.to_charlist(host)))
+
+      _ ->
+        false
     end
   end
+
+  def loopback?(_url), do: false
 
   defp test_endpoint?(env) do
     base = env["TIGHTBEAM_BASE_DIR"]

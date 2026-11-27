@@ -61,8 +61,9 @@ defmodule Tightbeam.TestCase do
     end
   end
 
-  setup do
+  setup context do
     assert_hermetic_tmp!()
+    tmp_dir = sandbox_tmp_dir(context)
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
 
@@ -95,8 +96,40 @@ defmodule Tightbeam.TestCase do
     # a real writer here or it would silently be asserting the fallback.
     start_supervised!({Tightbeam.TurnObservations, name: Tightbeam.TurnObservations})
 
-    :ok
+    {:ok, tmp_dir}
   end
+
+  @doc """
+  ExUnit makes every `:tmp_dir` under `<repo>/tmp`, outside the test sandbox, and
+  a child whose HOME is built there is refused: HOME and XDG_* stay sandbox-only,
+  with no symlink (F1 wi_34a7be66, b0 att_124bee40 (5); interpretation
+  art_b5ff92cd class A). A test asking for a tmp_dir gets a fresh one physically
+  inside the suite's test root instead, so a fixture's HOME, base and child test
+  root stay together there (`GuardRuntimeFixture`). Setup for async modules that
+  do not use this template: `setup {Tightbeam.TestCase, :sandbox_tmp_dir}`.
+  """
+  def sandbox_tmp_dir(%{tmp_dir: exunit_tmp} = context) when is_binary(exunit_tmp) do
+    root = Application.fetch_env!(:tightbeam, :test_suite_tmp)
+
+    # Short names: the ExUnit path carries the whole test name, and macOS limits
+    # socket paths to 104 bytes.
+    name = :erlang.phash2({context.module, context.test}) |> Integer.to_string(36)
+    dir = Path.join([root, "t", "#{name}-#{System.unique_integer([:positive])}"])
+    File.mkdir_p!(dir)
+
+    canonical = Tightbeam.TestSandboxPreflight.canonical(dir)
+
+    unless Tightbeam.TestSandboxPreflight.inside?(
+             canonical,
+             Tightbeam.TestIsolation.sandbox_root()
+           ),
+           do: raise("test tmp_dir #{canonical} is not inside the test sandbox")
+
+    File.rmdir(exunit_tmp)
+    [tmp_dir: canonical]
+  end
+
+  def sandbox_tmp_dir(_context), do: []
 
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db) do

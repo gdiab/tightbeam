@@ -141,6 +141,8 @@ done
 # Everything else the suite, its fixtures, the toolchain's own wrapper scripts
 # (erl/elixir/mix call dirname, basename, readlink, sed, uname) and the build
 # use. Absent tools are simply not linked; a test that needs one fails closed.
+# script(1) supplies the real pseudo-terminal the P5c suite tests drive the CLI
+# on (F1 erratum 1 rev 4 §1c.1; device_recovery_cli_test.exs on_tty).
 for tool in bash erlc escript elixirc iex node python3 sqlite3 cargo rustc rustdoc \
   cc c++ gcc clang ld ar as make pkg-config \
   cat cp mv rm mkdir rmdir ln ls chmod chown touch stat readlink realpath dirname \
@@ -149,7 +151,8 @@ for tool in bash erlc escript elixirc iex node python3 sqlite3 cargo rustc rustd
   tar gzip gunzip zcat mktemp mkfifo cmp diff od nohup timeout setsid flock \
   which hostname whoami sha256sum shasum md5sum file mount df du tty stty \
   getconf locale perl install patch curl jq rsync base64 unzip zip xxd nproc lsof getent \
-  iconv paste comm rev tac shuf truncate sync column nl fold xcrun sandbox-exec; do
+  iconv paste comm rev tac shuf truncate sync column nl fold xcrun sandbox-exec \
+  script; do
   [ -e "$root/bin/$tool" ] || link_tool "$tool"
 done
 

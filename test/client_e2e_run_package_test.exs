@@ -5,10 +5,12 @@ defmodule Tightbeam.ClientE2E.RunPackageTest do
 
   setup do
     # The fixture removes its own .git; keep it outside this checkout so a
-    # post-build Git lookup cannot fall through to the source repository.
+    # post-build Git lookup cannot fall through to the source repository. The
+    # suite's tmp root is inside the test sandbox, where its launches may run
+    # (F1 wi_34a7be66, art_b5ff92cd class B); beside the checkout they may not.
     root =
       Path.join(
-        Path.dirname(File.cwd!()),
+        System.tmp_dir!(),
         "client-e2e-package-#{System.unique_integer([:positive])}"
       )
 

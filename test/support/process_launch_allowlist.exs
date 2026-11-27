@@ -114,7 +114,7 @@ reviewer =
   # listener, and preflight children that must run from a decoy tree.
   %{
     file: "test/test_isolation_test.exs",
-    function: "defp raw_cli/3",
+    function: "defp raw_cli/4",
     kind: "System.cmd",
     reason:
       "positive control: the unguarded CLI launch that must reach the test-owned decoy, proving each guarded case is not vacuous",

@@ -2,6 +2,9 @@ defmodule Tightbeam.DeployReadinessTest do
   use ExUnit.Case, async: true
   alias Tightbeam.DeployReadiness, as: Ready
 
+  # F1 class A (art_b5ff92cd): tmp_dir inside the test sandbox.
+  setup {Tightbeam.TestCase, :sandbox_tmp_dir}
+
   test "production route never invokes the full-smoke callback in readiness mode" do
     assert Ready.route!("readiness", fn -> :bounded end, fn -> flunk("full smoke ran") end) ==
              :bounded
