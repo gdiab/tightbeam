@@ -1,5 +1,17 @@
 import Config
 
+# F1 (wi_34a7be66) erratum 2 C6 and erratum 3: Mix evaluates this file for every
+# MIX_ENV=test command, so the sandbox preflight is its first executable code,
+# before the setup below copies anything or launches rustc. It refuses unless
+# scripts/test_sandbox.sh built the sandbox this VM booted in, and records the
+# validated marker for test_helper.exs's second check. There is no switch.
+# The module is loaded from its test/support source here and unloaded again,
+# so the test build compiles it afresh (the recorded marker is kept).
+Code.require_file("../test/support/test_sandbox_preflight.ex", __DIR__)
+Tightbeam.TestSandboxPreflight.enforce!(Path.expand("..", __DIR__), :first)
+:code.delete(Tightbeam.TestSandboxPreflight)
+:code.purge(Tightbeam.TestSandboxPreflight)
+
 source_tool_home = System.fetch_env!("HOME")
 source_path = System.fetch_env!("PATH")
 source_cargo_home = System.get_env("CARGO_HOME", Path.join(source_tool_home, ".cargo"))

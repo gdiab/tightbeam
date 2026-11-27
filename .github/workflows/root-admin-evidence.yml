@@ -71,12 +71,17 @@ jobs:
           cargo fetch --locked --manifest-path native/topline_unicode/Cargo.toml
           cargo fetch --locked --manifest-path native/tightbeam_native/Cargo.toml
 
-      - name: Compile the base-preparation script's environment
+      # F1 r3 erratum 3: every MIX_ENV=test evaluation runs inside the test
+      # sandbox. mix deps.get runs first in the default environment (it fetches
+      # every environment's dependencies without evaluating config/test.exs); the
+      # test-environment compile then runs inside scripts/test_sandbox.sh.
+      - name: Fetch Mix dependencies (default environment, before the sandbox)
+        run: mix deps.get
+
+      - name: Compile the base-preparation script's environment (inside the test sandbox)
         env:
           MIX_ENV: test
-        run: |
-          mix deps.get
-          mix compile
+        run: scripts/test_sandbox.sh mix compile
 
       - name: Create tbowner (the database owner) and tbprobe (no sudoers entry)
         run: |
@@ -95,7 +100,7 @@ jobs:
         env:
           MIX_ENV: test
         run: |
-          mix run scripts/root_admin_evidence.exs prepare "$ROOT"
+          scripts/test_sandbox.sh mix run scripts/root_admin_evidence.exs prepare "$ROOT"
           sudo chown -R tbowner:tbowner "$ROOT/base"
           echo "OWNER_UID=$(id -u tbowner)" >> "$GITHUB_ENV"
           echo "OWNER_GID=$(id -g tbowner)" >> "$GITHUB_ENV"
