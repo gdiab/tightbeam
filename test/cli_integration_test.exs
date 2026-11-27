@@ -1967,8 +1967,14 @@ defmodule Tightbeam.CliIntegrationTest do
     assert listed =~ "cli-holder"
     assert_receive {:cli_call, %{origin: "agent:cli-holder", principal: {:session, "cli-holder"}}}
 
+    # Nothing explicit outside the tree: the suite's own TIGHTBEAM_BASE_DIR would be
+    # an explicit base under F2 (wi_34a7be66), so the launch declares it unset.
     {outside, 1} =
-      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"], cd: ctx.outside, stderr_to_stdout: true)
+      Tightbeam.FixtureSession.cmd(ctx.binary, ["list"],
+        cd: ctx.outside,
+        env: [{"TIGHTBEAM_BASE_DIR", nil}],
+        stderr_to_stdout: true
+      )
 
     assert outside =~ "identity required"
     assert outside =~ ".tightbeam-session"

@@ -88,6 +88,28 @@ pub fn default_in(home_dir: &Path) -> PathBuf {
     home_dir.join(".tightbeam")
 }
 
+/// How `TIGHTBEAM_BASE_DIR` itself is set. F2's selection (wi_34a7be66) makes a
+/// non-empty one an explicit source ahead of an ambient session file and refuses an
+/// empty one beside it, so it asks here rather than reading the variable itself;
+/// where the base then is stays `resolve_with`'s answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseDirSetting {
+    Unset,
+    Empty,
+    Set,
+}
+
+pub fn base_dir_setting<F>(get_env: &F) -> BaseDirSetting
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match get_env("TIGHTBEAM_BASE_DIR").as_deref() {
+        None => BaseDirSetting::Unset,
+        Some("") => BaseDirSetting::Empty,
+        Some(_) => BaseDirSetting::Set,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

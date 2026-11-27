@@ -84,6 +84,13 @@ defmodule Tightbeam.TestIsolationTest do
     System.cmd(cli(), args, cd: cd, env: [{"HOME", home} | env], stderr_to_stdout: true)
   end
 
+  # The raw launch that must reach the decoy session gateway. The suite's own
+  # TIGHTBEAM_BASE_DIR (the repair's, erratum 2 C2) is an explicit base, which F2
+  # (wi_34a7be66) puts ahead of the session file, so the control clears it.
+  defp raw_session_cli(args, cd, home, env \\ []) do
+    raw_cli(args, cd, home, [{"TIGHTBEAM_BASE_DIR", nil} | env])
+  end
+
   defp assert_refused_reaching_nothing(decoy, fun, names) do
     error = assert_raise TestIsolation.Refusal, fun
     assert error.message =~ names
@@ -101,7 +108,7 @@ defmodule Tightbeam.TestIsolationTest do
       tree.session
     )
 
-    {output, _status} = raw_cli(args, tree.inner, scratch!("raw-home"))
+    {output, _status} = raw_session_cli(args, tree.inner, scratch!("raw-home"))
 
     assert accepts(decoy) >= 1,
            "positive control: the raw launch must reach the decoy session gateway: #{output}"
@@ -141,7 +148,7 @@ defmodule Tightbeam.TestIsolationTest do
     )
 
     {output, _status} =
-      raw_cli(["list"], tree.inner, scratch!("raw-home"), [{"TIGHTBEAM_TEST_ROOT", nil}])
+      raw_session_cli(["list"], tree.inner, scratch!("raw-home"), [{"TIGHTBEAM_TEST_ROOT", nil}])
 
     assert accepts(decoy) >= 1, "positive control: #{output}"
   end
@@ -304,7 +311,7 @@ defmodule Tightbeam.TestIsolationTest do
       assert status == 78 and output =~ tree.session
       assert accepts(decoy) == 0
 
-      {output, _} = raw_cli(["list"], tree.inner, scratch!("raw-home"))
+      {output, _} = raw_session_cli(["list"], tree.inner, scratch!("raw-home"))
       assert accepts(decoy) >= 1, "positive control: #{output}"
     end
 

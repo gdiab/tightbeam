@@ -436,13 +436,30 @@ defmodule Tightbeam.DiscoveryPrecedenceTest do
       refute log =~ @poison
 
       # F2-5c on the codex inventory read over ssh: the -u options come right after env.
-      assert_received {:inventory_command, inventory}
+      # The inventory is the command running `node -e` (the one inventory_shell/1
+      # answers); the gate's session-file probe also goes through sh_out and is not it.
+      commands = inventory_commands()
+
+      assert [inventory] = Enum.filter(commands, &("node" in &1 and "-e" in &1)),
+             inspect(commands)
+
+      assert ["ssh" | _] = inventory
+      assert "codex@worker" in inventory, inspect(inventory)
       env_at = Enum.find_index(inventory, &(&1 == "env"))
-      assert env_at, inspect(inventory)
+      assert env_at && env_at < Enum.find_index(inventory, &(&1 == "node")), inspect(inventory)
 
       assert Enum.slice(inventory, env_at + 1, 4) ==
                ["-u", "TIGHTBEAM_TOKEN", "-u", "TIGHTBEAM_BASE_DIR"],
              inspect(inventory)
+    end
+  end
+
+  # Every command the spawn handed to sh_out, in order.
+  defp inventory_commands(acc \\ []) do
+    receive do
+      {:inventory_command, command} -> inventory_commands([command | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 end

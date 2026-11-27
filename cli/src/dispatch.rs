@@ -2322,7 +2322,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let raw_token = get_env("TIGHTBEAM_TOKEN");
-    let raw_base = get_env("TIGHTBEAM_BASE_DIR");
+    let base_setting = crate::base_dir::base_dir_setting(get_env);
     let url = get_env("TIGHTBEAM_URL").filter(|value| !value.is_empty());
     let token = raw_token.clone().filter(|value| !value.is_empty());
     let session = nearest_session_file(cwd, get_env("TIGHTBEAM_TEST_ROOT"));
@@ -2355,7 +2355,7 @@ where
     }
 
     // 2. The explicit base, wherever F1's resolver puts it.
-    if raw_base.as_deref().is_some_and(|value| !value.is_empty()) {
+    if base_setting == crate::base_dir::BaseDirSetting::Set {
         let base_dir = crate::base_dir::resolve_with(get_env, home_dir);
         let overridden = session.map(|path| Overridden {
             source: ExplicitSource::BaseDir,
@@ -2390,7 +2390,7 @@ where
             Err(_) => return Selection::Session { path, read },
         }
     }
-    if raw_base.as_deref() == Some("") {
+    if base_setting == crate::base_dir::BaseDirSetting::Empty {
         return Selection::Refused(Incomplete::EmptyBaseDir);
     }
 
