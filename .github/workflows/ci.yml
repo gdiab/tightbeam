@@ -55,7 +55,7 @@ jobs:
           - os: macos-latest
             name: macos
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","tb-macos"]') || matrix.os }}
+    runs-on: ${{ matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'macos-26' || matrix.os }}
     # Pull requests and the merge queue run source checks, the gate scripts,
     # and a compile. Every trusted push and manual run also executes the full
     # Mix and Cargo suites on both platforms before release packaging.
